@@ -73,33 +73,19 @@ SELL_PROPORTIONS: List[float] = []  # DISABLED (no staggered/partial sells)
 MAKER_FEE_BPS: float = 6.0
 TAKER_FEE_BPS: float = 10.0
 
-# Minimum profit threshold (bps) required before taking a resistance-based profit.
-# Prevents 'tp_res' exits that are actually net losers due to fees/spread.
+# Disable all legacy take-profit / stagger / stop logic (replaced by peak-based full-exit)
 MIN_TAKE_PROFIT_BPS: float = 0.0  # DISABLED
-
-# Minimum gross take-profit threshold (as a percentage of entry) before ANY profit-based sell.
-# Rule: do not sell unless the position is up at least +2.0% (except stop losses / risk-off / time stop).
 MIN_TAKE_PROFIT_PCT: float = 0.0  # DISABLED
-
-# Stop loss percent from average entry.
-# Rule: stop loss triggers at entry_price * (1 - 0.5%).
-STOP_LOSS_PCT: float = 0.0  # DISABLED (replaced by peak-based HARD_PEAK_STOP_PCT)
-
-
-# Profit-protect rule: once the position has reached +1.0% unrealized gain,
-# sell if it draws down by 0.25% from the best bid seen since entry.
-PROFIT_LOCK_IN_PCT: float = 0.0  # DISABLED
+STOP_LOSS_PCT: float = 0.0        # DISABLED (replaced by peak-based HARD_PEAK_STOP_PCT)
+PROFIT_LOCK_IN_PCT: float = 0.0   # DISABLED
 PROFIT_LOCK_IN_DRAWDOWN_PCT: float = 0.0  # DISABLED
 
 # Simplified SELL logic (peak-based trailing + peak stop)
 TRAIL_ARM_PCT: float = 0.015          # +1.5% arms trailing
-TRAIL_DRAWDOWN_PCT: float = 0.0025    # 0.25% drop from peak triggers sell after armed
-HARD_PEAK_STOP_PCT: float = 0.005     # 0.5% drop from peak triggers sell anytime
+TRAIL_DRAWDOWN_PCT: float = 0.0025    # 0.25% drop from peak triggers sell AFTER armed
+HARD_PEAK_STOP_PCT: float = 0.005     # 0.5% drop from peak triggers sell ANYTIME
 
-
-# Volatility-weighted trailing profit protection (arms after +1%).
-# We trail off the *peak* using a volatility band rather than a fixed percentage.
-# σ is computed as the rolling stddev of 1m returns over TRAIL_VOL_WINDOW_MIN.
+# Disable volatility-weighted trailing band system (legacy)
 TRAIL_VOL_WINDOW_MIN: int = 0  # DISABLED
 TRAIL_K_BASE: float = 0.0  # DISABLED
 TRAIL_K_MIN: float = 0.0  # DISABLED
@@ -269,7 +255,6 @@ MIN_RELIEF_RALLY_BPS: float = -8.0    # last few minutes should not be strongly 
 SELL_TARGET_GAP_SEC_BASE: float = 0.0   # DISABLED
 SELL_TARGET_GAP_SEC_MIN: float = 0.0    # DISABLED
 SELL_TARGET_GAP_SEC_MAX: float = 0.0    # DISABLED
-SELL_PROPORTIONS_V2: List[float] = []  # DISABLED
 EXTRA_PROFIT_BPS: float = 0.0  # DISABLED
 
 # Fair value smoothing (reduce sudden "dips" in fair value):
@@ -2887,29 +2872,6 @@ class TradingBot:
 
                     state = "HOLD"
 
-                    # Peak tracking since entry (bid-based) + trailing arm state.
-                    # - peak starts at avg_entry (or current bid if unknown) when position is open
-                    # - update peak whenever bid makes a new high
-                    # - arm trailing once peak profit reaches +1.5%
-                    if avg_entry_price is not None:
-                        if self.peak_bid.get(product) is None:
-                            base = float(avg_entry_price) if float(avg_entry_price) > 0 else float(bid)
-                            self.peak_bid[product] = float(base)
-                        prev_peak = float(self.peak_bid.get(product) or bid)
-                        if bid > prev_peak:
-                            self.peak_bid[product] = float(bid)
-                            prev_peak = float(bid)
-                        peak_bid_now = float(prev_peak)
-                        peak_profit_pct = (peak_bid_now / max(float(avg_entry_price), 1e-12)) - 1.0
-                        if peak_profit_pct >= TRAIL_ARM_PCT:
-                            self.trailing_active[product] = True
-                    else:
-                        # Defensive: should not happen when active_qty>0, but keep safe behavior.
-                        if self.peak_bid.get(product) is None:
-                            self.peak_bid[product] = float(bid)
-                        peak_bid_now = float(self.peak_bid.get(product) or bid)
-
-
                     async def _sell_all(note: str) -> None:
                         nonlocal active_qty, cash_usd, equity_usd
                         qty_to_sell = active_qty
@@ -2991,17 +2953,38 @@ class TradingBot:
                         state = "RISK_OFF_LIQUIDATE"
                         await _sell_all("risk_off_liq")
                     else:
-                        # Peak-based exits (no targets / no partial exits).
+                        # Update peak bid for peak-based exits
                         peak_bid_now = float(self.peak_bid.get(product) or bid)
-                        dd_frac = 0.0
-                        if peak_bid_now > 0:
-                            dd_frac = (peak_bid_now - float(bid)) / peak_bid_now
-                        if dd_frac >= HARD_PEAK_STOP_PCT:
+                        if bid > peak_bid_now:
+                            peak_bid_now = float(bid)
+                            self.peak_bid[product] = peak_bid_now
+
+                        # Peak profit since entry (based on avg entry)
+                        if avg_entry_price and avg_entry_price > 0:
+                            peak_profit_pct = (peak_bid_now / float(avg_entry_price)) - 1.0
+                        else:
+                            peak_profit_pct = 0.0
+
+                        # HARD peak stop: sell on 0.5% drop from peak at ANY time
+                        hard_stop_price = peak_bid_now * (1.0 - HARD_PEAK_STOP_PCT)
+                        if bid <= hard_stop_price:
                             state = "HARD_PEAK_STOP"
-                            await _sell_all(f"SELL:hard_peak_stop peak={peak_bid_now:.10f} bid={float(bid):.10f}")
-                        elif self.trailing_active.get(product, False) and dd_frac >= TRAIL_DRAWDOWN_PCT:
-                            state = "TRAIL_DRAWDOWN"
-                            await _sell_all(f"SELL:trail_drawdown peak={peak_bid_now:.10f} bid={float(bid):.10f}")
+                            await _sell_all("hard_peak_stop")
+                            await asyncio.sleep(EVAL_TICK_SEC)
+                            continue
+
+                        # Arm trailing only AFTER +1.5% peak profit
+                        if (not self.trailing_active.get(product, False)) and (peak_profit_pct >= TRAIL_ARM_PCT):
+                            self.trailing_active[product] = True
+
+                        # If armed, sell if price drops 0.25% from peak
+                        if self.trailing_active.get(product, False):
+                            trail_price = peak_bid_now * (1.0 - TRAIL_DRAWDOWN_PCT)
+                            if bid <= trail_price:
+                                state = "TRAIL_EXIT"
+                                await _sell_all("trail_exit")
+                                await asyncio.sleep(EVAL_TICK_SEC)
+                                continue
 
                     # If we just exited, skip add/exit logic and move on.
                     if active_qty <= 0:
@@ -3293,22 +3276,20 @@ class TradingBot:
                             else:
                                 # 24h anchored VWAP + fair value for micro context.
                                 avwap_24h = self._compute_anchored_vwap_24h(product, ts_now)
-                                ok, reason, dbg = self._entry_gate_bottoming(
+                                ok_entry, entry_reason, entry_dbg = self._entry_gate_bottoming(
                                     product_id=product,
                                     mid=mid,
                                     avwap_24h=avwap_24h,
                                     trending_down=trending_down,
                                     weekly_bias=weekly_bias,
                                 )
-                                entry_reason = reason
-                                entry_dbg = dbg
 
-                                if ok:
+                                if ok_entry:
                                     # Score candidates: prefer closer to the local low and deeper in support.
                                     zone_w = max(levels.support_zone_high - levels.support_zone_low, 1e-9)
                                     depth = (levels.support_zone_high - mid) / zone_w  # 0 at top, 1 at bottom
 
-                                    dist_low_pct = float(dbg.get("dist_low_pct", 0.0))
+                                    dist_low_pct = float(entry_dbg.get("dist_low_pct", 0.0))
                                     # Smaller dist_low_pct => better. Bound to avoid negative overflow.
                                     near_low_score = max(0.0, (ENTRY_NEAR_LOW_MAX_PCT - dist_low_pct)) / max(ENTRY_NEAR_LOW_MAX_PCT, 1e-12)
 
@@ -3325,7 +3306,7 @@ class TradingBot:
                                         }
 
                     # Optional debug print for gating (kept concise)
-                    if entry_reason and entry_reason != "OK_bottoming_stable_reclaim":
+                    if entry_reason and not entry_reason.startswith("BUY_OK:"):
                         pass  # keep prints quiet by default; see BUY note for the chosen candidate
 
                 # Always log snapshots for non-active products too.

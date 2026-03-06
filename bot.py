@@ -257,7 +257,17 @@ TIER_TP_COOLDOWN_SEC = 90.0
 ROTATE_MIN_TIER_DELTA = 1
 
 # Require minimum spread quality for scalps (you can tighten later)
-SCALP_MAX_SPREAD_BPS = 12.0
+SCALP_MAX_SPREAD_BPS: float = 12.0
+
+# Option-1 / tiered-entry support-zone buffer (basis points)
+SUPPORT_BUFFER_BPS: float = 20.0
+RSI_BUY_THRESHOLD: float = 35.0
+EMA_ENTRY_FAST: int = 9
+EMA_ENTRY_SLOW: int = 20
+EMA_SLOPE_MAX_DOWN_BPS: float = 12.0
+PIVOT_W: int = 2
+RESIST_BUFFER_BPS: float = 15.0
+REQUIRE_CONFIRMATIONS: int = 2
 
 # Ladder discipline
 BUY_COOLDOWN_SEC: float = 45.0        # minimum time between entries
@@ -1576,6 +1586,8 @@ def tiered_entry_gate(
     minute_candles: List['MinuteCandle'],
     weekly_bias: Optional[float],
     trending_down: bool,
+    support_buffer_bps: float,
+    resist_buffer_bps: float,
 ) -> Tuple[bool, int, str]:
     """
     Returns: (ok, tier, reason)
@@ -1586,20 +1598,20 @@ def tiered_entry_gate(
     risk_off = trending_down or (weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD)
 
     # A) Support proximity (re-use option1 support)
-    sup_ok, sup_reason = option1_in_support_zone(mid, levels_day, levels_week, SUPPORT_BUFFER_BPS)
+    sup_ok, sup_reason = option1_in_support_zone(mid, levels_day, levels_week, support_buffer_bps)
 
     # B) Reversal confirmation (option1 is 2-of-3)
     rev_ok, rev_reason = option1_reversal_confirmation(minute_candles)
 
     # HIGH: strict Option-1 (your original intent)
     if (not risk_off) and sup_ok and rev_ok:
-        room_ok, room_reason = option1_room_to_target(mid, levels_day, levels_week, RESIST_BUFFER_BPS)
+        room_ok, room_reason = option1_room_to_target(mid, levels_day, levels_week, resist_buffer_bps)
         if room_ok:
             return True, TIER_HIGH, f"HIGH:A={sup_reason};B={rev_reason};C={room_reason}"
 
     # MID: allow if support + reversal, but only require room to ~0.75%
     if sup_ok and rev_ok and (not risk_off):
-        room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_MID], resist_buffer_bps=RESIST_BUFFER_BPS)
+        room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_MID], resist_buffer_bps=resist_buffer_bps)
         if room_ok:
             return True, TIER_MID, f"MID:A={sup_reason};B={rev_reason};C={room_reason}"
 
@@ -1610,7 +1622,7 @@ def tiered_entry_gate(
         # We parse the option1 string: "pass=rsi+ema_reclaim" etc.
         passed_any = ("pass=" in rev_reason) and any(k in rev_reason for k in ("rsi", "ema_reclaim"))
         if sup_ok or passed_any:
-            room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_LOW], resist_buffer_bps=RESIST_BUFFER_BPS)
+            room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_LOW], resist_buffer_bps=resist_buffer_bps)
             if room_ok:
                 return True, TIER_LOW, f"LOW:A={sup_reason};B={rev_reason};C={room_reason}"
 
@@ -3578,6 +3590,8 @@ class TradingBot:
                                 minute_candles=minute_candles,
                                 weekly_bias=weekly_bias,
                                 trending_down=trending_down,
+                                support_buffer_bps=SUPPORT_BUFFER_BPS,
+                                resist_buffer_bps=RESIST_BUFFER_BPS,
                             )
 
                             if ok:

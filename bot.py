@@ -73,33 +73,19 @@ SELL_PROPORTIONS: List[float] = []  # DISABLED (no staggered/partial sells)
 MAKER_FEE_BPS: float = 6.0
 TAKER_FEE_BPS: float = 10.0
 
-# Minimum profit threshold (bps) required before taking a resistance-based profit.
-# Prevents 'tp_res' exits that are actually net losers due to fees/spread.
+# Disable all legacy take-profit / stagger / stop logic (replaced by peak-based full-exit)
 MIN_TAKE_PROFIT_BPS: float = 0.0  # DISABLED
-
-# Minimum gross take-profit threshold (as a percentage of entry) before ANY profit-based sell.
-# Rule: do not sell unless the position is up at least +2.0% (except stop losses / risk-off / time stop).
 MIN_TAKE_PROFIT_PCT: float = 0.0  # DISABLED
-
-# Stop loss percent from average entry.
-# Rule: stop loss triggers at entry_price * (1 - 0.5%).
-STOP_LOSS_PCT: float = 0.0  # DISABLED (replaced by peak-based HARD_PEAK_STOP_PCT)
-
-
-# Profit-protect rule: once the position has reached +1.0% unrealized gain,
-# sell if it draws down by 0.25% from the best bid seen since entry.
-PROFIT_LOCK_IN_PCT: float = 0.0  # DISABLED
+STOP_LOSS_PCT: float = 0.0        # DISABLED (replaced by peak-based HARD_PEAK_STOP_PCT)
+PROFIT_LOCK_IN_PCT: float = 0.0   # DISABLED
 PROFIT_LOCK_IN_DRAWDOWN_PCT: float = 0.0  # DISABLED
 
 # Simplified SELL logic (peak-based trailing + peak stop)
 TRAIL_ARM_PCT: float = 0.015          # +1.5% arms trailing
-TRAIL_DRAWDOWN_PCT: float = 0.0025    # 0.25% drop from peak triggers sell after armed
-HARD_PEAK_STOP_PCT: float = 0.005     # 0.5% drop from peak triggers sell anytime
+TRAIL_DRAWDOWN_PCT: float = 0.0025    # 0.25% drop from peak triggers sell AFTER armed
+HARD_PEAK_STOP_PCT: float = 0.005     # 0.5% drop from peak triggers sell ANYTIME
 
-
-# Volatility-weighted trailing profit protection (arms after +1%).
-# We trail off the *peak* using a volatility band rather than a fixed percentage.
-# σ is computed as the rolling stddev of 1m returns over TRAIL_VOL_WINDOW_MIN.
+# Disable volatility-weighted trailing band system (legacy)
 TRAIL_VOL_WINDOW_MIN: int = 0  # DISABLED
 TRAIL_K_BASE: float = 0.0  # DISABLED
 TRAIL_K_MIN: float = 0.0  # DISABLED
@@ -240,6 +226,49 @@ ENTRY_PCT_STEP: float = 0.025
 # Execution quality filters
 MAX_SPREAD_BPS: float = 20.0          # skip trading if spread too wide
 
+# ============================================================
+# TIERED BUY/SELL EXTENSION
+# ============================================================
+
+# Tier names (higher number = higher priority)
+TIER_LOW = 1
+TIER_MID = 2
+TIER_HIGH = 3
+
+# Profit-taking targets for tiers (these are TP sells; risk exits still use peak stop logic)
+TIER_TP_PCT = {
+    TIER_LOW: 0.0025,   # +0.25%
+    TIER_MID: 0.0075,   # +0.75% (in your requested 0.5–1% band)
+    TIER_HIGH: 0.015,   # +1.5% (leave room for +2%+ runners)
+}
+
+# How much of the position to sell at tier TP when hit
+# (Low tier: mostly scalp out; Mid: partial; High: smallest partial to keep runners)
+TIER_TP_SELL_FRAC = {
+    TIER_LOW: 0.85,
+    TIER_MID: 0.55,
+    TIER_HIGH: 0.25,
+}
+
+# Prevent TP spam (seconds between tier TP sells per product)
+TIER_TP_COOLDOWN_SEC = 90.0
+
+# Rotation rule: if holding tier < candidate_tier by at least this delta, rotate
+ROTATE_MIN_TIER_DELTA = 1
+
+# Require minimum spread quality for scalps (you can tighten later)
+SCALP_MAX_SPREAD_BPS: float = 12.0
+
+# Option-1 / tiered-entry support-zone buffer (basis points)
+SUPPORT_BUFFER_BPS: float = 20.0
+RSI_BUY_THRESHOLD: float = 35.0
+EMA_ENTRY_FAST: int = 9
+EMA_ENTRY_SLOW: int = 20
+EMA_SLOPE_MAX_DOWN_BPS: float = 12.0
+PIVOT_W: int = 2
+RESIST_BUFFER_BPS: float = 15.0
+REQUIRE_CONFIRMATIONS: int = 2
+
 # Ladder discipline
 BUY_COOLDOWN_SEC: float = 45.0        # minimum time between entries
 BUY_MIN_SPACING_SIGMA: float = 0.25   # require mid to be <= last_buy_price - (0.25*sigma)
@@ -269,7 +298,6 @@ MIN_RELIEF_RALLY_BPS: float = -8.0    # last few minutes should not be strongly 
 SELL_TARGET_GAP_SEC_BASE: float = 0.0   # DISABLED
 SELL_TARGET_GAP_SEC_MIN: float = 0.0    # DISABLED
 SELL_TARGET_GAP_SEC_MAX: float = 0.0    # DISABLED
-SELL_PROPORTIONS_V2: List[float] = []  # DISABLED
 EXTRA_PROFIT_BPS: float = 0.0  # DISABLED
 
 # Fair value smoothing (reduce sudden "dips" in fair value):
@@ -339,6 +367,10 @@ def _http_get_json(url: str, timeout: float = 12.0) -> Any:
 
 def _iso(ts: int) -> str:
     # Coinbase Exchange REST expects ISO8601 timestamps.
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _iso_utc(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -1023,16 +1055,38 @@ class MacroFetcher:
 
     async def fetch(self, product_id: str, start: int, end: int, granularity: str) -> List[Candle]:
         try:
+            print(f"[macro] get_candles {product_id} {granularity} start={int(start)} end={int(end)} span={(int(end)-int(start))}")
             resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.rest.get_candles(
                     product_id=product_id,
-                    start=str(start),
-                    end=str(end),
+                    start=str(int(start)),
+                    end=str(int(end)),
                     granularity=granularity,
                 )
             )
-            return _parse_candles_response(resp)
+            candles = _parse_candles_response(resp)
+            if candles:
+                return candles
+
+            # Fallback: Coinbase Exchange public candles endpoint (more reliable formatting)
+            gran_map = {
+                "ONE_MINUTE": 60,
+                "FIVE_MINUTE": 300,
+                "FIFTEEN_MINUTE": 900,
+                "ONE_HOUR": 3600,
+                "ONE_DAY": 86400,
+            }
+            g = gran_map.get(granularity)
+            if g:
+                rows = _fetch_candles_public(product_id=product_id, granularity=g, start=start, end=end, limit=300)
+                out = []
+                for r in rows:
+                    # r = [time, low, high, open, close, volume]
+                    out.append(Candle(ts=int(r[0]), open=float(r[3]), high=float(r[2]), low=float(r[1]), close=float(r[4]), volume=float(r[5])))
+                return out
+
+            return []
         except Exception as e:
             print(f"[macro] fetch failed for {product_id} {granularity}: {e}")
             return []
@@ -1055,11 +1109,25 @@ class MacroFetcher:
         span = gran_sec_map.get(granularity)
         if not span:
             return await self.fetch(product_id, start, end, granularity)
+
+        # --- ALIGN timestamps to candle boundaries (CRITICAL) ---
+        start_i = int(start)
+        end_i = int(end)
+
+        # floor to boundary
+        start_i = start_i - (start_i % span)
+        end_i = end_i - (end_i % span)
+
+        # ensure end is strictly after start by at least one bucket
+        if end_i <= start_i:
+            end_i = start_i + span
+
         chunk_span = span * max_candles_per_req
         out: List[Candle] = []
-        cursor = int(start)
-        while cursor < int(end):
-            chunk_end = min(int(end), cursor + chunk_span)
+        cursor = start_i
+
+        while cursor < end_i:
+            chunk_end = min(end_i, cursor + chunk_span)
             if chunk_end <= cursor:
                 break
             chunk = await self.fetch(product_id, cursor, chunk_end, granularity)
@@ -1492,6 +1560,88 @@ def option1_room_to_target(mid: float, day: Optional['MacroLevels'], week: Optio
     if (lvl + buf) < target:
         return False, f"capped_by={name}"
     return True, f"room_ok_next={name}"
+
+
+def _room_to_target_pct(mid: float, day: Optional['MacroLevels'], week: Optional['MacroLevels'], target_pct: float, resist_buffer_bps: float) -> Tuple[bool, str]:
+    if mid <= 0:
+        return False, "bad_mid"
+    target = mid * (1.0 + float(target_pct))
+    buf = mid * (resist_buffer_bps / 10_000.0)
+
+    resist_levels: List[Tuple[str, float]] = []
+    if day:
+        resist_levels += [
+            ("day_res_zone_low", day.resistance_zone_low),
+            ("day_vwap", day.vwap),
+            ("day_VAH", day.vah),
+        ]
+    if week:
+        resist_levels += [
+            ("week_res_zone_low", week.resistance_zone_low),
+            ("week_vwap", week.vwap),
+            ("week_VAH", week.vah),
+        ]
+
+    above = [(name, lvl) for name, lvl in resist_levels if lvl and lvl > mid]
+    if not above:
+        return True, "no_resistance_above"
+    name, lvl = min(above, key=lambda x: x[1])
+
+    if (lvl + buf) < target:
+        return False, f"capped_by={name}"
+    return True, f"room_ok_next={name}"
+
+
+def tiered_entry_gate(
+    *,
+    mid: float,
+    spread_bps: float,
+    levels_day: Optional['MacroLevels'],
+    levels_week: Optional['MacroLevels'],
+    minute_candles: List['MinuteCandle'],
+    weekly_bias: Optional[float],
+    trending_down: bool,
+    support_buffer_bps: float,
+    resist_buffer_bps: float,
+) -> Tuple[bool, int, str]:
+    """
+    Returns: (ok, tier, reason)
+      - tier: 1=low, 2=mid, 3=high
+    """
+
+    # Hard risk-off block stays: don’t scalp aggressively in extreme risk-off
+    risk_off = trending_down or (weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD)
+
+    # A) Support proximity (re-use option1 support)
+    sup_ok, sup_reason = option1_in_support_zone(mid, levels_day, levels_week, support_buffer_bps)
+
+    # B) Reversal confirmation (option1 is 2-of-3)
+    rev_ok, rev_reason = option1_reversal_confirmation(minute_candles)
+
+    # HIGH: strict Option-1 (your original intent)
+    if (not risk_off) and sup_ok and rev_ok:
+        room_ok, room_reason = option1_room_to_target(mid, levels_day, levels_week, resist_buffer_bps)
+        if room_ok:
+            return True, TIER_HIGH, f"HIGH:A={sup_reason};B={rev_reason};C={room_reason}"
+
+    # MID: allow if support + reversal, but only require room to ~0.75%
+    if sup_ok and rev_ok and (not risk_off):
+        room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_MID], resist_buffer_bps=resist_buffer_bps)
+        if room_ok:
+            return True, TIER_MID, f"MID:A={sup_reason};B={rev_reason};C={room_reason}"
+
+    # LOW (scalp): require tight spread + either support proximity OR mild reversal,
+    # and do NOT require room to 2% (only room to 0.25%)
+    if spread_bps <= SCALP_MAX_SPREAD_BPS and (not risk_off):
+        # Looser reversal: accept if RSI or EMA reclaim passed (not necessarily 2-of-3)
+        # We parse the option1 string: "pass=rsi+ema_reclaim" etc.
+        passed_any = ("pass=" in rev_reason) and any(k in rev_reason for k in ("rsi", "ema_reclaim"))
+        if sup_ok or passed_any:
+            room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_LOW], resist_buffer_bps=resist_buffer_bps)
+            if room_ok:
+                return True, TIER_LOW, f"LOW:A={sup_reason};B={rev_reason};C={room_reason}"
+
+    return False, 0, f"NO: A={sup_reason}; B={rev_reason}"
 
 # ------------------------------------------------------------
 # Portfolio management
@@ -2164,6 +2314,10 @@ class TradingBot:
         # Runner trailing state
         self.peak_bid: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         self.trailing_active: Dict[str, bool] = {p: False for p in PRODUCTS}
+        # Tier tracking for the active position
+        self.position_tier: Dict[str, int] = {p: 0 for p in PRODUCTS}
+        self.last_tier_tp_ts: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
+        self.position_entry_price: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         # Risk-off throttling state (per product)
         self.last_risk_off_ts: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         # Global exit timestamp (used to throttle re-entry after any liquidation)
@@ -2318,6 +2472,130 @@ class TradingBot:
         if sold <= 1e-12:
             return 0.0, None
         return float(cost), float(cost / sold)
+
+    def _fifo_reduce_lots(self, product: str, qty_to_remove: float) -> Tuple[float, Optional[float]]:
+        """Reduce position lots FIFO by qty_to_remove. Returns (removed_qty, fifo_avg_entry_price)."""
+        lots = self.positions.get(product, [])
+        if not lots or qty_to_remove <= 0:
+            return 0.0, None
+        remaining = float(qty_to_remove)
+        removed_qty = 0.0
+        removed_cost = 0.0
+        new_lots: List[PositionLot] = []
+        new_tags: List[str] = []
+        tags = self.lot_tags.get(product, [])
+
+        for i, lot in enumerate(lots):
+            tag = tags[i] if i < len(tags) else ""
+            if remaining <= 1e-12:
+                new_lots.append(lot)
+                new_tags.append(tag)
+                continue
+            take = min(float(lot.qty), remaining)
+            removed_qty += take
+            removed_cost += take * float(lot.price)
+            left = float(lot.qty) - take
+            remaining -= take
+            if left > 1e-12:
+                new_lots.append(PositionLot(qty=left, price=float(lot.price)))
+                new_tags.append(tag)
+
+        self.positions[product] = new_lots
+        self.lot_tags[product] = new_tags
+        avg_entry = (removed_cost / removed_qty) if removed_qty > 1e-12 else None
+        return removed_qty, avg_entry
+
+    async def _sell_partial(self, product: str, qty_to_sell: float, note: str) -> Optional[Tuple[float, float, float]]:
+        """Sell qty_to_sell and return (sold_qty, exec_price, fee_usd) if filled."""
+        tob = self.tob.get(product)
+        if not tob:
+            return None
+        bid = tob.bid
+
+        qty_to_sell = float(qty_to_sell)
+        if qty_to_sell <= 1e-12:
+            return None
+
+        exec_price = float(bid)
+        fee = 0.0
+        sold_qty = qty_to_sell
+
+        if isinstance(self.portfolio, LivePortfolio):
+            r = await self._live_sell_market(product_id=product, base_qty=qty_to_sell)
+            fill = self._require_live_fill(r, product_id=product, side="SELL")
+            if fill is None:
+                return None
+            filled_qty, avg_px, fee_val, filled_notional, order_id = fill
+            exec_price = float(avg_px)
+            fee = float(fee_val)
+            sold_qty = float(min(qty_to_sell, filled_qty))
+            try:
+                self.portfolio.cash_usd = float(await self._live_refresh_cash())
+            except Exception:
+                pass
+        else:
+            if self.portfolio:
+                self.portfolio.credit(sold_qty * exec_price, TAKER_FEE_BPS)
+
+        return sold_qty, exec_price, fee
+
+    async def _force_sell_product(self, product: str, note: str = "") -> None:
+        tob = self.tob.get(product)
+        if not tob:
+            return
+        bid = tob.bid
+
+        lots = self.positions.get(product, [])
+        qty = sum(l.qty for l in lots) if lots else 0.0
+        if qty <= 0:
+            return
+
+        if isinstance(self.portfolio, LivePortfolio):
+            r = await self._live_sell_market(product_id=product, base_qty=float(qty))
+            fill = self._require_live_fill(r, product_id=product, side="SELL")
+            if fill is None:
+                return
+            filled_qty, avg_px, fee_val, filled_notional, order_id = fill
+            exec_price = float(avg_px)
+            fee = float(fee_val)
+            qty_sold = float(min(qty, filled_qty))
+            try:
+                self.portfolio.cash_usd = float(await self._live_refresh_cash())
+            except Exception:
+                pass
+        else:
+            exec_price = float(bid)
+            fee = 0.0
+            qty_sold = float(qty)
+            if self.portfolio:
+                self.portfolio.credit(qty_sold * exec_price, TAKER_FEE_BPS)
+
+        self.tlog.log_trade(
+            event="SELL",
+            product_id=product,
+            side="SELL",
+            qty=qty_sold,
+            price=exec_price,
+            fee_usd_val=fee,
+            gross_pnl_usd=0.0,
+            net_pnl_usd=-fee,
+            entry_price=self.position_entry_price.get(product),
+            exit_price=exec_price,
+            weekly_bias=self.macro.compute_weekly_bias(product, tob.mid),
+            note=note,
+        )
+
+        ts_now = now_ts()
+        self.positions[product] = []
+        self.lot_tags[product] = []
+        self.ladder_plan[product] = None
+        self.peak_bid[product] = None
+        self.trailing_active[product] = False
+        self.position_tier[product] = 0
+        self.position_entry_price[product] = None
+        self.last_tier_tp_ts[product] = ts_now
+        self.last_exit_ts = ts_now
+        self.rearm_required[product] = True
 
 
     def _compute_fair_value(self, product_id: str, mid: float, avwap_24h: Optional[float]) -> Optional[float]:
@@ -2693,7 +2971,7 @@ class TradingBot:
                         })
                 # Daily 1‑minute candles: use live_1m if enough data else REST
                 live_rows = self.live_1m[product].export_rows(product)
-                if len(live_rows) >= DAY_CANDLES_MIN_FOR_LIVE:
+                if len(live_rows) >= 120:
                     candles_day: List[Candle] = [
                         Candle(
                             ts=int(r["ts"]),
@@ -2706,6 +2984,10 @@ class TradingBot:
                     ]
                 else:
                     candles_day = await self.fetcher.fetch_chunked(product, start_day, end_ts, "ONE_MINUTE")
+                if not candles_week:
+                    print(f"[macro] week empty for {product}")
+                if not candles_day:
+                    print(f"[macro] day empty for {product} (live_rows={len(live_rows)})")
                 if candles_day:
                     levels_day = compute_macro_levels(candles_day)
                     if levels_day:
@@ -2887,29 +3169,6 @@ class TradingBot:
 
                     state = "HOLD"
 
-                    # Peak tracking since entry (bid-based) + trailing arm state.
-                    # - peak starts at avg_entry (or current bid if unknown) when position is open
-                    # - update peak whenever bid makes a new high
-                    # - arm trailing once peak profit reaches +1.5%
-                    if avg_entry_price is not None:
-                        if self.peak_bid.get(product) is None:
-                            base = float(avg_entry_price) if float(avg_entry_price) > 0 else float(bid)
-                            self.peak_bid[product] = float(base)
-                        prev_peak = float(self.peak_bid.get(product) or bid)
-                        if bid > prev_peak:
-                            self.peak_bid[product] = float(bid)
-                            prev_peak = float(bid)
-                        peak_bid_now = float(prev_peak)
-                        peak_profit_pct = (peak_bid_now / max(float(avg_entry_price), 1e-12)) - 1.0
-                        if peak_profit_pct >= TRAIL_ARM_PCT:
-                            self.trailing_active[product] = True
-                    else:
-                        # Defensive: should not happen when active_qty>0, but keep safe behavior.
-                        if self.peak_bid.get(product) is None:
-                            self.peak_bid[product] = float(bid)
-                        peak_bid_now = float(self.peak_bid.get(product) or bid)
-
-
                     async def _sell_all(note: str) -> None:
                         nonlocal active_qty, cash_usd, equity_usd
                         qty_to_sell = active_qty
@@ -2982,6 +3241,9 @@ class TradingBot:
                         self.position_start_ts[product] = None
                         self.peak_bid[product] = None
                         self.trailing_active[product] = False
+                        self.position_tier[product] = 0
+                        self.position_entry_price[product] = None
+                        self.last_tier_tp_ts[product] = ts_now
                         self.last_risk_off_ts[product] = ts_now
                         self.last_exit_ts = ts_now
                         # Require price to move ABOVE day support before re-entry (price-based, not time-based)
@@ -2991,17 +3253,72 @@ class TradingBot:
                         state = "RISK_OFF_LIQUIDATE"
                         await _sell_all("risk_off_liq")
                     else:
-                        # Peak-based exits (no targets / no partial exits).
+                        # Update peak bid for peak-based exits
                         peak_bid_now = float(self.peak_bid.get(product) or bid)
-                        dd_frac = 0.0
-                        if peak_bid_now > 0:
-                            dd_frac = (peak_bid_now - float(bid)) / peak_bid_now
-                        if dd_frac >= HARD_PEAK_STOP_PCT:
+                        if bid > peak_bid_now:
+                            peak_bid_now = float(bid)
+                            self.peak_bid[product] = peak_bid_now
+
+                        # Peak profit since entry (based on avg entry)
+                        if avg_entry_price and avg_entry_price > 0:
+                            peak_profit_pct = (peak_bid_now / float(avg_entry_price)) - 1.0
+                        else:
+                            peak_profit_pct = 0.0
+
+                        held_tier = int(self.position_tier.get(product, 0) or 0)
+                        entry_px = self.position_entry_price.get(product) or avg_entry_price
+                        if entry_px and entry_px > 0 and held_tier in TIER_TP_PCT:
+                            tp_pct = float(TIER_TP_PCT[held_tier])
+                            tp_price = float(entry_px) * (1.0 + tp_pct)
+
+                            # cooldown
+                            if (ts_now - float(self.last_tier_tp_ts.get(product, 0.0))) >= TIER_TP_COOLDOWN_SEC:
+                                if bid >= tp_price:
+                                    # sell fraction of current active qty
+                                    frac = float(TIER_TP_SELL_FRAC.get(held_tier, 0.0))
+                                    qty_to_sell = float(active_qty) * frac
+                                    res = await self._sell_partial(product, qty_to_sell, note=f"TP_TIER{held_tier}")
+                                    if res is not None:
+                                        sold_qty, exec_price, fee = res
+                                        removed_qty, fifo_entry = self._fifo_reduce_lots(product, sold_qty)
+                                        active_qty = max(0.0, active_qty - removed_qty)
+                                        self.last_tier_tp_ts[product] = ts_now
+
+                                        self.tlog.log_trade(
+                                            event="SELL",
+                                            product_id=product,
+                                            side="SELL",
+                                            qty=sold_qty,
+                                            price=exec_price,
+                                            fee_usd_val=fee,
+                                            gross_pnl_usd=0.0,
+                                            net_pnl_usd=-fee,
+                                            entry_price=(fifo_entry if fifo_entry is not None else entry_px),
+                                            exit_price=exec_price,
+                                            weekly_bias=weekly_bias,
+                                            note=f"tier_tp|tier={held_tier}",
+                                        )
+
+                        # HARD peak stop: sell on 0.5% drop from peak at ANY time
+                        hard_stop_price = peak_bid_now * (1.0 - HARD_PEAK_STOP_PCT)
+                        if bid <= hard_stop_price:
                             state = "HARD_PEAK_STOP"
-                            await _sell_all(f"SELL:hard_peak_stop peak={peak_bid_now:.10f} bid={float(bid):.10f}")
-                        elif self.trailing_active.get(product, False) and dd_frac >= TRAIL_DRAWDOWN_PCT:
-                            state = "TRAIL_DRAWDOWN"
-                            await _sell_all(f"SELL:trail_drawdown peak={peak_bid_now:.10f} bid={float(bid):.10f}")
+                            await _sell_all("hard_peak_stop")
+                            await asyncio.sleep(EVAL_TICK_SEC)
+                            continue
+
+                        # Arm trailing only AFTER +1.5% peak profit
+                        if (not self.trailing_active.get(product, False)) and (peak_profit_pct >= TRAIL_ARM_PCT):
+                            self.trailing_active[product] = True
+
+                        # If armed, sell if price drops 0.25% from peak
+                        if self.trailing_active.get(product, False):
+                            trail_price = peak_bid_now * (1.0 - TRAIL_DRAWDOWN_PCT)
+                            if bid <= trail_price:
+                                state = "TRAIL_EXIT"
+                                await _sell_all("trail_exit")
+                                await asyncio.sleep(EVAL_TICK_SEC)
+                                continue
 
                     # If we just exited, skip add/exit logic and move on.
                     if active_qty <= 0:
@@ -3072,7 +3389,7 @@ class TradingBot:
                                         eff_price2 = float((n2 + fee2) / qty2) if qty2 > 0 else float(ask)
                                         self.positions[product].append(PositionLot(qty=qty2, price=eff_price2))
                                         buy_px2 = ask
-                                    self.lot_tags[product].append("L2")
+                                    self.lot_tags[product].append(f"T{self.position_tier.get(product, TIER_LOW)}")
                                     not_done[1] = float(n2)
                                     plan["notional_done"] = not_done
                                     self.last_buy_ts[product] = ts_now
@@ -3118,7 +3435,7 @@ class TradingBot:
                                         fee3 = self.portfolio.debit(n3, TAKER_FEE_BPS)
                                         px3 = float((n3 + fee3) / qty3) if qty3 > 0 else float(ask)
                                     self.positions[product].append(PositionLot(qty=qty3, price=px3))
-                                    self.lot_tags[product].append("L3")
+                                    self.lot_tags[product].append(f"T{self.position_tier.get(product, TIER_LOW)}")
                                     not_done[2] = float(n3)
                                     plan["notional_done"] = not_done
                                     self.last_buy_ts[product] = ts_now
@@ -3265,16 +3582,11 @@ class TradingBot:
                     continue
 
                 # -------------------------
-                # Flat: evaluate entries (bottoming + stabilization gate)
+                # Look for entries (tiered gate)
                 # -------------------------
-                if active_product is None and warmup_done:
-                    entry_reason = ""
-                    entry_dbg: Dict[str, float] = {}
-
-                    if spread_bps > MAX_SPREAD_BPS:
-                        entry_reason = "spread_too_wide"
-                    elif levels is None:
-                        entry_reason = "no_day_levels"
+                if warmup_done:
+                    if spread_bps > MAX_SPREAD_BPS or levels is None:
+                        pass
                     else:
                         # Price-based re-arm: after any exit on this product, require price to first
                         # trade ABOVE the day support zone by a buffer before allowing a new entry.
@@ -3282,51 +3594,41 @@ class TradingBot:
                             rearm_level = levels.support_zone_high * (1.0 + (REENTRY_REARM_BPS / 10_000.0))
                             if mid >= rearm_level:
                                 self.rearm_required[product] = False
-                            else:
-                                entry_reason = "rearm_waiting"
-                        if not entry_reason:
-                            # Keep the "support zone" concept: we only consider entries in the day support zone.
-                            if not (levels.support_zone_low <= mid <= levels.support_zone_high):
-                                entry_reason = "not_in_support_zone"
-                            elif weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD:
-                                entry_reason = "weekly_bias_gate"
-                            else:
-                                # 24h anchored VWAP + fair value for micro context.
-                                avwap_24h = self._compute_anchored_vwap_24h(product, ts_now)
-                                ok, reason, dbg = self._entry_gate_bottoming(
-                                    product_id=product,
-                                    mid=mid,
-                                    avwap_24h=avwap_24h,
-                                    trending_down=trending_down,
-                                    weekly_bias=weekly_bias,
-                                )
-                                entry_reason = reason
-                                entry_dbg = dbg
+                        if not self.rearm_required.get(product, False):
+                            minute_candles = list(self.live_1m.get(product).candles) if self.live_1m.get(product) else []
 
-                                if ok:
-                                    # Score candidates: prefer closer to the local low and deeper in support.
-                                    zone_w = max(levels.support_zone_high - levels.support_zone_low, 1e-9)
-                                    depth = (levels.support_zone_high - mid) / zone_w  # 0 at top, 1 at bottom
+                            ok, tier, reason = tiered_entry_gate(
+                                mid=mid,
+                                spread_bps=spread_bps,
+                                levels_day=levels_day,
+                                levels_week=levels_week,
+                                minute_candles=minute_candles,
+                                weekly_bias=weekly_bias,
+                                trending_down=trending_down,
+                                support_buffer_bps=SUPPORT_BUFFER_BPS,
+                                resist_buffer_bps=RESIST_BUFFER_BPS,
+                            )
 
-                                    dist_low_pct = float(dbg.get("dist_low_pct", 0.0))
-                                    # Smaller dist_low_pct => better. Bound to avoid negative overflow.
-                                    near_low_score = max(0.0, (ENTRY_NEAR_LOW_MAX_PCT - dist_low_pct)) / max(ENTRY_NEAR_LOW_MAX_PCT, 1e-12)
+                            if ok:
+                                cand = {
+                                    "product": product,
+                                    "tier": tier,
+                                    "mid": mid,
+                                    "bid": bid,
+                                    "ask": ask,
+                                    "weekly_bias": weekly_bias,
+                                    "sigma_bps": sigma_bps,
+                                    "entry_reason": reason,
+                                }
 
-                                    score = (1.15 * depth) + (1.25 * near_low_score)
-
-                                    if best_candidate is None or score > best_candidate["score"]:
-                                        best_candidate = {
-                                            "product": product,
-                                            "weekly_bias": weekly_bias,
-                                            "sigma_bps": sigma_bps,
-                                            "score": score,
-                                            "entry_reason": entry_reason,
-                                            "entry_dbg": entry_dbg,
-                                        }
-
-                    # Optional debug print for gating (kept concise)
-                    if entry_reason and entry_reason != "OK_bottoming_stable_reclaim":
-                        pass  # keep prints quiet by default; see BUY note for the chosen candidate
+                                # Choose highest tier; tie-break by lowest spread, then highest weekly bias
+                                if (best_candidate is None
+                                    or cand["tier"] > best_candidate["tier"]
+                                    or (cand["tier"] == best_candidate["tier"] and spread_bps < best_candidate.get("spread_bps", 1e9))
+                                    or (cand["tier"] == best_candidate["tier"] and (weekly_bias or 0.0) > (best_candidate.get("weekly_bias") or 0.0))
+                                ):
+                                    cand["spread_bps"] = spread_bps
+                                    best_candidate = cand
 
                 # Always log snapshots for non-active products too.
                 pos_qty = sum(l.qty for l in self.positions.get(product, []))
@@ -3356,8 +3658,19 @@ class TradingBot:
                     equity_usd=equity_usd,
                 )
 
-            # Execute entry after scanning all products (only if still flat).
-            if active_product is None and best_candidate is not None and self.portfolio is not None:
+            # Rotation: if holding a lower tier and a higher-tier candidate appears, exit then rotate
+            if active_product is not None and active_qty > 0 and best_candidate is not None:
+                held_tier = int(self.position_tier.get(active_product, 0) or 0)
+                cand_tier = int(best_candidate.get("tier", 0) or 0)
+
+                if best_candidate["product"] != active_product and cand_tier >= (held_tier + ROTATE_MIN_TIER_DELTA):
+                    await self._force_sell_product(active_product, note=f"ROTATE:{held_tier}->{cand_tier}")
+                    cash_usd = self.portfolio.cash_usd if self.portfolio else cash_usd
+                    active_product = None
+                    active_qty = 0.0
+
+            # Execute entry after scanning all products.
+            if best_candidate is not None and self.portfolio is not None and (active_product is None or active_qty <= 0):
                 product = best_candidate["product"]
                 tob = self.tob.get(product)
                 if tob:
@@ -3400,7 +3713,11 @@ class TradingBot:
 
                                 eff_price1 = float((n1 + fee1) / qty1) if qty1 > 0 else float(ask)
                                 self.positions[product] = [PositionLot(qty=qty1, price=eff_price1)]
-                            self.lot_tags[product] = ["L1"]
+                            buy_tier = int(best_candidate.get("tier", TIER_LOW))
+                            self.position_tier[product] = buy_tier
+                            self.position_entry_price[product] = float(eff_price1)
+                            self.last_tier_tp_ts[product] = 0.0
+                            self.lot_tags[product] = [f"T{self.position_tier[product]}"]
                             self.ladder_plan[product] = {
                                 "total_notional": float(total_notional),
                                 "fracs": (float(f1), float(f2), float(f3)),
@@ -3595,6 +3912,9 @@ async def main() -> None:
             PRODUCTS = list(PRODUCTS_DEFAULT)
     else:
         PRODUCTS = list(PRODUCTS_DEFAULT)
+
+    # Currency safety: enforce USD quote pairs.
+    PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
 
     print("[config] Trading products:", PRODUCTS)
 

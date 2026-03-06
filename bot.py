@@ -226,6 +226,39 @@ ENTRY_PCT_STEP: float = 0.025
 # Execution quality filters
 MAX_SPREAD_BPS: float = 20.0          # skip trading if spread too wide
 
+# ============================================================
+# TIERED BUY/SELL EXTENSION
+# ============================================================
+
+# Tier names (higher number = higher priority)
+TIER_LOW = 1
+TIER_MID = 2
+TIER_HIGH = 3
+
+# Profit-taking targets for tiers (these are TP sells; risk exits still use peak stop logic)
+TIER_TP_PCT = {
+    TIER_LOW: 0.0025,   # +0.25%
+    TIER_MID: 0.0075,   # +0.75% (in your requested 0.5–1% band)
+    TIER_HIGH: 0.015,   # +1.5% (leave room for +2%+ runners)
+}
+
+# How much of the position to sell at tier TP when hit
+# (Low tier: mostly scalp out; Mid: partial; High: smallest partial to keep runners)
+TIER_TP_SELL_FRAC = {
+    TIER_LOW: 0.85,
+    TIER_MID: 0.55,
+    TIER_HIGH: 0.25,
+}
+
+# Prevent TP spam (seconds between tier TP sells per product)
+TIER_TP_COOLDOWN_SEC = 90.0
+
+# Rotation rule: if holding tier < candidate_tier by at least this delta, rotate
+ROTATE_MIN_TIER_DELTA = 1
+
+# Require minimum spread quality for scalps (you can tighten later)
+SCALP_MAX_SPREAD_BPS = 12.0
+
 # Ladder discipline
 BUY_COOLDOWN_SEC: float = 45.0        # minimum time between entries
 BUY_MIN_SPACING_SIGMA: float = 0.25   # require mid to be <= last_buy_price - (0.25*sigma)
@@ -1478,6 +1511,86 @@ def option1_room_to_target(mid: float, day: Optional['MacroLevels'], week: Optio
         return False, f"capped_by={name}"
     return True, f"room_ok_next={name}"
 
+
+def _room_to_target_pct(mid: float, day: Optional['MacroLevels'], week: Optional['MacroLevels'], target_pct: float, resist_buffer_bps: float) -> Tuple[bool, str]:
+    if mid <= 0:
+        return False, "bad_mid"
+    target = mid * (1.0 + float(target_pct))
+    buf = mid * (resist_buffer_bps / 10_000.0)
+
+    resist_levels: List[Tuple[str, float]] = []
+    if day:
+        resist_levels += [
+            ("day_res_zone_low", day.resistance_zone_low),
+            ("day_vwap", day.vwap),
+            ("day_VAH", day.vah),
+        ]
+    if week:
+        resist_levels += [
+            ("week_res_zone_low", week.resistance_zone_low),
+            ("week_vwap", week.vwap),
+            ("week_VAH", week.vah),
+        ]
+
+    above = [(name, lvl) for name, lvl in resist_levels if lvl and lvl > mid]
+    if not above:
+        return True, "no_resistance_above"
+    name, lvl = min(above, key=lambda x: x[1])
+
+    if (lvl + buf) < target:
+        return False, f"capped_by={name}"
+    return True, f"room_ok_next={name}"
+
+
+def tiered_entry_gate(
+    *,
+    mid: float,
+    spread_bps: float,
+    levels_day: Optional['MacroLevels'],
+    levels_week: Optional['MacroLevels'],
+    minute_candles: List['MinuteCandle'],
+    weekly_bias: Optional[float],
+    trending_down: bool,
+) -> Tuple[bool, int, str]:
+    """
+    Returns: (ok, tier, reason)
+      - tier: 1=low, 2=mid, 3=high
+    """
+
+    # Hard risk-off block stays: don’t scalp aggressively in extreme risk-off
+    risk_off = trending_down or (weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD)
+
+    # A) Support proximity (re-use option1 support)
+    sup_ok, sup_reason = option1_in_support_zone(mid, levels_day, levels_week, SUPPORT_BUFFER_BPS)
+
+    # B) Reversal confirmation (option1 is 2-of-3)
+    rev_ok, rev_reason = option1_reversal_confirmation(minute_candles)
+
+    # HIGH: strict Option-1 (your original intent)
+    if (not risk_off) and sup_ok and rev_ok:
+        room_ok, room_reason = option1_room_to_target(mid, levels_day, levels_week, RESIST_BUFFER_BPS)
+        if room_ok:
+            return True, TIER_HIGH, f"HIGH:A={sup_reason};B={rev_reason};C={room_reason}"
+
+    # MID: allow if support + reversal, but only require room to ~0.75%
+    if sup_ok and rev_ok and (not risk_off):
+        room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_MID], resist_buffer_bps=RESIST_BUFFER_BPS)
+        if room_ok:
+            return True, TIER_MID, f"MID:A={sup_reason};B={rev_reason};C={room_reason}"
+
+    # LOW (scalp): require tight spread + either support proximity OR mild reversal,
+    # and do NOT require room to 2% (only room to 0.25%)
+    if spread_bps <= SCALP_MAX_SPREAD_BPS and (not risk_off):
+        # Looser reversal: accept if RSI or EMA reclaim passed (not necessarily 2-of-3)
+        # We parse the option1 string: "pass=rsi+ema_reclaim" etc.
+        passed_any = ("pass=" in rev_reason) and any(k in rev_reason for k in ("rsi", "ema_reclaim"))
+        if sup_ok or passed_any:
+            room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_LOW], resist_buffer_bps=RESIST_BUFFER_BPS)
+            if room_ok:
+                return True, TIER_LOW, f"LOW:A={sup_reason};B={rev_reason};C={room_reason}"
+
+    return False, 0, f"NO: A={sup_reason}; B={rev_reason}"
+
 # ------------------------------------------------------------
 # Portfolio management
 # ------------------------------------------------------------
@@ -2149,6 +2262,10 @@ class TradingBot:
         # Runner trailing state
         self.peak_bid: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         self.trailing_active: Dict[str, bool] = {p: False for p in PRODUCTS}
+        # Tier tracking for the active position
+        self.position_tier: Dict[str, int] = {p: 0 for p in PRODUCTS}
+        self.last_tier_tp_ts: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
+        self.position_entry_price: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         # Risk-off throttling state (per product)
         self.last_risk_off_ts: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         # Global exit timestamp (used to throttle re-entry after any liquidation)
@@ -2303,6 +2420,130 @@ class TradingBot:
         if sold <= 1e-12:
             return 0.0, None
         return float(cost), float(cost / sold)
+
+    def _fifo_reduce_lots(self, product: str, qty_to_remove: float) -> Tuple[float, Optional[float]]:
+        """Reduce position lots FIFO by qty_to_remove. Returns (removed_qty, fifo_avg_entry_price)."""
+        lots = self.positions.get(product, [])
+        if not lots or qty_to_remove <= 0:
+            return 0.0, None
+        remaining = float(qty_to_remove)
+        removed_qty = 0.0
+        removed_cost = 0.0
+        new_lots: List[PositionLot] = []
+        new_tags: List[str] = []
+        tags = self.lot_tags.get(product, [])
+
+        for i, lot in enumerate(lots):
+            tag = tags[i] if i < len(tags) else ""
+            if remaining <= 1e-12:
+                new_lots.append(lot)
+                new_tags.append(tag)
+                continue
+            take = min(float(lot.qty), remaining)
+            removed_qty += take
+            removed_cost += take * float(lot.price)
+            left = float(lot.qty) - take
+            remaining -= take
+            if left > 1e-12:
+                new_lots.append(PositionLot(qty=left, price=float(lot.price)))
+                new_tags.append(tag)
+
+        self.positions[product] = new_lots
+        self.lot_tags[product] = new_tags
+        avg_entry = (removed_cost / removed_qty) if removed_qty > 1e-12 else None
+        return removed_qty, avg_entry
+
+    async def _sell_partial(self, product: str, qty_to_sell: float, note: str) -> Optional[Tuple[float, float, float]]:
+        """Sell qty_to_sell and return (sold_qty, exec_price, fee_usd) if filled."""
+        tob = self.tob.get(product)
+        if not tob:
+            return None
+        bid = tob.bid
+
+        qty_to_sell = float(qty_to_sell)
+        if qty_to_sell <= 1e-12:
+            return None
+
+        exec_price = float(bid)
+        fee = 0.0
+        sold_qty = qty_to_sell
+
+        if isinstance(self.portfolio, LivePortfolio):
+            r = await self._live_sell_market(product_id=product, base_qty=qty_to_sell)
+            fill = self._require_live_fill(r, product_id=product, side="SELL")
+            if fill is None:
+                return None
+            filled_qty, avg_px, fee_val, filled_notional, order_id = fill
+            exec_price = float(avg_px)
+            fee = float(fee_val)
+            sold_qty = float(min(qty_to_sell, filled_qty))
+            try:
+                self.portfolio.cash_usd = float(await self._live_refresh_cash())
+            except Exception:
+                pass
+        else:
+            if self.portfolio:
+                self.portfolio.credit(sold_qty * exec_price, TAKER_FEE_BPS)
+
+        return sold_qty, exec_price, fee
+
+    async def _force_sell_product(self, product: str, note: str = "") -> None:
+        tob = self.tob.get(product)
+        if not tob:
+            return
+        bid = tob.bid
+
+        lots = self.positions.get(product, [])
+        qty = sum(l.qty for l in lots) if lots else 0.0
+        if qty <= 0:
+            return
+
+        if isinstance(self.portfolio, LivePortfolio):
+            r = await self._live_sell_market(product_id=product, base_qty=float(qty))
+            fill = self._require_live_fill(r, product_id=product, side="SELL")
+            if fill is None:
+                return
+            filled_qty, avg_px, fee_val, filled_notional, order_id = fill
+            exec_price = float(avg_px)
+            fee = float(fee_val)
+            qty_sold = float(min(qty, filled_qty))
+            try:
+                self.portfolio.cash_usd = float(await self._live_refresh_cash())
+            except Exception:
+                pass
+        else:
+            exec_price = float(bid)
+            fee = 0.0
+            qty_sold = float(qty)
+            if self.portfolio:
+                self.portfolio.credit(qty_sold * exec_price, TAKER_FEE_BPS)
+
+        self.tlog.log_trade(
+            event="SELL",
+            product_id=product,
+            side="SELL",
+            qty=qty_sold,
+            price=exec_price,
+            fee_usd_val=fee,
+            gross_pnl_usd=0.0,
+            net_pnl_usd=-fee,
+            entry_price=self.position_entry_price.get(product),
+            exit_price=exec_price,
+            weekly_bias=self.macro.compute_weekly_bias(product, tob.mid),
+            note=note,
+        )
+
+        ts_now = now_ts()
+        self.positions[product] = []
+        self.lot_tags[product] = []
+        self.ladder_plan[product] = None
+        self.peak_bid[product] = None
+        self.trailing_active[product] = False
+        self.position_tier[product] = 0
+        self.position_entry_price[product] = None
+        self.last_tier_tp_ts[product] = ts_now
+        self.last_exit_ts = ts_now
+        self.rearm_required[product] = True
 
 
     def _compute_fair_value(self, product_id: str, mid: float, avwap_24h: Optional[float]) -> Optional[float]:
@@ -2944,6 +3185,9 @@ class TradingBot:
                         self.position_start_ts[product] = None
                         self.peak_bid[product] = None
                         self.trailing_active[product] = False
+                        self.position_tier[product] = 0
+                        self.position_entry_price[product] = None
+                        self.last_tier_tp_ts[product] = ts_now
                         self.last_risk_off_ts[product] = ts_now
                         self.last_exit_ts = ts_now
                         # Require price to move ABOVE day support before re-entry (price-based, not time-based)
@@ -2964,6 +3208,40 @@ class TradingBot:
                             peak_profit_pct = (peak_bid_now / float(avg_entry_price)) - 1.0
                         else:
                             peak_profit_pct = 0.0
+
+                        held_tier = int(self.position_tier.get(product, 0) or 0)
+                        entry_px = self.position_entry_price.get(product) or avg_entry_price
+                        if entry_px and entry_px > 0 and held_tier in TIER_TP_PCT:
+                            tp_pct = float(TIER_TP_PCT[held_tier])
+                            tp_price = float(entry_px) * (1.0 + tp_pct)
+
+                            # cooldown
+                            if (ts_now - float(self.last_tier_tp_ts.get(product, 0.0))) >= TIER_TP_COOLDOWN_SEC:
+                                if bid >= tp_price:
+                                    # sell fraction of current active qty
+                                    frac = float(TIER_TP_SELL_FRAC.get(held_tier, 0.0))
+                                    qty_to_sell = float(active_qty) * frac
+                                    res = await self._sell_partial(product, qty_to_sell, note=f"TP_TIER{held_tier}")
+                                    if res is not None:
+                                        sold_qty, exec_price, fee = res
+                                        removed_qty, fifo_entry = self._fifo_reduce_lots(product, sold_qty)
+                                        active_qty = max(0.0, active_qty - removed_qty)
+                                        self.last_tier_tp_ts[product] = ts_now
+
+                                        self.tlog.log_trade(
+                                            event="SELL",
+                                            product_id=product,
+                                            side="SELL",
+                                            qty=sold_qty,
+                                            price=exec_price,
+                                            fee_usd_val=fee,
+                                            gross_pnl_usd=0.0,
+                                            net_pnl_usd=-fee,
+                                            entry_price=(fifo_entry if fifo_entry is not None else entry_px),
+                                            exit_price=exec_price,
+                                            weekly_bias=weekly_bias,
+                                            note=f"tier_tp|tier={held_tier}",
+                                        )
 
                         # HARD peak stop: sell on 0.5% drop from peak at ANY time
                         hard_stop_price = peak_bid_now * (1.0 - HARD_PEAK_STOP_PCT)
@@ -3055,7 +3333,7 @@ class TradingBot:
                                         eff_price2 = float((n2 + fee2) / qty2) if qty2 > 0 else float(ask)
                                         self.positions[product].append(PositionLot(qty=qty2, price=eff_price2))
                                         buy_px2 = ask
-                                    self.lot_tags[product].append("L2")
+                                    self.lot_tags[product].append(f"T{self.position_tier.get(product, TIER_LOW)}")
                                     not_done[1] = float(n2)
                                     plan["notional_done"] = not_done
                                     self.last_buy_ts[product] = ts_now
@@ -3101,7 +3379,7 @@ class TradingBot:
                                         fee3 = self.portfolio.debit(n3, TAKER_FEE_BPS)
                                         px3 = float((n3 + fee3) / qty3) if qty3 > 0 else float(ask)
                                     self.positions[product].append(PositionLot(qty=qty3, price=px3))
-                                    self.lot_tags[product].append("L3")
+                                    self.lot_tags[product].append(f"T{self.position_tier.get(product, TIER_LOW)}")
                                     not_done[2] = float(n3)
                                     plan["notional_done"] = not_done
                                     self.last_buy_ts[product] = ts_now
@@ -3248,16 +3526,11 @@ class TradingBot:
                     continue
 
                 # -------------------------
-                # Flat: evaluate entries (bottoming + stabilization gate)
+                # Look for entries (tiered gate)
                 # -------------------------
-                if active_product is None and warmup_done:
-                    entry_reason = ""
-                    entry_dbg: Dict[str, float] = {}
-
-                    if spread_bps > MAX_SPREAD_BPS:
-                        entry_reason = "spread_too_wide"
-                    elif levels is None:
-                        entry_reason = "no_day_levels"
+                if warmup_done:
+                    if spread_bps > MAX_SPREAD_BPS or levels is None:
+                        pass
                     else:
                         # Price-based re-arm: after any exit on this product, require price to first
                         # trade ABOVE the day support zone by a buffer before allowing a new entry.
@@ -3265,49 +3538,39 @@ class TradingBot:
                             rearm_level = levels.support_zone_high * (1.0 + (REENTRY_REARM_BPS / 10_000.0))
                             if mid >= rearm_level:
                                 self.rearm_required[product] = False
-                            else:
-                                entry_reason = "rearm_waiting"
-                        if not entry_reason:
-                            # Keep the "support zone" concept: we only consider entries in the day support zone.
-                            if not (levels.support_zone_low <= mid <= levels.support_zone_high):
-                                entry_reason = "not_in_support_zone"
-                            elif weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD:
-                                entry_reason = "weekly_bias_gate"
-                            else:
-                                # 24h anchored VWAP + fair value for micro context.
-                                avwap_24h = self._compute_anchored_vwap_24h(product, ts_now)
-                                ok_entry, entry_reason, entry_dbg = self._entry_gate_bottoming(
-                                    product_id=product,
-                                    mid=mid,
-                                    avwap_24h=avwap_24h,
-                                    trending_down=trending_down,
-                                    weekly_bias=weekly_bias,
-                                )
+                        if not self.rearm_required.get(product, False):
+                            minute_candles = list(self.live_1m.get(product).candles) if self.live_1m.get(product) else []
 
-                                if ok_entry:
-                                    # Score candidates: prefer closer to the local low and deeper in support.
-                                    zone_w = max(levels.support_zone_high - levels.support_zone_low, 1e-9)
-                                    depth = (levels.support_zone_high - mid) / zone_w  # 0 at top, 1 at bottom
+                            ok, tier, reason = tiered_entry_gate(
+                                mid=mid,
+                                spread_bps=spread_bps,
+                                levels_day=levels_day,
+                                levels_week=levels_week,
+                                minute_candles=minute_candles,
+                                weekly_bias=weekly_bias,
+                                trending_down=trending_down,
+                            )
 
-                                    dist_low_pct = float(entry_dbg.get("dist_low_pct", 0.0))
-                                    # Smaller dist_low_pct => better. Bound to avoid negative overflow.
-                                    near_low_score = max(0.0, (ENTRY_NEAR_LOW_MAX_PCT - dist_low_pct)) / max(ENTRY_NEAR_LOW_MAX_PCT, 1e-12)
+                            if ok:
+                                cand = {
+                                    "product": product,
+                                    "tier": tier,
+                                    "mid": mid,
+                                    "bid": bid,
+                                    "ask": ask,
+                                    "weekly_bias": weekly_bias,
+                                    "sigma_bps": sigma_bps,
+                                    "entry_reason": reason,
+                                }
 
-                                    score = (1.15 * depth) + (1.25 * near_low_score)
-
-                                    if best_candidate is None or score > best_candidate["score"]:
-                                        best_candidate = {
-                                            "product": product,
-                                            "weekly_bias": weekly_bias,
-                                            "sigma_bps": sigma_bps,
-                                            "score": score,
-                                            "entry_reason": entry_reason,
-                                            "entry_dbg": entry_dbg,
-                                        }
-
-                    # Optional debug print for gating (kept concise)
-                    if entry_reason and not entry_reason.startswith("BUY_OK:"):
-                        pass  # keep prints quiet by default; see BUY note for the chosen candidate
+                                # Choose highest tier; tie-break by lowest spread, then highest weekly bias
+                                if (best_candidate is None
+                                    or cand["tier"] > best_candidate["tier"]
+                                    or (cand["tier"] == best_candidate["tier"] and spread_bps < best_candidate.get("spread_bps", 1e9))
+                                    or (cand["tier"] == best_candidate["tier"] and (weekly_bias or 0.0) > (best_candidate.get("weekly_bias") or 0.0))
+                                ):
+                                    cand["spread_bps"] = spread_bps
+                                    best_candidate = cand
 
                 # Always log snapshots for non-active products too.
                 pos_qty = sum(l.qty for l in self.positions.get(product, []))
@@ -3337,8 +3600,19 @@ class TradingBot:
                     equity_usd=equity_usd,
                 )
 
-            # Execute entry after scanning all products (only if still flat).
-            if active_product is None and best_candidate is not None and self.portfolio is not None:
+            # Rotation: if holding a lower tier and a higher-tier candidate appears, exit then rotate
+            if active_product is not None and active_qty > 0 and best_candidate is not None:
+                held_tier = int(self.position_tier.get(active_product, 0) or 0)
+                cand_tier = int(best_candidate.get("tier", 0) or 0)
+
+                if best_candidate["product"] != active_product and cand_tier >= (held_tier + ROTATE_MIN_TIER_DELTA):
+                    await self._force_sell_product(active_product, note=f"ROTATE:{held_tier}->{cand_tier}")
+                    cash_usd = self.portfolio.cash_usd if self.portfolio else cash_usd
+                    active_product = None
+                    active_qty = 0.0
+
+            # Execute entry after scanning all products.
+            if best_candidate is not None and self.portfolio is not None and (active_product is None or active_qty <= 0):
                 product = best_candidate["product"]
                 tob = self.tob.get(product)
                 if tob:
@@ -3381,7 +3655,11 @@ class TradingBot:
 
                                 eff_price1 = float((n1 + fee1) / qty1) if qty1 > 0 else float(ask)
                                 self.positions[product] = [PositionLot(qty=qty1, price=eff_price1)]
-                            self.lot_tags[product] = ["L1"]
+                            buy_tier = int(best_candidate.get("tier", TIER_LOW))
+                            self.position_tier[product] = buy_tier
+                            self.position_entry_price[product] = float(eff_price1)
+                            self.last_tier_tp_ts[product] = 0.0
+                            self.lot_tags[product] = [f"T{self.position_tier[product]}"]
                             self.ladder_plan[product] = {
                                 "total_notional": float(total_notional),
                                 "fracs": (float(f1), float(f2), float(f3)),
@@ -3576,6 +3854,9 @@ async def main() -> None:
             PRODUCTS = list(PRODUCTS_DEFAULT)
     else:
         PRODUCTS = list(PRODUCTS_DEFAULT)
+
+    # Currency safety: enforce USD quote pairs.
+    PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
 
     print("[config] Trading products:", PRODUCTS)
 

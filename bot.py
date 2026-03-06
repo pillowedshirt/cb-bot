@@ -73,6 +73,24 @@ SELL_PROPORTIONS: List[float] = []  # DISABLED (no staggered/partial sells)
 MAKER_FEE_BPS: float = 6.0
 TAKER_FEE_BPS: float = 10.0
 
+# Net-of-cost exit model
+EST_SLIPPAGE_BPS: float = 6.0
+EST_ADVERSE_FILL_BPS: float = 6.0
+
+# Tier net gains (in addition to costs)
+TIER_NET_GAIN_PCT: Dict[int, float] = {
+    1: 0.0025,  # +0.25%
+    2: 0.0050,  # +0.50%
+    3: 0.0150,  # +1.50%
+}
+
+# Tier trailing drawdown from peak once armed
+TIER_DD_PCT: Dict[int, float] = {
+    1: 0.00075,  # 0.075%
+    2: 0.00125,  # 0.125%
+    3: 0.00250,  # 0.25%
+}
+
 # Disable all legacy take-profit / stagger / stop logic (replaced by peak-based full-exit)
 MIN_TAKE_PROFIT_BPS: float = 0.0  # DISABLED
 MIN_TAKE_PROFIT_PCT: float = 0.0  # DISABLED
@@ -239,7 +257,7 @@ TIER_HIGH = 3
 # Profit-taking targets for tiers (these are TP sells; risk exits still use peak stop logic)
 TIER_TP_PCT = {
     TIER_LOW: 0.0025,   # +0.25%
-    TIER_MID: 0.0075,   # +0.75% (in your requested 0.5–1% band)
+    TIER_MID: 0.0050,   # +0.50%
     TIER_HIGH: 0.015,   # +1.5% (leave room for +2%+ runners)
 }
 
@@ -1610,9 +1628,6 @@ def tiered_entry_gate(
       - tier: 1=low, 2=mid, 3=high
     """
 
-    # Hard risk-off block stays: don’t scalp aggressively in extreme risk-off
-    risk_off = trending_down or (weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD)
-
     # A) Support proximity (re-use option1 support)
     sup_ok, sup_reason = option1_in_support_zone(mid, levels_day, levels_week, support_buffer_bps)
 
@@ -1620,20 +1635,20 @@ def tiered_entry_gate(
     rev_ok, rev_reason = option1_reversal_confirmation(minute_candles)
 
     # HIGH: strict Option-1 (your original intent)
-    if (not risk_off) and sup_ok and rev_ok:
+    if sup_ok and rev_ok:
         room_ok, room_reason = option1_room_to_target(mid, levels_day, levels_week, resist_buffer_bps)
         if room_ok:
             return True, TIER_HIGH, f"HIGH:A={sup_reason};B={rev_reason};C={room_reason}"
 
     # MID: allow if support + reversal, but only require room to ~0.75%
-    if sup_ok and rev_ok and (not risk_off):
+    if sup_ok and rev_ok:
         room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_MID], resist_buffer_bps=resist_buffer_bps)
         if room_ok:
             return True, TIER_MID, f"MID:A={sup_reason};B={rev_reason};C={room_reason}"
 
     # LOW (scalp): require tight spread + either support proximity OR mild reversal,
     # and do NOT require room to 2% (only room to 0.25%)
-    if spread_bps <= SCALP_MAX_SPREAD_BPS and (not risk_off):
+    if spread_bps <= SCALP_MAX_SPREAD_BPS:
         # Looser reversal: accept if RSI or EMA reclaim passed (not necessarily 2-of-3)
         # We parse the option1 string: "pass=rsi+ema_reclaim" etc.
         passed_any = ("pass=" in rev_reason) and any(k in rev_reason for k in ("rsi", "ema_reclaim"))
@@ -2285,6 +2300,163 @@ class LivePortfolio:
     def sell_market(self, product_id: str, base_qty: float) -> dict:
         return self._market_order(side="SELL", product_id=product_id, base_qty=float(base_qty))
 
+    def buy_limit_post_only(self, product_id: str, quote_usd: float, limit_price: float) -> dict:
+        # Place a post-only limit buy using generic create order endpoint
+        client_order_id = str(uuid.uuid4())
+        payload = {
+            "client_order_id": client_order_id,
+            "product_id": product_id,
+            "side": "BUY",
+            "order_configuration": {
+                "limit_limit_gtc": {
+                    "quote_size": str(round(float(quote_usd), 2)),
+                    "limit_price": format(float(limit_price), ".8f").rstrip("0").rstrip("."),
+                    "post_only": True,
+                }
+            },
+        }
+        return self.rest.post("/api/v3/brokerage/orders", data=payload)
+
+    def sell_limit_post_only(self, product_id: str, base_qty: float, limit_price: float) -> dict:
+        client_order_id = str(uuid.uuid4())
+        payload = {
+            "client_order_id": client_order_id,
+            "product_id": product_id,
+            "side": "SELL",
+            "order_configuration": {
+                "limit_limit_gtc": {
+                    "base_size": format(float(base_qty), ".10f").rstrip("0").rstrip("."),
+                    "limit_price": format(float(limit_price), ".8f").rstrip("0").rstrip("."),
+                    "post_only": True,
+                }
+            },
+        }
+        return self.rest.post("/api/v3/brokerage/orders", data=payload)
+
+    def place_maker_with_reprice(
+        self,
+        *,
+        side: str,
+        product_id: str,
+        quote_usd: Optional[float] = None,
+        base_qty: Optional[float] = None,
+        start_price: float,
+        max_wait_sec: float = 6.0,
+        reprice_every_sec: float = 2.0,
+    ) -> dict:
+        """
+        Places post-only limit order and reprices a few times to improve fill odds,
+        without ever crossing the spread (so it stays maker).
+        Returns an ExecutionResult-like dict via existing fill parsing pipeline.
+        """
+        side_u = side.upper()
+        assert side_u in ("BUY", "SELL")
+
+        deadline = time.time() + float(max_wait_sec)
+        limit_px = float(start_price)
+
+        last_order_id = None
+
+        while time.time() < deadline:
+            try:
+                if side_u == "BUY":
+                    resp = self.buy_limit_post_only(product_id=product_id, quote_usd=float(quote_usd or 0.0), limit_price=limit_px)
+                else:
+                    resp = self.sell_limit_post_only(product_id=product_id, base_qty=float(base_qty or 0.0), limit_price=limit_px)
+            except Exception as e:
+                return ExecutionResult(
+                    ok=False,
+                    order_id=last_order_id,
+                    client_order_id=None,
+                    product_id=product_id,
+                    side=side_u,
+                    filled_qty=0.0,
+                    avg_price=None,
+                    fee_usd=0.0,
+                    filled_notional_usd=None,
+                    status="ERROR",
+                    error=str(e),
+                ).to_dict()
+
+            order_id = self._extract_order_id(resp)
+            last_order_id = order_id
+            if not order_id:
+                break
+
+            t0 = time.time()
+            while time.time() - t0 < float(reprice_every_sec) and time.time() < deadline:
+                od = self.rest.get_order(order_id=order_id)
+                od_d = od.to_dict() if hasattr(od, "to_dict") else od
+                status = str(((od_d.get("order") or {}).get("status")) or "").upper()
+
+                if "FILLED" in status:
+                    fills = self._fetch_fills_for_order(order_id=order_id, product_id=product_id)
+                    qty_f, avg_px_f, fee_f, notional_f = self._aggregate_fills(fills)
+
+                    if qty_f <= 0:
+                        qty_o, avg_px_o, fee_o, notional_o = self._parse_order_fill_fields(od_d)
+                        qty_f, avg_px_f, fee_f, notional_f = qty_o, avg_px_o, fee_o, notional_o
+
+                    try:
+                        q = float(qty_f) if qty_f is not None else 0.0
+                        px = float(avg_px_f) if avg_px_f is not None else None
+                        notion = float(notional_f) if notional_f is not None else None
+
+                        if px is not None and px > 0 and notion is not None and notion > 0:
+                            expected_base = notion / px
+                            if q <= 0 or (abs(q - expected_base) / max(expected_base, 1e-12)) > 0.10:
+                                qty_f = float(expected_base)
+
+                        if (avg_px_f is None or float(avg_px_f) <= 0) and notion is not None and float(qty_f) > 0:
+                            avg_px_f = float(notion) / float(qty_f)
+                    except Exception:
+                        pass
+
+                    try:
+                        self.sync_after_trade(attempts=6, sleep_sec=0.5)
+                    except Exception:
+                        pass
+
+                    return ExecutionResult(
+                        ok=True,
+                        order_id=order_id,
+                        client_order_id=(od_d.get("order") or {}).get("client_order_id"),
+                        product_id=product_id,
+                        side=side_u,
+                        filled_qty=float(qty_f),
+                        avg_price=(float(avg_px_f) if avg_px_f else None),
+                        fee_usd=float(fee_f or 0.0),
+                        filled_notional_usd=(float(notional_f) if notional_f else None),
+                        status="FILLED",
+                        error=None,
+                    ).to_dict()
+
+                time.sleep(0.25)
+
+            try:
+                self.rest.cancel_orders(order_ids=[order_id])
+            except Exception:
+                pass
+
+            if side_u == "BUY":
+                limit_px *= 1.0002
+            else:
+                limit_px *= 0.9998
+
+        return ExecutionResult(
+            ok=False,
+            order_id=last_order_id,
+            client_order_id=None,
+            product_id=product_id,
+            side=side_u,
+            filled_qty=0.0,
+            avg_price=None,
+            fee_usd=0.0,
+            filled_notional_usd=None,
+            status="NO_FILL",
+            error="maker_no_fill",
+        ).to_dict()
+
 
 class TradingBot:
     """
@@ -2341,13 +2513,14 @@ class TradingBot:
         self.position_start_ts: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         # Runner trailing state
         self.peak_bid: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
+        self.entry_notional_usd: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
+        self.entry_buy_fee_usd: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
+        self.entry_buy_fee_bps: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
         self.trailing_active: Dict[str, bool] = {p: False for p in PRODUCTS}
         # Tier tracking for the active position
         self.position_tier: Dict[str, int] = {p: 0 for p in PRODUCTS}
         self.last_tier_tp_ts: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
         self.position_entry_price: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
-        # Risk-off throttling state (per product)
-        self.last_risk_off_ts: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
         # Global exit timestamp (used to throttle re-entry after any liquidation)
         self.last_exit_ts: Optional[float] = None
         # Price-based re-entry gating (prevents rapid churn without using time)
@@ -2539,6 +2712,7 @@ class TradingBot:
         if not tob:
             return None
         bid = tob.bid
+        ask = tob.ask
 
         qty_to_sell = float(qty_to_sell)
         if qty_to_sell <= 1e-12:
@@ -2549,7 +2723,7 @@ class TradingBot:
         sold_qty = qty_to_sell
 
         if isinstance(self.portfolio, LivePortfolio):
-            r = await self._live_sell_market(product_id=product, base_qty=qty_to_sell)
+            r = await self._live_sell_maker(product_id=product, base_qty=qty_to_sell, ask=ask)
             fill = self._require_live_fill(r, product_id=product, side="SELL")
             if fill is None:
                 return None
@@ -2579,7 +2753,7 @@ class TradingBot:
             return
 
         if isinstance(self.portfolio, LivePortfolio):
-            r = await self._live_sell_market(product_id=product, base_qty=float(qty))
+            r = await self._live_sell_maker(product_id=product, base_qty=float(qty), ask=tob.ask)
             fill = self._require_live_fill(r, product_id=product, side="SELL")
             if fill is None:
                 return
@@ -2621,6 +2795,9 @@ class TradingBot:
         self.trailing_active[product] = False
         self.position_tier[product] = 0
         self.position_entry_price[product] = None
+        self.entry_notional_usd[product] = 0.0
+        self.entry_buy_fee_usd[product] = 0.0
+        self.entry_buy_fee_bps[product] = 0.0
         self.last_tier_tp_ts[product] = ts_now
         self.last_exit_ts = ts_now
         self.rearm_required[product] = True
@@ -2859,18 +3036,34 @@ class TradingBot:
     # --------------------------------------------------------
     # Live execution helpers (avoid blocking asyncio loop)
     # --------------------------------------------------------
-    async def _live_buy_market(self, *, product_id: str, quote_usd: float) -> Any:
-        """Run LivePortfolio.buy_market in a worker thread to avoid blocking the event loop."""
+    async def _live_buy_maker(self, *, product_id: str, quote_usd: float, bid: float) -> Any:
         if not isinstance(self.portfolio, LivePortfolio):
             raise RuntimeError("live buy called without LivePortfolio")
-        return await asyncio.to_thread(self.portfolio.buy_market, product_id=product_id, quote_usd=float(quote_usd))
+        # buy maker at bid (doesn't cross ask)
+        return await asyncio.to_thread(
+            self.portfolio.place_maker_with_reprice,
+            side="BUY",
+            product_id=product_id,
+            quote_usd=float(quote_usd),
+            start_price=float(bid),
+            max_wait_sec=6.0,
+            reprice_every_sec=2.0,
+        )
 
 
-    async def _live_sell_market(self, *, product_id: str, base_qty: float) -> Any:
-        """Run LivePortfolio.sell_market in a worker thread to avoid blocking the event loop."""
+    async def _live_sell_maker(self, *, product_id: str, base_qty: float, ask: float) -> Any:
         if not isinstance(self.portfolio, LivePortfolio):
             raise RuntimeError("live sell called without LivePortfolio")
-        return await asyncio.to_thread(self.portfolio.sell_market, product_id=product_id, base_qty=float(base_qty))
+        # sell maker at ask (doesn't cross bid)
+        return await asyncio.to_thread(
+            self.portfolio.place_maker_with_reprice,
+            side="SELL",
+            product_id=product_id,
+            base_qty=float(base_qty),
+            start_price=float(ask),
+            max_wait_sec=6.0,
+            reprice_every_sec=2.0,
+        )
 
 
     async def _live_refresh_cash(self) -> float:
@@ -3052,7 +3245,6 @@ class TradingBot:
           (daily preferred, else weekly) and the 1m regime filter is not strongly trending down.
         - Exit: sell the entire position when price reaches the macro RESISTANCE zone.
         - Stop loss: sell the entire position if price breaks materially below the support zone.
-        - Risk-off: if risk_off triggers (downtrend or weekly bias below threshold), LIQUIDATE
           the entire position immediately.
 
         NOTE: This replaces the previous fair-value dip + sigma exit behavior, but keeps all
@@ -3181,8 +3373,6 @@ class TradingBot:
                 trending_down = _regime_is_trending_down(product)
                 sigma_bps = _sigma_bps_from_1m(product, mid)
 
-                risk_off = trending_down or (weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD)
-
                 # -------------------------
                 # Manage OPEN position
                 # -------------------------
@@ -3216,7 +3406,7 @@ class TradingBot:
                         exec_price = bid
                         fee = 0.0
                         if isinstance(self.portfolio, LivePortfolio):
-                            r = await self._live_sell_market(product_id=product, base_qty=qty_to_sell)
+                            r = await self._live_sell_maker(product_id=product, base_qty=qty_to_sell, ask=ask)
                             fill = self._require_live_fill(r, product_id=product, side="SELL")
                             if fill is None:
                                 return
@@ -3270,79 +3460,51 @@ class TradingBot:
                         self.trailing_active[product] = False
                         self.position_tier[product] = 0
                         self.position_entry_price[product] = None
+                        self.entry_notional_usd[product] = 0.0
+                        self.entry_buy_fee_usd[product] = 0.0
+                        self.entry_buy_fee_bps[product] = 0.0
                         self.last_tier_tp_ts[product] = ts_now
-                        self.last_risk_off_ts[product] = ts_now
                         self.last_exit_ts = ts_now
                         # Require price to move ABOVE day support before re-entry (price-based, not time-based)
                         self.rearm_required[product] = True
 
-                    # Peak-based exits (no targets / no partial exits).
-                    # (Risk-off liquidation removed intentionally.)
+                    # -----------------------------
+                    # NET-OF-COST + TIERED TRAILING EXIT (single-position)
+                    # -----------------------------
+                    peak = float(self.peak_bid.get(product) or bid)
+                    if bid > peak:
+                        peak = float(bid)
+                        self.peak_bid[product] = peak
 
-                    # Update peak bid for peak-based exits
-                    peak_bid_now = float(self.peak_bid.get(product) or bid)
-                    if bid > peak_bid_now:
-                        peak_bid_now = float(bid)
-                        self.peak_bid[product] = peak_bid_now
-
-                    # Peak profit since entry (based on avg entry)
-                    if avg_entry_price and avg_entry_price > 0:
-                        peak_profit_pct = (peak_bid_now / float(avg_entry_price)) - 1.0
-                    else:
-                        peak_profit_pct = 0.0
-
-                    held_tier = int(self.position_tier.get(product, 0) or 0)
-                    entry_px = self.position_entry_price.get(product) or avg_entry_price
-                    if entry_px and entry_px > 0 and held_tier in TIER_TP_PCT:
-                        tp_pct = float(TIER_TP_PCT[held_tier])
-                        tp_price = float(entry_px) * (1.0 + tp_pct)
-
-                        # cooldown
-                        if (ts_now - float(self.last_tier_tp_ts.get(product, 0.0))) >= TIER_TP_COOLDOWN_SEC:
-                            if bid >= tp_price:
-                                # sell fraction of current active qty
-                                frac = float(TIER_TP_SELL_FRAC.get(held_tier, 0.0))
-                                qty_to_sell = float(active_qty) * frac
-                                res = await self._sell_partial(product, qty_to_sell, note=f"TP_TIER{held_tier}")
-                                if res is not None:
-                                    sold_qty, exec_price, fee = res
-                                    removed_qty, fifo_entry = self._fifo_reduce_lots(product, sold_qty)
-                                    active_qty = max(0.0, active_qty - removed_qty)
-                                    self.last_tier_tp_ts[product] = ts_now
-
-                                    self.tlog.log_trade(
-                                        event="SELL",
-                                        product_id=product,
-                                        side="SELL",
-                                        qty=sold_qty,
-                                        price=exec_price,
-                                        fee_usd_val=fee,
-                                        gross_pnl_usd=0.0,
-                                        net_pnl_usd=-fee,
-                                        entry_price=(fifo_entry if fifo_entry is not None else entry_px),
-                                        exit_price=exec_price,
-                                        weekly_bias=weekly_bias,
-                                        note=f"tier_tp|tier={held_tier}",
-                                    )
-
-                    # HARD peak stop: sell on 0.5% drop from peak at ANY time
-                    hard_stop_price = peak_bid_now * (1.0 - HARD_PEAK_STOP_PCT)
-                    if bid <= hard_stop_price:
-                        state = "HARD_PEAK_STOP"
-                        await _sell_all("hard_peak_stop")
-                        await asyncio.sleep(EVAL_TICK_SEC)
+                    entry_px = float(avg_entry_price) if avg_entry_price else None
+                    if not entry_px or entry_px <= 0:
                         continue
 
-                    # Arm trailing only AFTER +1.5% peak profit
-                    if (not self.trailing_active.get(product, False)) and (peak_profit_pct >= TRAIL_ARM_PCT):
-                        self.trailing_active[product] = True
+                    buy_fee_bps = float(self.entry_buy_fee_bps.get(product, MAKER_FEE_BPS))
+                    sell_fee_bps = float(MAKER_FEE_BPS)
+                    cost_bps = buy_fee_bps + sell_fee_bps + float(spread_bps) + float(EST_SLIPPAGE_BPS) + float(EST_ADVERSE_FILL_BPS)
+                    cost_pct = cost_bps / 10000.0
 
-                    # If armed, sell if price drops 0.25% from peak
-                    if self.trailing_active.get(product, False):
-                        trail_price = peak_bid_now * (1.0 - TRAIL_DRAWDOWN_PCT)
-                        if bid <= trail_price:
-                            state = "TRAIL_EXIT"
-                            await _sell_all("trail_exit")
+                    gross_now = (float(bid) / entry_px) - 1.0
+                    gross_peak = (float(peak) / entry_px) - 1.0
+                    net_now = gross_now - cost_pct
+                    net_peak = gross_peak - cost_pct
+
+                    tier = 0
+                    if net_peak >= TIER_NET_GAIN_PCT[3]:
+                        tier = 3
+                    elif net_peak >= TIER_NET_GAIN_PCT[2]:
+                        tier = 2
+                    elif net_peak >= TIER_NET_GAIN_PCT[1]:
+                        tier = 1
+
+                    if tier == 0:
+                        pass
+                    else:
+                        dd = float(TIER_DD_PCT[tier])
+                        if float(bid) <= float(peak) * (1.0 - dd):
+                            state = f"NET_TRAIL_T{tier}|net_now={net_now:.5f}|net_peak={net_peak:.5f}"
+                            await _sell_all(f"net_tier_trail_t{tier}")
                             await asyncio.sleep(EVAL_TICK_SEC)
                             continue
 
@@ -3380,7 +3542,7 @@ class TradingBot:
 
                     # Laddered adds (only if plan exists and we still have cash).
                     plan = self.ladder_plan.get(product)
-                    can_add = (spread_bps <= MAX_SPREAD_BPS) and (not trending_down) and (weekly_bias is None or weekly_bias >= WEEKLY_BIAS_THRESHOLD)
+                    can_add = (spread_bps <= MAX_SPREAD_BPS)
                     if plan and self.portfolio and can_add:
                         total_notional = float(plan.get("total_notional", 0.0))
                         f1, f2, f3 = plan.get("fracs", LADDER_FRACS)
@@ -3394,7 +3556,7 @@ class TradingBot:
                             if (levels_day.support_zone_low <= mid <= levels_day.support_zone_high) and (mid <= dip_trigger):
                                 if await self._live_can_afford(n2, TAKER_FEE_BPS):
                                     if isinstance(self.portfolio, LivePortfolio):
-                                        r = await self._live_buy_market(product_id=product, quote_usd=n2)
+                                        r = await self._live_buy_maker(product_id=product, quote_usd=n2, bid=bid)
                                         fill = self._require_live_fill(r, product_id=product, side="BUY")
                                         if fill is None:
                                             continue
@@ -3440,7 +3602,7 @@ class TradingBot:
                             if mid >= float(avwap_24h_now):
                                 if await self._live_can_afford(n3, TAKER_FEE_BPS):
                                     if isinstance(self.portfolio, LivePortfolio):
-                                        r = await self._live_buy_market(product_id=product, quote_usd=n3)
+                                        r = await self._live_buy_maker(product_id=product, quote_usd=n3, bid=bid)
                                         fill = self._require_live_fill(r, product_id=product, side="BUY")
                                         if fill is None:
                                             continue
@@ -3504,7 +3666,7 @@ class TradingBot:
                         exec_price = bid
                         fee = 0.0
                         if isinstance(self.portfolio, LivePortfolio):
-                            r = await self._live_sell_market(product_id=product, base_qty=qty_to_sell)
+                            r = await self._live_sell_maker(product_id=product, base_qty=qty_to_sell, ask=ask)
                             fill = self._require_live_fill(r, product_id=product, side="SELL")
                             if fill is None:
                                 return
@@ -3575,7 +3737,9 @@ class TradingBot:
                             self.peak_bid[product] = None
                             self.trailing_active[product] = False
                             self.ladder_plan[product] = None
-                            self.last_risk_off_ts[product] = ts_now
+                            self.entry_notional_usd[product] = 0.0
+                            self.entry_buy_fee_usd[product] = 0.0
+                            self.entry_buy_fee_bps[product] = 0.0
                             self.last_exit_ts = ts_now
                             self.rearm_required[product] = True
 
@@ -3716,7 +3880,7 @@ class TradingBot:
 
                     if await self._live_can_afford(n1, TAKER_FEE_BPS):
                             if isinstance(self.portfolio, LivePortfolio):
-                                r = await self._live_buy_market(product_id=product, quote_usd=n1)
+                                r = await self._live_buy_maker(product_id=product, quote_usd=n1, bid=bid)
                                 fill = self._require_live_fill(r, product_id=product, side="BUY")
                                 if fill is None:
                                     await asyncio.sleep(EVAL_TICK_SEC)
@@ -3732,6 +3896,12 @@ class TradingBot:
                                 self.positions[product] = [PositionLot(qty=filled_qty, price=eff_price1)]
                                 qty1 = filled_qty
                                 buy_px1 = avg_px
+                                self.entry_notional_usd[product] = float(filled_notional or 0.0)
+                                self.entry_buy_fee_usd[product] = float(fee1 or 0.0)
+                                if filled_notional and float(filled_notional) > 0:
+                                    self.entry_buy_fee_bps[product] = float(fee1 or 0.0) / float(filled_notional) * 10000.0
+                                else:
+                                    self.entry_buy_fee_bps[product] = MAKER_FEE_BPS
                             else:
                                 qty1 = n1 / ask
                                 buy_px1 = ask
@@ -3739,6 +3909,12 @@ class TradingBot:
 
                                 eff_price1 = float((n1 + fee1) / qty1) if qty1 > 0 else float(ask)
                                 self.positions[product] = [PositionLot(qty=qty1, price=eff_price1)]
+                                self.entry_notional_usd[product] = float(n1)
+                                self.entry_buy_fee_usd[product] = float(fee1 or 0.0)
+                                if n1 > 0:
+                                    self.entry_buy_fee_bps[product] = float(fee1 or 0.0) / float(n1) * 10000.0
+                                else:
+                                    self.entry_buy_fee_bps[product] = MAKER_FEE_BPS
                             buy_tier = int(best_candidate.get("tier", TIER_LOW))
                             self.position_tier[product] = buy_tier
                             self.position_entry_price[product] = float(eff_price1)

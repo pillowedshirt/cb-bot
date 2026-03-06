@@ -114,6 +114,12 @@ DAY_CANDLES_MIN_FOR_LIVE: int = 60 * 24  # 1440
 # and then later returns back into the support zone.
 REENTRY_REARM_BPS: float = 15.0
 
+# Fair-value smoothing
+FAIR_VALUE_MEDIAN_WINDOW: int = 9
+FAIR_VALUE_SMOOTH_ALPHA: float = 0.35
+FAIR_VALUE_MAX_STEP_BPS: float = 12.0
+FAIR_VALUE_MAX_STEP_DOWN_BPS: float = 18.0
+
 
 # ============================================================
 # CANONICAL STRATEGY CONFIG

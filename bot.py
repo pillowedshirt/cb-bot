@@ -240,6 +240,10 @@ TRAIL_MAX_DRAWDOWN_PCT: float = 0.0
 # Helper functions
 # ------------------------------------------------------------
 
+def log(msg: str) -> None:
+    """Console logger with immediate flush so output always appears in the terminal."""
+    print(msg, flush=True)
+
 def now_ts() -> float:
     """Return current UNIX timestamp as float."""
     return time.time()
@@ -2607,6 +2611,7 @@ class TradingBot:
         self._stop_event = asyncio.Event()
         # startup timestamp (used for FIRST_BUY_DELAY_SEC warm-up)
         self.bot_start_ts: float = now_ts()
+        self.last_heartbeat_ts: float = 0.0
     async def preload_micro_history(self) -> None:
         """Preload the last MICRO_PRELOAD_MINUTES of 1m candles into micro buffers at startup.
 
@@ -2629,9 +2634,9 @@ class TradingBot:
                         continue
                     self.mid_series[product].push(ts, mid)
                     self.live_1m[product].push_mid(ts, mid)
-            print(f"[startup] preloaded {MICRO_PRELOAD_MINUTES}m micro context for {len(PRODUCTS)} products")
+            log(f"[startup] preloaded {MICRO_PRELOAD_MINUTES}m micro context for {len(PRODUCTS)} products")
         except Exception as e:
-            print(f"[startup] micro preload failed: {e}")
+            log(f"[startup] micro preload failed: {e}")
 
 
     # --------------------------------------------------------
@@ -3134,8 +3139,12 @@ class TradingBot:
 
     async def run(self) -> None:
         """Launch all asynchronous loops and wait for them to finish."""
+        log("[run] TradingBot.run() started")
+        log(f"[run] paper_trading={PAPER_TRADING} products={PRODUCTS}")
         # Preload micro + signal context (last 24 hours of 1m candles)
+        log("[run] preloading micro history")
         await self.preload_micro_history()
+        log("[run] starting websocket / macro / evaluation / telemetry tasks")
         tasks = [
             asyncio.create_task(self.ws_loop()),
             asyncio.create_task(self.macro_loop()),
@@ -3356,7 +3365,16 @@ class TradingBot:
 
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
-            ts_now = now_ts_i()
+            ts_now = now_ts()
+            if ts_now - self.last_heartbeat_ts >= 30.0:
+                try:
+                    cash_usd = float(self.portfolio.cash_usd)
+                except Exception:
+                    cash_usd = float("nan")
+
+                log(f"[heartbeat] running | products={len(PRODUCTS)} | cash_usd={cash_usd:.2f}")
+                self.last_heartbeat_ts = ts_now
+
             warmup_done = (ts_now - self.bot_start_ts) >= FIRST_BUY_DELAY_SEC
 
             snap_live: Optional[Dict[str, Dict[str, float]]] = None
@@ -3606,6 +3624,7 @@ class TradingBot:
                         expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
                     )
 
+            log(f"[loop] sleeping {EVAL_TICK_SEC:.1f}s until next evaluation")
             await asyncio.sleep(EVAL_TICK_SEC)
 
 
@@ -3734,18 +3753,26 @@ def load_coinbase_client() -> RESTClient:
 
 async def main() -> None:
     global PRODUCTS
+
+    log("[startup] bot.py launching")
+    log(f"[startup] file={os.path.abspath(__file__)}")
+    log("[startup] loading Coinbase client")
     rest = load_coinbase_client()
+
+    log("[startup] loading environment")
     load_dotenv()
     api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
     pem = load_pem_secret_from_env()
 
+    log("[startup] selecting products")
     if AUTO_SELECT_PRODUCTS:
         try:
             PRODUCTS = await asyncio.to_thread(select_diversified_products)
             if not PRODUCTS:
+                log("[select] auto-selection returned no products; using defaults")
                 PRODUCTS = list(PRODUCTS_DEFAULT)
         except Exception as e:
-            print("[select] failed, using default products:", e)
+            log(f"[select] failed, using default products: {e}")
             PRODUCTS = list(PRODUCTS_DEFAULT)
     else:
         PRODUCTS = list(PRODUCTS_DEFAULT)
@@ -3753,11 +3780,14 @@ async def main() -> None:
     # Currency safety: enforce USD quote pairs.
     PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
 
-    print("[config] Trading products:", PRODUCTS)
-
+    log(f"[config] Trading products: {PRODUCTS}")
+    log("[startup] creating TradingBot instance")
     bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
+
     if not hasattr(bot, "run"):
         raise RuntimeError("TradingBot instance has no run(); ensure you are running the updated bot.py file.")
+
+    log("[startup] entering TradingBot.run()")
     await bot.run()
 if __name__ == "__main__":
     try:

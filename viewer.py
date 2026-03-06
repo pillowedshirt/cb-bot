@@ -4,7 +4,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 TZ = "America/Phoenix"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -102,7 +101,9 @@ def plot_macro(ax, df: pd.DataFrame, levels: dict, title: str, line_width: int, 
 
 st.sidebar.header("Controls")
 refresh_sec = st.sidebar.slider("Refresh (seconds)", 0.5, 5.0, 1.0)
-st_autorefresh(interval=int(refresh_sec * 1000), key="viewer_autorefresh")
+manual_refresh = st.sidebar.button("Refresh now")
+if manual_refresh:
+    st.rerun()
 
 st.sidebar.divider()
 st.sidebar.subheader("Micro window")

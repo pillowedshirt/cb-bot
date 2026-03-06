@@ -114,35 +114,30 @@ DAY_CANDLES_MIN_FOR_LIVE: int = 60 * 24  # 1440
 # and then later returns back into the support zone.
 REENTRY_REARM_BPS: float = 15.0
 
-# Fair-value smoothing
-FAIR_VALUE_MEDIAN_WINDOW: int = 9
-FAIR_VALUE_SMOOTH_ALPHA: float = 0.35
-FAIR_VALUE_MAX_STEP_BPS: float = 12.0
-FAIR_VALUE_MAX_STEP_DOWN_BPS: float = 18.0
-
-
 # ============================================================
 # CANONICAL STRATEGY CONFIG
 # ============================================================
 
 # Warm-up / cadence
-FIRST_BUY_DELAY_SEC: float = 30.0 * 60.0
+FIRST_BUY_DELAY_SEC: float = 5.0 * 60.0
 BUY_COOLDOWN_SEC: float = 45.0
-POST_EXIT_COOLDOWN_SEC: float = 5 * 60.0
+POST_EXIT_COOLDOWN_SEC: float = 5.0 * 60.0
 EVAL_TICK_SEC: float = 2.0
 
-# Exposure / allocation
+# Allocation / exposure
 MAX_OPEN_POSITIONS: int = 20
+MAX_NEW_ENTRIES_PER_EVAL: int = 4
 MIN_ENTRY_USD: float = 1.0
 MAX_EXPOSURE_PER_PRODUCT_USD: float = 40.0
-TARGET_UTIL_MIN: float = 0.25
-TARGET_UTIL_MID: float = 0.60
+
+TARGET_UTIL_MIN: float = 0.35
+TARGET_UTIL_MID: float = 0.65
 TARGET_UTIL_MAX: float = 0.90
+
 HIGH_SCORE_UTIL_THRESHOLD: float = 80.0
 MID_SCORE_UTIL_THRESHOLD: float = 65.0
-MAX_NEW_ENTRIES_PER_EVAL: int = 3
 
-# Execution friction
+# Friction / execution
 MAX_SPREAD_BPS: float = 20.0
 SCALP_MAX_SPREAD_BPS: float = 12.0
 MAKER_FEE_BPS: float = 6.0
@@ -151,12 +146,12 @@ EST_SLIPPAGE_BPS: float = 6.0
 EST_ADVERSE_FILL_BPS: float = 6.0
 
 # Dip / reversal detection
-DIP_LOOKBACK_MIN = 90
-DIP_MAX_AGE_MIN = 15
-DIP_MIN_PCT = 0.0020
-DIP_RATE_MIN_BPS_PER_MIN = 6.0
-REV_MIN_UP_CANDLES = 2
-REV_RECLAIM_BPS = 8.0
+DIP_LOOKBACK_MIN: int = 90
+DIP_MAX_AGE_MIN: int = 12
+DIP_MIN_PCT: float = 0.0015
+DIP_RATE_MIN_BPS_PER_MIN: float = 4.0
+REV_MIN_UP_CANDLES: int = 2
+REV_RECLAIM_BPS: float = 8.0
 
 # Tier score bands
 TIER_LOW = 1
@@ -164,25 +159,14 @@ TIER_MID = 2
 TIER_HIGH = 3
 
 TIER_SCORE_BANDS = {
-    TIER_LOW: (50.0, 64.9999),
-    TIER_MID: (65.0, 79.9999),
+    TIER_LOW: (48.0, 64.9999),
+    TIER_MID: (64.0, 79.9999),
     TIER_HIGH: (80.0, 100.0),
 }
 
-# Entry context
+# Support / room / regime
 SUPPORT_BUFFER_BPS: float = 20.0
 RESIST_BUFFER_BPS: float = 15.0
-RSI_BUY_THRESHOLD: float = 35.0
-EMA_ENTRY_FAST: int = 9
-EMA_ENTRY_SLOW: int = 20
-EMA_SLOPE_MAX_DOWN_BPS: float = 12.0
-PIVOT_W: int = 2
-REQUIRE_CONFIRMATIONS: int = 2
-
-# Regime filter
-EMA_FAST_MINUTES: int = 20
-EMA_SLOW_MINUTES: int = 60
-MAX_TREND_STRENGTH_BPS: float = 35.0
 WEEKLY_BIAS_THRESHOLD: float = -0.5
 
 # Score weights
@@ -190,31 +174,31 @@ SCORE_DIP_DEPTH_W: float = 24.0
 SCORE_DIP_SPEED_W: float = 16.0
 SCORE_REVERSAL_W: float = 20.0
 SCORE_SUPPORT_W: float = 14.0
-SCORE_ROOM_W: float = 18.0
+SCORE_ROOM_W: float = 20.0
 SCORE_REGIME_W: float = 8.0
-SCORE_SPREAD_PENALTY_W: float = 12.0
-SCORE_COST_PENALTY_W: float = 10.0
+SCORE_SPREAD_PENALTY_W: float = 14.0
+SCORE_COST_PENALTY_W: float = 12.0
 
-# Exit inventory fractions by tier
+# Exit plan by tier
 EXIT_PLAN = {
     TIER_LOW:  {"scalp_frac": 0.80, "core_frac": 0.20, "runner_frac": 0.00},
     TIER_MID:  {"scalp_frac": 0.45, "core_frac": 0.40, "runner_frac": 0.15},
     TIER_HIGH: {"scalp_frac": 0.20, "core_frac": 0.45, "runner_frac": 0.35},
 }
 
-# Volatility-scaled objective multipliers
 SCALP_SIGMA_MULT = {
     TIER_LOW: 0.75,
     TIER_MID: 0.90,
     TIER_HIGH: 1.10,
 }
+
 CORE_SIGMA_MULT = {
     TIER_LOW: 1.20,
     TIER_MID: 1.60,
     TIER_HIGH: 2.20,
 }
 
-# Peak-based protective exits
+# Protective exits for remaining inventory
 TRAIL_ARM_PCT: float = 0.015
 TRAIL_DRAWDOWN_PCT: float = 0.0025
 HARD_PEAK_STOP_PCT: float = 0.005
@@ -227,6 +211,12 @@ RISK_OFF_MIN_NOTIONAL_USD: float = 1.0
 
 # Product universe filter
 MIN_DAILY_RANGE_PCT: float = 0.05
+
+# Fair-value smoothing
+FAIR_VALUE_MEDIAN_WINDOW: int = 9
+FAIR_VALUE_SMOOTH_ALPHA: float = 0.35
+FAIR_VALUE_MAX_STEP_BPS: float = 12.0
+FAIR_VALUE_MAX_STEP_DOWN_BPS: float = 18.0
 
 # Legacy trailing-band constants kept disabled for compatibility with helper methods
 TRAIL_VOL_WINDOW_MIN: int = 0
@@ -850,9 +840,9 @@ class TradeLogger:
             w.writerow([
                 "ts", "dt_mst", "event", "product_id", "side", "qty", "price", "notional_usd",
                 "fee_usd", "gross_pnl_usd", "net_pnl_usd", "cum_pnl_usd",
-                "entry_price", "exit_price", "weekly_bias", "note",
-                "entry_score", "entry_tier", "entry_reason", "expected_net_edge_bps", "lot_role",
-                "exit_role", "exit_reason"
+                "entry_price", "exit_price", "weekly_bias",
+                "entry_score", "entry_tier", "entry_reason", "expected_net_edge_bps",
+                "lot_role", "exit_role", "note"
             ])
 
     def log_trade(
@@ -877,7 +867,6 @@ class TradeLogger:
         expected_net_edge_bps: Optional[float] = None,
         lot_role: str = "",
         exit_role: str = "",
-        exit_reason: str = "",
     ) -> None:
         notional = float(filled_notional_usd) if filled_notional_usd is not None else (float(qty) * float(price))
         self.cum_pnl_usd += net_pnl_usd
@@ -893,14 +882,13 @@ class TradeLogger:
                 "" if entry_price is None else f"{entry_price:.10f}",
                 "" if exit_price is None else f"{exit_price:.10f}",
                 "" if weekly_bias is None else f"{weekly_bias:.6f}",
-                note,
                 "" if entry_score is None else f"{entry_score:.6f}",
                 "" if entry_tier is None else str(entry_tier),
                 entry_reason,
                 "" if expected_net_edge_bps is None else f"{expected_net_edge_bps:.6f}",
                 lot_role,
                 exit_role,
-                exit_reason,
+                note,
             ])
 
 
@@ -3316,7 +3304,7 @@ class TradingBot:
             util_target = TARGET_UTIL_MIN
 
         if strong_candidate_count >= 4:
-            util_target = min(TARGET_UTIL_MAX, util_target + 0.10)
+            util_target = min(TARGET_UTIL_MAX, util_target + 0.08)
 
         target_gross_exposure = current_equity_usd * util_target
         deployable_gap = max(0.0, target_gross_exposure - current_total_exposure_usd)
@@ -3449,7 +3437,7 @@ class TradingBot:
                                 entry_price=(fifo_avg_entry if fifo_avg_entry is not None else avg_entry_price),
                                 exit_price=exec_price, weekly_bias=weekly_bias, note=exit_reason or "sell",
                                 filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
-                                exit_role=exit_role or "risk_off", exit_reason=exit_reason or "sell",
+                                exit_role=exit_role or "risk_off",
                             )
                             self._fifo_reduce_lots(product_id, sell_qty)
 

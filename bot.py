@@ -360,6 +360,10 @@ def _iso(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _iso_utc(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _fetch_exchange_products() -> List[Dict[str, Any]]:
     data = _http_get_json("https://api.exchange.coinbase.com/products")
     if isinstance(data, list):
@@ -1045,12 +1049,33 @@ class MacroFetcher:
                 None,
                 lambda: self.rest.get_candles(
                     product_id=product_id,
-                    start=str(start),
-                    end=str(end),
+                    start=_iso_utc(start),
+                    end=_iso_utc(end),
                     granularity=granularity,
                 )
             )
-            return _parse_candles_response(resp)
+            candles = _parse_candles_response(resp)
+            if candles:
+                return candles
+
+            # Fallback: Coinbase Exchange public candles endpoint (more reliable formatting)
+            gran_map = {
+                "ONE_MINUTE": 60,
+                "FIVE_MINUTE": 300,
+                "FIFTEEN_MINUTE": 900,
+                "ONE_HOUR": 3600,
+                "ONE_DAY": 86400,
+            }
+            g = gran_map.get(granularity)
+            if g:
+                rows = _fetch_candles_public(product_id=product_id, granularity=g, start=start, end=end, limit=300)
+                out = []
+                for r in rows:
+                    # r = [time, low, high, open, close, volume]
+                    out.append(Candle(ts=int(r[0]), open=float(r[3]), high=float(r[2]), low=float(r[1]), close=float(r[4]), volume=float(r[5])))
+                return out
+
+            return []
         except Exception as e:
             print(f"[macro] fetch failed for {product_id} {granularity}: {e}")
             return []
@@ -2919,7 +2944,7 @@ class TradingBot:
                         })
                 # Daily 1‑minute candles: use live_1m if enough data else REST
                 live_rows = self.live_1m[product].export_rows(product)
-                if len(live_rows) >= DAY_CANDLES_MIN_FOR_LIVE:
+                if len(live_rows) >= 120:
                     candles_day: List[Candle] = [
                         Candle(
                             ts=int(r["ts"]),
@@ -2932,6 +2957,10 @@ class TradingBot:
                     ]
                 else:
                     candles_day = await self.fetcher.fetch_chunked(product, start_day, end_ts, "ONE_MINUTE")
+                if not candles_week:
+                    print(f"[macro] week empty for {product}")
+                if not candles_day:
+                    print(f"[macro] day empty for {product} (live_rows={len(live_rows)})")
                 if candles_day:
                     levels_day = compute_macro_levels(candles_day)
                     if levels_day:

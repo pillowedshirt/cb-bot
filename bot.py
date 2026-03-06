@@ -64,9 +64,9 @@ PRODUCTS_DEFAULT: List[str] = [
 # We pick a set of USD pairs that (a) are liquid on Coinbase Exchange and
 # (b) tend to have higher realized volatility when BTC is quiet, while keeping
 # correlations in the basket lower.
-AUTO_SELECT_PRODUCTS: bool = False
-TARGET_PRODUCT_COUNT: int = 5          # total products to trade (includes BTC if available)
-CANDIDATE_TOP_BY_USD_VOL: int = 40      # only consider the top-N USD-volume products (liquidity filter)
+AUTO_SELECT_PRODUCTS: bool = True
+TARGET_PRODUCT_COUNT: int = 8          # total products to trade (includes BTC if available)
+CANDIDATE_TOP_BY_USD_VOL: int = 60      # only consider the top-N USD-volume products (liquidity filter)
 SELECTION_LOOKBACK_DAYS: int = 140      # daily bars to pull for correlation/volatility scoring
 SELECTION_BTC_QUIET_ROLL_DAYS: int = 14 # define "BTC quiet" by rolling vol over this many days
 SELECTION_REFRESH_SEC: int = 6 * 60 * 60  # recompute selection every 6 hours
@@ -118,15 +118,19 @@ REENTRY_REARM_BPS: float = 15.0
 # CANONICAL STRATEGY CONFIG
 # ============================================================
 
+# ============================================================
+# HIGHER-FREQUENCY CANONICAL TRADE CONFIG
+# ============================================================
+
 # Warm-up / cadence
-FIRST_BUY_DELAY_SEC: float = 5.0 * 60.0
-BUY_COOLDOWN_SEC: float = 45.0
-POST_EXIT_COOLDOWN_SEC: float = 5.0 * 60.0
+FIRST_BUY_DELAY_SEC: float = 0.0
+BUY_COOLDOWN_SEC: float = 20.0
+POST_EXIT_COOLDOWN_SEC: float = 120.0
+MAX_NEW_ENTRIES_PER_EVAL: int = 4
 EVAL_TICK_SEC: float = 2.0
 
 # Allocation / exposure
 MAX_OPEN_POSITIONS: int = 20
-MAX_NEW_ENTRIES_PER_EVAL: int = 4
 MIN_ENTRY_USD: float = 1.0
 MAX_EXPOSURE_PER_PRODUCT_USD: float = 40.0
 
@@ -134,24 +138,24 @@ TARGET_UTIL_MIN: float = 0.35
 TARGET_UTIL_MID: float = 0.65
 TARGET_UTIL_MAX: float = 0.90
 
-HIGH_SCORE_UTIL_THRESHOLD: float = 80.0
-MID_SCORE_UTIL_THRESHOLD: float = 65.0
+HIGH_SCORE_UTIL_THRESHOLD: float = 78.0
+MID_SCORE_UTIL_THRESHOLD: float = 60.0
 
-# Friction / execution
-MAX_SPREAD_BPS: float = 20.0
-SCALP_MAX_SPREAD_BPS: float = 12.0
+# Execution friction
+MAX_SPREAD_BPS: float = 24.0
+SCALP_MAX_SPREAD_BPS: float = 15.0
 MAKER_FEE_BPS: float = 6.0
 TAKER_FEE_BPS: float = 10.0
 EST_SLIPPAGE_BPS: float = 6.0
 EST_ADVERSE_FILL_BPS: float = 6.0
 
 # Dip / reversal detection
-DIP_LOOKBACK_MIN: int = 90
+DIP_LOOKBACK_MIN: int = 75
 DIP_MAX_AGE_MIN: int = 12
 DIP_MIN_PCT: float = 0.0015
 DIP_RATE_MIN_BPS_PER_MIN: float = 4.0
-REV_MIN_UP_CANDLES: int = 2
-REV_RECLAIM_BPS: float = 8.0
+REV_MIN_UP_CANDLES: int = 1
+REV_RECLAIM_BPS: float = 5.0
 
 # Tier score bands
 TIER_LOW = 1
@@ -159,64 +163,70 @@ TIER_MID = 2
 TIER_HIGH = 3
 
 TIER_SCORE_BANDS = {
-    TIER_LOW: (48.0, 64.9999),
+    TIER_LOW: (48.0, 63.9999),
     TIER_MID: (64.0, 79.9999),
     TIER_HIGH: (80.0, 100.0),
 }
 
 # Support / room / regime
-SUPPORT_BUFFER_BPS: float = 20.0
-RESIST_BUFFER_BPS: float = 15.0
-WEEKLY_BIAS_THRESHOLD: float = -0.5
+SUPPORT_BUFFER_BPS: float = 30.0
+RESIST_BUFFER_BPS: float = 10.0
+WEEKLY_BIAS_THRESHOLD: float = -0.70
 
 # Score weights
-SCORE_DIP_DEPTH_W: float = 24.0
-SCORE_DIP_SPEED_W: float = 16.0
-SCORE_REVERSAL_W: float = 20.0
-SCORE_SUPPORT_W: float = 14.0
-SCORE_ROOM_W: float = 20.0
-SCORE_REGIME_W: float = 8.0
-SCORE_SPREAD_PENALTY_W: float = 14.0
-SCORE_COST_PENALTY_W: float = 12.0
+SCORE_DIP_DEPTH_W: float = 22.0
+SCORE_DIP_SPEED_W: float = 14.0
+SCORE_REVERSAL_W: float = 18.0
+SCORE_SUPPORT_W: float = 12.0
+SCORE_ROOM_W: float = 16.0
+SCORE_REGIME_W: float = 6.0
+SCORE_SPREAD_PENALTY_W: float = 10.0
+SCORE_COST_PENALTY_W: float = 10.0
 
 # Exit plan by tier
 EXIT_PLAN = {
-    TIER_LOW:  {"scalp_frac": 0.80, "core_frac": 0.20, "runner_frac": 0.00},
-    TIER_MID:  {"scalp_frac": 0.45, "core_frac": 0.40, "runner_frac": 0.15},
-    TIER_HIGH: {"scalp_frac": 0.20, "core_frac": 0.45, "runner_frac": 0.35},
+    TIER_LOW:  {"scalp_frac": 1.00, "core_frac": 0.00, "runner_frac": 0.00},
+    TIER_MID:  {"scalp_frac": 0.65, "core_frac": 0.35, "runner_frac": 0.00},
+    TIER_HIGH: {"scalp_frac": 0.35, "core_frac": 0.40, "runner_frac": 0.25},
 }
 
 SCALP_SIGMA_MULT = {
-    TIER_LOW: 0.75,
-    TIER_MID: 0.90,
-    TIER_HIGH: 1.10,
+    TIER_LOW: 0.55,
+    TIER_MID: 0.75,
+    TIER_HIGH: 0.95,
 }
 
 CORE_SIGMA_MULT = {
-    TIER_LOW: 1.20,
-    TIER_MID: 1.60,
-    TIER_HIGH: 2.20,
+    TIER_LOW: 0.90,
+    TIER_MID: 1.20,
+    TIER_HIGH: 1.65,
 }
 
-# Protective exits for remaining inventory
-TRAIL_ARM_PCT: float = 0.015
-TRAIL_DRAWDOWN_PCT: float = 0.0025
-HARD_PEAK_STOP_PCT: float = 0.005
+# Protective exits
+TRAIL_ARM_PCT: float = 0.009
+TRAIL_DRAWDOWN_PCT: float = 0.0020
+HARD_PEAK_STOP_PCT: float = 0.0045
 
 # Safety exits
-TIME_STOP_SEC: int = 6 * 60 * 60
+TIME_STOP_SEC: int = 4 * 60 * 60
 RISK_OFF_REDUCTION_FRAC: float = 0.05
 RISK_OFF_COOLDOWN_SEC: float = 60.0
 RISK_OFF_MIN_NOTIONAL_USD: float = 1.0
 
-# Product universe filter
-MIN_DAILY_RANGE_PCT: float = 0.05
+# Universe / selection
+AUTO_SELECT_PRODUCTS: bool = True
+TARGET_PRODUCT_COUNT: int = 8
+CANDIDATE_TOP_BY_USD_VOL: int = 60
+MIN_DAILY_RANGE_PCT: float = 0.06
 
 # Fair-value smoothing
 FAIR_VALUE_MEDIAN_WINDOW: int = 9
-FAIR_VALUE_SMOOTH_ALPHA: float = 0.35
-FAIR_VALUE_MAX_STEP_BPS: float = 12.0
-FAIR_VALUE_MAX_STEP_DOWN_BPS: float = 18.0
+FAIR_VALUE_SMOOTH_ALPHA: float = 0.18
+FAIR_VALUE_MAX_STEP_BPS: float = 24.0
+FAIR_VALUE_MAX_STEP_DOWN_BPS: float = 16.0
+
+# Sell floor
+MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT: float = 8.0
 
 # Legacy trailing-band constants kept disabled for compatibility with helper methods
 TRAIL_VOL_WINDOW_MIN: int = 0
@@ -261,6 +271,24 @@ def safe_float(x: Any) -> Optional[float]:
 def clamp(x: float, lo: float, hi: float) -> float:
     """Clamp x into the inclusive range [lo, hi]."""
     return float(max(lo, min(hi, x)))
+
+
+def can_exit_net_positive(
+    *,
+    entry_price: float,
+    exit_price: float,
+    taker_fee_bps: float,
+    est_slippage_bps: float,
+    est_adverse_fill_bps: float,
+    min_net_profit_bps: float,
+) -> bool:
+    if entry_price <= 0 or exit_price <= 0:
+        return False
+
+    gross_bps = ((exit_price / entry_price) - 1.0) * 10000.0
+    total_cost_bps = taker_fee_bps + est_slippage_bps + est_adverse_fill_bps
+    net_bps = gross_bps - total_cost_bps
+    return net_bps >= min_net_profit_bps
 
 # ------------------------------------------------------------
 # Product auto-selection (liquidity + diversification)
@@ -841,8 +869,7 @@ class TradeLogger:
                 "ts", "dt_mst", "event", "product_id", "side", "qty", "price", "notional_usd",
                 "fee_usd", "gross_pnl_usd", "net_pnl_usd", "cum_pnl_usd",
                 "entry_price", "exit_price", "weekly_bias",
-                "entry_score", "entry_tier", "entry_reason", "expected_net_edge_bps",
-                "lot_role", "exit_role", "note"
+                "entry_score", "entry_tier", "expected_net_edge_bps", "exit_role", "note"
             ])
 
     def log_trade(
@@ -863,9 +890,7 @@ class TradeLogger:
         filled_notional_usd: Optional[float] = None,
         entry_score: Optional[float] = None,
         entry_tier: Optional[int] = None,
-        entry_reason: str = "",
         expected_net_edge_bps: Optional[float] = None,
-        lot_role: str = "",
         exit_role: str = "",
     ) -> None:
         notional = float(filled_notional_usd) if filled_notional_usd is not None else (float(qty) * float(price))
@@ -884,9 +909,7 @@ class TradeLogger:
                 "" if weekly_bias is None else f"{weekly_bias:.6f}",
                 "" if entry_score is None else f"{entry_score:.6f}",
                 "" if entry_tier is None else str(entry_tier),
-                entry_reason,
                 "" if expected_net_edge_bps is None else f"{expected_net_edge_bps:.6f}",
-                lot_role,
                 exit_role,
                 note,
             ])
@@ -1491,6 +1514,10 @@ class EntryScore:
     expected_net_edge_bps: float
 
 
+def _clip_score(x: float) -> float:
+    return float(max(0.0, min(100.0, x)))
+
+
 def _score_to_tier(score: float) -> int:
     if score >= TIER_SCORE_BANDS[TIER_HIGH][0]:
         return TIER_HIGH
@@ -1501,61 +1528,58 @@ def _score_to_tier(score: float) -> int:
     return 0
 
 
-def _clip_score(x: float) -> float:
-    return float(max(0.0, min(100.0, x)))
-
-
 def _support_proximity_score(mid: float, day: Optional['MacroLevels'], week: Optional['MacroLevels']) -> float:
     if mid <= 0:
         return 0.0
 
-    candidates = []
-    for levels in (day, week):
-        if not levels:
+    vals = []
+    for lv in (day, week):
+        if not lv:
             continue
-        if levels.support_zone_low > 0 and levels.support_zone_high > 0:
-            if levels.support_zone_low <= mid <= levels.support_zone_high:
-                return 100.0
-            zone_mid = (levels.support_zone_low + levels.support_zone_high) / 2.0
-            dist_pct = abs(mid - zone_mid) / mid
-            candidates.append(max(0.0, 100.0 - (dist_pct * 10000.0 * 4.0)))
-        if levels.prev_low > 0:
-            dist_pct = abs(mid - levels.prev_low) / mid
-            candidates.append(max(0.0, 100.0 - (dist_pct * 10000.0 * 5.0)))
-        if levels.val > 0:
-            dist_pct = abs(mid - levels.val) / mid
-            candidates.append(max(0.0, 100.0 - (dist_pct * 10000.0 * 5.0)))
 
-    return float(max(candidates)) if candidates else 0.0
+        if getattr(lv, "support_zone_low", 0) > 0 and getattr(lv, "support_zone_high", 0) > 0:
+            if lv.support_zone_low <= mid <= lv.support_zone_high:
+                return 100.0
+            zone_mid = (lv.support_zone_low + lv.support_zone_high) / 2.0
+            dist_pct = abs(mid - zone_mid) / mid
+            vals.append(max(0.0, 100.0 - dist_pct * 10000.0 * 3.0))
+
+        if getattr(lv, "prev_low", 0) > 0:
+            dist_pct = abs(mid - lv.prev_low) / mid
+            vals.append(max(0.0, 100.0 - dist_pct * 10000.0 * 4.0))
+
+        if getattr(lv, "val", 0) > 0:
+            dist_pct = abs(mid - lv.val) / mid
+            vals.append(max(0.0, 100.0 - dist_pct * 10000.0 * 4.0))
+
+    return float(max(vals)) if vals else 0.0
 
 
 def _room_score(mid: float, day: Optional['MacroLevels'], week: Optional['MacroLevels'], resist_buffer_bps: float) -> Tuple[float, str]:
-    room_ok, room_reason = option1_room_to_target(mid, day, week, resist_buffer_bps)
-    if room_ok:
-        return 100.0, room_reason
+    ok, reason = option1_room_to_target(mid, day, week, resist_buffer_bps)
+    if ok:
+        return 100.0, reason
 
-    low_room_ok, low_room_reason = _room_to_target_pct(
-        mid, day, week, target_pct=0.0040, resist_buffer_bps=resist_buffer_bps
+    ok2, reason2 = _room_to_target_pct(
+        mid, day, week,
+        target_pct=0.0035,
+        resist_buffer_bps=resist_buffer_bps,
     )
-    if low_room_ok:
-        return 60.0, low_room_reason
-    return 0.0, room_reason
+    if ok2:
+        return 60.0, reason2
+
+    return 0.0, reason
 
 
-def _estimate_net_edge_bps(
-    *,
-    score_room: float,
-    spread_bps: float,
-    tier_hint: int
-) -> float:
+def _estimate_net_edge_bps(score_room: float, spread_bps: float, tier_hint: int) -> float:
     gross_target_bps = {
-        TIER_LOW: 35.0,
-        TIER_MID: 70.0,
-        TIER_HIGH: 140.0,
-    }.get(tier_hint, 35.0)
+        TIER_LOW: 24.0,
+        TIER_MID: 45.0,
+        TIER_HIGH: 85.0,
+    }.get(tier_hint, 24.0)
 
     friction = spread_bps + TAKER_FEE_BPS + EST_SLIPPAGE_BPS + EST_ADVERSE_FILL_BPS
-    room_bonus = (score_room / 100.0) * 20.0
+    room_bonus = (score_room / 100.0) * 12.0
     return float(gross_target_bps + room_bonus - friction)
 
 
@@ -1568,7 +1592,7 @@ def score_entry_candidate(
     minute_candles: List['MinuteCandle'],
     weekly_bias: Optional[float],
     trending_down: bool,
-    resist_buffer_bps: float
+    resist_buffer_bps: float,
 ) -> EntryScore:
     if mid <= 0:
         return EntryScore(False, 0.0, 0, "bad_mid", 0, 0, 0, 0, 0, 0, 0, 0, -999.0)
@@ -1591,21 +1615,20 @@ def score_entry_candidate(
     rev_ok, rev_reason = _dip_reversal_ok(minute_candles, trough_low)
     reversal_score = 100.0 if rev_ok else 0.0
 
-    dip_depth_score = _clip_score((dip_pct / 0.0150) * 100.0)
-    dip_speed_score = _clip_score((dip_rate / max(DIP_RATE_MIN_BPS_PER_MIN, 1e-9)) * 45.0)
-
+    dip_depth_score = _clip_score((dip_pct / 0.0100) * 100.0)
+    dip_speed_score = _clip_score((dip_rate / max(DIP_RATE_MIN_BPS_PER_MIN, 1e-9)) * 50.0)
     support_score = _support_proximity_score(mid, levels_day, levels_week)
     room_score, room_reason = _room_score(mid, levels_day, levels_week, resist_buffer_bps)
 
     if weekly_bias is None:
-        regime_score = 50.0
+        regime_score = 55.0
     else:
         regime_score = _clip_score((weekly_bias + 1.0) * 50.0)
 
     if trending_down:
-        regime_score = min(regime_score, 25.0)
+        regime_score = min(regime_score, 30.0)
 
-    spread_penalty = max(0.0, (spread_bps - 5.0)) * (SCORE_SPREAD_PENALTY_W / 20.0)
+    spread_penalty = max(0.0, spread_bps - 6.0) * (SCORE_SPREAD_PENALTY_W / 20.0)
     cost_penalty = (TAKER_FEE_BPS + EST_SLIPPAGE_BPS + EST_ADVERSE_FILL_BPS) * (SCORE_COST_PENALTY_W / 25.0)
 
     raw_score = (
@@ -1621,38 +1644,34 @@ def score_entry_candidate(
 
     final_score = _clip_score(raw_score)
     tier = _score_to_tier(final_score)
-    expected_net_edge_bps = _estimate_net_edge_bps(
-        score_room=room_score,
-        spread_bps=spread_bps,
-        tier_hint=max(tier, TIER_LOW),
-    )
+    edge_bps = _estimate_net_edge_bps(room_score, spread_bps, max(tier, TIER_LOW))
 
     if not rev_ok:
-        return EntryScore(False, final_score, tier, f"reversal_fail {rev_reason}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+        return EntryScore(False, final_score, tier, f"reversal_fail {rev_reason}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
     if support_score <= 0.0:
-        return EntryScore(False, final_score, tier, "support_fail", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+        return EntryScore(False, final_score, tier, "support_fail", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
     if room_score <= 0.0:
-        return EntryScore(False, final_score, tier, f"room_fail {room_reason}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+        return EntryScore(False, final_score, tier, f"room_fail {room_reason}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
     if spread_bps > MAX_SPREAD_BPS:
-        return EntryScore(False, final_score, tier, f"spread_high={spread_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+        return EntryScore(False, final_score, tier, f"spread_high={spread_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
     if tier == TIER_LOW and spread_bps > SCALP_MAX_SPREAD_BPS:
-        return EntryScore(False, final_score, tier, f"spread_high_low_tier={spread_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+        return EntryScore(False, final_score, tier, f"spread_high_low_tier={spread_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
     if final_score < TIER_SCORE_BANDS[TIER_LOW][0]:
-        return EntryScore(False, final_score, 0, f"score_too_low={final_score:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+        return EntryScore(False, final_score, 0, f"score_too_low={final_score:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
-    if expected_net_edge_bps <= 0.0:
-        return EntryScore(False, final_score, 0, f"net_edge_nonpositive={expected_net_edge_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+    if edge_bps <= 0.0:
+        return EntryScore(False, final_score, 0, f"net_edge_nonpositive={edge_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
     return EntryScore(
         True,
         final_score,
         tier,
-        f"score_ok={final_score:.1f} room={room_reason} edge_bps={expected_net_edge_bps:.1f}",
+        f"score_ok={final_score:.1f} room={room_reason} edge_bps={edge_bps:.1f}",
         dip_depth_score,
         dip_speed_score,
         reversal_score,
@@ -1661,7 +1680,7 @@ def score_entry_candidate(
         regime_score,
         spread_penalty,
         cost_penalty,
-        expected_net_edge_bps,
+        edge_bps,
     )
 
 
@@ -3303,32 +3322,32 @@ class TradingBot:
         else:
             util_target = TARGET_UTIL_MIN
 
-        if strong_candidate_count >= 4:
-            util_target = min(TARGET_UTIL_MAX, util_target + 0.08)
+        if strong_candidate_count >= 5:
+            util_target = min(TARGET_UTIL_MAX, util_target + 0.05)
 
         target_gross_exposure = current_equity_usd * util_target
         deployable_gap = max(0.0, target_gross_exposure - current_total_exposure_usd)
 
-        score_weight = max(0.25, min(1.0, candidate_score / 100.0))
+        score_weight = max(0.35, min(1.0, candidate_score / 100.0))
 
         if candidate_score >= 80.0:
-            base_alloc_frac = 0.12
-        elif candidate_score >= 65.0:
-            base_alloc_frac = 0.08
+            base_alloc_frac = 0.10
+        elif candidate_score >= 64.0:
+            base_alloc_frac = 0.07
         else:
-            base_alloc_frac = 0.05
+            base_alloc_frac = 0.045
 
-        slot_softener = 1.0
-        if open_position_count >= 10:
-            slot_softener = 0.90
-        if open_position_count >= 15:
-            slot_softener = 0.80
+        if open_position_count >= 12:
+            base_alloc_frac *= 0.90
+        if open_position_count >= 18:
+            base_alloc_frac *= 0.80
 
-        proposed = available_cash_usd * base_alloc_frac * score_weight * slot_softener
-        proposed = min(proposed, deployable_gap if deployable_gap > 0 else proposed)
+        proposed = available_cash_usd * base_alloc_frac * score_weight
+        if deployable_gap > 0:
+            proposed = min(proposed, deployable_gap)
 
-        remaining_product_room = max(0.0, MAX_EXPOSURE_PER_PRODUCT_USD - current_product_exposure_usd)
-        proposed = min(proposed, remaining_product_room)
+        remaining_room = max(0.0, MAX_EXPOSURE_PER_PRODUCT_USD - current_product_exposure_usd)
+        proposed = min(proposed, remaining_room)
 
         if proposed < MIN_ENTRY_USD:
             return 0.0
@@ -3380,33 +3399,61 @@ class TradingBot:
                     exit_reason = None
                     exit_role = None
                     if bid >= targets["scalp_target"] and not lot_meta.get("scalp_done", False):
-                        sell_qty = position_qty * exit_plan["scalp_frac"]
-                        exit_reason = "scalp_target_hit"
-                        exit_role = "scalp_release"
-                        lot_meta["scalp_done"] = True
+                        if can_exit_net_positive(
+                            entry_price=avg_entry_price,
+                            exit_price=bid,
+                            taker_fee_bps=TAKER_FEE_BPS,
+                            est_slippage_bps=EST_SLIPPAGE_BPS,
+                            est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                            min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                        ):
+                            sell_qty = position_qty * exit_plan["scalp_frac"]
+                            exit_reason = "scalp_target_hit"
+                            exit_role = "scalp_release"
+                            lot_meta["scalp_done"] = True
                     elif bid >= targets["core_target"] and not lot_meta.get("core_done", False):
-                        sell_qty = position_qty * exit_plan["core_frac"]
-                        exit_reason = "core_target_hit"
-                        exit_role = "core_release"
-                        lot_meta["core_done"] = True
+                        if can_exit_net_positive(
+                            entry_price=avg_entry_price,
+                            exit_price=bid,
+                            taker_fee_bps=TAKER_FEE_BPS,
+                            est_slippage_bps=EST_SLIPPAGE_BPS,
+                            est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                            min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                        ):
+                            sell_qty = position_qty * exit_plan["core_frac"]
+                            exit_reason = "core_target_hit"
+                            exit_role = "core_release"
+                            lot_meta["core_done"] = True
 
                     remaining_qty = sum(l.qty for l in self.positions.get(product_id, []))
-                    peak_price = float(self.peak_bid.get(product_id) or bid)
-                    if peak_price <= 0:
-                        peak_price = bid
-                    if bid > peak_price:
-                        peak_price = bid
-                        self.peak_bid[product_id] = peak_price
-                    drawdown_from_peak = max(0.0, (peak_price - bid) / peak_price)
-                    peak_profit = max(0.0, (peak_price - avg_entry_price) / avg_entry_price)
+                    peak_bid = float(self.peak_bid.get(product_id) or bid)
+                    if peak_bid <= 0:
+                        peak_bid = bid
+                    if bid > peak_bid:
+                        peak_bid = bid
+                        self.peak_bid[product_id] = peak_bid
+                    drawdown_from_peak = max(0.0, (peak_bid - bid) / peak_bid) if peak_bid and peak_bid > 0 else 0.0
+                    peak_profit = max(0.0, (peak_bid - avg_entry_price) / avg_entry_price) if peak_bid and avg_entry_price > 0 else 0.0
+
+                    # True stop-loss / protective exit: always allowed
                     if drawdown_from_peak >= HARD_PEAK_STOP_PCT:
                         sell_qty = remaining_qty
                         exit_reason = "hard_peak_stop"
                         exit_role = "hard_peak_stop"
+
+                    # Discretionary trailing profit exit: only allowed if net positive after costs
                     elif peak_profit >= TRAIL_ARM_PCT and drawdown_from_peak >= TRAIL_DRAWDOWN_PCT:
-                        sell_qty = remaining_qty
-                        exit_reason = "armed_trailing_drawdown"
-                        exit_role = "runner_trail_exit"
+                        if can_exit_net_positive(
+                            entry_price=avg_entry_price,
+                            exit_price=bid,
+                            taker_fee_bps=TAKER_FEE_BPS,
+                            est_slippage_bps=EST_SLIPPAGE_BPS,
+                            est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                            min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                        ):
+                            sell_qty = remaining_qty
+                            exit_reason = "armed_trailing_drawdown"
+                            exit_role = "runner_trail_exit"
 
                     sell_qty = min(position_qty, max(0.0, sell_qty))
                     if sell_qty > 0:
@@ -3461,7 +3508,8 @@ class TradingBot:
                         "spread_bps": spread_bps,
                         "score": scored.score,
                         "tier": scored.tier,
-                        "reason": scored.reason,
+                        "entry_reason": scored.reason,
+                        "entry_score_obj": scored,
                         "expected_net_edge_bps": scored.expected_net_edge_bps,
                         "weekly_bias": weekly_bias,
                     })
@@ -3552,12 +3600,10 @@ class TradingBot:
                         event="BUY", product_id=product_id, side="BUY", qty=qty1, price=buy_px1,
                         fee_usd_val=fee1, gross_pnl_usd=0.0, net_pnl_usd=-fee1,
                         entry_price=buy_px1, exit_price=None, weekly_bias=candidate.get("weekly_bias"),
-                        note=candidate.get("reason", "score_entry"),
+                        note=candidate.get("entry_reason", "score_entry"),
                         filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
                         entry_score=float(candidate["score"]), entry_tier=int(candidate["tier"]),
-                        entry_reason=str(candidate.get("reason", "score_entry")),
                         expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
-                        lot_role="runner",
                     )
 
             await asyncio.sleep(EVAL_TICK_SEC)

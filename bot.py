@@ -1055,12 +1055,13 @@ class MacroFetcher:
 
     async def fetch(self, product_id: str, start: int, end: int, granularity: str) -> List[Candle]:
         try:
+            print(f"[macro] get_candles {product_id} {granularity} start={int(start)} end={int(end)} span={(int(end)-int(start))}")
             resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.rest.get_candles(
                     product_id=product_id,
-                    start=_iso_utc(start),
-                    end=_iso_utc(end),
+                    start=str(int(start)),
+                    end=str(int(end)),
                     granularity=granularity,
                 )
             )

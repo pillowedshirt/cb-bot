@@ -1108,11 +1108,25 @@ class MacroFetcher:
         span = gran_sec_map.get(granularity)
         if not span:
             return await self.fetch(product_id, start, end, granularity)
+
+        # --- ALIGN timestamps to candle boundaries (CRITICAL) ---
+        start_i = int(start)
+        end_i = int(end)
+
+        # floor to boundary
+        start_i = start_i - (start_i % span)
+        end_i = end_i - (end_i % span)
+
+        # ensure end is strictly after start by at least one bucket
+        if end_i <= start_i:
+            end_i = start_i + span
+
         chunk_span = span * max_candles_per_req
         out: List[Candle] = []
-        cursor = int(start)
-        while cursor < int(end):
-            chunk_end = min(int(end), cursor + chunk_span)
+        cursor = start_i
+
+        while cursor < end_i:
+            chunk_end = min(end_i, cursor + chunk_span)
             if chunk_end <= cursor:
                 break
             chunk = await self.fetch(product_id, cursor, chunk_end, granularity)

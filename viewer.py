@@ -381,7 +381,14 @@ while True:
         if not buys.empty:
             axp.scatter(buys["dt"], buys["price"], marker="^", s=80, color="blue", edgecolors="white", linewidths=0.5, zorder=6, label="BUY")
         if not sells.empty:
-            axp.scatter(sells["dt"], sells["price"], marker="v", s=60, label="SELL")
+            axp.scatter(
+                sells["dt"], sells["price"],
+                marker="v", s=80,
+                color="red",
+                edgecolors="white", linewidths=0.5,
+                zorder=7,
+                label="SELL"
+            )
 
     axp.set_xlabel("time (MST)")
     axp.set_ylabel("price")

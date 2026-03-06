@@ -94,7 +94,8 @@ TRAIL_MIN_DRAWDOWN_PCT: float = 0.0  # DISABLED
 TRAIL_MAX_DRAWDOWN_PCT: float = 0.0  # DISABLED
 
 # Laddered entry sizing (fractions of all-in notional).
-LADDER_FRACS: Tuple[float, float, float] = (0.50, 0.30, 0.20)
+BUY_DEPLOY_FRAC: float = 0.95   # deploy 95% of cash each new position; leave 5% buffer
+LADDER_FRACS: Tuple[float, float, float] = (1.00, 0.00, 0.00)
 
 # Tranche-2 add trigger: add when price dips below entry1 by ADD2_K * σ (σ from 60m rolling 1m returns).
 ADD2_K_SIGMA: float = 0.75
@@ -2218,6 +2219,33 @@ class LivePortfolio:
             qty_o, avg_px_o, fee_o, notional_o = self._parse_order_fill_fields(order_d)
             qty_f, avg_px_f, fee_f, notional_f = qty_o, avg_px_o, fee_o, notional_o
 
+        # -------------------------------
+        # FILL UNIT RECONCILIATION (CRITICAL)
+        # Ensure filled_qty is BASE units and consistent with notional/price.
+        # This prevents "qty looks like USD" bugs that create impossible positions/logs.
+        # -------------------------------
+        try:
+            side_u2 = side_u  # BUY or SELL
+            q = float(qty_f) if qty_f is not None else 0.0
+            px = float(avg_px_f) if avg_px_f is not None else None
+            notion = float(notional_f) if notional_f is not None else None
+
+            if px is not None and px > 0 and notion is not None and notion > 0:
+                expected_base = notion / px
+
+                # If qty is wildly inconsistent, replace qty with expected_base.
+                # (Most common failure: BUY returns qty field in QUOTE units by mistake.)
+                if q <= 0 or (abs(q - expected_base) / max(expected_base, 1e-12)) > 0.10:
+                    # prefer expected_base, but preserve the idea of "some fill happened"
+                    qty_f = float(expected_base)
+
+            # If we still don't have a usable avg_px but have notional and qty, derive it.
+            if (avg_px_f is None or float(avg_px_f) <= 0) and notion is not None and float(qty_f) > 0:
+                avg_px_f = float(notion) / float(qty_f)
+
+        except Exception:
+            pass
+
         # Determine outcome
         if qty_f <= 1e-12:
             # Terminal-but-unfilled should not be logged as success.
@@ -3130,9 +3158,8 @@ class TradingBot:
                 return float(sig * 10000.0)
 
             def _all_in_notional(cash_usd_val: float) -> float:
-                # Keep a small buffer so fee debit doesn't fail on rounding.
-                buf = max(1.0, cash_usd_val * 0.0025)  # 0.25% or $1
-                return max(0.0, cash_usd_val - buf)
+                # Deploy a fixed fraction of cash; keep the rest for fees + rounding safety.
+                return max(0.0, float(cash_usd_val) * BUY_DEPLOY_FRAC)
 
             best_candidate = None  # dict with keys used below
 
@@ -3249,76 +3276,40 @@ class TradingBot:
                         # Require price to move ABOVE day support before re-entry (price-based, not time-based)
                         self.rearm_required[product] = True
 
-                    if risk_off and (self.last_risk_off_ts.get(product) is None or (ts_now - self.last_risk_off_ts.get(product, 0.0) >= RISK_OFF_COOLDOWN_SEC)):
-                        state = "RISK_OFF_LIQUIDATE"
-                        await _sell_all("risk_off_liq")
+                    # Peak-based exits (no targets / no partial exits).
+                    # (Risk-off liquidation removed intentionally.)
+                    # Update peak bid for peak-based exits
+                    peak_bid_now = float(self.peak_bid.get(product) or bid)
+                    if bid > peak_bid_now:
+                        peak_bid_now = float(bid)
+                        self.peak_bid[product] = peak_bid_now
+
+                    # Peak profit since entry (based on avg entry)
+                    if avg_entry_price and avg_entry_price > 0:
+                        peak_profit_pct = (peak_bid_now / float(avg_entry_price)) - 1.0
                     else:
-                        # Update peak bid for peak-based exits
-                        peak_bid_now = float(self.peak_bid.get(product) or bid)
-                        if bid > peak_bid_now:
-                            peak_bid_now = float(bid)
-                            self.peak_bid[product] = peak_bid_now
+                        peak_profit_pct = 0.0
 
-                        # Peak profit since entry (based on avg entry)
-                        if avg_entry_price and avg_entry_price > 0:
-                            peak_profit_pct = (peak_bid_now / float(avg_entry_price)) - 1.0
-                        else:
-                            peak_profit_pct = 0.0
+                    # HARD peak stop: sell on 0.5% drop from peak at ANY time
+                    hard_stop_price = peak_bid_now * (1.0 - HARD_PEAK_STOP_PCT)
+                    if bid <= hard_stop_price:
+                        state = "HARD_PEAK_STOP"
+                        await _sell_all("hard_peak_stop")
+                        await asyncio.sleep(EVAL_TICK_SEC)
+                        continue
 
-                        held_tier = int(self.position_tier.get(product, 0) or 0)
-                        entry_px = self.position_entry_price.get(product) or avg_entry_price
-                        if entry_px and entry_px > 0 and held_tier in TIER_TP_PCT:
-                            tp_pct = float(TIER_TP_PCT[held_tier])
-                            tp_price = float(entry_px) * (1.0 + tp_pct)
+                    # Arm trailing only AFTER +1.5% peak profit
+                    if (not self.trailing_active.get(product, False)) and (peak_profit_pct >= TRAIL_ARM_PCT):
+                        self.trailing_active[product] = True
 
-                            # cooldown
-                            if (ts_now - float(self.last_tier_tp_ts.get(product, 0.0))) >= TIER_TP_COOLDOWN_SEC:
-                                if bid >= tp_price:
-                                    # sell fraction of current active qty
-                                    frac = float(TIER_TP_SELL_FRAC.get(held_tier, 0.0))
-                                    qty_to_sell = float(active_qty) * frac
-                                    res = await self._sell_partial(product, qty_to_sell, note=f"TP_TIER{held_tier}")
-                                    if res is not None:
-                                        sold_qty, exec_price, fee = res
-                                        removed_qty, fifo_entry = self._fifo_reduce_lots(product, sold_qty)
-                                        active_qty = max(0.0, active_qty - removed_qty)
-                                        self.last_tier_tp_ts[product] = ts_now
-
-                                        self.tlog.log_trade(
-                                            event="SELL",
-                                            product_id=product,
-                                            side="SELL",
-                                            qty=sold_qty,
-                                            price=exec_price,
-                                            fee_usd_val=fee,
-                                            gross_pnl_usd=0.0,
-                                            net_pnl_usd=-fee,
-                                            entry_price=(fifo_entry if fifo_entry is not None else entry_px),
-                                            exit_price=exec_price,
-                                            weekly_bias=weekly_bias,
-                                            note=f"tier_tp|tier={held_tier}",
-                                        )
-
-                        # HARD peak stop: sell on 0.5% drop from peak at ANY time
-                        hard_stop_price = peak_bid_now * (1.0 - HARD_PEAK_STOP_PCT)
-                        if bid <= hard_stop_price:
-                            state = "HARD_PEAK_STOP"
-                            await _sell_all("hard_peak_stop")
+                    # If armed, sell if price drops 0.25% from peak
+                    if self.trailing_active.get(product, False):
+                        trail_price = peak_bid_now * (1.0 - TRAIL_DRAWDOWN_PCT)
+                        if bid <= trail_price:
+                            state = "TRAIL_EXIT"
+                            await _sell_all("trail_exit")
                             await asyncio.sleep(EVAL_TICK_SEC)
                             continue
-
-                        # Arm trailing only AFTER +1.5% peak profit
-                        if (not self.trailing_active.get(product, False)) and (peak_profit_pct >= TRAIL_ARM_PCT):
-                            self.trailing_active[product] = True
-
-                        # If armed, sell if price drops 0.25% from peak
-                        if self.trailing_active.get(product, False):
-                            trail_price = peak_bid_now * (1.0 - TRAIL_DRAWDOWN_PCT)
-                            if bid <= trail_price:
-                                state = "TRAIL_EXIT"
-                                await _sell_all("trail_exit")
-                                await asyncio.sleep(EVAL_TICK_SEC)
-                                continue
 
                     # If we just exited, skip add/exit logic and move on.
                     if active_qty <= 0:

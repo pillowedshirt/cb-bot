@@ -64,7 +64,7 @@ PRODUCTS_DEFAULT: List[str] = [
 # We pick a set of USD pairs that (a) are liquid on Coinbase Exchange and
 # (b) tend to have higher realized volatility when BTC is quiet, while keeping
 # correlations in the basket lower.
-AUTO_SELECT_PRODUCTS: bool = True
+AUTO_SELECT_PRODUCTS: bool = False
 TARGET_PRODUCT_COUNT: int = 8          # total products to trade (includes BTC if available)
 CANDIDATE_TOP_BY_USD_VOL: int = 60      # only consider the top-N USD-volume products (liquidity filter)
 SELECTION_LOOKBACK_DAYS: int = 140      # daily bars to pull for correlation/volatility scoring
@@ -214,7 +214,7 @@ RISK_OFF_COOLDOWN_SEC: float = 60.0
 RISK_OFF_MIN_NOTIONAL_USD: float = 1.0
 
 # Universe / selection
-AUTO_SELECT_PRODUCTS: bool = True
+AUTO_SELECT_PRODUCTS: bool = False
 TARGET_PRODUCT_COUNT: int = 8
 CANDIDATE_TOP_BY_USD_VOL: int = 60
 MIN_DAILY_RANGE_PCT: float = 0.06

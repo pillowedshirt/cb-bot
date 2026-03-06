@@ -53,42 +53,6 @@ USE_USD_HOLD_AS_TRADABLE: bool = False
 ENABLE_SESSION_FILTER: bool = False
 SESSION_ALLOWED_UTC_HOURS: Optional[List[int]] = list(range(13, 23))  # 13:00–22:59 UTC (US/EU overlap)
 
-# Fixed trade sizing parameters
-MAX_EXPOSURE_PER_PRODUCT_USD: float = 40.0  # maximum inventory cost per product
-
-# Fees (basis points). 1 bp = 0.01%.
-MAKER_FEE_BPS: float = 6.0
-TAKER_FEE_BPS: float = 10.0
-
-# Net-of-cost exit model
-EST_SLIPPAGE_BPS: float = 6.0
-EST_ADVERSE_FILL_BPS: float = 6.0
-
-
-# Disable all legacy take-profit / stagger / stop logic (replaced by peak-based full-exit)
-MIN_TAKE_PROFIT_BPS: float = 0.0  # DISABLED
-MIN_TAKE_PROFIT_PCT: float = 0.0  # DISABLED
-STOP_LOSS_PCT: float = 0.0        # DISABLED (replaced by peak-based HARD_PEAK_STOP_PCT)
-PROFIT_LOCK_IN_PCT: float = 0.0   # DISABLED
-PROFIT_LOCK_IN_DRAWDOWN_PCT: float = 0.0  # DISABLED
-
-# Simplified SELL logic (peak-based trailing + peak stop)
-TRAIL_ARM_PCT: float = 0.015          # +1.5% arms trailing
-TRAIL_DRAWDOWN_PCT: float = 0.0025    # 0.25% drop from peak triggers sell AFTER armed
-HARD_PEAK_STOP_PCT: float = 0.005     # 0.5% drop from peak triggers sell ANYTIME
-
-# Disable volatility-weighted trailing band system (legacy)
-TRAIL_VOL_WINDOW_MIN: int = 0  # DISABLED
-TRAIL_K_BASE: float = 0.0  # DISABLED
-TRAIL_K_MIN: float = 0.0  # DISABLED
-TRAIL_K_MAX: float = 0.0  # DISABLED
-TRAIL_MIN_DRAWDOWN_PCT: float = 0.0  # DISABLED
-TRAIL_MAX_DRAWDOWN_PCT: float = 0.0  # DISABLED
-
-
-# Product universe filter: require ~30% single-day range volatility (high-low)/close.
-# This is computed from the most recent daily candle via Coinbase Exchange public market-data.
-MIN_DAILY_RANGE_PCT: float = 0.05
 
 # Products to trade. High liquidity pairs only.
 # If AUTO_SELECT_PRODUCTS is True, this list is treated as a fallback default.
@@ -144,79 +108,127 @@ SIGMA_WINDOW_MINUTES: int = 60
 # Require a full day of 1m candles before using in-memory live_1m for daily levels.
 DAY_CANDLES_MIN_FOR_LIVE: int = 60 * 24  # 1440
 
-# Evaluation loop cadence (seconds). Slows decision making to 1m-scale behavior.
-EVAL_TICK_SEC: float = 2.0
-
-# After any full exit, wait before allowing a new entry (prevents rapid flip-flopping).
-POST_EXIT_COOLDOWN_SEC: float = 5 * 60.0
 
 # Price-based re-entry re-arm: after any full exit, the bot will NOT re-enter
 # until price has first moved ABOVE the day support zone by this buffer (in bps),
 # and then later returns back into the support zone.
 REENTRY_REARM_BPS: float = 15.0
 
-# Bias gating: do not open new longs if weekly bias is below this threshold
-WEEKLY_BIAS_THRESHOLD: float = -0.5
 
 # ============================================================
-# BUY/SELL LOGIC TUNING (paper mode)
-#
-# These parameters ONLY affect trade decision logic and sizing.
-# All other bot behaviors (feeds, logging, viewer formats) remain unchanged.
+# CANONICAL STRATEGY CONFIG
 # ============================================================
 
-# Warm-up: do not permit the very first buy until this many seconds after startup.
-FIRST_BUY_DELAY_SEC: float = 30.0 * 60.0  # 30 minutes
+# Warm-up / cadence
+FIRST_BUY_DELAY_SEC: float = 30.0 * 60.0
+BUY_COOLDOWN_SEC: float = 45.0
+POST_EXIT_COOLDOWN_SEC: float = 5 * 60.0
+EVAL_TICK_SEC: float = 2.0
 
+# Exposure / allocation
+MAX_OPEN_POSITIONS: int = 20
+MIN_ENTRY_USD: float = 1.0
+MAX_EXPOSURE_PER_PRODUCT_USD: float = 40.0
+TARGET_UTIL_MIN: float = 0.25
+TARGET_UTIL_MID: float = 0.60
+TARGET_UTIL_MAX: float = 0.90
+HIGH_SCORE_UTIL_THRESHOLD: float = 80.0
+MID_SCORE_UTIL_THRESHOLD: float = 65.0
+MAX_NEW_ENTRIES_PER_EVAL: int = 3
 
+# Execution friction
+MAX_SPREAD_BPS: float = 20.0
+SCALP_MAX_SPREAD_BPS: float = 12.0
+MAKER_FEE_BPS: float = 6.0
+TAKER_FEE_BPS: float = 10.0
+EST_SLIPPAGE_BPS: float = 6.0
+EST_ADVERSE_FILL_BPS: float = 6.0
 
-MIN_ENTRY_USD: float = 1.0             # safety floor; primary sizing is % of available cash
+# Dip / reversal detection
+DIP_LOOKBACK_MIN = 90
+DIP_MAX_AGE_MIN = 15
+DIP_MIN_PCT = 0.0020
+DIP_RATE_MIN_BPS_PER_MIN = 6.0
+REV_MIN_UP_CANDLES = 2
+REV_RECLAIM_BPS = 8.0
 
+# Tier score bands
+TIER_LOW = 1
+TIER_MID = 2
+TIER_HIGH = 3
 
-# Cash-based entry sizing (requested):
-# We treat each PositionLot as one "position slot" across the whole account.
-# The next buy uses a percentage of AVAILABLE cash that increases as more slots are filled:
-#   0 other open slots -> 10.0% of available cash
-#   1 other open slots -> 12.5%
-#   2 other open slots -> 15.0%
-#   ...
-# Up to MAX_OPEN_POSITIONS slots total; the final slot invests the remaining cash (minus fees).
-MAX_OPEN_POSITIONS: int = 10
-ENTRY_PCT_BASE: float = 0.10
-ENTRY_PCT_STEP: float = 0.025
+TIER_SCORE_BANDS = {
+    TIER_LOW: (50.0, 64.9999),
+    TIER_MID: (65.0, 79.9999),
+    TIER_HIGH: (80.0, 100.0),
+}
 
-# Execution quality filters
-MAX_SPREAD_BPS: float = 20.0          # skip trading if spread too wide
-
-# Option-1 entry model parameters
+# Entry context
 SUPPORT_BUFFER_BPS: float = 20.0
+RESIST_BUFFER_BPS: float = 15.0
 RSI_BUY_THRESHOLD: float = 35.0
 EMA_ENTRY_FAST: int = 9
 EMA_ENTRY_SLOW: int = 20
 EMA_SLOPE_MAX_DOWN_BPS: float = 12.0
 PIVOT_W: int = 2
-RESIST_BUFFER_BPS: float = 15.0
 REQUIRE_CONFIRMATIONS: int = 2
 
-# Entry discipline
-BUY_COOLDOWN_SEC: float = 45.0        # minimum time between entries
-BUY_MIN_SPACING_SIGMA: float = 0.25   # require mid to be <= last_buy_price - (0.25*sigma)
+# Regime filter
+EMA_FAST_MINUTES: int = 20
+EMA_SLOW_MINUTES: int = 60
+MAX_TREND_STRENGTH_BPS: float = 35.0
+WEEKLY_BIAS_THRESHOLD: float = -0.5
 
-# Exit tuning
+# Score weights
+SCORE_DIP_DEPTH_W: float = 24.0
+SCORE_DIP_SPEED_W: float = 16.0
+SCORE_REVERSAL_W: float = 20.0
+SCORE_SUPPORT_W: float = 14.0
+SCORE_ROOM_W: float = 18.0
+SCORE_REGIME_W: float = 8.0
+SCORE_SPREAD_PENALTY_W: float = 12.0
+SCORE_COST_PENALTY_W: float = 10.0
 
-# Fair value smoothing (reduce sudden "dips" in fair value):
-# - We compute a raw fair value (anchored VWAP / value-area midpoint / vwap fallback)
-# - Then apply a small median filter + EWMA + per-tick max-step clamp in bps.
-FAIR_VALUE_MEDIAN_WINDOW: int = 9
-FAIR_VALUE_SMOOTH_ALPHA: float = 0.12
-FAIR_VALUE_MAX_STEP_BPS: float = 30.0
-FAIR_VALUE_MAX_STEP_DOWN_BPS: float = 18.0
+# Exit inventory fractions by tier
+EXIT_PLAN = {
+    TIER_LOW:  {"scalp_frac": 0.80, "core_frac": 0.20, "runner_frac": 0.00},
+    TIER_MID:  {"scalp_frac": 0.45, "core_frac": 0.40, "runner_frac": 0.15},
+    TIER_HIGH: {"scalp_frac": 0.20, "core_frac": 0.45, "runner_frac": 0.35},
+}
+
+# Volatility-scaled objective multipliers
+SCALP_SIGMA_MULT = {
+    TIER_LOW: 0.75,
+    TIER_MID: 0.90,
+    TIER_HIGH: 1.10,
+}
+CORE_SIGMA_MULT = {
+    TIER_LOW: 1.20,
+    TIER_MID: 1.60,
+    TIER_HIGH: 2.20,
+}
+
+# Peak-based protective exits
+TRAIL_ARM_PCT: float = 0.015
+TRAIL_DRAWDOWN_PCT: float = 0.0025
+HARD_PEAK_STOP_PCT: float = 0.005
 
 # Safety exits
-TIME_STOP_SEC: int = 6 * 60 * 60      # 6 hours
-RISK_OFF_REDUCTION_FRAC: float = 0.05  # reduce position by 5% on risk-off events
-RISK_OFF_COOLDOWN_SEC: float = 60.0     # throttle risk-off/time-stop reductions to once per minute
-RISK_OFF_MIN_NOTIONAL_USD: float = 1.0  # if reduction notional < $1, liquidate remainder to avoid dust spam
+TIME_STOP_SEC: int = 6 * 60 * 60
+RISK_OFF_REDUCTION_FRAC: float = 0.05
+RISK_OFF_COOLDOWN_SEC: float = 60.0
+RISK_OFF_MIN_NOTIONAL_USD: float = 1.0
+
+# Product universe filter
+MIN_DAILY_RANGE_PCT: float = 0.05
+
+# Legacy trailing-band constants kept disabled for compatibility with helper methods
+TRAIL_VOL_WINDOW_MIN: int = 0
+TRAIL_K_BASE: float = 0.0
+TRAIL_K_MIN: float = 0.0
+TRAIL_K_MAX: float = 0.0
+TRAIL_MIN_DRAWDOWN_PCT: float = 0.0
+TRAIL_MAX_DRAWDOWN_PCT: float = 0.0
 
 # ------------------------------------------------------------
 # Helper functions
@@ -652,6 +664,9 @@ class MacroLevels:
 class PositionLot:
     qty: float
     price: float
+    tier: int = TIER_LOW
+    score: float = 0.0
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 class MacroManager:
@@ -829,7 +844,9 @@ class TradeLogger:
             w.writerow([
                 "ts", "dt_mst", "event", "product_id", "side", "qty", "price", "notional_usd",
                 "fee_usd", "gross_pnl_usd", "net_pnl_usd", "cum_pnl_usd",
-                "entry_price", "exit_price", "weekly_bias", "note"
+                "entry_price", "exit_price", "weekly_bias", "note",
+                "entry_score", "entry_tier", "entry_reason", "expected_net_edge_bps", "lot_role",
+                "exit_role", "exit_reason"
             ])
 
     def log_trade(
@@ -848,6 +865,13 @@ class TradeLogger:
         weekly_bias: Optional[float] = None,
         note: str = "",
         filled_notional_usd: Optional[float] = None,
+        entry_score: Optional[float] = None,
+        entry_tier: Optional[int] = None,
+        entry_reason: str = "",
+        expected_net_edge_bps: Optional[float] = None,
+        lot_role: str = "",
+        exit_role: str = "",
+        exit_reason: str = "",
     ) -> None:
         notional = float(filled_notional_usd) if filled_notional_usd is not None else (float(qty) * float(price))
         self.cum_pnl_usd += net_pnl_usd
@@ -863,7 +887,14 @@ class TradeLogger:
                 "" if entry_price is None else f"{entry_price:.10f}",
                 "" if exit_price is None else f"{exit_price:.10f}",
                 "" if weekly_bias is None else f"{weekly_bias:.6f}",
-                note
+                note,
+                "" if entry_score is None else f"{entry_score:.6f}",
+                "" if entry_tier is None else str(entry_tier),
+                entry_reason,
+                "" if expected_net_edge_bps is None else f"{expected_net_edge_bps:.6f}",
+                lot_role,
+                exit_role,
+                exit_reason,
             ])
 
 
@@ -886,7 +917,10 @@ class MarketLogger:
                 "ts", "dt_mst", "product_id", "bid", "ask", "mid", "spread_bps",
                 "exposures_usd", "position_qty", "avg_entry_price",
                 "anchored_vwap", "fair_value", "sigma_bps", "weekly_bias",
-                "state", "cash_usd", "equity_usd"
+                "state", "cash_usd", "equity_usd",
+                "entry_score", "entry_tier", "entry_reason", "expected_net_edge_bps",
+                "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
+                "room_score", "regime_score", "spread_penalty", "cost_penalty"
             ])
 
     def log_snapshot(
@@ -908,6 +942,18 @@ class MarketLogger:
         state: str,
         cash_usd: float,
         equity_usd: float,
+        entry_score: Optional[float] = None,
+        entry_tier: Optional[int] = None,
+        entry_reason: str = "",
+        expected_net_edge_bps: Optional[float] = None,
+        dip_depth_score: Optional[float] = None,
+        dip_speed_score: Optional[float] = None,
+        reversal_score: Optional[float] = None,
+        support_score: Optional[float] = None,
+        room_score: Optional[float] = None,
+        regime_score: Optional[float] = None,
+        spread_penalty: Optional[float] = None,
+        cost_penalty: Optional[float] = None,
     ) -> None:
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -921,7 +967,19 @@ class MarketLogger:
                 "" if sigma_bps is None else f"{sigma_bps:.6f}",
                 "" if weekly_bias is None else f"{weekly_bias:.6f}",
                 state,
-                f"{cash_usd:.6f}", f"{equity_usd:.6f}"
+                f"{cash_usd:.6f}", f"{equity_usd:.6f}",
+                "" if entry_score is None else f"{entry_score:.6f}",
+                "" if entry_tier is None else str(entry_tier),
+                entry_reason,
+                "" if expected_net_edge_bps is None else f"{expected_net_edge_bps:.6f}",
+                "" if dip_depth_score is None else f"{dip_depth_score:.6f}",
+                "" if dip_speed_score is None else f"{dip_speed_score:.6f}",
+                "" if reversal_score is None else f"{reversal_score:.6f}",
+                "" if support_score is None else f"{support_score:.6f}",
+                "" if room_score is None else f"{room_score:.6f}",
+                "" if regime_score is None else f"{regime_score:.6f}",
+                "" if spread_penalty is None else f"{spread_penalty:.6f}",
+                "" if cost_penalty is None else f"{cost_penalty:.6f}"
             ])
 
 
@@ -1344,28 +1402,170 @@ def compute_sigma_bps(series: RollingMidSeries, window_sec: int = 60 * 60) -> Op
 
 
 # ------------------------------------------------------------
-# Option-1 entry helpers (support -> reversal -> room to +2%)
+# Scored entry helpers
 # ------------------------------------------------------------
 
-def _ema(arr: np.ndarray, span: int) -> np.ndarray:
-    if arr.size == 0:
-        return arr
-    s = pd.Series(arr)
-    return s.ewm(span=int(span), adjust=False).mean().to_numpy(dtype=float)
-
-def _rsi(closes: np.ndarray, period: int = 14) -> Optional[float]:
-    if closes.size < period + 2:
+def _dip_metrics(minute_candles: List['MinuteCandle']) -> Optional[Dict[str, float]]:
+    if not minute_candles:
         return None
-    diff = np.diff(closes.astype(float))
-    up = np.maximum(diff, 0.0)
-    down = np.maximum(-diff, 0.0)
-    roll_up = pd.Series(up).ewm(alpha=1.0/period, adjust=False).mean()
-    roll_down = pd.Series(down).ewm(alpha=1.0/period, adjust=False).mean()
-    rs = roll_up.iloc[-1] / (roll_down.iloc[-1] + 1e-12)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return float(rsi)
+    lookback = minute_candles[-int(DIP_LOOKBACK_MIN):]
+    if len(lookback) < 5:
+        return None
+    lows = [float(c.low) for c in lookback]
+    highs = [float(c.high) for c in lookback]
+    closes = [float(c.close) for c in lookback]
+    trough_low = min(lows)
+    trough_idx = lows.index(trough_low)
+    current = closes[-1]
+    pre_high = max(highs[:trough_idx + 1]) if trough_idx >= 0 else max(highs)
+    if pre_high <= 0 or current <= 0:
+        return None
+    dip_pct = max(0.0, (pre_high - trough_low) / pre_high)
+    trough_age_min = max(0, len(lookback) - 1 - trough_idx)
+    dip_rate_bps_per_min = ((pre_high - trough_low) / pre_high) * 10_000.0 / max(1, trough_idx + 1)
+    return {
+        "dip_pct": float(dip_pct),
+        "dip_rate_bps_per_min": float(dip_rate_bps_per_min),
+        "trough_age_min": int(trough_age_min),
+        "trough_low": float(trough_low),
+    }
 
-def option1_entry_gate(
+
+def _dip_reversal_ok(minute_candles: List['MinuteCandle'], trough_low: float) -> Tuple[bool, str]:
+    if len(minute_candles) < max(REV_MIN_UP_CANDLES + 2, 5):
+        return False, "not_enough_candles"
+    closes = [float(c.close) for c in minute_candles]
+    up_count = 0
+    for i in range(len(closes) - REV_MIN_UP_CANDLES, len(closes)):
+        if i <= 0:
+            continue
+        if closes[i] > closes[i - 1]:
+            up_count += 1
+    reclaim_level = trough_low * (1.0 + REV_RECLAIM_BPS / 10_000.0)
+    if closes[-1] < reclaim_level:
+        return False, f"no_reclaim last={closes[-1]:.6f} req={reclaim_level:.6f}"
+    if up_count < REV_MIN_UP_CANDLES:
+        return False, f"up_candles={up_count}"
+    return True, f"up_candles={up_count} reclaim_ok"
+
+
+def _room_to_target_pct(
+    mid: float,
+    day: Optional['MacroLevels'],
+    week: Optional['MacroLevels'],
+    target_pct: float,
+    resist_buffer_bps: float,
+) -> Tuple[bool, str]:
+    if mid <= 0:
+        return False, "bad_mid"
+    target_px = mid * (1.0 + target_pct)
+    levels = [x for x in [
+        (day.resistance_zone_low if day else None),
+        (day.resistance_zone_high if day else None),
+        (day.prev_high if day else None),
+        (week.resistance_zone_low if week else None),
+        (week.resistance_zone_high if week else None),
+        (week.prev_high if week else None),
+    ] if x is not None and x > 0]
+    if not levels:
+        return True, "no_resistance_data"
+    nearest_res = min(levels)
+    buffer_px = mid * (resist_buffer_bps / 10_000.0)
+    if target_px <= (nearest_res - buffer_px):
+        return True, f"target_ok target={target_px:.6f} res={nearest_res:.6f}"
+    return False, f"target_blocked target={target_px:.6f} res={nearest_res:.6f}"
+
+
+def option1_room_to_target(mid: float, day: Optional['MacroLevels'], week: Optional['MacroLevels'], resist_buffer_bps: float) -> Tuple[bool, str]:
+    return _room_to_target_pct(mid, day, week, target_pct=0.0080, resist_buffer_bps=resist_buffer_bps)
+
+
+@dataclass
+class EntryScore:
+    ok: bool
+    score: float
+    tier: int
+    reason: str
+    dip_depth_score: float
+    dip_speed_score: float
+    reversal_score: float
+    support_score: float
+    room_score: float
+    regime_score: float
+    spread_penalty: float
+    cost_penalty: float
+    expected_net_edge_bps: float
+
+
+def _score_to_tier(score: float) -> int:
+    if score >= TIER_SCORE_BANDS[TIER_HIGH][0]:
+        return TIER_HIGH
+    if score >= TIER_SCORE_BANDS[TIER_MID][0]:
+        return TIER_MID
+    if score >= TIER_SCORE_BANDS[TIER_LOW][0]:
+        return TIER_LOW
+    return 0
+
+
+def _clip_score(x: float) -> float:
+    return float(max(0.0, min(100.0, x)))
+
+
+def _support_proximity_score(mid: float, day: Optional['MacroLevels'], week: Optional['MacroLevels']) -> float:
+    if mid <= 0:
+        return 0.0
+
+    candidates = []
+    for levels in (day, week):
+        if not levels:
+            continue
+        if levels.support_zone_low > 0 and levels.support_zone_high > 0:
+            if levels.support_zone_low <= mid <= levels.support_zone_high:
+                return 100.0
+            zone_mid = (levels.support_zone_low + levels.support_zone_high) / 2.0
+            dist_pct = abs(mid - zone_mid) / mid
+            candidates.append(max(0.0, 100.0 - (dist_pct * 10000.0 * 4.0)))
+        if levels.prev_low > 0:
+            dist_pct = abs(mid - levels.prev_low) / mid
+            candidates.append(max(0.0, 100.0 - (dist_pct * 10000.0 * 5.0)))
+        if levels.val > 0:
+            dist_pct = abs(mid - levels.val) / mid
+            candidates.append(max(0.0, 100.0 - (dist_pct * 10000.0 * 5.0)))
+
+    return float(max(candidates)) if candidates else 0.0
+
+
+def _room_score(mid: float, day: Optional['MacroLevels'], week: Optional['MacroLevels'], resist_buffer_bps: float) -> Tuple[float, str]:
+    room_ok, room_reason = option1_room_to_target(mid, day, week, resist_buffer_bps)
+    if room_ok:
+        return 100.0, room_reason
+
+    low_room_ok, low_room_reason = _room_to_target_pct(
+        mid, day, week, target_pct=0.0040, resist_buffer_bps=resist_buffer_bps
+    )
+    if low_room_ok:
+        return 60.0, low_room_reason
+    return 0.0, room_reason
+
+
+def _estimate_net_edge_bps(
+    *,
+    score_room: float,
+    spread_bps: float,
+    tier_hint: int
+) -> float:
+    gross_target_bps = {
+        TIER_LOW: 35.0,
+        TIER_MID: 70.0,
+        TIER_HIGH: 140.0,
+    }.get(tier_hint, 35.0)
+
+    friction = spread_bps + TAKER_FEE_BPS + EST_SLIPPAGE_BPS + EST_ADVERSE_FILL_BPS
+    room_bonus = (score_room / 100.0) * 20.0
+    return float(gross_target_bps + room_bonus - friction)
+
+
+def score_entry_candidate(
     *,
     mid: float,
     spread_bps: float,
@@ -1373,36 +1573,146 @@ def option1_entry_gate(
     levels_week: Optional['MacroLevels'],
     minute_candles: List['MinuteCandle'],
     weekly_bias: Optional[float],
+    trending_down: bool,
+    resist_buffer_bps: float
+) -> EntryScore:
+    if mid <= 0:
+        return EntryScore(False, 0.0, 0, "bad_mid", 0, 0, 0, 0, 0, 0, 0, 0, -999.0)
+
+    dm = _dip_metrics(minute_candles)
+    if not dm:
+        return EntryScore(False, 0.0, 0, "dip_missing", 0, 0, 0, 0, 0, 0, 0, 0, -999.0)
+
+    dip_pct = float(dm["dip_pct"])
+    dip_rate = float(dm["dip_rate_bps_per_min"])
+    trough_age = int(dm["trough_age_min"])
+    trough_low = float(dm["trough_low"])
+
+    if dip_pct < DIP_MIN_PCT:
+        return EntryScore(False, 0.0, 0, f"dip_too_small={dip_pct:.4f}", 0, 0, 0, 0, 0, 0, 0, 0, -999.0)
+
+    if trough_age > DIP_MAX_AGE_MIN:
+        return EntryScore(False, 0.0, 0, f"dip_too_old age_min={trough_age}", 0, 0, 0, 0, 0, 0, 0, 0, -999.0)
+
+    rev_ok, rev_reason = _dip_reversal_ok(minute_candles, trough_low)
+    reversal_score = 100.0 if rev_ok else 0.0
+
+    dip_depth_score = _clip_score((dip_pct / 0.0150) * 100.0)
+    dip_speed_score = _clip_score((dip_rate / max(DIP_RATE_MIN_BPS_PER_MIN, 1e-9)) * 45.0)
+
+    support_score = _support_proximity_score(mid, levels_day, levels_week)
+    room_score, room_reason = _room_score(mid, levels_day, levels_week, resist_buffer_bps)
+
+    if weekly_bias is None:
+        regime_score = 50.0
+    else:
+        regime_score = _clip_score((weekly_bias + 1.0) * 50.0)
+
+    if trending_down:
+        regime_score = min(regime_score, 25.0)
+
+    spread_penalty = max(0.0, (spread_bps - 5.0)) * (SCORE_SPREAD_PENALTY_W / 20.0)
+    cost_penalty = (TAKER_FEE_BPS + EST_SLIPPAGE_BPS + EST_ADVERSE_FILL_BPS) * (SCORE_COST_PENALTY_W / 25.0)
+
+    raw_score = (
+        (dip_depth_score / 100.0) * SCORE_DIP_DEPTH_W
+        + (dip_speed_score / 100.0) * SCORE_DIP_SPEED_W
+        + (reversal_score / 100.0) * SCORE_REVERSAL_W
+        + (support_score / 100.0) * SCORE_SUPPORT_W
+        + (room_score / 100.0) * SCORE_ROOM_W
+        + (regime_score / 100.0) * SCORE_REGIME_W
+        - spread_penalty
+        - cost_penalty
+    )
+
+    final_score = _clip_score(raw_score)
+    tier = _score_to_tier(final_score)
+    expected_net_edge_bps = _estimate_net_edge_bps(
+        score_room=room_score,
+        spread_bps=spread_bps,
+        tier_hint=max(tier, TIER_LOW),
+    )
+
+    if not rev_ok:
+        return EntryScore(False, final_score, tier, f"reversal_fail {rev_reason}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+
+    if support_score <= 0.0:
+        return EntryScore(False, final_score, tier, "support_fail", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+
+    if room_score <= 0.0:
+        return EntryScore(False, final_score, tier, f"room_fail {room_reason}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+
+    if spread_bps > MAX_SPREAD_BPS:
+        return EntryScore(False, final_score, tier, f"spread_high={spread_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+
+    if tier == TIER_LOW and spread_bps > SCALP_MAX_SPREAD_BPS:
+        return EntryScore(False, final_score, tier, f"spread_high_low_tier={spread_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+
+    if final_score < TIER_SCORE_BANDS[TIER_LOW][0]:
+        return EntryScore(False, final_score, 0, f"score_too_low={final_score:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+
+    if expected_net_edge_bps <= 0.0:
+        return EntryScore(False, final_score, 0, f"net_edge_nonpositive={expected_net_edge_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, expected_net_edge_bps)
+
+    return EntryScore(
+        True,
+        final_score,
+        tier,
+        f"score_ok={final_score:.1f} room={room_reason} edge_bps={expected_net_edge_bps:.1f}",
+        dip_depth_score,
+        dip_speed_score,
+        reversal_score,
+        support_score,
+        room_score,
+        regime_score,
+        spread_penalty,
+        cost_penalty,
+        expected_net_edge_bps,
+    )
+
+
+def tiered_entry_gate(
+    *,
+    mid: float,
+    spread_bps: float,
+    levels_day: Optional['MacroLevels'],
+    levels_week: Optional['MacroLevels'],
+    minute_candles: List['MinuteCandle'],
+    weekly_bias: Optional[float],
+    trending_down: bool,
     support_buffer_bps: float,
     resist_buffer_bps: float,
-) -> Tuple[bool, str]:
-    """Canonical Option-1 entry gate: support -> reversal -> room."""
-    if spread_bps > MAX_SPREAD_BPS:
-        return False, f"NO: spread_high={spread_bps:.1f}"
-
-    if weekly_bias is not None and weekly_bias < WEEKLY_BIAS_THRESHOLD:
-        return False, f"NO: weekly_bias={weekly_bias:.3f}"
-
-    in_support, support_reason = option1_in_support_zone(mid, levels_day, levels_week, support_buffer_bps)
-    if not in_support:
-        return False, f"NO: {support_reason}"
-
-    rev_ok, rev_count, rev_reason = option1_reversal_confirmed(
-        minute_candles,
-        rsi_buy_threshold=RSI_BUY_THRESHOLD,
-        ema_fast=EMA_ENTRY_FAST,
-        ema_slow=EMA_ENTRY_SLOW,
-        ema_slope_max_down_bps=EMA_SLOPE_MAX_DOWN_BPS,
-        pivot_w=PIVOT_W,
+) -> Tuple[bool, int, str]:
+    scored = score_entry_candidate(
+        mid=mid,
+        spread_bps=spread_bps,
+        levels_day=levels_day,
+        levels_week=levels_week,
+        minute_candles=minute_candles,
+        weekly_bias=weekly_bias,
+        trending_down=trending_down,
+        resist_buffer_bps=resist_buffer_bps,
     )
-    if not rev_ok or rev_count < REQUIRE_CONFIRMATIONS:
-        return False, f"NO: reversal_fail {rev_reason}"
+    return scored.ok, scored.tier, scored.reason
 
-    room_ok, room_reason = option1_room_to_target(mid, levels_day, levels_week, resist_buffer_bps)
-    if not room_ok:
-        return False, f"NO: room_fail {room_reason}"
+def _sigma_target_price(entry_price: float, sigma_bps: float, mult: float) -> float:
+    if entry_price <= 0:
+        return entry_price
+    move_pct = (sigma_bps / 10000.0) * mult
+    return entry_price * (1.0 + move_pct)
 
-    return True, f"OK: {support_reason}; {rev_reason}; {room_reason}"
+
+def get_exit_plan_for_tier(tier: int) -> Dict[str, float]:
+    return EXIT_PLAN.get(tier, EXIT_PLAN[TIER_LOW])
+
+
+def get_exit_targets(entry_price: float, sigma_bps: float, tier: int) -> Dict[str, float]:
+    scalp_target = _sigma_target_price(entry_price, sigma_bps, SCALP_SIGMA_MULT[tier])
+    core_target = _sigma_target_price(entry_price, sigma_bps, CORE_SIGMA_MULT[tier])
+    return {
+        "scalp_target": scalp_target,
+        "core_target": core_target,
+    }
 
 
 # ------------------------------------------------------------
@@ -2449,7 +2759,7 @@ class TradingBot:
             left = float(lot.qty) - take
             remaining -= take
             if left > 1e-12:
-                new_lots.append(PositionLot(qty=left, price=float(lot.price)))
+                new_lots.append(PositionLot(qty=left, price=float(lot.price), tier=lot.tier, score=lot.score, meta=dict(lot.meta)))
                 new_tags.append(tag)
 
         self.positions[product] = new_lots
@@ -2739,49 +3049,20 @@ class TradingBot:
         trending_down: bool,
         weekly_bias: Optional[float],
     ) -> Tuple[bool, str, Dict[str, float]]:
-        """Option-1 entry gate (support zone -> reversal confirmation -> room to +2%).
-
-        NOTE:
-          - This replaces the previous time-windowed "bottoming/stabilization/local-low/base-build" gate.
-          - Spread filters, buy cooldown, sizing, sell logic, live fill-truth, and CSV schemas are unchanged.
-        """
-        if mid <= 0:
-            return False, "BUY_REJECT:A:bad_mid", {}
-
-        # Macro context already computed by MacroManager
         day = self.macro.get_levels(product_id, "day")
         week = self.macro.get_levels(product_id, "week")
-
-        ok_a, why_a = option1_in_support_zone(float(mid), day, week, float(SUPPORT_BUFFER_BPS))
-        if not ok_a:
-            return False, f"BUY_REJECT:A:{why_a}", {"A": 0.0}
-
-        # Use in-memory 1m candles for this product (built from mid ticks)
-        candles_deque = self.live_1m.get(product_id).candles if self.live_1m.get(product_id) is not None else None
-        minute_candles = list(candles_deque) if candles_deque is not None else []
-        ok_b, why_b = option1_reversal_confirmation(minute_candles)
-        if not ok_b:
-            return False, f"BUY_REJECT:B:{why_b}", {"B": 0.0}
-
-        ok_c, why_c = option1_room_to_target(float(mid), day, week, float(RESIST_BUFFER_BPS))
-        if not ok_c:
-            return False, f"BUY_REJECT:C:{why_c}", {"C": 0.0}
-
-        # For downstream candidate scoring/debug: approximate "dist_low_pct" vs the nearest major support anchor.
-        support_refs: List[float] = []
-        if day:
-            support_refs += [float(day.support_zone_low), float(day.prev_low), float(day.val)]
-        if week:
-            support_refs += [float(week.support_zone_low), float(week.prev_low), float(week.val)]
-        support_refs = [x for x in support_refs if x and x > 0]
-        support_ref = min(support_refs) if support_refs else float(mid)
-        dist_low_pct = (float(mid) / max(float(support_ref), 1e-12)) - 1.0
-
-        reason = f"BUY_OK:A={why_a};B={why_b};C={why_c}"
-        dbg = {
-            "dist_low_pct": float(dist_low_pct),
-        }
-        return True, reason, dbg
+        minute_candles = list(self.live_1m.get(product_id).candles) if self.live_1m.get(product_id) else []
+        scored = score_entry_candidate(
+            mid=float(mid),
+            spread_bps=float(self.tob[product_id].spread_bps) if product_id in self.tob else 0.0,
+            levels_day=day,
+            levels_week=week,
+            minute_candles=minute_candles,
+            weekly_bias=weekly_bias,
+            trending_down=trending_down,
+            resist_buffer_bps=float(RESIST_BUFFER_BPS),
+        )
+        return scored.ok, scored.reason, {"score": scored.score}
 
 
 
@@ -2992,17 +3273,73 @@ class TradingBot:
     # --------------------------------------------------------
     # Evaluation loop
     # --------------------------------------------------------
-    def _compute_entry_notional(self, product_id: str, available_cash: float) -> float:
-        """Slot-based sizing using only cash, open slots, and per-product exposure cap."""
-        open_slots = sum(1 for lots in self.positions.values() if lots)
-        pct = min(1.0, ENTRY_PCT_BASE + (open_slots * ENTRY_PCT_STEP))
-        entry_notional = max(float(MIN_ENTRY_USD), float(available_cash) * float(pct))
-        product_exposure = 0.0
+    def _current_product_exposure_usd(self, product_id: str) -> float:
         tob = self.tob.get(product_id)
-        if tob:
-            product_exposure = sum(l.qty for l in self.positions.get(product_id, [])) * float(tob.mid)
-        remaining_exposure_for_product = max(0.0, float(MAX_EXPOSURE_PER_PRODUCT_USD) - float(product_exposure))
-        return max(0.0, min(entry_notional, remaining_exposure_for_product))
+        if not tob:
+            return 0.0
+        return float(sum(l.qty for l in self.positions.get(product_id, [])) * tob.mid)
+
+    def _current_total_exposure_usd(self) -> float:
+        total = 0.0
+        for product_id in PRODUCTS:
+            total += self._current_product_exposure_usd(product_id)
+        return float(total)
+
+    def _open_position_count(self) -> int:
+        return sum(1 for lots in self.positions.values() if sum(l.qty for l in lots) > 0)
+
+    def compute_entry_notional(
+        self,
+        *,
+        available_cash_usd: float,
+        current_total_exposure_usd: float,
+        current_equity_usd: float,
+        current_product_exposure_usd: float,
+        candidate_score: float,
+        open_position_count: int,
+        strong_candidate_count: int,
+    ) -> float:
+        if available_cash_usd <= 0:
+            return 0.0
+
+        if candidate_score >= HIGH_SCORE_UTIL_THRESHOLD:
+            util_target = TARGET_UTIL_MAX
+        elif candidate_score >= MID_SCORE_UTIL_THRESHOLD:
+            util_target = TARGET_UTIL_MID
+        else:
+            util_target = TARGET_UTIL_MIN
+
+        if strong_candidate_count >= 4:
+            util_target = min(TARGET_UTIL_MAX, util_target + 0.10)
+
+        target_gross_exposure = current_equity_usd * util_target
+        deployable_gap = max(0.0, target_gross_exposure - current_total_exposure_usd)
+
+        score_weight = max(0.25, min(1.0, candidate_score / 100.0))
+
+        if candidate_score >= 80.0:
+            base_alloc_frac = 0.12
+        elif candidate_score >= 65.0:
+            base_alloc_frac = 0.08
+        else:
+            base_alloc_frac = 0.05
+
+        slot_softener = 1.0
+        if open_position_count >= 10:
+            slot_softener = 0.90
+        if open_position_count >= 15:
+            slot_softener = 0.80
+
+        proposed = available_cash_usd * base_alloc_frac * score_weight * slot_softener
+        proposed = min(proposed, deployable_gap if deployable_gap > 0 else proposed)
+
+        remaining_product_room = max(0.0, MAX_EXPOSURE_PER_PRODUCT_USD - current_product_exposure_usd)
+        proposed = min(proposed, remaining_product_room)
+
+        if proposed < MIN_ENTRY_USD:
+            return 0.0
+
+        return float(proposed)
 
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -3019,191 +3356,215 @@ class TradingBot:
             else:
                 cash_usd = float(self.portfolio.cash_usd) if self.portfolio else 0.0
 
-            active_product: Optional[str] = None
-            active_qty = 0.0
-            for p, lots in self.positions.items():
-                if lots:
-                    q = sum(lot.qty for lot in lots)
-                    if q > 0:
-                        active_product = p
-                        active_qty = q
-                        break
+            total_exposure = self._current_total_exposure_usd()
+            equity_usd = cash_usd + total_exposure
 
-            best_candidate = None
-
-            for product in PRODUCTS:
-                tob = self.tob.get(product)
+            candidates = []
+            for product_id in PRODUCTS:
+                tob = self.tob.get(product_id)
                 if not tob:
                     continue
                 bid, ask, mid, spread_bps = tob.bid, tob.ask, tob.mid, tob.spread_bps
-                levels_day = self.macro.get_levels(product, "day")
-                levels_week = self.macro.get_levels(product, "week")
-                weekly_bias = self.macro.compute_weekly_bias(product, mid) if levels_week else None
-                sigma_bps = None
+                levels_day = self.macro.get_levels(product_id, "day")
+                levels_week = self.macro.get_levels(product_id, "week")
+                weekly_bias = self.macro.compute_weekly_bias(product_id, mid) if levels_week else None
+                minute_candles = list(self.live_1m.get(product_id).candles) if self.live_1m.get(product_id) else []
+                sigma_bps = self._compute_sigma_bps_from_1m(product_id)
 
-                if active_product == product and active_qty > 0:
-                    lots = self.positions.get(product, [])
-                    qsum = sum(l.qty for l in lots)
-                    avg_entry_price = (sum(l.qty * l.price for l in lots) / qsum) if qsum > 0 else None
-                    if avg_entry_price and avg_entry_price > 0:
-                        peak = float(self.peak_bid.get(product) or bid)
-                        if bid > peak:
-                            peak = float(bid)
-                            self.peak_bid[product] = peak
+                lots = self.positions.get(product_id, [])
+                position_qty = sum(l.qty for l in lots)
+                avg_entry_price = (sum(l.qty * l.price for l in lots) / position_qty) if position_qty > 0 else None
 
-                        peak_profit = (peak / float(avg_entry_price)) - 1.0
-                        drawdown_from_peak = 1.0 - (float(bid) / peak) if peak > 0 else 0.0
+                if position_qty > 0 and avg_entry_price and avg_entry_price > 0:
+                    lot = lots[0]
+                    lot_tier = lot.tier if lot.tier in EXIT_PLAN else TIER_LOW
+                    lot_meta = lot.meta
+                    exit_plan = get_exit_plan_for_tier(lot_tier)
+                    targets = get_exit_targets(entry_price=avg_entry_price, sigma_bps=(sigma_bps or 35.0), tier=lot_tier)
 
-                        sell_reason = None
-                        if drawdown_from_peak >= HARD_PEAK_STOP_PCT:
-                            sell_reason = "hard_peak_stop"
-                        elif peak_profit >= TRAIL_ARM_PCT and drawdown_from_peak >= TRAIL_DRAWDOWN_PCT:
-                            sell_reason = "armed_trailing_drawdown"
+                    sell_qty = 0.0
+                    exit_reason = None
+                    exit_role = None
+                    if bid >= targets["scalp_target"] and not lot_meta.get("scalp_done", False):
+                        sell_qty = position_qty * exit_plan["scalp_frac"]
+                        exit_reason = "scalp_target_hit"
+                        exit_role = "scalp_release"
+                        lot_meta["scalp_done"] = True
+                    elif bid >= targets["core_target"] and not lot_meta.get("core_done", False):
+                        sell_qty = position_qty * exit_plan["core_frac"]
+                        exit_reason = "core_target_hit"
+                        exit_role = "core_release"
+                        lot_meta["core_done"] = True
 
-                        if sell_reason:
-                            qty_to_sell = active_qty
-                            if isinstance(self.portfolio, LivePortfolio):
-                                try:
-                                    _snap = await self._live_refresh_snapshot(force=False, ttl_sec=0.0) or {}
-                                    _acct_qty = self.portfolio.get_total_asset(product.split("-")[0], snapshot=_snap)
-                                    if _acct_qty > 0:
-                                        qty_to_sell = min(float(active_qty), float(_acct_qty))
-                                except Exception:
-                                    pass
-                            if qty_to_sell > 0:
-                                lots_before = list(self.positions.get(product, []))
-                                notional_usd = qty_to_sell * bid
-                                exec_price = bid
-                                fee = 0.0
-                                filled_notional = None
-                                if isinstance(self.portfolio, LivePortfolio):
-                                    r = await self._live_sell_maker(product_id=product, base_qty=qty_to_sell, ask=ask)
-                                    fill = self._require_live_fill(r, product_id=product, side="SELL")
-                                    if fill is not None:
-                                        filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
-                                        qty_to_sell = min(float(qty_to_sell), float(filled_qty))
-                                        exec_price = float(avg_px)
-                                        fee = float(fee_val)
-                                        notional_usd = float(filled_notional) if filled_notional is not None else float(qty_to_sell) * float(avg_px)
-                                        try:
-                                            cash_usd = float(await self._live_refresh_cash())
-                                        except Exception:
-                                            pass
-                                    else:
-                                        qty_to_sell = 0.0
-                                else:
-                                    fee = self.portfolio.credit(notional_usd, TAKER_FEE_BPS)
+                    remaining_qty = sum(l.qty for l in self.positions.get(product_id, []))
+                    peak_price = float(self.peak_bid.get(product_id) or bid)
+                    if peak_price <= 0:
+                        peak_price = bid
+                    if bid > peak_price:
+                        peak_price = bid
+                        self.peak_bid[product_id] = peak_price
+                    drawdown_from_peak = max(0.0, (peak_price - bid) / peak_price)
+                    peak_profit = max(0.0, (peak_price - avg_entry_price) / avg_entry_price)
+                    if drawdown_from_peak >= HARD_PEAK_STOP_PCT:
+                        sell_qty = remaining_qty
+                        exit_reason = "hard_peak_stop"
+                        exit_role = "hard_peak_stop"
+                    elif peak_profit >= TRAIL_ARM_PCT and drawdown_from_peak >= TRAIL_DRAWDOWN_PCT:
+                        sell_qty = remaining_qty
+                        exit_reason = "armed_trailing_drawdown"
+                        exit_role = "runner_trail_exit"
 
-                                if qty_to_sell > 0:
-                                    fifo_cost, fifo_avg_entry = self._fifo_cost_basis(lots_before, qty_to_sell)
-                                    pnl_gross = float(notional_usd) - float(fifo_cost)
-                                    self.tlog.log_trade(
-                                        event="SELL", product_id=product, side="SELL", qty=qty_to_sell, price=exec_price,
-                                        fee_usd_val=fee, gross_pnl_usd=pnl_gross, net_pnl_usd=pnl_gross - fee,
-                                        entry_price=(fifo_avg_entry if fifo_avg_entry is not None else avg_entry_price),
-                                        exit_price=exec_price, weekly_bias=weekly_bias, note=sell_reason,
-                                        filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
-                                    )
-                                    self.positions[product] = []
-                                    self.peak_bid[product] = None
-                                    self.last_buy_ts[product] = None
-                                    self.last_buy_price[product] = None
-                                    self.position_start_ts[product] = None
-                                    self.rearm_required[product] = True
-                                    self.last_exit_ts = ts_now
-                                    active_product = None
-                                    active_qty = 0.0
-
-                if active_product is None and warmup_done and spread_bps <= MAX_SPREAD_BPS and levels_day is not None:
-                    if self.rearm_required.get(product, False):
-                        rearm_level = levels_day.support_zone_high * (1.0 + (REENTRY_REARM_BPS / 10_000.0))
-                        if mid >= rearm_level:
-                            self.rearm_required[product] = False
-                    if not self.rearm_required.get(product, False):
-                        minute_candles = list(self.live_1m.get(product).candles) if self.live_1m.get(product) else []
-                        ok, reason = option1_entry_gate(
-                            mid=mid,
-                            spread_bps=spread_bps,
-                            levels_day=levels_day,
-                            levels_week=levels_week,
-                            minute_candles=minute_candles,
-                            weekly_bias=weekly_bias,
-                            support_buffer_bps=SUPPORT_BUFFER_BPS,
-                            resist_buffer_bps=RESIST_BUFFER_BPS,
-                        )
-                        if ok:
-                            best_candidate = {
-                                "product": product,
-                                "bid": bid,
-                                "ask": ask,
-                                "mid": mid,
-                                "spread_bps": spread_bps,
-                                "weekly_bias": weekly_bias,
-                                "entry_reason": reason,
-                            }
-
-                pos_qty = sum(l.qty for l in self.positions.get(product, []))
-                avg_entry_price = None
-                lots = self.positions.get(product, [])
-                if lots:
-                    qsum = sum(l.qty for l in lots)
-                    if qsum > 0:
-                        avg_entry_price = sum(l.qty * l.price for l in lots) / qsum
-                pos_value = pos_qty * mid
-                equity_usd = cash_usd + pos_value
-                self.mlog.log_snapshot(
-                    ts=ts_now, product_id=product, bid=bid, ask=ask, mid=mid, spread_bps=spread_bps,
-                    exposures_usd=pos_value, position_qty=pos_qty, avg_entry_price=avg_entry_price,
-                    anchored_vwap=self._compute_anchored_vwap_24h(product, ts_now),
-                    fair_value=self._compute_fair_value(product, mid, self._compute_anchored_vwap_24h(product, ts_now)),
-                    sigma_bps=sigma_bps, weekly_bias=weekly_bias,
-                    state=("HOLD" if active_product == product and active_qty > 0 else "WATCH"),
-                    cash_usd=cash_usd, equity_usd=equity_usd,
-                )
-
-            if best_candidate is not None and self.portfolio is not None and active_product is None:
-                product = best_candidate["product"]
-                tob = self.tob.get(product)
-                if tob:
-                    bid, ask, mid = tob.bid, tob.ask, tob.mid
-                    available_cash = float(cash_usd)
-                    entry_notional = self._compute_entry_notional(product, available_cash)
-                    if entry_notional >= MIN_ENTRY_USD and await self._live_can_afford(entry_notional, TAKER_FEE_BPS):
-                        fee1 = 0.0
+                    sell_qty = min(position_qty, max(0.0, sell_qty))
+                    if sell_qty > 0:
+                        notional_usd = sell_qty * bid
+                        exec_price = bid
+                        fee = 0.0
                         filled_notional = None
                         if isinstance(self.portfolio, LivePortfolio):
-                            r = await self._live_buy_maker(product_id=product, quote_usd=entry_notional, bid=bid)
-                            fill = self._require_live_fill(r, product_id=product, side="BUY")
+                            r = await self._live_sell_maker(product_id=product_id, base_qty=sell_qty, ask=ask)
+                            fill = self._require_live_fill(r, product_id=product_id, side="SELL")
                             if fill is not None:
                                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
-                                qty1 = float(filled_qty)
-                                buy_px1 = float(avg_px)
-                                fee1 = float(fee_val)
-                                eff_price1 = float((filled_notional + fee1) / qty1) if qty1 > 0 and filled_notional is not None else buy_px1
+                                sell_qty = min(float(sell_qty), float(filled_qty))
+                                exec_price = float(avg_px)
+                                fee = float(fee_val)
+                                notional_usd = float(filled_notional) if filled_notional is not None else float(sell_qty) * float(avg_px)
                             else:
-                                qty1 = 0.0
-                                buy_px1 = ask
-                                eff_price1 = ask
+                                sell_qty = 0.0
                         else:
-                            qty1 = entry_notional / ask
-                            buy_px1 = ask
-                            fee1 = self.portfolio.debit(entry_notional, TAKER_FEE_BPS)
-                            eff_price1 = float((entry_notional + fee1) / qty1) if qty1 > 0 else float(ask)
+                            fee = self.portfolio.credit(notional_usd, TAKER_FEE_BPS)
 
-                        if qty1 > 0:
-                            self.positions[product] = [PositionLot(qty=qty1, price=eff_price1)]
-                            self.position_start_ts[product] = ts_now
-                            self.last_buy_ts[product] = ts_now
-                            self.last_buy_price[product] = ask
-                            self.anchor_ts[product] = ts_now
-                            self.peak_bid[product] = bid
+                        if sell_qty > 0:
+                            fifo_cost, fifo_avg_entry = self._fifo_cost_basis(list(lots), sell_qty)
+                            pnl_gross = float(notional_usd) - float(fifo_cost)
                             self.tlog.log_trade(
-                                event="BUY", product_id=product, side="BUY", qty=qty1, price=buy_px1,
-                                fee_usd_val=fee1, gross_pnl_usd=0.0, net_pnl_usd=-fee1,
-                                entry_price=buy_px1, exit_price=None, weekly_bias=best_candidate["weekly_bias"],
-                                note=best_candidate.get("entry_reason", "option1_entry"),
+                                event="SELL", product_id=product_id, side="SELL", qty=sell_qty, price=exec_price,
+                                fee_usd_val=fee, gross_pnl_usd=pnl_gross, net_pnl_usd=pnl_gross - fee,
+                                entry_price=(fifo_avg_entry if fifo_avg_entry is not None else avg_entry_price),
+                                exit_price=exec_price, weekly_bias=weekly_bias, note=exit_reason or "sell",
                                 filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
+                                exit_role=exit_role or "risk_off", exit_reason=exit_reason or "sell",
                             )
+                            self._fifo_reduce_lots(product_id, sell_qty)
+
+                scored = score_entry_candidate(
+                    mid=mid,
+                    spread_bps=spread_bps,
+                    levels_day=levels_day,
+                    levels_week=levels_week,
+                    minute_candles=minute_candles,
+                    weekly_bias=weekly_bias,
+                    trending_down=False,
+                    resist_buffer_bps=RESIST_BUFFER_BPS,
+                )
+
+                if scored.ok and warmup_done and self._open_position_count() < MAX_OPEN_POSITIONS:
+                    candidates.append({
+                        "product_id": product_id,
+                        "mid": mid,
+                        "bid": bid,
+                        "ask": ask,
+                        "spread_bps": spread_bps,
+                        "score": scored.score,
+                        "tier": scored.tier,
+                        "reason": scored.reason,
+                        "expected_net_edge_bps": scored.expected_net_edge_bps,
+                        "weekly_bias": weekly_bias,
+                    })
+
+                self.mlog.log_snapshot(
+                    ts=ts_now,
+                    product_id=product_id,
+                    bid=bid,
+                    ask=ask,
+                    mid=mid,
+                    spread_bps=spread_bps,
+                    exposures_usd=self._current_product_exposure_usd(product_id),
+                    position_qty=position_qty,
+                    avg_entry_price=avg_entry_price,
+                    anchored_vwap=self._compute_anchored_vwap_24h(product_id, ts_now),
+                    fair_value=self._compute_fair_value(product_id, mid, self._compute_anchored_vwap_24h(product_id, ts_now)),
+                    sigma_bps=sigma_bps,
+                    weekly_bias=weekly_bias,
+                    state=("HOLD" if position_qty > 0 else "WATCH"),
+                    cash_usd=cash_usd,
+                    equity_usd=equity_usd,
+                    entry_score=scored.score,
+                    entry_tier=scored.tier,
+                    entry_reason=scored.reason,
+                    expected_net_edge_bps=scored.expected_net_edge_bps,
+                    dip_depth_score=scored.dip_depth_score,
+                    dip_speed_score=scored.dip_speed_score,
+                    reversal_score=scored.reversal_score,
+                    support_score=scored.support_score,
+                    room_score=scored.room_score,
+                    regime_score=scored.regime_score,
+                    spread_penalty=scored.spread_penalty,
+                    cost_penalty=scored.cost_penalty,
+                )
+
+            candidates.sort(key=lambda x: (x["score"], x["expected_net_edge_bps"]), reverse=True)
+            strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
+
+            for candidate in candidates[:MAX_NEW_ENTRIES_PER_EVAL]:
+                product_id = candidate["product_id"]
+                if sum(l.qty for l in self.positions.get(product_id, [])) > 0:
+                    continue
+                product_exposure = self._current_product_exposure_usd(product_id)
+                total_exposure = self._current_total_exposure_usd()
+                open_count = self._open_position_count()
+
+                entry_notional = self.compute_entry_notional(
+                    available_cash_usd=cash_usd,
+                    current_total_exposure_usd=total_exposure,
+                    current_equity_usd=equity_usd,
+                    current_product_exposure_usd=product_exposure,
+                    candidate_score=candidate["score"],
+                    open_position_count=open_count,
+                    strong_candidate_count=strong_candidate_count,
+                )
+                if entry_notional < MIN_ENTRY_USD or not await self._live_can_afford(entry_notional, TAKER_FEE_BPS):
+                    continue
+
+                bid, ask = candidate["bid"], candidate["ask"]
+                fee1 = 0.0
+                filled_notional = None
+                if isinstance(self.portfolio, LivePortfolio):
+                    r = await self._live_buy_maker(product_id=product_id, quote_usd=entry_notional, bid=bid)
+                    fill = self._require_live_fill(r, product_id=product_id, side="BUY")
+                    if fill is not None:
+                        filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                        qty1 = float(filled_qty)
+                        buy_px1 = float(avg_px)
+                        fee1 = float(fee_val)
+                        eff_price1 = float((filled_notional + fee1) / qty1) if qty1 > 0 and filled_notional is not None else buy_px1
+                    else:
+                        continue
+                else:
+                    qty1 = entry_notional / ask
+                    buy_px1 = ask
+                    fee1 = self.portfolio.debit(entry_notional, TAKER_FEE_BPS)
+                    eff_price1 = float((entry_notional + fee1) / qty1) if qty1 > 0 else float(ask)
+
+                if qty1 > 0:
+                    lot_meta = {"scalp_done": False, "core_done": False}
+                    self.positions[product_id] = [PositionLot(qty=qty1, price=eff_price1, tier=int(candidate["tier"]), score=float(candidate["score"]), meta=lot_meta)]
+                    self.position_start_ts[product_id] = ts_now
+                    self.last_buy_ts[product_id] = ts_now
+                    self.last_buy_price[product_id] = ask
+                    self.anchor_ts[product_id] = ts_now
+                    self.peak_bid[product_id] = bid
+                    self.tlog.log_trade(
+                        event="BUY", product_id=product_id, side="BUY", qty=qty1, price=buy_px1,
+                        fee_usd_val=fee1, gross_pnl_usd=0.0, net_pnl_usd=-fee1,
+                        entry_price=buy_px1, exit_price=None, weekly_bias=candidate.get("weekly_bias"),
+                        note=candidate.get("reason", "score_entry"),
+                        filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
+                        entry_score=float(candidate["score"]), entry_tier=int(candidate["tier"]),
+                        entry_reason=str(candidate.get("reason", "score_entry")),
+                        expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
+                        lot_role="runner",
+                    )
 
             await asyncio.sleep(EVAL_TICK_SEC)
 

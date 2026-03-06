@@ -1,6 +1,7 @@
 import os
 import math
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import streamlit as st
@@ -133,7 +134,10 @@ m = numeric(m, [
     "ts", "mid", "bid", "ask", "spread_bps",
     "exposures_usd", "position_qty", "avg_entry_price",
     "anchored_vwap", "fair_value", "sigma_bps", "weekly_bias",
-    "cash_usd", "equity_usd"
+    "cash_usd", "equity_usd",
+    "entry_score", "entry_tier", "expected_net_edge_bps",
+    "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
+    "room_score", "regime_score", "spread_penalty", "cost_penalty"
 ])
 ml = numeric(ml, [
     "ts", "support_zone_low", "support_zone_high", "resistance_zone_low", "resistance_zone_high",
@@ -149,6 +153,8 @@ if not products:
 
 default_idx = products.index("BTC-USD") if "BTC-USD" in products else 0
 product = st.selectbox("Product", products, index=default_idx)
+
+
 
 macro_dfs = {}
 for label, path in MACRO_FILES.items():
@@ -180,6 +186,18 @@ with colB:
 
 m_prod = m_view[m_view["product_id"] == product].dropna(subset=["ts", "mid"]).copy()
 m_prod["dt"] = to_dt_mst(m_prod["ts"])
+
+latest_row = m_prod.iloc[-1] if not m_prod.empty else None
+if latest_row is not None:
+    st.markdown(
+        f"""
+**Entry score:** {latest_row.get('entry_score', np.nan):.1f}  
+**Tier:** {latest_row.get('entry_tier', '')}  
+**Expected net edge (bps):** {latest_row.get('expected_net_edge_bps', np.nan):.1f}  
+**Reason:** {latest_row.get('entry_reason', '')}
+"""
+    )
+
 
 if not t.empty and all(c in t.columns for c in ["ts", "product_id", "side", "price"]):
     t = numeric(t, ["ts", "price", "cum_pnl_usd", "net_pnl_usd"])

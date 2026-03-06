@@ -249,6 +249,30 @@ MAX_SPREAD_BPS: float = 20.0          # skip trading if spread too wide
 # TIERED BUY/SELL EXTENSION
 # ============================================================
 
+# ============================================================
+# DIP-BASED ENTRY (dip is REQUIRED for any buy)
+# ============================================================
+
+# Lookback window to detect dips
+DIP_LOOKBACK_MIN = 90          # how far back to look for a peak->trough dip
+DIP_MAX_AGE_MIN = 15           # trough must be recent (prevents buying old dips)
+DIP_MIN_PCT = 0.0020           # minimum dip required (0.20%) to allow ANY buy
+
+# Dip size thresholds -> tier
+DIP_TIER_THRESH_PCT = {
+    1: 0.0035,   # LOW tier if dip >= 0.35%
+    2: 0.0080,   # MID tier if dip >= 0.80%
+    3: 0.0150,   # HIGH tier if dip >= 1.50%
+}
+
+# Dip "rapidness" requirement (bps per minute)
+# Larger dips that happen fast get promoted; slow drifts are deprioritized.
+DIP_RATE_MIN_BPS_PER_MIN = 6.0   # 0.06% per minute
+
+# Reversal trigger after trough (buy only when uptrend starts)
+REV_MIN_UP_CANDLES = 2          # require N consecutive up closes after trough
+REV_RECLAIM_BPS = 8.0           # require price rebound at least +8 bps off trough low
+
 # Tier names (higher number = higher priority)
 TIER_LOW = 1
 TIER_MID = 2
@@ -952,8 +976,9 @@ class TradeLogger:
         exit_price: Optional[float] = None,
         weekly_bias: Optional[float] = None,
         note: str = "",
+        filled_notional_usd: Optional[float] = None,
     ) -> None:
-        notional = qty * price
+        notional = float(filled_notional_usd) if filled_notional_usd is not None else (float(qty) * float(price))
         self.cum_pnl_usd += net_pnl_usd
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -1442,6 +1467,86 @@ def _rsi(closes: np.ndarray, period: int = 14) -> Optional[float]:
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return float(rsi)
 
+def _dip_metrics(minute_candles: List['MinuteCandle']) -> Optional[dict]:
+    """
+    Compute dip magnitude and speed from recent 1m candles.
+    Dip defined as peak close -> trough low within lookback.
+    Returns dict with: dip_pct, dip_rate_bps_per_min, trough_age_min, trough_low, peak_close.
+    """
+    if not minute_candles or len(minute_candles) < 30:
+        return None
+
+    look = minute_candles[-DIP_LOOKBACK_MIN:] if len(minute_candles) > DIP_LOOKBACK_MIN else minute_candles[:]
+    closes = np.array([c.close for c in look], dtype=float)
+    lows = np.array([c.low for c in look], dtype=float)
+
+    # Peak is the max close in window; trough is min low AFTER that peak
+    peak_i = int(np.argmax(closes))
+    peak_close = float(closes[peak_i])
+
+    if peak_close <= 0 or peak_i >= len(look) - 3:
+        return None
+
+    trough_i = int(peak_i + np.argmin(lows[peak_i:]))
+    trough_low = float(lows[trough_i])
+
+    if trough_low <= 0 or trough_low >= peak_close:
+        return None
+
+    dip_pct = (peak_close / trough_low) - 1.0  # e.g. 0.01 = 1% dip
+
+    # Dip speed: dip_bps / minutes from peak to trough
+    mins = max(1, trough_i - peak_i)
+    dip_rate_bps_per_min = (dip_pct * 10_000.0) / float(mins)
+
+    trough_age_min = (len(look) - 1) - trough_i
+
+    return {
+        "dip_pct": float(dip_pct),
+        "dip_rate_bps_per_min": float(dip_rate_bps_per_min),
+        "trough_age_min": int(trough_age_min),
+        "trough_low": float(trough_low),
+        "peak_close": float(peak_close),
+        "peak_i": int(peak_i),
+        "trough_i": int(trough_i),
+    }
+
+
+def _dip_reversal_ok(minute_candles: List['MinuteCandle'], trough_low: float) -> Tuple[bool, str]:
+    """
+    Define "uptrend starts after dip":
+    - rebound off trough low by REV_RECLAIM_BPS
+    - last REV_MIN_UP_CANDLES are up closes
+    - close above EMA9 (simple structure reclaim)
+    """
+    if not minute_candles or len(minute_candles) < 20:
+        return False, "insufficient_1m"
+
+    recent = minute_candles[-120:] if len(minute_candles) > 120 else minute_candles[:]
+    closes = np.array([c.close for c in recent], dtype=float)
+
+    if closes[-1] <= 0:
+        return False, "bad_close"
+
+    reclaim_price = float(trough_low) * (1.0 + (REV_RECLAIM_BPS / 10_000.0))
+    if closes[-1] < reclaim_price:
+        return False, "no_rebound"
+
+    # consecutive up closes
+    up_ok = True
+    for k in range(REV_MIN_UP_CANDLES):
+        if closes[-1 - k] <= closes[-2 - k]:
+            up_ok = False
+            break
+    if not up_ok:
+        return False, "no_uptrend"
+
+    ema9 = _ema(closes, 9)
+    if ema9.size and closes[-1] < ema9[-1]:
+        return False, "below_ema9"
+
+    return True, "reversal_ok"
+
 def _pivot_high(highs: np.ndarray, w: int) -> Optional[int]:
     n = highs.size
     if n < (2*w + 3):
@@ -1628,36 +1733,61 @@ def tiered_entry_gate(
       - tier: 1=low, 2=mid, 3=high
     """
 
-    # A) Support proximity (re-use option1 support)
-    sup_ok, sup_reason = option1_in_support_zone(mid, levels_day, levels_week, support_buffer_bps)
+    # Dip is REQUIRED for any buy
+    dm = _dip_metrics(minute_candles)
+    if not dm:
+        return False, 0, "NO: dip=missing"
 
-    # B) Reversal confirmation (option1 is 2-of-3)
-    rev_ok, rev_reason = option1_reversal_confirmation(minute_candles)
+    dip_pct = float(dm["dip_pct"])
+    dip_rate = float(dm["dip_rate_bps_per_min"])
+    trough_age = int(dm["trough_age_min"])
+    trough_low = float(dm["trough_low"])
 
-    # HIGH: strict Option-1 (your original intent)
-    if sup_ok and rev_ok:
+    if dip_pct < DIP_MIN_PCT:
+        return False, 0, f"NO: dip_too_small={dip_pct:.4f}"
+
+    if trough_age > DIP_MAX_AGE_MIN:
+        return False, 0, f"NO: dip_too_old age_min={trough_age}"
+
+    if dip_rate < DIP_RATE_MIN_BPS_PER_MIN:
+        return False, 0, f"NO: dip_too_slow rate_bpspm={dip_rate:.2f}"
+
+    # Determine tier from dip size (larger dip => higher tier)
+    tier = TIER_LOW
+    if dip_pct >= DIP_TIER_THRESH_PCT[3]:
+        tier = TIER_HIGH
+    elif dip_pct >= DIP_TIER_THRESH_PCT[2]:
+        tier = TIER_MID
+    elif dip_pct >= DIP_TIER_THRESH_PCT[1]:
+        tier = TIER_LOW
+
+    # Buy only when reversal starts (uptrend after dip)
+    rev_ok, rev_reason = _dip_reversal_ok(minute_candles, trough_low)
+    if not rev_ok:
+        return False, 0, f"NO: dip_ok tier={tier} but {rev_reason}"
+
+    # Optional: keep room-to-target as a safety check (recommended)
+    # You asked for post-dips only; this doesn't violate that—it prevents buying dips with no runway.
+    if tier == TIER_HIGH:
         room_ok, room_reason = option1_room_to_target(mid, levels_day, levels_week, resist_buffer_bps)
-        if room_ok:
-            return True, TIER_HIGH, f"HIGH:A={sup_reason};B={rev_reason};C={room_reason}"
+        if not room_ok:
+            return False, 0, f"NO: room_fail {room_reason}"
+    else:
+        # for low/mid, require only room to the tier target
+        room_ok, room_reason = _room_to_target_pct(
+            mid, levels_day, levels_week,
+            target_pct=TIER_TP_PCT[tier],
+            resist_buffer_bps=resist_buffer_bps,
+        )
+        if not room_ok:
+            return False, 0, f"NO: room_fail {room_reason}"
 
-    # MID: allow if support + reversal, but only require room to ~0.75%
-    if sup_ok and rev_ok:
-        room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_MID], resist_buffer_bps=resist_buffer_bps)
-        if room_ok:
-            return True, TIER_MID, f"MID:A={sup_reason};B={rev_reason};C={room_reason}"
+    # Spread gating (keep it; dip scalps die to spread)
+    if tier == TIER_LOW and spread_bps > SCALP_MAX_SPREAD_BPS:
+        return False, 0, f"NO: spread_high={spread_bps:.1f}"
 
-    # LOW (scalp): require tight spread + either support proximity OR mild reversal,
-    # and do NOT require room to 2% (only room to 0.25%)
-    if spread_bps <= SCALP_MAX_SPREAD_BPS:
-        # Looser reversal: accept if RSI or EMA reclaim passed (not necessarily 2-of-3)
-        # We parse the option1 string: "pass=rsi+ema_reclaim" etc.
-        passed_any = ("pass=" in rev_reason) and any(k in rev_reason for k in ("rsi", "ema_reclaim"))
-        if sup_ok or passed_any:
-            room_ok, room_reason = _room_to_target_pct(mid, levels_day, levels_week, target_pct=TIER_TP_PCT[TIER_LOW], resist_buffer_bps=resist_buffer_bps)
-            if room_ok:
-                return True, TIER_LOW, f"LOW:A={sup_reason};B={rev_reason};C={room_reason}"
+    return True, tier, f"DIP:tier={tier} dip={dip_pct*100:.2f}% rate={dip_rate:.1f}bpspm age={trough_age}m; {rev_reason}; {room_reason}"
 
-    return False, 0, f"NO: A={sup_reason}; B={rev_reason}"
 
 # ------------------------------------------------------------
 # Portfolio management
@@ -2033,33 +2163,35 @@ class LivePortfolio:
         return last
 
     def _parse_order_fill_fields(self, order_d: dict) -> Tuple[float, Optional[float], float, Optional[float]]:
-        """Fallback: extract (filled_qty, avg_price, fee_usd, filled_notional_usd) from an order dict."""
-        d = order_d
-        if isinstance(order_d.get("order"), dict):
-            d = order_d.get("order")  # type: ignore[assignment]
-        if isinstance(order_d.get("data"), dict):
-            d = order_d.get("data")  # type: ignore[assignment]
+        """
+        Parse order fields into (filled_qty_base, avg_price, fee_usd, filled_notional_usd).
+        MUST be base qty for filled_qty. If ambiguous, derive qty = notional/avg_price.
+        """
+        od = (order_d.get("order") if isinstance(order_d, dict) else None) or order_d
+        side = str(od.get("side") or "").upper()
 
-        def fget(*keys: str) -> Any:
-            for k in keys:
-                if k in d:
-                    return d.get(k)
-            return None
+        # Common fields across SDK versions
+        filled_size = safe_float(od.get("filled_size") or od.get("filledSize") or od.get("filled_base_size") or od.get("filledBaseSize"))
+        filled_value = safe_float(od.get("filled_value") or od.get("filledValue") or od.get("filled_quote_size") or od.get("filledQuoteSize"))
+        avg_price = safe_float(od.get("average_filled_price") or od.get("averageFilledPrice") or od.get("avg_price") or od.get("avgPrice"))
+        fee = safe_float(od.get("total_fees") or od.get("totalFees") or od.get("fee") or od.get("fees")) or 0.0
 
-        filled_qty = safe_float(fget("filled_size", "filledSize", "filled_qty", "filledQty", "filled_quantity", "filledQuantity")) or 0.0
-        avg_price = safe_float(fget("average_filled_price", "averageFilledPrice", "avg_price", "avgPrice", "average_price", "averagePrice"))
+        # Decide what is base qty vs notional
+        filled_qty = float(filled_size or 0.0)
+        filled_notional = filled_value
 
-        # Filled value / notional in quote (USD for -USD pairs)
-        filled_value = safe_float(fget("filled_value", "filledValue", "executed_value", "executedValue", "filled_notional", "filledNotional"))
+        # If avg_price missing but we have size/value, derive it
+        if (avg_price is None or avg_price <= 0) and filled_qty > 0 and filled_notional is not None and filled_notional > 0:
+            avg_price = float(filled_notional) / float(filled_qty)
 
-        fee = fget("total_fees", "totalFees", "fee", "fees", "total_fee", "totalFee")
-        fee_usd_val = 0.0
-        if isinstance(fee, dict):
-            fee_usd_val = safe_float(fee.get("value")) or 0.0
-        else:
-            fee_usd_val = safe_float(fee) or 0.0
+        # If qty looks wrong (e.g., is actually quote), repair from notional/price
+        if avg_price is not None and avg_price > 0 and filled_notional is not None and filled_notional > 0:
+            expected_qty = float(filled_notional) / float(avg_price)
+            if filled_qty <= 0 or (abs(filled_qty - expected_qty) / max(expected_qty, 1e-12)) > 0.10:
+                filled_qty = float(expected_qty)
 
-        return float(filled_qty), (float(avg_price) if avg_price is not None else None), float(fee_usd_val), (float(filled_value) if filled_value is not None else None)
+        return float(filled_qty), (float(avg_price) if avg_price else None), float(fee), (float(filled_notional) if filled_notional else None)
+
 
     def _fetch_fills_for_order(self, order_id: str, product_id: str) -> List[dict]:
         """Best-effort fills fetch. Uses SDK if available, else returns [].
@@ -2248,9 +2380,11 @@ class LivePortfolio:
             if px is not None and px > 0 and notion is not None and notion > 0:
                 expected_base = notion / px
 
+                if side_u2 == "BUY":
+                    qty_f = float(expected_base)
                 # If qty is wildly inconsistent, replace qty with expected_base.
                 # (Most common failure: BUY returns qty field in QUOTE units by mistake.)
-                if q <= 0 or (abs(q - expected_base) / max(expected_base, 1e-12)) > 0.10:
+                elif q <= 0 or (abs(q - expected_base) / max(expected_base, 1e-12)) > 0.10:
                     # prefer expected_base, but preserve the idea of "some fill happened"
                     qty_f = float(expected_base)
 
@@ -2785,6 +2919,7 @@ class TradingBot:
             exit_price=exec_price,
             weekly_bias=self.macro.compute_weekly_bias(product, tob.mid),
             note=note,
+            filled_notional_usd=(float(filled_notional) if isinstance(self.portfolio, LivePortfolio) and filled_notional is not None else None),
         )
 
         ts_now = now_ts()
@@ -3443,6 +3578,7 @@ class TradingBot:
                             exit_price=exec_price,
                             weekly_bias=weekly_bias,
                             note=note,
+                            filled_notional_usd=(float(filled_notional) if isinstance(self.portfolio, LivePortfolio) and filled_notional is not None else None),
                         )
 
                         self.positions[product] = []
@@ -3595,6 +3731,7 @@ class TradingBot:
                                         exit_price=None,
                                         weekly_bias=weekly_bias,
                                         note="ladder_L2|dip_add",
+                                        filled_notional_usd=(float(filled_notional) if isinstance(self.portfolio, LivePortfolio) and filled_notional is not None else None),
                                     )
 
                         # Tranche 3: add when price reclaims anchored VWAP (often marks transition out of base).
@@ -3641,6 +3778,7 @@ class TradingBot:
                                         exit_price=None,
                                         weekly_bias=weekly_bias,
                                         note="ladder_L3|reclaim_avwap",
+                                        filled_notional_usd=(float(filled_notional) if isinstance(self.portfolio, LivePortfolio) and filled_notional is not None else None),
                                     )
 
                     # Helper: sell a specific qty (FIFO) while keeping CSV schema identical.
@@ -3702,6 +3840,7 @@ class TradingBot:
                             exit_price=exec_price,
                             weekly_bias=weekly_bias,
                             note=note,
+                            filled_notional_usd=(float(filled_notional) if isinstance(self.portfolio, LivePortfolio) and filled_notional is not None else None),
                         )
 
                         # Reduce lots FIFO.
@@ -3948,6 +4087,7 @@ class TradingBot:
                                 exit_price=None,
                                 weekly_bias=weekly_bias,
                                 note=f"ladder_L1|{best_candidate.get('entry_reason', 'OK')}",
+                                filled_notional_usd=(float(filled_notional) if isinstance(self.portfolio, LivePortfolio) and filled_notional is not None else None),
                             )
 
                             cash_usd2 = self.portfolio.cash_usd

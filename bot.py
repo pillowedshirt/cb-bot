@@ -132,7 +132,8 @@ EVAL_TICK_SEC: float = 2.0
 # Allocation / exposure
 MAX_OPEN_POSITIONS: int = 20
 MIN_ENTRY_USD: float = 1.0
-MAX_EXPOSURE_PER_PRODUCT_USD: float = 40.0
+ENTRY_SIZE_USD: float = 8.0
+MAX_EXPOSURE_PER_PRODUCT_USD: float = 80.0
 
 TARGET_UTIL_MIN: float = 0.35
 TARGET_UTIL_MID: float = 0.65

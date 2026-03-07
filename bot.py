@@ -897,23 +897,39 @@ class TradeLogger:
         expected_net_edge_bps: Optional[float] = None,
         exit_role: str = "",
     ) -> None:
-        notional = float(filled_notional_usd) if filled_notional_usd is not None else (float(qty) * float(price))
-        self.cum_pnl_usd += net_pnl_usd
+        qty_val = float(qty)
+        price_val = float(price)
+        notional = float(filled_notional_usd) if filled_notional_usd is not None else (qty_val * price_val)
+
+        # Final defensive normalization:
+        # If qty looks wrong (for example, quote/notional USD was passed into qty),
+        # repair it from notional / price so trades.csv always stores base quantity.
+        if price_val > 0 and notional > 0:
+            expected_qty = notional / price_val
+            if qty_val <= 0:
+                qty_val = expected_qty
+            else:
+                rel_err = abs(qty_val - expected_qty) / max(expected_qty, 1e-12)
+                if rel_err > 0.10:
+                    qty_val = expected_qty
+
+        self.cum_pnl_usd += float(net_pnl_usd)
+
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             tsv = now_ts()
             dt_mst = datetime.fromtimestamp(tsv, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
             w.writerow([
                 f"{tsv:.6f}", dt_mst, event, product_id, side,
-                f"{qty:.10f}", f"{price:.10f}", f"{notional:.10f}",
-                f"{fee_usd_val:.10f}", f"{gross_pnl_usd:.10f}", f"{net_pnl_usd:.10f}",
+                f"{qty_val:.10f}", f"{price_val:.10f}", f"{notional:.10f}",
+                f"{float(fee_usd_val):.10f}", f"{float(gross_pnl_usd):.10f}", f"{float(net_pnl_usd):.10f}",
                 f"{self.cum_pnl_usd:.10f}",
-                "" if entry_price is None else f"{entry_price:.10f}",
-                "" if exit_price is None else f"{exit_price:.10f}",
-                "" if weekly_bias is None else f"{weekly_bias:.6f}",
-                "" if entry_score is None else f"{entry_score:.6f}",
+                "" if entry_price is None else f"{float(entry_price):.10f}",
+                "" if exit_price is None else f"{float(exit_price):.10f}",
+                "" if weekly_bias is None else f"{float(weekly_bias):.6f}",
+                "" if entry_score is None else f"{float(entry_score):.6f}",
                 "" if entry_tier is None else str(entry_tier),
-                "" if expected_net_edge_bps is None else f"{expected_net_edge_bps:.6f}",
+                "" if expected_net_edge_bps is None else f"{float(expected_net_edge_bps):.6f}",
                 exit_role,
                 note,
             ])

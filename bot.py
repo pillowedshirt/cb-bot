@@ -1,7 +1,7 @@
 # STRATEGY SUMMARY
 # - Entry model: support-zone proximity + reversal confirmation + room-to-target
-# - Exit model: full exit only via hard peak stop or armed trailing drawdown
-# - Sizing model: slot-based percentage of available cash
+# - Exit model: tiered targets plus trailing, time, no-progress, and invalidation protection
+# - Sizing model: exposure-aware entries with one optional add into confirmed winners
 # - Logging model: Coinbase fills are source of truth in live mode
 # - Viewer model: reads bot-generated CSV outputs only; does not recompute alternate trade logic
 
@@ -37,7 +37,7 @@ TZ = ZoneInfo(TZ_NAME)
 # ============================================================
 
 # Paper trading mode. If True, no real orders are sent on Coinbase.
-PAPER_TRADING: bool = False
+PAPER_TRADING: bool = True
 
 # Starting account balance in USD (paper mode)
 STARTING_CASH_USD: float = 100.0
@@ -84,6 +84,7 @@ PRODUCTS: List[str] = list(PRODUCTS_DEFAULT)
 # Resolve paths relative to this script so that bot and viewer always refer to
 # the same files regardless of the current working directory.
 TRADES_CSV_PATH: str = os.path.join(BASE_DIR, "trades.csv")
+ORDERS_CSV_PATH: str = os.path.join(BASE_DIR, "orders.csv")
 MARKET_CSV_PATH: str = os.path.join(BASE_DIR, "market.csv")
 MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
@@ -171,21 +172,42 @@ TARGET_UTIL_MAX: float = 0.90
 HIGH_SCORE_UTIL_THRESHOLD: float = 78.0
 MID_SCORE_UTIL_THRESHOLD: float = 60.0
 
+# Execution mode
+# MARKET = more reliable fills, higher taker fee/spread cost.
+# MAKER = cheaper if filled, but can fail/no-fill often.
+# LIMIT_THEN_MARKET = try maker briefly, then fall back to market.
+ENTRY_EXECUTION_MODE: str = "MARKET"
+EXIT_EXECUTION_MODE: str = "LIMIT_THEN_MARKET"
+
 # Execution friction
-MAX_SPREAD_BPS: float = 24.0
-SCALP_MAX_SPREAD_BPS: float = 15.0
+MAX_SPREAD_BPS: float = 18.0
+SCALP_MAX_SPREAD_BPS: float = 10.0
 MAKER_FEE_BPS: float = 6.0
 TAKER_FEE_BPS: float = 10.0
 EST_SLIPPAGE_BPS: float = 6.0
 EST_ADVERSE_FILL_BPS: float = 6.0
+
+# Fee-aware edge requirements
+MIN_REQUIRED_NET_EDGE_BPS: float = 35.0
+MIN_TARGET_TO_COST_MULT: float = 2.75
+ROUND_TRIP_SAFETY_BPS: float = 8.0
+
+# Order logging / safety
+LOG_ORDER_ATTEMPTS: bool = True
+REQUIRE_CONFIRMED_FILL_FOR_TRADE_LOG: bool = True
 
 # Dip / reversal detection
 DIP_LOOKBACK_MIN: int = 75
 DIP_MAX_AGE_MIN: int = 12
 DIP_MIN_PCT: float = 0.0015
 DIP_RATE_MIN_BPS_PER_MIN: float = 4.0
-REV_MIN_UP_CANDLES: int = 1
-REV_RECLAIM_BPS: float = 5.0
+REV_MIN_UP_CANDLES: int = 2
+REV_RECLAIM_BPS: float = 8.0
+REQUIRE_HIGHER_LOW_CONFIRMATION: bool = True
+REQUIRE_MICRO_VWAP_RECLAIM: bool = True
+MICRO_TREND_LOOKBACK_MIN: int = 15
+MICRO_TREND_DOWN_BPS: float = -18.0
+VWAP_RECLAIM_BUFFER_BPS: float = 3.0
 
 # Tier score bands
 TIER_LOW = 1
@@ -233,12 +255,31 @@ CORE_SIGMA_MULT = {
 }
 
 # Protective exits
-TRAIL_ARM_PCT: float = 0.009
+TRAIL_ARM_PCT: float = 0.0065
 TRAIL_DRAWDOWN_PCT: float = 0.0020
-HARD_PEAK_STOP_PCT: float = 0.0045
+HARD_PEAK_STOP_PCT: float = 0.0040
+
+# Faster invalidation/time exits for day-trading/scalping behavior
+TIME_STOP_SEC: int = 45 * 60
+NO_PROGRESS_STOP_SEC: int = 12 * 60
+MIN_PROGRESS_BPS_BEFORE_TIME_STOP: float = 8.0
+INVALIDATION_BUFFER_BPS: float = 10.0
+
+# Risk brakes
+MAX_DAILY_LOSS_USD: float = 3.00
+MAX_CONSECUTIVE_LOSSES: int = 3
+COOLDOWN_AFTER_LOSS_SEC: float = 15 * 60
+MAX_TRADES_PER_HOUR: int = 6
+MAX_TRADES_PER_PRODUCT_PER_HOUR: int = 2
+PAUSE_AFTER_DAILY_LOSS_SEC: float = 6 * 60 * 60
+
+# Scaling
+ALLOW_SCALE_INTO_WINNERS: bool = True
+MAX_SCALE_ADDS_PER_POSITION: int = 1
+SCALE_ONLY_IF_UNREALIZED_NET_BPS_ABOVE: float = 22.0
+SCALE_ADD_FRACTION_OF_ENTRY: float = 0.50
 
 # Safety exits
-TIME_STOP_SEC: int = 4 * 60 * 60
 RISK_OFF_REDUCTION_FRAC: float = 0.05
 RISK_OFF_COOLDOWN_SEC: float = 60.0
 RISK_OFF_MIN_NOTIONAL_USD: float = 1.0
@@ -972,6 +1013,92 @@ class TradeLogger:
                 "" if expected_net_edge_bps is None else f"{float(expected_net_edge_bps):.6f}",
                 exit_role,
                 note,
+            ])
+
+
+class OrderLogger:
+    """
+    Writes every order attempt to orders.csv.
+    This is separate from trades.csv.
+
+    trades.csv = confirmed fills only.
+    orders.csv = attempts, failed buys, no-fills, rejects, errors, partials.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._ensure_header()
+
+    def _ensure_header(self) -> None:
+        if os.path.exists(self.path):
+            return
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "ts", "dt_mst", "event", "product_id", "side", "mode",
+                "requested_quote_usd", "requested_base_qty",
+                "ok", "status", "order_id", "client_order_id",
+                "filled_qty", "avg_price", "filled_notional_usd", "fee_usd",
+                "reason", "raw_error"
+            ])
+
+    def log_order(
+        self,
+        *,
+        event: str,
+        product_id: str,
+        side: str,
+        mode: str,
+        requested_quote_usd: Optional[float] = None,
+        requested_base_qty: Optional[float] = None,
+        result: Optional[Any] = None,
+        reason: str = "",
+        raw_error: str = "",
+    ) -> None:
+        tsv = now_ts()
+        dt_mst = datetime.fromtimestamp(tsv, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+        ok = False
+        status = ""
+        order_id = ""
+        client_order_id = ""
+        filled_qty = 0.0
+        avg_price = ""
+        filled_notional = ""
+        fee_usd_val = 0.0
+        err = raw_error or ""
+
+        try:
+            d = result.to_dict() if hasattr(result, "to_dict") else result
+            if isinstance(d, dict):
+                ok = bool(d.get("ok", False))
+                status = str(d.get("status", ""))
+                order_id = str(d.get("order_id") or "")
+                client_order_id = str(d.get("client_order_id") or "")
+                filled_qty = float(d.get("filled_qty") or 0.0)
+                if d.get("avg_price") is not None:
+                    avg_price = f"{float(d.get('avg_price')):.10f}"
+                if d.get("filled_notional_usd") is not None:
+                    filled_notional = f"{float(d.get('filled_notional_usd')):.10f}"
+                fee_usd_val = float(d.get("fee_usd") or 0.0)
+                if d.get("error"):
+                    err = str(d.get("error"))
+        except Exception as e:
+            err = err or str(e)
+
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                f"{tsv:.6f}", dt_mst, event, product_id, side, mode,
+                "" if requested_quote_usd is None else f"{float(requested_quote_usd):.10f}",
+                "" if requested_base_qty is None else f"{float(requested_base_qty):.10f}",
+                str(bool(ok)), status, order_id, client_order_id,
+                f"{float(filled_qty):.10f}",
+                avg_price,
+                filled_notional,
+                f"{float(fee_usd_val):.10f}",
+                reason,
+                err,
             ])
 
 
@@ -1724,8 +1851,22 @@ def score_entry_candidate(
     if final_score < TIER_SCORE_BANDS[TIER_LOW][0]:
         return EntryScore(False, final_score, 0, f"score_too_low={final_score:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
 
-    if edge_bps <= 0.0:
-        return EntryScore(False, final_score, 0, f"net_edge_nonpositive={edge_bps:.1f}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
+    if edge_bps < MIN_REQUIRED_NET_EDGE_BPS:
+        return EntryScore(
+            False,
+            final_score,
+            0,
+            f"net_edge_too_low={edge_bps:.1f}<required={MIN_REQUIRED_NET_EDGE_BPS:.1f}",
+            dip_depth_score,
+            dip_speed_score,
+            reversal_score,
+            support_score,
+            room_score,
+            regime_score,
+            spread_penalty,
+            cost_penalty,
+            edge_bps,
+        )
 
     return EntryScore(
         True,
@@ -2632,6 +2773,7 @@ class TradingBot:
         self.fetcher = MacroFetcher(rest)
         self.macro = MacroManager()
         self.tlog = TradeLogger(TRADES_CSV_PATH)
+        self.olog = OrderLogger(ORDERS_CSV_PATH)
         self.mlog = MarketLogger(MARKET_CSV_PATH)
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
@@ -2695,6 +2837,15 @@ class TradingBot:
         # startup timestamp (used for FIRST_BUY_DELAY_SEC warm-up)
         self.bot_start_ts: float = now_ts()
         self.last_heartbeat_ts: float = 0.0
+
+        # Risk/session state
+        self.daily_pnl_date: Optional[str] = None
+        self.daily_realized_pnl_usd: float = 0.0
+        self.consecutive_losses: int = 0
+        self.paused_until_ts: float = 0.0
+        self.trade_timestamps: Deque[float] = deque(maxlen=500)
+        self.product_trade_timestamps: Dict[str, Deque[float]] = {p: deque(maxlen=200) for p in PRODUCTS}
+        self.scale_add_count: Dict[str, int] = {p: 0 for p in PRODUCTS}
     async def preload_micro_history(self) -> None:
         """Preload the last MICRO_PRELOAD_MINUTES of 1m candles into micro buffers at startup.
 
@@ -2865,6 +3016,11 @@ class TradingBot:
 
         self.positions[product] = new_lots
         self.lot_tags[product] = new_tags
+        if not new_lots:
+            self.position_start_ts[product] = None
+            self.position_entry_price[product] = None
+            self.peak_bid[product] = None
+            self.scale_add_count[product] = 0
         avg_entry = (removed_cost / removed_qty) if removed_qty > 1e-12 else None
         return removed_qty, avg_entry
 
@@ -2958,6 +3114,7 @@ class TradingBot:
         self.trailing_active[product] = False
         self.position_tier[product] = 0
         self.position_entry_price[product] = None
+        self.scale_add_count[product] = 0
         self.entry_notional_usd[product] = 0.0
         self.entry_buy_fee_usd[product] = 0.0
         self.entry_buy_fee_bps[product] = 0.0
@@ -3141,6 +3298,188 @@ class TradingBot:
         return float(min(max(k, TRAIL_K_MIN), TRAIL_K_MAX))
 
 
+    def _round_trip_cost_bps(
+        self,
+        *,
+        entry_mode: Optional[str] = None,
+        exit_mode: Optional[str] = None,
+        spread_bps: float = 0.0,
+    ) -> float:
+        entry_mode = str(entry_mode or ENTRY_EXECUTION_MODE).upper().strip()
+        exit_mode = str(exit_mode or EXIT_EXECUTION_MODE).upper().strip()
+
+        entry_fee = TAKER_FEE_BPS if entry_mode in ("MARKET", "LIMIT_THEN_MARKET") else MAKER_FEE_BPS
+        exit_fee = TAKER_FEE_BPS if exit_mode in ("MARKET", "LIMIT_THEN_MARKET") else MAKER_FEE_BPS
+
+        return float(
+            entry_fee
+            + exit_fee
+            + float(spread_bps)
+            + EST_SLIPPAGE_BPS
+            + EST_ADVERSE_FILL_BPS
+            + ROUND_TRIP_SAFETY_BPS
+        )
+
+    def _target_move_bps_from_room_and_sigma(
+        self,
+        *,
+        mid: float,
+        product_id: str,
+        levels_day: Optional['MacroLevels'],
+        levels_week: Optional['MacroLevels'],
+        sigma_bps: Optional[float],
+    ) -> float:
+        candidates: List[float] = []
+
+        for lv in (levels_day, levels_week):
+            if not lv:
+                continue
+            for attr in ("resistance_zone_low", "resistance_zone_high", "prev_high", "vah", "breakout"):
+                v = getattr(lv, attr, None)
+                try:
+                    val = float(v)
+                except Exception:
+                    continue
+                if val > mid:
+                    candidates.append(((val / mid) - 1.0) * 10000.0)
+
+        if sigma_bps is not None and sigma_bps > 0:
+            candidates.append(float(sigma_bps) * 1.15)
+
+        if not candidates:
+            return 0.0
+
+        # Use the nearest realistic upside target rather than an unrealistic far target.
+        return float(max(0.0, min(candidates)))
+
+    def _fee_aware_expected_edge_bps(
+        self,
+        *,
+        product_id: str,
+        mid: float,
+        spread_bps: float,
+        levels_day: Optional['MacroLevels'],
+        levels_week: Optional['MacroLevels'],
+        sigma_bps: Optional[float],
+    ) -> Tuple[float, float, float]:
+        target_bps = self._target_move_bps_from_room_and_sigma(
+            mid=mid,
+            product_id=product_id,
+            levels_day=levels_day,
+            levels_week=levels_week,
+            sigma_bps=sigma_bps,
+        )
+        cost_bps = self._round_trip_cost_bps(spread_bps=spread_bps)
+        net_bps = float(target_bps - cost_bps)
+        return net_bps, target_bps, cost_bps
+
+    def _micro_trending_down(self, product_id: str) -> Tuple[bool, str]:
+        series = self.live_1m.get(product_id)
+        if not series or len(series.candles) < max(5, MICRO_TREND_LOOKBACK_MIN):
+            return False, "trend_unknown"
+
+        candles = list(series.candles)
+        closes = [float(c.close) for c in candles[-MICRO_TREND_LOOKBACK_MIN:] if float(c.close) > 0]
+        if len(closes) < 5:
+            return False, "trend_unknown"
+
+        first = closes[0]
+        last = closes[-1]
+        move_bps = ((last / first) - 1.0) * 10000.0 if first > 0 else 0.0
+
+        lower_highs = 0
+        for i in range(2, len(closes)):
+            if closes[i] < closes[i - 1] < closes[i - 2]:
+                lower_highs += 1
+
+        if move_bps <= MICRO_TREND_DOWN_BPS and lower_highs >= 2:
+            return True, f"micro_down move_bps={move_bps:.1f} lower_seq={lower_highs}"
+
+        return False, f"micro_ok move_bps={move_bps:.1f}"
+
+    def _micro_vwap_reclaimed(self, product_id: str, mid: float) -> Tuple[bool, str]:
+        avwap = self._compute_anchored_vwap_24h(product_id, now_ts())
+        if avwap is None or avwap <= 0:
+            return True, "vwap_unknown"
+
+        required = float(avwap) * bps_to_mult(VWAP_RECLAIM_BUFFER_BPS)
+        if mid >= required:
+            return True, f"vwap_reclaim mid>=avwap+{VWAP_RECLAIM_BUFFER_BPS:.1f}bps"
+
+        return False, f"below_vwap mid={mid:.8f} avwap={avwap:.8f}"
+
+    def _higher_low_confirmed(self, product_id: str) -> Tuple[bool, str]:
+        series = self.live_1m.get(product_id)
+        if not series or len(series.candles) < 8:
+            return False, "higher_low_unknown"
+
+        candles = list(series.candles)[-8:]
+        lows = [float(c.low) for c in candles]
+        closes = [float(c.close) for c in candles]
+
+        recent_low = min(lows[-3:])
+        prior_low = min(lows[:5])
+        close_strength = closes[-1] > closes[-2] >= closes[-3]
+
+        if recent_low > prior_low and close_strength:
+            return True, "higher_low_confirmed"
+
+        return False, "higher_low_not_confirmed"
+
+    def _risk_pause_active(self) -> bool:
+        return now_ts() < float(self.paused_until_ts or 0.0)
+
+    def _reset_daily_pnl_if_needed(self) -> None:
+        today = datetime.now(TZ).strftime("%Y-%m-%d")
+        if self.daily_pnl_date != today:
+            self.daily_pnl_date = today
+            self.daily_realized_pnl_usd = 0.0
+            self.consecutive_losses = 0
+
+    def _record_realized_trade_result(self, net_pnl_usd: float) -> None:
+        self._reset_daily_pnl_if_needed()
+        self.daily_realized_pnl_usd += float(net_pnl_usd)
+
+        if net_pnl_usd < 0:
+            self.consecutive_losses += 1
+            self.paused_until_ts = max(self.paused_until_ts, now_ts() + COOLDOWN_AFTER_LOSS_SEC)
+        elif net_pnl_usd > 0:
+            self.consecutive_losses = 0
+
+        if self.daily_realized_pnl_usd <= -abs(MAX_DAILY_LOSS_USD):
+            self.paused_until_ts = max(self.paused_until_ts, now_ts() + PAUSE_AFTER_DAILY_LOSS_SEC)
+            log(f"[risk-pause] daily loss reached ${self.daily_realized_pnl_usd:.2f}; paused until {self.paused_until_ts}")
+
+        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            self.paused_until_ts = max(self.paused_until_ts, now_ts() + PAUSE_AFTER_DAILY_LOSS_SEC)
+            log(f"[risk-pause] consecutive losses={self.consecutive_losses}; paused until {self.paused_until_ts}")
+
+    def _trade_rate_ok(self, product_id: str) -> bool:
+        t = now_ts()
+        one_hour_ago = t - 3600.0
+
+        recent_global = [x for x in self.trade_timestamps if x >= one_hour_ago]
+        if len(recent_global) >= MAX_TRADES_PER_HOUR:
+            return False
+
+        dq = self.product_trade_timestamps.get(product_id)
+        if dq is None:
+            self.product_trade_timestamps[product_id] = deque(maxlen=200)
+            dq = self.product_trade_timestamps[product_id]
+
+        recent_product = [x for x in dq if x >= one_hour_ago]
+        if len(recent_product) >= MAX_TRADES_PER_PRODUCT_PER_HOUR:
+            return False
+
+        return True
+
+    def _record_trade_timestamp(self, product_id: str) -> None:
+        t = now_ts()
+        self.trade_timestamps.append(t)
+        if product_id not in self.product_trade_timestamps:
+            self.product_trade_timestamps[product_id] = deque(maxlen=200)
+        self.product_trade_timestamps[product_id].append(t)
+
     def _entry_gate_bottoming(
         self,
         *,
@@ -3170,6 +3509,15 @@ class TradingBot:
     # --------------------------------------------------------
     # Live execution helpers (avoid blocking asyncio loop)
     # --------------------------------------------------------
+    async def _live_buy_market(self, *, product_id: str, quote_usd: float) -> Any:
+        if not isinstance(self.portfolio, LivePortfolio):
+            raise RuntimeError("live market buy called without LivePortfolio")
+        return await asyncio.to_thread(
+            self.portfolio.buy_market,
+            product_id,
+            float(quote_usd),
+        )
+
     async def _live_buy_maker(self, *, product_id: str, quote_usd: float, bid: float) -> Any:
         if not isinstance(self.portfolio, LivePortfolio):
             raise RuntimeError("live buy called without LivePortfolio")
@@ -3198,6 +3546,113 @@ class TradingBot:
             max_wait_sec=6.0,
             reprice_every_sec=2.0,
         )
+
+    async def _live_sell_market(self, *, product_id: str, base_qty: float) -> Any:
+        if not isinstance(self.portfolio, LivePortfolio):
+            raise RuntimeError("live market sell called without LivePortfolio")
+        return await asyncio.to_thread(
+            self.portfolio.sell_market,
+            product_id,
+            float(base_qty),
+        )
+
+    async def _execute_live_buy(
+        self,
+        *,
+        product_id: str,
+        quote_usd: float,
+        bid: float,
+        ask: float,
+        reason: str,
+    ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
+        """Execute a live buy and return only a Coinbase-confirmed fill."""
+        mode = str(ENTRY_EXECUTION_MODE).upper().strip()
+        result = None
+
+        try:
+            if mode == "MARKET":
+                result = await self._live_buy_market(product_id=product_id, quote_usd=quote_usd)
+            elif mode == "MAKER":
+                result = await self._live_buy_maker(product_id=product_id, quote_usd=quote_usd, bid=bid)
+            elif mode == "LIMIT_THEN_MARKET":
+                result = await self._live_buy_maker(product_id=product_id, quote_usd=quote_usd, bid=bid)
+                fill = self._require_live_fill(result, product_id=product_id, side="BUY")
+                if LOG_ORDER_ATTEMPTS:
+                    self.olog.log_order(
+                        event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode="MAKER_FIRST",
+                        requested_quote_usd=quote_usd, result=result, reason=reason,
+                    )
+                if fill is not None:
+                    return fill
+                result = await self._live_buy_market(product_id=product_id, quote_usd=quote_usd)
+            else:
+                raise RuntimeError(f"Invalid ENTRY_EXECUTION_MODE={ENTRY_EXECUTION_MODE}")
+
+            fill = self._require_live_fill(result, product_id=product_id, side="BUY")
+            if LOG_ORDER_ATTEMPTS:
+                self.olog.log_order(
+                    event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode,
+                    requested_quote_usd=quote_usd, result=result, reason=reason,
+                )
+            return fill
+
+        except Exception as e:
+            if LOG_ORDER_ATTEMPTS:
+                self.olog.log_order(
+                    event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode,
+                    requested_quote_usd=quote_usd, result=result, reason=reason, raw_error=str(e),
+                )
+            log(f"[buy-error] {product_id} mode={mode} quote=${quote_usd:.2f}: {e}")
+            return None
+
+    async def _execute_live_sell(
+        self,
+        *,
+        product_id: str,
+        base_qty: float,
+        bid: float,
+        ask: float,
+        reason: str,
+    ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
+        """Execute a live sell and return only a Coinbase-confirmed fill."""
+        mode = str(EXIT_EXECUTION_MODE).upper().strip()
+        result = None
+
+        try:
+            if mode == "MARKET":
+                result = await self._live_sell_market(product_id=product_id, base_qty=base_qty)
+            elif mode == "MAKER":
+                result = await self._live_sell_maker(product_id=product_id, base_qty=base_qty, ask=ask)
+            elif mode == "LIMIT_THEN_MARKET":
+                result = await self._live_sell_maker(product_id=product_id, base_qty=base_qty, ask=ask)
+                fill = self._require_live_fill(result, product_id=product_id, side="SELL")
+                if LOG_ORDER_ATTEMPTS:
+                    self.olog.log_order(
+                        event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode="MAKER_FIRST",
+                        requested_base_qty=base_qty, result=result, reason=reason,
+                    )
+                if fill is not None:
+                    return fill
+                result = await self._live_sell_market(product_id=product_id, base_qty=base_qty)
+            else:
+                raise RuntimeError(f"Invalid EXIT_EXECUTION_MODE={EXIT_EXECUTION_MODE}")
+
+            fill = self._require_live_fill(result, product_id=product_id, side="SELL")
+            if LOG_ORDER_ATTEMPTS:
+                self.olog.log_order(
+                    event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode,
+                    requested_base_qty=base_qty, result=result, reason=reason,
+                )
+            return fill
+
+        except Exception as e:
+            if LOG_ORDER_ATTEMPTS:
+                self.olog.log_order(
+                    event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode,
+                    requested_base_qty=base_qty, result=result, reason=reason, raw_error=str(e),
+                )
+            log(f"[sell-error] {product_id} mode={mode} qty={base_qty:.12f}: {e}")
+            return None
 
 
     async def _live_refresh_cash(self) -> float:
@@ -3455,6 +3910,7 @@ class TradingBot:
                 self.position_start_ts[product_id] = None
                 self.position_entry_price[product_id] = None
                 self.peak_bid[product_id] = None
+                self.scale_add_count[product_id] = 0
                 sold_count += 1
 
                 snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
@@ -3892,6 +4348,29 @@ class TradingBot:
                             exit_reason = "armed_trailing_drawdown"
                             exit_role = "runner_trail_exit"
 
+                    # Time stop / no-progress stop / invalidation stop.
+                    pos_start = self.position_start_ts.get(product_id)
+                    if pos_start is not None and position_qty > 0 and avg_entry_price and avg_entry_price > 0:
+                        age_sec = ts_now - float(pos_start)
+                        unrealized_bps = ((bid / avg_entry_price) - 1.0) * 10000.0
+
+                        if age_sec >= NO_PROGRESS_STOP_SEC and unrealized_bps < MIN_PROGRESS_BPS_BEFORE_TIME_STOP:
+                            exit_reason = f"no_progress_stop age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
+                            exit_role = "no_progress_stop"
+                            sell_qty = position_qty
+
+                        if age_sec >= TIME_STOP_SEC:
+                            exit_reason = f"time_stop age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
+                            exit_role = "time_stop"
+                            sell_qty = position_qty
+
+                        if levels_day and getattr(levels_day, "support_zone_low", 0) > 0:
+                            invalidation_px = float(levels_day.support_zone_low) * bps_to_mult(-INVALIDATION_BUFFER_BPS)
+                            if bid < invalidation_px:
+                                exit_reason = f"invalidation_stop bid<{invalidation_px:.8f}"
+                                exit_role = "invalidation_stop"
+                                sell_qty = position_qty
+
                     sell_qty = min(position_qty, max(0.0, sell_qty))
                     if sell_qty > 0:
                         notional_usd = sell_qty * bid
@@ -3899,8 +4378,13 @@ class TradingBot:
                         fee = 0.0
                         filled_notional = None
                         if isinstance(self.portfolio, LivePortfolio):
-                            r = await self._live_sell_maker(product_id=product_id, base_qty=sell_qty, ask=ask)
-                            fill = self._require_live_fill(r, product_id=product_id, side="SELL")
+                            fill = await self._execute_live_sell(
+                                product_id=product_id,
+                                base_qty=sell_qty,
+                                bid=bid,
+                                ask=ask,
+                                reason=exit_reason or "sell",
+                            )
                             if fill is not None:
                                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
                                 sell_qty = min(float(sell_qty), float(filled_qty))
@@ -3923,7 +4407,13 @@ class TradingBot:
                                 filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
                                 exit_role=exit_role or "risk_off",
                             )
+                            self._record_trade_timestamp(product_id)
+                            self._record_realized_trade_result(pnl_gross - fee)
                             self._fifo_reduce_lots(product_id, sell_qty)
+
+                trending_down, trend_reason = self._micro_trending_down(product_id)
+                vwap_ok, vwap_reason = self._micro_vwap_reclaimed(product_id, mid)
+                hl_ok, hl_reason = self._higher_low_confirmed(product_id)
 
                 scored = score_entry_candidate(
                     mid=mid,
@@ -3932,11 +4422,76 @@ class TradingBot:
                     levels_week=levels_week,
                     minute_candles=minute_candles,
                     weekly_bias=weekly_bias,
-                    trending_down=False,
+                    trending_down=trending_down,
                     resist_buffer_bps=RESIST_BUFFER_BPS,
                 )
 
-                if scored.ok and warmup_done and self._open_position_count() < MAX_OPEN_POSITIONS:
+                fee_edge_bps, target_bps, cost_bps = self._fee_aware_expected_edge_bps(
+                    product_id=product_id,
+                    mid=mid,
+                    spread_bps=spread_bps,
+                    levels_day=levels_day,
+                    levels_week=levels_week,
+                    sigma_bps=sigma_bps,
+                )
+
+                confirmation_ok = True
+                confirmation_reasons = []
+
+                if REQUIRE_MICRO_VWAP_RECLAIM and not vwap_ok:
+                    confirmation_ok = False
+                    confirmation_reasons.append(vwap_reason)
+
+                if REQUIRE_HIGHER_LOW_CONFIRMATION and not hl_ok:
+                    confirmation_ok = False
+                    confirmation_reasons.append(hl_reason)
+
+                if trending_down and fee_edge_bps < (MIN_REQUIRED_NET_EDGE_BPS * 1.50):
+                    confirmation_ok = False
+                    confirmation_reasons.append(trend_reason)
+
+                if cost_bps > 0 and target_bps < (cost_bps * MIN_TARGET_TO_COST_MULT):
+                    confirmation_ok = False
+                    confirmation_reasons.append(
+                        f"target_to_cost_fail target={target_bps:.1f} cost={cost_bps:.1f}"
+                    )
+
+                if fee_edge_bps < MIN_REQUIRED_NET_EDGE_BPS:
+                    confirmation_ok = False
+                    confirmation_reasons.append(
+                        f"fee_edge_fail net={fee_edge_bps:.1f}<required={MIN_REQUIRED_NET_EDGE_BPS:.1f}"
+                    )
+
+                if not confirmation_ok:
+                    scored = EntryScore(
+                        False,
+                        scored.score,
+                        scored.tier,
+                        "confirm_fail " + "; ".join(confirmation_reasons),
+                        scored.dip_depth_score,
+                        scored.dip_speed_score,
+                        scored.reversal_score,
+                        scored.support_score,
+                        scored.room_score,
+                        scored.regime_score,
+                        scored.spread_penalty,
+                        scored.cost_penalty,
+                        fee_edge_bps,
+                    )
+                else:
+                    scored.expected_net_edge_bps = fee_edge_bps
+                    scored.reason = (
+                        f"{scored.reason}; fee_edge={fee_edge_bps:.1f}; target={target_bps:.1f}; "
+                        f"cost={cost_bps:.1f}; {vwap_reason}; {hl_reason}; {trend_reason}"
+                    )
+
+                if (
+                    scored.ok
+                    and warmup_done
+                    and not self._risk_pause_active()
+                    and self._trade_rate_ok(product_id)
+                    and self._open_position_count() < MAX_OPEN_POSITIONS
+                ):
                     candidates.append({
                         "product_id": product_id,
                         "mid": mid,
@@ -3987,17 +4542,13 @@ class TradingBot:
 
             for candidate in candidates[:MAX_NEW_ENTRIES_PER_EVAL]:
                 product_id = candidate["product_id"]
+                existing_qty = sum(l.qty for l in self.positions.get(product_id, []))
                 if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
                     try:
                         snap_check = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
-                        if self.portfolio.get_product_total_qty(product_id, snapshot=snap_check) > 1e-12:
-                            continue
+                        existing_qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap_check)
                     except Exception:
-                        if sum(l.qty for l in self.positions.get(product_id, [])) > 0:
-                            continue
-                else:
-                    if sum(l.qty for l in self.positions.get(product_id, [])) > 0:
-                        continue
+                        existing_qty = sum(l.qty for l in self.positions.get(product_id, []))
                 product_exposure = self._current_product_exposure_usd(product_id)
                 total_exposure = self._current_total_exposure_usd()
                 open_count = self._open_position_count()
@@ -4011,6 +4562,34 @@ class TradingBot:
                     open_position_count=open_count,
                     strong_candidate_count=strong_candidate_count,
                 )
+
+                if existing_qty > 1e-12:
+                    if not ALLOW_SCALE_INTO_WINNERS:
+                        continue
+
+                    current_adds = int(self.scale_add_count.get(product_id, 0))
+                    if current_adds >= MAX_SCALE_ADDS_PER_POSITION:
+                        continue
+
+                    local_lots = self.positions.get(product_id, [])
+                    local_qty = sum(l.qty for l in local_lots)
+                    local_cost = sum(l.qty * l.price for l in local_lots)
+                    if local_qty <= 0 or local_cost <= 0:
+                        continue
+
+                    local_avg = local_cost / local_qty
+                    unrealized_net_bps = (
+                        ((candidate["bid"] / local_avg) - 1.0) * 10000.0
+                        - self._round_trip_cost_bps(spread_bps=candidate["spread_bps"])
+                    )
+                    if unrealized_net_bps < SCALE_ONLY_IF_UNREALIZED_NET_BPS_ABOVE:
+                        continue
+
+                    entry_notional = min(
+                        entry_notional,
+                        float(ENTRY_SIZE_USD) * float(SCALE_ADD_FRACTION_OF_ENTRY),
+                    )
+
                 if entry_notional < MIN_ENTRY_USD or not await self._live_can_afford(entry_notional, TAKER_FEE_BPS):
                     continue
 
@@ -4018,8 +4597,13 @@ class TradingBot:
                 fee1 = 0.0
                 filled_notional = None
                 if isinstance(self.portfolio, LivePortfolio):
-                    r = await self._live_buy_maker(product_id=product_id, quote_usd=entry_notional, bid=bid)
-                    fill = self._require_live_fill(r, product_id=product_id, side="BUY")
+                    fill = await self._execute_live_buy(
+                        product_id=product_id,
+                        quote_usd=entry_notional,
+                        bid=bid,
+                        ask=ask,
+                        reason=candidate.get("entry_reason", "score_entry"),
+                    )
                     if fill is not None:
                         filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
                         qty1 = float(filled_qty)
@@ -4036,8 +4620,31 @@ class TradingBot:
 
                 if qty1 > 0:
                     lot_meta = {"scalp_done": False, "core_done": False}
-                    self.positions[product_id] = [PositionLot(qty=qty1, price=eff_price1, tier=int(candidate["tier"]), score=float(candidate["score"]), meta=lot_meta)]
-                    self.position_start_ts[product_id] = ts_now
+                    existing_lots = self.positions.get(product_id, [])
+                    if existing_lots:
+                        existing_lots.append(
+                            PositionLot(
+                                qty=qty1,
+                                price=eff_price1,
+                                tier=int(candidate["tier"]),
+                                score=float(candidate["score"]),
+                                meta=lot_meta,
+                            )
+                        )
+                        self.positions[product_id] = existing_lots
+                        self.scale_add_count[product_id] = int(self.scale_add_count.get(product_id, 0)) + 1
+                    else:
+                        self.positions[product_id] = [
+                            PositionLot(
+                                qty=qty1,
+                                price=eff_price1,
+                                tier=int(candidate["tier"]),
+                                score=float(candidate["score"]),
+                                meta=lot_meta,
+                            )
+                        ]
+                        self.scale_add_count[product_id] = 0
+                        self.position_start_ts[product_id] = ts_now
                     self.last_buy_ts[product_id] = ts_now
                     self.last_buy_price[product_id] = ask
                     self.anchor_ts[product_id] = ts_now
@@ -4051,6 +4658,7 @@ class TradingBot:
                         entry_score=float(candidate["score"]), entry_tier=int(candidate["tier"]),
                         expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
                     )
+                    self._record_trade_timestamp(product_id)
 
             log(f"[loop] sleeping {EVAL_TICK_SEC:.1f}s until next evaluation")
             await asyncio.sleep(EVAL_TICK_SEC)

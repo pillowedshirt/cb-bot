@@ -11,6 +11,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MARKET_CSV = os.path.join(BASE_DIR, "market.csv")
 TRADES_CSV = os.path.join(BASE_DIR, "trades.csv")
+ORDERS_CSV = os.path.join(BASE_DIR, "orders.csv")
 MACRO_FILES = {
     "Past week (15m)": os.path.join(BASE_DIR, "macro_week.csv"),
     "Past day (1m)": os.path.join(BASE_DIR, "macro_day.csv"),
@@ -124,6 +125,7 @@ st.sidebar.caption("VAL/VAH: approximate activity-weighted value area from bot o
 
 m = load_csv(MARKET_CSV)
 t = load_csv(TRADES_CSV)
+o = load_csv(ORDERS_CSV)
 ml = load_csv(MACRO_LEVELS_CSV)
 
 if m.empty:
@@ -200,7 +202,17 @@ if latest_row is not None:
 
 
 if not t.empty and all(c in t.columns for c in ["ts", "product_id", "side", "price"]):
-    t = numeric(t, ["ts", "price", "cum_pnl_usd", "net_pnl_usd"])
+    t = numeric(t, ["ts", "price", "qty", "notional_usd", "cum_pnl_usd", "net_pnl_usd"])
+
+    if "event" in t.columns:
+        t = t[t["event"].isin(["BUY", "SELL", "STARTUP_LIQUIDATION"])].copy()
+
+    if "qty" in t.columns:
+        t = t[pd.to_numeric(t["qty"], errors="coerce").fillna(0.0) > 0].copy()
+
+    if "price" in t.columns:
+        t = t[pd.to_numeric(t["price"], errors="coerce").fillna(0.0) > 0].copy()
+
     t_prod = t[t["product_id"] == product].copy()
     if not t_prod.empty:
         t_prod["dt"] = to_dt_mst(t_prod["ts"])
@@ -226,8 +238,12 @@ if "fair_value" in m_prod.columns:
         axp.plot(m_prod["dt"], fv, linewidth=1, linestyle="--", label="fair value")
 
 if not t_prod.empty:
-    buys = t_prod[t_prod["side"] == "BUY"]
-    sells = t_prod[t_prod["side"] == "SELL"]
+    if "event" in t_prod.columns:
+        buys = t_prod[(t_prod["event"] == "BUY") & (t_prod["side"] == "BUY")]
+        sells = t_prod[(t_prod["event"].isin(["SELL", "STARTUP_LIQUIDATION"])) & (t_prod["side"] == "SELL")]
+    else:
+        buys = t_prod[t_prod["side"] == "BUY"]
+        sells = t_prod[t_prod["side"] == "SELL"]
     if not buys.empty:
         axp.scatter(buys["dt"], buys["price"], marker="^", s=80, color="blue", edgecolors="white", linewidths=0.5, zorder=6, label="BUY")
     if not sells.empty:
@@ -268,3 +284,24 @@ else:
         cols = ["dt_mst"] + [c for c in t_sorted.columns if c != "dt_mst"]
         t_sorted = t_sorted[cols]
     st.dataframe(t_sorted, width='stretch', height=780)
+
+
+st.subheader("Recent order attempts")
+if not o.empty:
+    o = numeric(o, [
+        "ts", "requested_quote_usd", "requested_base_qty",
+        "filled_qty", "avg_price", "filled_notional_usd", "fee_usd"
+    ])
+    if "ts" in o.columns:
+        o = o.sort_values("ts", ascending=False)
+    show_cols = [
+        c for c in [
+            "dt_mst", "event", "product_id", "side", "mode",
+            "requested_quote_usd", "requested_base_qty",
+            "ok", "status", "filled_qty", "avg_price",
+            "filled_notional_usd", "fee_usd", "reason", "raw_error"
+        ] if c in o.columns
+    ]
+    st.dataframe(o[show_cols].head(30), use_container_width=True)
+else:
+    st.write("No order attempts logged yet.")

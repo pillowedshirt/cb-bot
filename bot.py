@@ -152,7 +152,7 @@ STARTUP_LIQUIDATION_USE_MARKET: bool = True
 
 # Skip tiny balances whose estimated USD value is below this threshold.
 # Your current $1–$2 holdings may be near exchange minimums, so some sells may fail or be skipped.
-MIN_STARTUP_LIQUIDATION_USD: float = 1.00
+MIN_STARTUP_LIQUIDATION_USD: float = 0.01
 
 # How long to wait for websocket top-of-book prices before startup reconciliation.
 STARTUP_TOB_TIMEOUT_SEC: float = 30.0
@@ -3222,17 +3222,39 @@ class TradingBot:
 
     async def _wait_for_tob_ready(self, timeout_sec: float = STARTUP_TOB_TIMEOUT_SEC) -> None:
         """
-        Wait until at least one top-of-book price is available.
-        Startup liquidation needs bid prices for estimated USD value.
+        Wait for top-of-book prices for all configured products before startup reconciliation.
+        This prevents startup liquidation from skipping products simply because the websocket
+        has not received their first bid/ask yet.
         """
         t0 = now_ts()
+        last_log = 0.0
+
         while now_ts() - t0 < float(timeout_sec):
-            ready = [p for p in PRODUCTS if self.tob.get(p) is not None]
-            if ready:
-                log(f"[startup] top-of-book ready for {len(ready)}/{len(PRODUCTS)} products")
+            ready = [
+                p for p in PRODUCTS
+                if self.tob.get(p) is not None
+                and self.tob[p].bid > 0
+                and self.tob[p].ask > 0
+            ]
+
+            if len(ready) >= len(PRODUCTS):
+                log(f"[startup] top-of-book ready for all {len(ready)}/{len(PRODUCTS)} products")
                 return
+
+            if now_ts() - last_log >= 5.0:
+                missing = [p for p in PRODUCTS if p not in ready]
+                log(f"[startup] waiting for top-of-book | ready={len(ready)}/{len(PRODUCTS)} missing={missing}")
+                last_log = now_ts()
+
             await asyncio.sleep(0.25)
-        log("[startup] top-of-book wait timed out; continuing with available prices only")
+
+        missing = [
+            p for p in PRODUCTS
+            if self.tob.get(p) is None
+            or self.tob[p].bid <= 0
+            or self.tob[p].ask <= 0
+        ]
+        log(f"[startup] top-of-book wait timed out; missing={missing}; liquidation will skip products without valid bid/ask")
 
     def _live_mid_by_product(self) -> Dict[str, float]:
         mids: Dict[str, float] = {}
@@ -3331,8 +3353,28 @@ class TradingBot:
             if est_usd < MIN_STARTUP_LIQUIDATION_USD:
                 log(
                     f"[startup-liquidation] skipping {product_id}: estimated value ${est_usd:.4f} "
-                    f"is below MIN_STARTUP_LIQUIDATION_USD=${MIN_STARTUP_LIQUIDATION_USD:.2f}"
+                    f"is below MIN_STARTUP_LIQUIDATION_USD=${MIN_STARTUP_LIQUIDATION_USD:.2f}; adopting as managed holding"
                 )
+
+                if total_qty > 1e-12 and tob and tob.mid > 0:
+                    approx_entry = float(tob.mid)
+                    self.positions[product_id] = [
+                        PositionLot(
+                            qty=float(total_qty),
+                            price=approx_entry,
+                            tier=TIER_LOW,
+                            score=0.0,
+                            meta={
+                                "coinbase_existing_tiny_balance": True,
+                                "scalp_done": False,
+                                "core_done": False,
+                            },
+                        )
+                    ]
+                    self.position_start_ts[product_id] = now_ts()
+                    self.position_entry_price[product_id] = approx_entry
+                    self.peak_bid[product_id] = float(tob.bid)
+
                 skipped_count += 1
                 continue
 
@@ -3359,6 +3401,36 @@ class TradingBot:
                 if fill is None:
                     log(f"[startup-liquidation] sell did not fill for {product_id}: {r}")
                     skipped_count += 1
+
+                    # If the sell failed, adopt the remaining Coinbase balance so the normal
+                    # exit logic can still see and manage it instead of leaving it invisible
+                    # to self.positions.
+                    try:
+                        snap_after_fail = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                        remaining_qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap_after_fail or {})
+                        tob_after_fail = self.tob.get(product_id)
+                        if remaining_qty > 1e-12 and tob_after_fail and tob_after_fail.mid > 0:
+                            approx_entry = float(tob_after_fail.mid)
+                            self.positions[product_id] = [
+                                PositionLot(
+                                    qty=float(remaining_qty),
+                                    price=approx_entry,
+                                    tier=TIER_LOW,
+                                    score=0.0,
+                                    meta={
+                                        "coinbase_existing_after_failed_liquidation": True,
+                                        "scalp_done": False,
+                                        "core_done": False,
+                                    },
+                                )
+                            ]
+                            self.position_start_ts[product_id] = now_ts()
+                            self.position_entry_price[product_id] = approx_entry
+                            self.peak_bid[product_id] = float(tob_after_fail.bid)
+                            log(f"[startup-liquidation] adopted remaining {product_id} qty={remaining_qty:.12f} after failed sell")
+                    except Exception as adopt_err:
+                        log(f"[startup-liquidation] could not adopt remaining {product_id} after failed sell: {adopt_err}")
+
                     continue
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill

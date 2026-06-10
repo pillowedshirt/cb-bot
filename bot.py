@@ -132,9 +132,51 @@ EVAL_TICK_SEC: float = 2.0
 
 # Allocation / exposure
 MAX_OPEN_POSITIONS: int = 20
+
+# Minimum Coinbase order size guard.
+# This is a bot-side minimum. Coinbase may still enforce product-specific minimums.
 MIN_ENTRY_USD: float = 1.0
+MIN_LIVE_ORDER_USD: float = 5.0
+
+# Old fixed-dollar sizing is disabled.
 ENTRY_SIZE_USD: float = 8.0
-MAX_EXPOSURE_PER_PRODUCT_USD: float = 80.0
+USE_FIXED_ENTRY_SIZE_USD: bool = False
+
+# New probability-weighted percentage-of-equity sizing.
+USE_EQUITY_PERCENT_POSITION_SIZING: bool = True
+
+# A single new buy can be 5%–20% of total account equity.
+# Total equity means cash + positions valued using live mids.
+MIN_POSITION_PCT_OF_EQUITY: float = 0.05
+MAX_SINGLE_BUY_PCT_OF_EQUITY: float = 0.20
+
+# Max total exposure per product can reach 50% of total equity through scale-ins.
+MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.50
+
+# Probability mapping:
+# estimated probability <= 55% gets minimum size.
+# estimated probability >= 80% gets maximum single-buy size.
+PROB_FOR_MIN_SIZE: float = 0.55
+PROB_FOR_MAX_SIZE: float = 0.80
+
+# Cash reserve.
+# The bot will not intentionally spend this final amount.
+RESERVE_USD: float = 2.00
+
+# Capital rotation:
+# If available cash is insufficient for a stronger setup, the bot may sell weaker
+# existing positions only when they are net-profitable after estimated fees.
+ENABLE_PROFITABLE_ROTATION: bool = True
+ROTATION_MIN_NEW_PROB_ADVANTAGE: float = 0.08
+ROTATION_MIN_NEW_SCORE_ADVANTAGE: float = 8.0
+ROTATION_MIN_NET_PROFIT_BPS: float = 15.0
+ROTATION_SELL_FRACTION: float = 1.0
+
+# Coinbase fee-tier auto-refresh.
+AUTO_REFRESH_COINBASE_FEE_TIER: bool = True
+FEE_TIER_REFRESH_SEC: float = 60 * 60
+FEE_TIER_FALLBACK_MAKER_BPS: float = 40.0
+FEE_TIER_FALLBACK_TAKER_BPS: float = 60.0
 
 # Coinbase portfolio source-of-truth behavior.
 # In live mode, Coinbase balances and fills should be treated as authoritative.
@@ -157,13 +199,6 @@ MIN_STARTUP_LIQUIDATION_USD: float = 0.01
 
 # How long to wait for websocket top-of-book prices before startup reconciliation.
 STARTUP_TOB_TIMEOUT_SEC: float = 30.0
-
-# Keep a small USD reserve so the bot does not try to deploy every penny.
-RESERVE_USD: float = 2.00
-
-# Fixed entry sizing mode.
-# This makes ENTRY_SIZE_USD actually control buy size instead of the current percentage-based sizing.
-USE_FIXED_ENTRY_SIZE_USD: bool = True
 
 TARGET_UTIL_MIN: float = 0.35
 TARGET_UTIL_MID: float = 0.65
@@ -328,6 +363,14 @@ def now_ts_i() -> int:
 def bps_to_mult(bps: float) -> float:
     """Convert basis points to multiplicative factor (e.g. 50 bps → 1.005)."""
     return 1.0 + (bps / 10_000.0)
+
+
+def clamp_float(x: float, lo: float, hi: float) -> float:
+    return float(max(float(lo), min(float(hi), float(x))))
+
+
+def lerp_float(a: float, b: float, t: float) -> float:
+    return float(float(a) + (float(b) - float(a)) * float(t))
 
 
 def fee_usd(notional_usd: float, fee_bps: float) -> float:
@@ -2207,6 +2250,91 @@ class LivePortfolio:
 
         return float(max(0.0, equity))
 
+    def get_fee_tier_bps(self) -> Tuple[Optional[float], Optional[float], str]:
+        """
+        Try to read the account's Coinbase Advanced fee tier.
+
+        Returns:
+            (maker_fee_bps, taker_fee_bps, reason)
+
+        Coinbase typically returns decimal rates:
+            "0.0060" = 0.60% = 60 bps
+
+        This method is intentionally defensive because Coinbase SDK method
+        signatures can differ by installed SDK version.
+        """
+        resp = None
+        last_err = ""
+
+        call_attempts = [
+            lambda: self.rest.get_transaction_summary(),
+            lambda: self.rest.get_transaction_summary(product_type="SPOT"),
+            lambda: self.rest.get_transaction_summary(product_type="UNKNOWN_PRODUCT_TYPE"),
+        ]
+
+        for fn in call_attempts:
+            try:
+                resp = fn()
+                break
+            except Exception as e:
+                last_err = str(e)
+                resp = None
+
+        if resp is None:
+            return None, None, f"fee_tier_unavailable: {last_err}"
+
+        d = self._to_dict(resp)
+
+        # Coinbase SDKs may wrap the payload differently.
+        candidates = [
+            d,
+            d.get("transaction_summary") if isinstance(d, dict) else None,
+            d.get("summary") if isinstance(d, dict) else None,
+        ]
+
+        fee_tier = None
+        for c in candidates:
+            if isinstance(c, dict) and isinstance(c.get("fee_tier"), dict):
+                fee_tier = c.get("fee_tier")
+                break
+
+        if not isinstance(fee_tier, dict):
+            # Sometimes nested response objects are lists or under data.
+            data = d.get("data") if isinstance(d, dict) else None
+            if isinstance(data, dict) and isinstance(data.get("fee_tier"), dict):
+                fee_tier = data.get("fee_tier")
+
+        if not isinstance(fee_tier, dict):
+            keys = list(d.keys()) if isinstance(d, dict) else type(d)
+            return None, None, f"fee_tier_missing_in_response keys={keys}"
+
+        maker_raw = (
+            fee_tier.get("maker_fee_rate")
+            or fee_tier.get("maker_fee")
+            or fee_tier.get("maker_rate")
+        )
+        taker_raw = (
+            fee_tier.get("taker_fee_rate")
+            or fee_tier.get("taker_fee")
+            or fee_tier.get("taker_rate")
+        )
+
+        try:
+            maker_bps = float(maker_raw) * 10000.0
+            taker_bps = float(taker_raw) * 10000.0
+        except Exception as e:
+            return None, None, f"fee_tier_parse_error: {e}; fee_tier={fee_tier}"
+
+        if maker_bps < 0 or taker_bps < 0 or maker_bps > 500 or taker_bps > 500:
+            return None, None, f"fee_tier_out_of_range maker={maker_bps} taker={taker_bps}"
+
+        pricing_tier = str(fee_tier.get("pricing_tier") or fee_tier.get("tier") or "")
+        return (
+            float(maker_bps),
+            float(taker_bps),
+            f"fee_tier_ok {pricing_tier} maker={maker_bps:.2f}bps taker={taker_bps:.2f}bps",
+        )
+
     def sync_after_trade(self, attempts: int = 8, sleep_sec: float = 0.5) -> None:
         """Force-refresh balances a few times to let Coinbase settle post-trade."""
         for _ in range(max(1, int(attempts))):
@@ -2846,6 +2974,14 @@ class TradingBot:
         self.trade_timestamps: Deque[float] = deque(maxlen=500)
         self.product_trade_timestamps: Dict[str, Deque[float]] = {p: deque(maxlen=200) for p in PRODUCTS}
         self.scale_add_count: Dict[str, int] = {p: 0 for p in PRODUCTS}
+
+        # Dynamic Coinbase fee state.
+        # Defaults are conservative until Coinbase fee tier is successfully detected.
+        self.current_maker_fee_bps: float = float(FEE_TIER_FALLBACK_MAKER_BPS)
+        self.current_taker_fee_bps: float = float(FEE_TIER_FALLBACK_TAKER_BPS)
+        self.last_fee_tier_refresh_ts: float = 0.0
+        self.last_fee_tier_reason: str = "not_refreshed_yet"
+
     async def preload_micro_history(self) -> None:
         """Preload the last MICRO_PRELOAD_MINUTES of 1m candles into micro buffers at startup.
 
@@ -3055,7 +3191,7 @@ class TradingBot:
                 pass
         else:
             if self.portfolio:
-                self.portfolio.credit(sold_qty * exec_price, TAKER_FEE_BPS)
+                self.portfolio.credit(sold_qty * exec_price, self._exit_fee_bps_for_mode())
 
         return sold_qty, exec_price, fee
 
@@ -3088,7 +3224,7 @@ class TradingBot:
             fee = 0.0
             qty_sold = float(qty)
             if self.portfolio:
-                self.portfolio.credit(qty_sold * exec_price, TAKER_FEE_BPS)
+                self.portfolio.credit(qty_sold * exec_price, self._exit_fee_bps_for_mode())
 
         self.tlog.log_trade(
             event="SELL",
@@ -3298,6 +3434,55 @@ class TradingBot:
         return float(min(max(k, TRAIL_K_MIN), TRAIL_K_MAX))
 
 
+    async def _refresh_coinbase_fee_tier_if_needed(self, *, force: bool = False) -> None:
+        """
+        Refresh Coinbase maker/taker fee bps from transaction_summary when available.
+        Falls back to conservative configured values if unavailable.
+        """
+        if not AUTO_REFRESH_COINBASE_FEE_TIER:
+            return
+        if not isinstance(self.portfolio, LivePortfolio):
+            return
+
+        t = now_ts()
+        if (not force) and (t - float(self.last_fee_tier_refresh_ts or 0.0)) < float(FEE_TIER_REFRESH_SEC):
+            return
+
+        try:
+            maker_bps, taker_bps, reason = await asyncio.to_thread(self.portfolio.get_fee_tier_bps)
+            if maker_bps is not None and taker_bps is not None:
+                self.current_maker_fee_bps = float(maker_bps)
+                self.current_taker_fee_bps = float(taker_bps)
+                self.last_fee_tier_reason = reason
+                log(f"[fee-tier] refreshed {reason}")
+            else:
+                self.current_maker_fee_bps = float(FEE_TIER_FALLBACK_MAKER_BPS)
+                self.current_taker_fee_bps = float(FEE_TIER_FALLBACK_TAKER_BPS)
+                self.last_fee_tier_reason = reason
+                log(
+                    f"[fee-tier] using fallback maker={self.current_maker_fee_bps:.2f}bps "
+                    f"taker={self.current_taker_fee_bps:.2f}bps reason={reason}"
+                )
+        except Exception as e:
+            self.current_maker_fee_bps = float(FEE_TIER_FALLBACK_MAKER_BPS)
+            self.current_taker_fee_bps = float(FEE_TIER_FALLBACK_TAKER_BPS)
+            self.last_fee_tier_reason = f"fee_tier_exception: {e}"
+            log(f"[fee-tier] fallback after exception: {e}")
+
+        self.last_fee_tier_refresh_ts = t
+
+    def _entry_fee_bps_for_mode(self) -> float:
+        mode = str(ENTRY_EXECUTION_MODE).upper().strip()
+        if mode in ("MARKET", "LIMIT_THEN_MARKET"):
+            return float(self.current_taker_fee_bps)
+        return float(self.current_maker_fee_bps)
+
+    def _exit_fee_bps_for_mode(self) -> float:
+        mode = str(EXIT_EXECUTION_MODE).upper().strip()
+        if mode in ("MARKET", "LIMIT_THEN_MARKET"):
+            return float(self.current_taker_fee_bps)
+        return float(self.current_maker_fee_bps)
+
     def _round_trip_cost_bps(
         self,
         *,
@@ -3308,8 +3493,16 @@ class TradingBot:
         entry_mode = str(entry_mode or ENTRY_EXECUTION_MODE).upper().strip()
         exit_mode = str(exit_mode or EXIT_EXECUTION_MODE).upper().strip()
 
-        entry_fee = TAKER_FEE_BPS if entry_mode in ("MARKET", "LIMIT_THEN_MARKET") else MAKER_FEE_BPS
-        exit_fee = TAKER_FEE_BPS if exit_mode in ("MARKET", "LIMIT_THEN_MARKET") else MAKER_FEE_BPS
+        entry_fee = (
+            float(self.current_taker_fee_bps)
+            if entry_mode in ("MARKET", "LIMIT_THEN_MARKET")
+            else float(self.current_maker_fee_bps)
+        )
+        exit_fee = (
+            float(self.current_taker_fee_bps)
+            if exit_mode in ("MARKET", "LIMIT_THEN_MARKET")
+            else float(self.current_maker_fee_bps)
+        )
 
         return float(
             entry_fee
@@ -3372,6 +3565,78 @@ class TradingBot:
         cost_bps = self._round_trip_cost_bps(spread_bps=spread_bps)
         net_bps = float(target_bps - cost_bps)
         return net_bps, target_bps, cost_bps
+
+    def _estimate_prob_up_from_candidate(
+        self,
+        *,
+        score: float,
+        expected_net_edge_bps: float,
+        spread_bps: float,
+        target_bps: Optional[float] = None,
+        cost_bps: Optional[float] = None,
+        trending_down: bool = False,
+        vwap_ok: bool = False,
+        higher_low_ok: bool = False,
+    ) -> float:
+        """
+        Estimate probability that price reaches the intended profitable move from the buy point.
+
+        This is not a true statistical probability yet.
+        It is a calibrated probability proxy based on signal quality.
+        Later, it can be calibrated from actual trades.csv outcomes.
+        """
+        s = clamp_float(float(score), 0.0, 100.0)
+
+        # Base probability from score:
+        # score 50 => about 55%
+        # score 80 => about 70%
+        # score 100 => about 80%
+        prob = 0.50 + ((s - 40.0) / 150.0)
+
+        # Fee-adjusted edge matters.
+        if expected_net_edge_bps >= MIN_REQUIRED_NET_EDGE_BPS:
+            prob += 0.03
+        if expected_net_edge_bps >= MIN_REQUIRED_NET_EDGE_BPS * 1.75:
+            prob += 0.04
+        if expected_net_edge_bps < MIN_REQUIRED_NET_EDGE_BPS:
+            prob -= 0.08
+
+        # Target-to-cost quality.
+        if target_bps is not None and cost_bps is not None and cost_bps > 0:
+            ratio = float(target_bps) / float(cost_bps)
+            if ratio >= 4.0:
+                prob += 0.04
+            elif ratio >= 3.0:
+                prob += 0.02
+            elif ratio < MIN_TARGET_TO_COST_MULT:
+                prob -= 0.08
+
+        # Confirmation boosts.
+        if vwap_ok:
+            prob += 0.025
+        if higher_low_ok:
+            prob += 0.025
+
+        # Trend/spread penalties.
+        if trending_down:
+            prob -= 0.07
+        if spread_bps > SCALP_MAX_SPREAD_BPS:
+            prob -= 0.03
+        if spread_bps > MAX_SPREAD_BPS:
+            prob -= 0.10
+
+        return clamp_float(prob, 0.50, 0.85)
+
+    def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
+        """
+        Map estimated probability to a single-buy percentage of total equity.
+        55% or lower => 5%.
+        80% or higher => 20%.
+        """
+        p = clamp_float(float(estimated_prob_up), 0.0, 1.0)
+        denom = max(1e-9, float(PROB_FOR_MAX_SIZE) - float(PROB_FOR_MIN_SIZE))
+        t = clamp_float((p - float(PROB_FOR_MIN_SIZE)) / denom, 0.0, 1.0)
+        return lerp_float(MIN_POSITION_PCT_OF_EQUITY, MAX_SINGLE_BUY_PCT_OF_EQUITY, t)
 
     def _micro_trending_down(self, product_id: str) -> Tuple[bool, str]:
         series = self.live_1m.get(product_id)
@@ -3663,11 +3928,32 @@ class TradingBot:
 
 
 
-    async def _live_can_afford(self, notional_usd: float, fee_bps: float) -> bool:
-        """Non-blocking afford-check for LivePortfolio (runs REST snapshot in a worker thread)."""
+    async def _live_can_afford(self, notional_usd: float, fee_bps: Optional[float] = None) -> bool:
+        """
+        Confirm there is enough available Coinbase USD for the requested buy.
+        Uses Coinbase available USD as the authority.
+        """
+        if fee_bps is None:
+            fee_bps = self._entry_fee_bps_for_mode()
+
+        notional_usd = float(max(0.0, notional_usd))
+        if notional_usd <= 0:
+            return False
+
+        if isinstance(self.portfolio, PaperPortfolio):
+            return bool(self.portfolio.can_afford(notional_usd, float(fee_bps)))
+
         if not isinstance(self.portfolio, LivePortfolio):
-            return bool(self.portfolio.can_afford(notional_usd, fee_bps)) if self.portfolio else False
-        return bool(await asyncio.to_thread(self.portfolio.can_afford, float(notional_usd), float(fee_bps)))
+            return False
+
+        def _check() -> bool:
+            snap = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
+            available = self.portfolio.get_tradable_usd(snapshot=snap)
+            required = notional_usd * (1.0 + float(fee_bps) / 10000.0)
+            required += float(RESERVE_USD)
+            return available >= required
+
+        return bool(await asyncio.to_thread(_check))
 
     async def _live_refresh_snapshot(self, *, force: bool = True, ttl_sec: float = 0.0) -> Optional[Dict[str, Dict[str, float]]]:
         """Refresh live balances snapshot from Coinbase in a worker thread (non-blocking for event loop)."""
@@ -3978,6 +4264,9 @@ class TradingBot:
             log("[run] reconciling live Coinbase portfolio before trading")
             await self._startup_portfolio_reconcile()
 
+        if isinstance(self.portfolio, LivePortfolio):
+            await self._refresh_coinbase_fee_tier_if_needed(force=True)
+
         log("[run] starting macro / evaluation / telemetry tasks")
         tasks = [
             ws_task,
@@ -4165,6 +4454,202 @@ class TradingBot:
 
         return sum(1 for lots in self.positions.values() if sum(l.qty for l in lots) > 0)
 
+    def _estimate_position_unrealized_net_bps(self, product_id: str, bid: float) -> Optional[float]:
+        lots = self.positions.get(product_id, [])
+        qty = sum(l.qty for l in lots)
+        if qty <= 0:
+            return None
+        cost = sum(l.qty * l.price for l in lots)
+        if cost <= 0:
+            return None
+        avg_entry = cost / qty
+        spread_bps = 0.0
+        tob = self.tob.get(product_id)
+        if tob and tob.mid > 0:
+            spread_bps = tob.spread_bps
+        gross_bps = ((float(bid) / float(avg_entry)) - 1.0) * 10000.0
+        exit_cost_bps = (
+            self._exit_fee_bps_for_mode()
+            + EST_SLIPPAGE_BPS
+            + ROUND_TRIP_SAFETY_BPS
+            + float(spread_bps)
+        )
+        return float(gross_bps - exit_cost_bps)
+
+    def _position_score_for_rotation(self, product_id: str) -> float:
+        lots = self.positions.get(product_id, [])
+        if not lots:
+            return 0.0
+        try:
+            return float(max(l.score for l in lots))
+        except Exception:
+            return 0.0
+
+    def _position_prob_for_rotation(self, product_id: str) -> float:
+        lots = self.positions.get(product_id, [])
+        if not lots:
+            return 0.0
+        # Existing lots may not have probability in meta yet, so fall back from score.
+        probs = []
+        for lot in lots:
+            try:
+                probability = float(lot.meta.get("estimated_prob_up"))
+            except Exception:
+                probability = self._estimate_prob_up_from_candidate(
+                    score=float(lot.score),
+                    expected_net_edge_bps=MIN_REQUIRED_NET_EDGE_BPS,
+                    spread_bps=0.0,
+                )
+            probs.append(probability)
+        return float(max(probs)) if probs else 0.0
+
+    async def _try_rotate_capital_for_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        needed_cash_usd: float,
+        equity_usd: float,
+    ) -> float:
+        """
+        If a stronger setup appears but available cash is insufficient, sell weaker
+        existing positions only if they are net-positive after fees.
+
+        Returns additional cash likely freed.
+        """
+        if not ENABLE_PROFITABLE_ROTATION:
+            return 0.0
+        if needed_cash_usd <= 0:
+            return 0.0
+        if not isinstance(self.portfolio, LivePortfolio):
+            return 0.0
+
+        new_product = str(candidate["product_id"])
+        new_prob = float(candidate.get("estimated_prob_up", 0.0))
+        new_score = float(candidate.get("score", 0.0))
+
+        rotation_candidates: List[Tuple[float, str, float, float]] = []
+        snapshot: Optional[Dict[str, Dict[str, float]]] = None
+        if SOURCE_OF_TRUTH_COINBASE:
+            try:
+                snapshot = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+            except Exception:
+                snapshot = None
+
+        for held_product in PRODUCTS:
+            if held_product == new_product:
+                continue
+
+            tob = self.tob.get(held_product)
+            if not tob or tob.bid <= 0 or tob.ask <= 0:
+                continue
+
+            held_qty = sum(l.qty for l in self.positions.get(held_product, []))
+            if SOURCE_OF_TRUTH_COINBASE and snapshot is not None:
+                held_qty = self.portfolio.get_product_available_qty(held_product, snapshot=snapshot)
+
+            if held_qty <= 1e-12:
+                continue
+
+            held_prob = self._position_prob_for_rotation(held_product)
+            held_score = self._position_score_for_rotation(held_product)
+            net_bps = self._estimate_position_unrealized_net_bps(held_product, tob.bid)
+
+            if net_bps is None or net_bps < ROTATION_MIN_NET_PROFIT_BPS:
+                continue
+
+            probability_advantage = new_prob - held_prob
+            score_advantage = new_score - held_score
+            if (
+                probability_advantage < ROTATION_MIN_NEW_PROB_ADVANTAGE
+                and score_advantage < ROTATION_MIN_NEW_SCORE_ADVANTAGE
+            ):
+                continue
+
+            est_value = float(held_qty) * float(tob.bid)
+            # Lower priority number sells first: weakest probability, then lower score.
+            priority = held_prob + (held_score / 200.0)
+            rotation_candidates.append((priority, held_product, held_qty, est_value))
+
+        rotation_candidates.sort(key=lambda item: item[0])
+
+        freed = 0.0
+        for _priority, held_product, held_qty, est_value in rotation_candidates:
+            if freed >= needed_cash_usd:
+                break
+
+            tob = self.tob.get(held_product)
+            if not tob:
+                continue
+
+            sell_qty = float(held_qty) * float(ROTATION_SELL_FRACTION)
+            if sell_qty <= 0:
+                continue
+
+            log(
+                f"[rotation] selling weaker profitable {held_product} to fund {new_product} "
+                f"sell_qty={sell_qty:.12f} est_value=${est_value:.2f} "
+                f"new_prob={new_prob:.3f} equity=${equity_usd:.2f}"
+            )
+
+            fill = await self._execute_live_sell(
+                product_id=held_product,
+                base_qty=sell_qty,
+                bid=float(tob.bid),
+                ask=float(tob.ask),
+                reason=f"profitable_rotation_to_{new_product}",
+            )
+
+            if fill is None:
+                continue
+
+            filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+            filled_qty = float(filled_qty)
+            avg_px = float(avg_px)
+            fee = float(fee_val)
+            notional_usd = (
+                float(filled_notional)
+                if filled_notional is not None
+                else filled_qty * avg_px
+            )
+
+            lots = self.positions.get(held_product, [])
+            fifo_cost, fifo_avg_entry = self._fifo_cost_basis(list(lots), filled_qty)
+            pnl_gross = float(notional_usd) - float(fifo_cost)
+
+            self.tlog.log_trade(
+                event="SELL",
+                product_id=held_product,
+                side="SELL",
+                qty=filled_qty,
+                price=avg_px,
+                fee_usd_val=fee,
+                gross_pnl_usd=pnl_gross,
+                net_pnl_usd=pnl_gross - fee,
+                entry_price=(fifo_avg_entry if fifo_avg_entry is not None else None),
+                exit_price=avg_px,
+                weekly_bias=None,
+                note=f"profitable_rotation_to_{new_product}",
+                filled_notional_usd=notional_usd,
+                exit_role="profitable_rotation",
+            )
+
+            self._record_trade_timestamp(held_product)
+            self._record_realized_trade_result(pnl_gross - fee)
+            self._fifo_reduce_lots(held_product, filled_qty)
+
+            freed += max(0.0, notional_usd - fee)
+
+            if sum(l.qty for l in self.positions.get(held_product, [])) <= 1e-12:
+                self.positions[held_product] = []
+                self.position_start_ts[held_product] = None
+                self.position_entry_price[held_product] = None
+                self.peak_bid[held_product] = None
+                self.scale_add_count[held_product] = 0
+
+            await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+
+        return float(freed)
+
     def compute_entry_notional(
         self,
         *,
@@ -4175,18 +4660,60 @@ class TradingBot:
         candidate_score: float,
         open_position_count: int,
         strong_candidate_count: int,
+        estimated_prob_up: Optional[float] = None,
     ) -> float:
-        if available_cash_usd <= 0:
+        """
+        Compute buy size.
+
+        New preferred behavior:
+        - total equity = cash + positions
+        - single buy = 5%–20% of total equity based on estimated probability
+        - max exposure per product = 50% of total equity
+        - never spend unavailable cash
+        """
+        available_cash_usd = float(max(0.0, available_cash_usd))
+        current_equity_usd = float(max(0.0, current_equity_usd))
+        current_product_exposure_usd = float(max(0.0, current_product_exposure_usd))
+
+        if available_cash_usd <= 0 or current_equity_usd <= 0:
             return 0.0
 
+        spendable_cash = max(0.0, available_cash_usd - float(RESERVE_USD))
+        if spendable_cash <= 0:
+            return 0.0
+
+        if USE_EQUITY_PERCENT_POSITION_SIZING:
+            prob = estimated_prob_up
+            if prob is None:
+                # Fallback from score only.
+                prob = self._estimate_prob_up_from_candidate(
+                    score=float(candidate_score),
+                    expected_net_edge_bps=MIN_REQUIRED_NET_EDGE_BPS,
+                    spread_bps=0.0,
+                )
+
+            single_buy_pct = self._position_pct_from_probability(float(prob))
+            proposed = current_equity_usd * float(single_buy_pct)
+
+            max_product_exposure = current_equity_usd * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
+            remaining_product_room = max(0.0, max_product_exposure - current_product_exposure_usd)
+
+            proposed = min(proposed, remaining_product_room, spendable_cash)
+
+            if proposed < max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD)):
+                return 0.0
+
+            return float(proposed)
+
         if USE_FIXED_ENTRY_SIZE_USD:
-            spendable_cash = max(0.0, float(available_cash_usd) - float(RESERVE_USD))
-            remaining_room = max(0.0, MAX_EXPOSURE_PER_PRODUCT_USD - current_product_exposure_usd)
-            proposed = min(float(ENTRY_SIZE_USD), spendable_cash, remaining_room)
-            if proposed < MIN_ENTRY_USD:
+            max_product_exposure = current_equity_usd * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
+            remaining_product_room = max(0.0, max_product_exposure - current_product_exposure_usd)
+            proposed = min(float(ENTRY_SIZE_USD), spendable_cash, remaining_product_room)
+            if proposed < max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD)):
                 return 0.0
             return float(proposed)
 
+        # Legacy dynamic fallback. Kept only as backup.
         if candidate_score >= HIGH_SCORE_UTIL_THRESHOLD:
             util_target = TARGET_UTIL_MAX
         elif candidate_score >= MID_SCORE_UTIL_THRESHOLD:
@@ -4199,7 +4726,6 @@ class TradingBot:
 
         target_gross_exposure = current_equity_usd * util_target
         deployable_gap = max(0.0, target_gross_exposure - current_total_exposure_usd)
-
         score_weight = max(0.35, min(1.0, candidate_score / 100.0))
 
         if candidate_score >= 80.0:
@@ -4209,19 +4735,15 @@ class TradingBot:
         else:
             base_alloc_frac = 0.045
 
-        if open_position_count >= 12:
-            base_alloc_frac *= 0.90
-        if open_position_count >= 18:
-            base_alloc_frac *= 0.80
-
         proposed = available_cash_usd * base_alloc_frac * score_weight
         if deployable_gap > 0:
             proposed = min(proposed, deployable_gap)
 
-        remaining_room = max(0.0, MAX_EXPOSURE_PER_PRODUCT_USD - current_product_exposure_usd)
-        proposed = min(proposed, remaining_room)
+        max_product_exposure = current_equity_usd * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
+        remaining_room = max(0.0, max_product_exposure - current_product_exposure_usd)
+        proposed = min(proposed, remaining_room, spendable_cash)
 
-        if proposed < MIN_ENTRY_USD:
+        if proposed < max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD)):
             return 0.0
 
         return float(proposed)
@@ -4229,6 +4751,7 @@ class TradingBot:
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
+            await self._refresh_coinbase_fee_tier_if_needed(force=False)
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:
                     cash_usd = float(self.portfolio.cash_usd)
@@ -4295,7 +4818,7 @@ class TradingBot:
                         if can_exit_net_positive(
                             entry_price=avg_entry_price,
                             exit_price=bid,
-                            taker_fee_bps=TAKER_FEE_BPS,
+                            taker_fee_bps=self._exit_fee_bps_for_mode(),
                             est_slippage_bps=EST_SLIPPAGE_BPS,
                             est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
                             min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
@@ -4308,7 +4831,7 @@ class TradingBot:
                         if can_exit_net_positive(
                             entry_price=avg_entry_price,
                             exit_price=bid,
-                            taker_fee_bps=TAKER_FEE_BPS,
+                            taker_fee_bps=self._exit_fee_bps_for_mode(),
                             est_slippage_bps=EST_SLIPPAGE_BPS,
                             est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
                             min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
@@ -4339,7 +4862,7 @@ class TradingBot:
                         if can_exit_net_positive(
                             entry_price=avg_entry_price,
                             exit_price=bid,
-                            taker_fee_bps=TAKER_FEE_BPS,
+                            taker_fee_bps=self._exit_fee_bps_for_mode(),
                             est_slippage_bps=EST_SLIPPAGE_BPS,
                             est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
                             min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
@@ -4394,7 +4917,7 @@ class TradingBot:
                             else:
                                 sell_qty = 0.0
                         else:
-                            fee = self.portfolio.credit(notional_usd, TAKER_FEE_BPS)
+                            fee = self.portfolio.credit(notional_usd, self._exit_fee_bps_for_mode())
 
                         if sell_qty > 0:
                             fifo_cost, fifo_avg_entry = self._fifo_cost_basis(list(lots), sell_qty)
@@ -4485,6 +5008,18 @@ class TradingBot:
                         f"cost={cost_bps:.1f}; {vwap_reason}; {hl_reason}; {trend_reason}"
                     )
 
+                estimated_prob_up = self._estimate_prob_up_from_candidate(
+                    score=float(scored.score),
+                    expected_net_edge_bps=float(fee_edge_bps),
+                    spread_bps=float(spread_bps),
+                    target_bps=float(target_bps),
+                    cost_bps=float(cost_bps),
+                    trending_down=bool(trending_down),
+                    vwap_ok=bool(vwap_ok),
+                    higher_low_ok=bool(hl_ok),
+                )
+                position_pct = self._position_pct_from_probability(estimated_prob_up)
+
                 if (
                     scored.ok
                     and warmup_done
@@ -4503,6 +5038,10 @@ class TradingBot:
                         "entry_reason": scored.reason,
                         "entry_score_obj": scored,
                         "expected_net_edge_bps": scored.expected_net_edge_bps,
+                        "estimated_prob_up": float(estimated_prob_up),
+                        "position_pct": float(position_pct),
+                        "target_bps": float(target_bps),
+                        "cost_bps": float(cost_bps),
                         "weekly_bias": weekly_bias,
                     })
 
@@ -4537,7 +5076,14 @@ class TradingBot:
                     cost_penalty=scored.cost_penalty,
                 )
 
-            candidates.sort(key=lambda x: (x["score"], x["expected_net_edge_bps"]), reverse=True)
+            candidates.sort(
+                key=lambda x: (
+                    float(x.get("estimated_prob_up", 0.0)),
+                    float(x.get("expected_net_edge_bps", 0.0)),
+                    float(x.get("score", 0.0)),
+                ),
+                reverse=True,
+            )
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
 
             for candidate in candidates[:MAX_NEW_ENTRIES_PER_EVAL]:
@@ -4558,9 +5104,10 @@ class TradingBot:
                     current_total_exposure_usd=total_exposure,
                     current_equity_usd=equity_usd,
                     current_product_exposure_usd=product_exposure,
-                    candidate_score=candidate["score"],
+                    candidate_score=float(candidate["score"]),
                     open_position_count=open_count,
                     strong_candidate_count=strong_candidate_count,
+                    estimated_prob_up=float(candidate.get("estimated_prob_up", 0.55)),
                 )
 
                 if existing_qty > 1e-12:
@@ -4585,12 +5132,65 @@ class TradingBot:
                     if unrealized_net_bps < SCALE_ONLY_IF_UNREALIZED_NET_BPS_ABOVE:
                         continue
 
+                    # Scale-ins are still probability/equity based, but smaller than initial entries.
                     entry_notional = min(
                         entry_notional,
-                        float(ENTRY_SIZE_USD) * float(SCALE_ADD_FRACTION_OF_ENTRY),
+                        float(equity_usd)
+                        * float(MAX_SINGLE_BUY_PCT_OF_EQUITY)
+                        * float(SCALE_ADD_FRACTION_OF_ENTRY),
                     )
 
-                if entry_notional < MIN_ENTRY_USD or not await self._live_can_afford(entry_notional, TAKER_FEE_BPS):
+                    # Never allow total product exposure above 50% of equity.
+                    max_product_exposure = (
+                        float(equity_usd) * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
+                    )
+                    remaining_product_room = max(
+                        0.0,
+                        max_product_exposure - float(product_exposure),
+                    )
+                    entry_notional = min(entry_notional, remaining_product_room)
+
+                min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
+
+                if entry_notional < min_order:
+                    continue
+
+                entry_fee_bps = self._entry_fee_bps_for_mode()
+                can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
+
+                if not can_afford and ENABLE_PROFITABLE_ROTATION:
+                    # Refresh real cash before deciding how much is missing.
+                    if isinstance(self.portfolio, LivePortfolio):
+                        snap_before_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                        live_cash_before = self.portfolio.get_tradable_usd(
+                            snapshot=snap_before_rotation or {}
+                        )
+                    else:
+                        live_cash_before = float(self.portfolio.cash_usd if self.portfolio else 0.0)
+
+                    required_with_fee = (
+                        entry_notional * (1.0 + entry_fee_bps / 10000.0)
+                        + float(RESERVE_USD)
+                    )
+                    needed_cash = max(0.0, required_with_fee - float(live_cash_before))
+
+                    if needed_cash > 0:
+                        await self._try_rotate_capital_for_candidate(
+                            candidate=candidate,
+                            needed_cash_usd=needed_cash,
+                            equity_usd=equity_usd,
+                        )
+
+                    # Re-check affordability after possible profitable rotation.
+                    if isinstance(self.portfolio, LivePortfolio):
+                        snap_after_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                        cash_usd = self.portfolio.get_tradable_usd(
+                            snapshot=snap_after_rotation or {}
+                        )
+                    can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
+
+                if not can_afford:
+                    # Do not place buy orders when available funds are insufficient.
                     continue
 
                 bid, ask = candidate["bid"], candidate["ask"]
@@ -4615,11 +5215,18 @@ class TradingBot:
                 else:
                     qty1 = entry_notional / ask
                     buy_px1 = ask
-                    fee1 = self.portfolio.debit(entry_notional, TAKER_FEE_BPS)
+                    fee1 = self.portfolio.debit(entry_notional, self._entry_fee_bps_for_mode())
                     eff_price1 = float((entry_notional + fee1) / qty1) if qty1 > 0 else float(ask)
 
                 if qty1 > 0:
-                    lot_meta = {"scalp_done": False, "core_done": False}
+                    lot_meta = {
+                        "scalp_done": False,
+                        "core_done": False,
+                        "estimated_prob_up": float(candidate.get("estimated_prob_up", 0.0)),
+                        "position_pct": float(candidate.get("position_pct", 0.0)),
+                        "target_bps": float(candidate.get("target_bps", 0.0)),
+                        "cost_bps": float(candidate.get("cost_bps", 0.0)),
+                    }
                     existing_lots = self.positions.get(product_id, [])
                     if existing_lots:
                         existing_lots.append(
@@ -4653,7 +5260,11 @@ class TradingBot:
                         event="BUY", product_id=product_id, side="BUY", qty=qty1, price=buy_px1,
                         fee_usd_val=fee1, gross_pnl_usd=0.0, net_pnl_usd=-fee1,
                         entry_price=buy_px1, exit_price=None, weekly_bias=candidate.get("weekly_bias"),
-                        note=candidate.get("entry_reason", "score_entry"),
+                        note=(
+                            f"{candidate.get('entry_reason', 'score_entry')} "
+                            f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f} "
+                            f"pos_pct={float(candidate.get('position_pct', 0.0)):.3f}"
+                        ),
                         filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
                         entry_score=float(candidate["score"]), entry_tier=int(candidate["tier"]),
                         expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),

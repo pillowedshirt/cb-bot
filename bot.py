@@ -135,6 +135,35 @@ MIN_ENTRY_USD: float = 1.0
 ENTRY_SIZE_USD: float = 8.0
 MAX_EXPOSURE_PER_PRODUCT_USD: float = 80.0
 
+# Coinbase portfolio source-of-truth behavior.
+# In live mode, Coinbase balances and fills should be treated as authoritative.
+SOURCE_OF_TRUTH_COINBASE: bool = True
+
+# Startup handling for existing Coinbase crypto balances in PRODUCTS.
+# Options:
+#   "LIQUIDATE_EXISTING" = sell existing available balances for configured products before new entries.
+#   "ADOPT_EXISTING"    = treat existing balances as bot-managed positions using current mid as approximate entry.
+#   "IGNORE_EXISTING"   = leave existing balances alone, but still include them in equity/exposure calculations.
+LIVE_STARTUP_MODE: str = "LIQUIDATE_EXISTING"
+
+# Use market sells for startup liquidation.
+# This is more likely to exit than maker-only post-only sells, but may pay taker fees/slippage.
+STARTUP_LIQUIDATION_USE_MARKET: bool = True
+
+# Skip tiny balances whose estimated USD value is below this threshold.
+# Your current $1–$2 holdings may be near exchange minimums, so some sells may fail or be skipped.
+MIN_STARTUP_LIQUIDATION_USD: float = 1.00
+
+# How long to wait for websocket top-of-book prices before startup reconciliation.
+STARTUP_TOB_TIMEOUT_SEC: float = 30.0
+
+# Keep a small USD reserve so the bot does not try to deploy every penny.
+RESERVE_USD: float = 2.00
+
+# Fixed entry sizing mode.
+# This makes ENTRY_SIZE_USD actually control buy size instead of the current percentage-based sizing.
+USE_FIXED_ENTRY_SIZE_USD: bool = True
+
 TARGET_UTIL_MIN: float = 0.35
 TARGET_UTIL_MID: float = 0.65
 TARGET_UTIL_MAX: float = 0.90
@@ -263,6 +292,16 @@ def bps_to_mult(bps: float) -> float:
 def fee_usd(notional_usd: float, fee_bps: float) -> float:
     """Return fee in USD for a given notional and fee rate."""
     return notional_usd * (fee_bps / 10_000.0)
+
+
+def product_base_asset(product_id: str) -> str:
+    """
+    Convert a Coinbase product like 'BTC-USD' into its base asset, e.g. 'BTC'.
+    """
+    try:
+        return str(product_id).split("-")[0].strip().upper()
+    except Exception:
+        return ""
 
 
 def safe_float(x: Any) -> Optional[float]:
@@ -1967,6 +2006,33 @@ class LivePortfolio:
         d = snap.get(asset, {})
         return float(max(0.0, float(d.get("total", 0.0))))
 
+    def get_available_asset(self, asset: str, snapshot: Optional[Dict[str, Dict[str, float]]] = None) -> float:
+        """
+        Return available balance for an asset from Coinbase.
+        Use this for sell sizing because held/locked balances may not be tradable.
+        """
+        snap = snapshot if snapshot is not None else self.refresh_snapshot()
+        d = snap.get(str(asset).upper(), {})
+        return float(max(0.0, float(d.get("available", 0.0))))
+
+    def get_product_total_qty(self, product_id: str, snapshot: Optional[Dict[str, Dict[str, float]]] = None) -> float:
+        """
+        Return Coinbase total balance for the base asset in a product like BTC-USD.
+        """
+        asset = product_base_asset(product_id)
+        if not asset:
+            return 0.0
+        return self.get_total_asset(asset, snapshot=snapshot)
+
+    def get_product_available_qty(self, product_id: str, snapshot: Optional[Dict[str, Dict[str, float]]] = None) -> float:
+        """
+        Return Coinbase available/sellable balance for the base asset in a product like BTC-USD.
+        """
+        asset = product_base_asset(product_id)
+        if not asset:
+            return 0.0
+        return self.get_available_asset(asset, snapshot=snapshot)
+
     def compute_equity_usd(
         self,
         *,
@@ -3154,16 +3220,239 @@ class TradingBot:
             return None
         return await asyncio.to_thread(self.portfolio.refresh_snapshot, force=bool(force), ttl_sec=float(ttl_sec))
 
+    async def _wait_for_tob_ready(self, timeout_sec: float = STARTUP_TOB_TIMEOUT_SEC) -> None:
+        """
+        Wait until at least one top-of-book price is available.
+        Startup liquidation needs bid prices for estimated USD value.
+        """
+        t0 = now_ts()
+        while now_ts() - t0 < float(timeout_sec):
+            ready = [p for p in PRODUCTS if self.tob.get(p) is not None]
+            if ready:
+                log(f"[startup] top-of-book ready for {len(ready)}/{len(PRODUCTS)} products")
+                return
+            await asyncio.sleep(0.25)
+        log("[startup] top-of-book wait timed out; continuing with available prices only")
+
+    def _live_mid_by_product(self) -> Dict[str, float]:
+        mids: Dict[str, float] = {}
+        for p in PRODUCTS:
+            tob = self.tob.get(p)
+            if tob and tob.mid > 0:
+                mids[p] = float(tob.mid)
+        return mids
+
+    async def _adopt_existing_coinbase_holdings(self) -> None:
+        """
+        Convert existing Coinbase balances into local PositionLot objects.
+        This gives the bot the ability to manage/sell them.
+
+        Important:
+        - The entry price is approximated using current mid.
+        - This is not true historical cost basis.
+        - For accurate tax/P&L, Coinbase fills/history are still the authority.
+        """
+        if not isinstance(self.portfolio, LivePortfolio):
+            return
+
+        snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+        if not snap:
+            return
+
+        adopted = 0
+        for product_id in PRODUCTS:
+            tob = self.tob.get(product_id)
+            if not tob or tob.mid <= 0:
+                continue
+
+            qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+            if qty <= 1e-12:
+                self.positions[product_id] = []
+                continue
+
+            approx_entry = float(tob.mid)
+            self.positions[product_id] = [
+                PositionLot(
+                    qty=float(qty),
+                    price=approx_entry,
+                    tier=TIER_LOW,
+                    score=0.0,
+                    meta={
+                        "coinbase_existing": True,
+                        "scalp_done": False,
+                        "core_done": False,
+                    },
+                )
+            ]
+            self.position_start_ts[product_id] = now_ts()
+            self.position_entry_price[product_id] = approx_entry
+            self.peak_bid[product_id] = float(tob.bid)
+            adopted += 1
+
+        log(f"[startup] adopted {adopted} existing Coinbase holdings as managed positions")
+
+    async def _liquidate_existing_coinbase_holdings(self) -> None:
+        """
+        Sell existing available balances for configured PRODUCTS on startup.
+
+        This intentionally uses Coinbase available balance as the sellable source of truth.
+        Total balance may include hold/locked amounts that cannot be sold.
+        """
+        if not isinstance(self.portfolio, LivePortfolio):
+            return
+
+        snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+        if not snap:
+            log("[startup-liquidation] no Coinbase snapshot available")
+            return
+
+        sold_count = 0
+        skipped_count = 0
+
+        for product_id in PRODUCTS:
+            tob = self.tob.get(product_id)
+            if not tob or tob.bid <= 0:
+                log(f"[startup-liquidation] skipping {product_id}: no bid available")
+                skipped_count += 1
+                continue
+
+            available_qty = self.portfolio.get_product_available_qty(product_id, snapshot=snap)
+            total_qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+            if available_qty <= 1e-12 and total_qty <= 1e-12:
+                continue
+
+            est_usd = float(available_qty) * float(tob.bid)
+
+            if available_qty <= 1e-12:
+                log(f"[startup-liquidation] {product_id}: total exists but available=0; cannot sell held/locked balance")
+                skipped_count += 1
+                continue
+
+            if est_usd < MIN_STARTUP_LIQUIDATION_USD:
+                log(
+                    f"[startup-liquidation] skipping {product_id}: estimated value ${est_usd:.4f} "
+                    f"is below MIN_STARTUP_LIQUIDATION_USD=${MIN_STARTUP_LIQUIDATION_USD:.2f}"
+                )
+                skipped_count += 1
+                continue
+
+            log(
+                f"[startup-liquidation] selling {product_id}: "
+                f"available_qty={available_qty:.12f}, est_usd=${est_usd:.4f}"
+            )
+
+            try:
+                if STARTUP_LIQUIDATION_USE_MARKET:
+                    r = await asyncio.to_thread(
+                        self.portfolio.sell_market,
+                        product_id,
+                        float(available_qty),
+                    )
+                else:
+                    r = await self._live_sell_maker(
+                        product_id=product_id,
+                        base_qty=float(available_qty),
+                        ask=float(tob.ask),
+                    )
+
+                fill = self._require_live_fill(r, product_id=product_id, side="SELL")
+                if fill is None:
+                    log(f"[startup-liquidation] sell did not fill for {product_id}: {r}")
+                    skipped_count += 1
+                    continue
+
+                filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                self.tlog.log_trade(
+                    event="STARTUP_LIQUIDATION",
+                    product_id=product_id,
+                    side="SELL",
+                    qty=float(filled_qty),
+                    price=float(avg_px),
+                    fee_usd_val=float(fee_val),
+                    gross_pnl_usd=0.0,
+                    net_pnl_usd=-float(fee_val),
+                    entry_price=None,
+                    exit_price=float(avg_px),
+                    weekly_bias=None,
+                    note="startup_liquidate_existing_coinbase_balance",
+                    filled_notional_usd=float(filled_notional),
+                    exit_role="startup_liquidation",
+                )
+
+                self.positions[product_id] = []
+                self.position_start_ts[product_id] = None
+                self.position_entry_price[product_id] = None
+                self.peak_bid[product_id] = None
+                sold_count += 1
+
+                snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+
+            except Exception as e:
+                log(f"[startup-liquidation] error selling {product_id}: {e}")
+                skipped_count += 1
+
+        final_snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+        final_cash = self.portfolio.get_tradable_usd(snapshot=final_snap or {})
+        final_equity = self.portfolio.compute_equity_usd(
+            mid_by_product=self._live_mid_by_product(),
+            snapshot=final_snap,
+        )
+
+        log(
+            f"[startup-liquidation] complete | sold={sold_count} skipped={skipped_count} "
+            f"| tradable_usd=${final_cash:.2f} | equity_usd≈${final_equity:.2f}"
+        )
+
+    async def _startup_portfolio_reconcile(self) -> None:
+        """One-time live startup portfolio handling."""
+        if not isinstance(self.portfolio, LivePortfolio):
+            return
+
+        await self._wait_for_tob_ready(timeout_sec=STARTUP_TOB_TIMEOUT_SEC)
+
+        snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+        if not snap:
+            log("[startup] unable to read Coinbase balances")
+            return
+
+        cash = self.portfolio.get_tradable_usd(snapshot=snap)
+        equity = self.portfolio.compute_equity_usd(
+            mid_by_product=self._live_mid_by_product(),
+            snapshot=snap,
+        )
+        log(f"[startup] Coinbase snapshot before mode={LIVE_STARTUP_MODE}: tradable_usd=${cash:.2f}, equity_usd≈${equity:.2f}")
+
+        mode = str(LIVE_STARTUP_MODE).upper().strip()
+
+        if mode == "LIQUIDATE_EXISTING":
+            await self._liquidate_existing_coinbase_holdings()
+        elif mode == "ADOPT_EXISTING":
+            await self._adopt_existing_coinbase_holdings()
+        elif mode == "IGNORE_EXISTING":
+            log("[startup] ignoring existing holdings for management, but still using Coinbase for cash/equity")
+        else:
+            raise RuntimeError(
+                "Invalid LIVE_STARTUP_MODE. Use 'LIQUIDATE_EXISTING', 'ADOPT_EXISTING', or 'IGNORE_EXISTING'."
+            )
+
     async def run(self) -> None:
-        """Launch all asynchronous loops and wait for them to finish."""
+        """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
         log("[run] TradingBot.run() started")
         log(f"[run] paper_trading={PAPER_TRADING} products={PRODUCTS}")
-        # Preload micro + signal context (last 24 hours of 1m candles)
+
         log("[run] preloading micro history")
         await self.preload_micro_history()
-        log("[run] starting websocket / macro / evaluation / telemetry tasks")
+
+        log("[run] starting websocket task first")
+        ws_task = asyncio.create_task(self.ws_loop())
+
+        if isinstance(self.portfolio, LivePortfolio) and SOURCE_OF_TRUTH_COINBASE:
+            log("[run] reconciling live Coinbase portfolio before trading")
+            await self._startup_portfolio_reconcile()
+
+        log("[run] starting macro / evaluation / telemetry tasks")
         tasks = [
-            asyncio.create_task(self.ws_loop()),
+            ws_task,
             asyncio.create_task(self.macro_loop()),
             asyncio.create_task(self.eval_loop()),
             asyncio.create_task(self.telemetry_loop()),
@@ -3316,6 +3605,15 @@ class TradingBot:
         tob = self.tob.get(product_id)
         if not tob:
             return 0.0
+
+        if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+            try:
+                snap = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+                return float(qty) * float(tob.mid)
+            except Exception:
+                pass
+
         return float(sum(l.qty for l in self.positions.get(product_id, [])) * tob.mid)
 
     def _current_total_exposure_usd(self) -> float:
@@ -3325,6 +3623,18 @@ class TradingBot:
         return float(total)
 
     def _open_position_count(self) -> int:
+        if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+            try:
+                snap = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                count = 0
+                for product_id in PRODUCTS:
+                    qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+                    if qty > 1e-12:
+                        count += 1
+                return count
+            except Exception:
+                pass
+
         return sum(1 for lots in self.positions.values() if sum(l.qty for l in lots) > 0)
 
     def compute_entry_notional(
@@ -3340,6 +3650,14 @@ class TradingBot:
     ) -> float:
         if available_cash_usd <= 0:
             return 0.0
+
+        if USE_FIXED_ENTRY_SIZE_USD:
+            spendable_cash = max(0.0, float(available_cash_usd) - float(RESERVE_USD))
+            remaining_room = max(0.0, MAX_EXPOSURE_PER_PRODUCT_USD - current_product_exposure_usd)
+            proposed = min(float(ENTRY_SIZE_USD), spendable_cash, remaining_room)
+            if proposed < MIN_ENTRY_USD:
+                return 0.0
+            return float(proposed)
 
         if candidate_score >= HIGH_SCORE_UTIL_THRESHOLD:
             util_target = TARGET_UTIL_MAX
@@ -3405,7 +3723,19 @@ class TradingBot:
                 cash_usd = float(self.portfolio.cash_usd) if self.portfolio else 0.0
 
             total_exposure = self._current_total_exposure_usd()
-            equity_usd = cash_usd + total_exposure
+
+            if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+                try:
+                    equity_usd = float(
+                        self.portfolio.compute_equity_usd(
+                            mid_by_product=self._live_mid_by_product(),
+                            snapshot=snap_live,
+                        )
+                    )
+                except Exception:
+                    equity_usd = cash_usd + total_exposure
+            else:
+                equity_usd = cash_usd + total_exposure
 
             candidates = []
             for product_id in PRODUCTS:
@@ -3585,8 +3915,17 @@ class TradingBot:
 
             for candidate in candidates[:MAX_NEW_ENTRIES_PER_EVAL]:
                 product_id = candidate["product_id"]
-                if sum(l.qty for l in self.positions.get(product_id, [])) > 0:
-                    continue
+                if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+                    try:
+                        snap_check = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                        if self.portfolio.get_product_total_qty(product_id, snapshot=snap_check) > 1e-12:
+                            continue
+                    except Exception:
+                        if sum(l.qty for l in self.positions.get(product_id, [])) > 0:
+                            continue
+                else:
+                    if sum(l.qty for l in self.positions.get(product_id, [])) > 0:
+                        continue
                 product_exposure = self._current_product_exposure_usd(product_id)
                 total_exposure = self._current_total_exposure_usd()
                 open_count = self._open_position_count()
@@ -3653,14 +3992,26 @@ class TradingBot:
         while not self._stop_event.is_set():
             ts_now = now_ts_i()
             total_equity = 0.0
-            cash_usd = self.portfolio.cash_usd if self.portfolio else 0.0
-            # Compute total equity across all products
-            for product, lots in self.positions.items():
-                tob = self.tob.get(product)
-                if tob and lots:
-                    mid = (tob.bid + tob.ask) / 2.0
-                    total_equity += sum(lot.qty for lot in lots) * mid
-            equity_usd = cash_usd + total_equity
+
+            if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+                try:
+                    snap_live = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
+                    cash_usd = self.portfolio.get_tradable_usd(snapshot=snap_live)
+                    equity_usd = self.portfolio.compute_equity_usd(
+                        mid_by_product=self._live_mid_by_product(),
+                        snapshot=snap_live,
+                    )
+                except Exception:
+                    cash_usd = self.portfolio.cash_usd if self.portfolio else 0.0
+                    equity_usd = cash_usd
+            else:
+                cash_usd = self.portfolio.cash_usd if self.portfolio else 0.0
+                for product, lots in self.positions.items():
+                    tob = self.tob.get(product)
+                    if tob and lots:
+                        mid = (tob.bid + tob.ask) / 2.0
+                        total_equity += sum(lot.qty for lot in lots) * mid
+                equity_usd = cash_usd + total_equity
             # Log per product snapshot
             for product in PRODUCTS:
                 tob = self.tob.get(product)
@@ -3669,9 +4020,23 @@ class TradingBot:
                 mid = (tob.bid + tob.ask) / 2.0
                 spread_bps = ((tob.ask - tob.bid) / mid) * 10_000.0 if mid > 0 else 0.0
                 positions = self.positions[product]
-                exposures_usd = sum(lot.qty * lot.price for lot in positions)
-                position_qty = sum(lot.qty for lot in positions)
-                avg_entry_price = (exposures_usd / position_qty) if position_qty > 0 else None
+
+                if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+                    try:
+                        snap_live_product = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                        position_qty = self.portfolio.get_product_total_qty(product, snapshot=snap_live_product)
+                        exposures_usd = float(position_qty) * float(mid)
+                        local_qty = sum(lot.qty for lot in positions)
+                        local_cost = sum(lot.qty * lot.price for lot in positions)
+                        avg_entry_price = (local_cost / local_qty) if local_qty > 0 else None
+                    except Exception:
+                        exposures_usd = sum(lot.qty * lot.price for lot in positions)
+                        position_qty = sum(lot.qty for lot in positions)
+                        avg_entry_price = (exposures_usd / position_qty) if position_qty > 0 else None
+                else:
+                    exposures_usd = sum(lot.qty * lot.price for lot in positions)
+                    position_qty = sum(lot.qty for lot in positions)
+                    avg_entry_price = (exposures_usd / position_qty) if position_qty > 0 else None
                 # anchored vwap (24h anchored, always-on)
                 avwap = self._compute_anchored_vwap_24h(product, ts_now)
 
@@ -3682,7 +4047,7 @@ class TradingBot:
 
                 sigma_bps = self._compute_sigma_bps_from_1m(product)
                 weekly_bias = self.macro.compute_weekly_bias(product, mid)
-                state = "long" if positions else "flat"
+                state = "long" if position_qty > 0 else "flat"
                 self.mlog.log_snapshot(
                     ts=ts_now,
                     product_id=product,

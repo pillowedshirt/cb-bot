@@ -285,6 +285,24 @@ TRAIL_ARM_PCT: float = 0.0065
 TRAIL_DRAWDOWN_PCT: float = 0.0020
 HARD_PEAK_STOP_PCT: float = 0.0040
 
+# Armed target exits.
+# Targets do not immediately sell. They arm a trailing release.
+SCALP_TARGET_ARM_DRAWDOWN_PCT: float = 0.0010  # 0.10%
+CORE_TARGET_ARM_DRAWDOWN_PCT: float = 0.0020   # 0.20%
+RUNNER_TARGET_ARM_DRAWDOWN_PCT: float = 0.0030 # 0.30%
+
+# Minimum realized net gain required for discretionary profit exits.
+# 1 basis point = 0.01%.
+MIN_NET_GAIN_AFTER_FEES_BPS: float = 1.0
+
+# Time-based exits are disabled for this strategy style.
+ENABLE_NO_PROGRESS_STOP: bool = False
+ENABLE_TIME_STOP: bool = False
+
+# Keep structure/risk exits enabled.
+ENABLE_INVALIDATION_STOP: bool = True
+ENABLE_HARD_PEAK_STOP: bool = True
+
 # Faster invalidation/time exits for day-trading/scalping behavior
 TIME_STOP_SEC: int = 45 * 60
 NO_PROGRESS_STOP_SEC: int = 12 * 60
@@ -399,15 +417,53 @@ def can_exit_net_positive(
     taker_fee_bps: float,
     est_slippage_bps: float,
     est_adverse_fill_bps: float,
-    min_net_profit_bps: float,
+    min_net_profit_bps: float = 0.0,
 ) -> bool:
+    """
+    Estimate whether an exit is net-positive after exit-side costs.
+
+    entry_price should already include buy-side fee when using PositionLot.price.
+    That means the buy fee is already embedded in cost basis.
+
+    This check estimates:
+    exit proceeds after exit fee/slippage/adverse buffer
+    versus effective entry cost basis.
+    """
     if entry_price <= 0 or exit_price <= 0:
         return False
 
-    gross_bps = ((exit_price / entry_price) - 1.0) * 10000.0
-    total_cost_bps = taker_fee_bps + est_slippage_bps + est_adverse_fill_bps
-    net_bps = gross_bps - total_cost_bps
-    return net_bps >= min_net_profit_bps
+    exit_cost_bps = (
+        float(taker_fee_bps)
+        + float(est_slippage_bps)
+        + float(est_adverse_fill_bps)
+    )
+
+    gross_move_bps = ((float(exit_price) / float(entry_price)) - 1.0) * 10000.0
+    estimated_net_bps = gross_move_bps - exit_cost_bps
+
+    return estimated_net_bps >= float(min_net_profit_bps)
+
+
+def required_exit_price_for_net_gain(
+    *,
+    effective_entry_price: float,
+    exit_fee_bps: float,
+    est_slippage_bps: float,
+    est_adverse_fill_bps: float,
+    min_net_gain_bps: float,
+) -> float:
+    """
+    Calculate the minimum exit price needed to clear a desired net gain.
+
+    effective_entry_price should include the buy-side fee.
+    """
+    total_required_bps = (
+        float(exit_fee_bps)
+        + float(est_slippage_bps)
+        + float(est_adverse_fill_bps)
+        + float(min_net_gain_bps)
+    )
+    return float(effective_entry_price) * bps_to_mult(total_required_bps)
 
 # ------------------------------------------------------------
 # Product auto-selection (liquidity + diversification)
@@ -5186,32 +5242,122 @@ class TradingBot:
                     sell_qty = 0.0
                     exit_reason = None
                     exit_role = None
-                    if bid >= targets["scalp_target"] and not lot_meta.get("scalp_done", False):
+                    required_net_exit_px = required_exit_price_for_net_gain(
+                        effective_entry_price=avg_entry_price,
+                        exit_fee_bps=self._exit_fee_bps_for_mode(),
+                        est_slippage_bps=EST_SLIPPAGE_BPS,
+                        est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                        min_net_gain_bps=max(
+                            MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                            MIN_NET_GAIN_AFTER_FEES_BPS,
+                        ),
+                    )
+
+                    # Arm scalp target instead of instantly selling it.
+                    if (
+                        bid >= max(targets["scalp_target"], required_net_exit_px)
+                        and not lot_meta.get("scalp_done", False)
+                        and not lot_meta.get("scalp_armed", False)
+                    ):
                         if can_exit_net_positive(
                             entry_price=avg_entry_price,
                             exit_price=bid,
                             taker_fee_bps=self._exit_fee_bps_for_mode(),
                             est_slippage_bps=EST_SLIPPAGE_BPS,
                             est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                            min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                            min_net_profit_bps=max(
+                                MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                                MIN_NET_GAIN_AFTER_FEES_BPS,
+                            ),
                         ):
-                            sell_qty = position_qty * exit_plan["scalp_frac"]
-                            exit_reason = "scalp_target_hit"
-                            exit_role = "scalp_release"
-                            lot_meta["scalp_done"] = True
-                    elif bid >= targets["core_target"] and not lot_meta.get("core_done", False):
+                            lot_meta["scalp_armed"] = True
+                            lot_meta["scalp_arm_price"] = float(bid)
+                            lot_meta["scalp_arm_peak"] = float(bid)
+                            log(f"[exit-arm] {product_id} scalp armed at {bid:.8f}")
+
+                    # Arm core target instead of instantly selling it.
+                    if (
+                        bid >= max(targets["core_target"], required_net_exit_px)
+                        and not lot_meta.get("core_done", False)
+                        and not lot_meta.get("core_armed", False)
+                    ):
                         if can_exit_net_positive(
                             entry_price=avg_entry_price,
                             exit_price=bid,
                             taker_fee_bps=self._exit_fee_bps_for_mode(),
                             est_slippage_bps=EST_SLIPPAGE_BPS,
                             est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                            min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                            min_net_profit_bps=max(
+                                MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                                MIN_NET_GAIN_AFTER_FEES_BPS,
+                            ),
                         ):
-                            sell_qty = position_qty * exit_plan["core_frac"]
-                            exit_reason = "core_target_hit"
-                            exit_role = "core_release"
-                            lot_meta["core_done"] = True
+                            lot_meta["core_armed"] = True
+                            lot_meta["core_arm_price"] = float(bid)
+                            lot_meta["core_arm_peak"] = float(bid)
+                            log(f"[exit-arm] {product_id} core armed at {bid:.8f}")
+
+                    # If scalp is armed, keep tracking the highest bid after arming.
+                    # Sell only after a pullback from that post-arm high.
+                    if lot_meta.get("scalp_armed", False) and not lot_meta.get("scalp_done", False):
+                        scalp_peak = float(lot_meta.get("scalp_arm_peak") or bid)
+                        if bid > scalp_peak:
+                            scalp_peak = float(bid)
+                            lot_meta["scalp_arm_peak"] = scalp_peak
+
+                        scalp_drawdown = max(0.0, (scalp_peak - bid) / scalp_peak) if scalp_peak > 0 else 0.0
+
+                        if scalp_drawdown >= SCALP_TARGET_ARM_DRAWDOWN_PCT:
+                            if can_exit_net_positive(
+                                entry_price=avg_entry_price,
+                                exit_price=bid,
+                                taker_fee_bps=self._exit_fee_bps_for_mode(),
+                                est_slippage_bps=EST_SLIPPAGE_BPS,
+                                est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                                min_net_profit_bps=max(
+                                    MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                                    MIN_NET_GAIN_AFTER_FEES_BPS,
+                                ),
+                            ):
+                                sell_qty = max(sell_qty, position_qty * exit_plan["scalp_frac"])
+                                exit_reason = (
+                                    f"scalp_armed_pullback peak={scalp_peak:.8f} "
+                                    f"drawdown={scalp_drawdown:.4%}"
+                                )
+                                exit_role = "scalp_armed_release"
+                                lot_meta["scalp_done"] = True
+                                lot_meta["scalp_armed"] = False
+
+                    # If core is armed, keep tracking the highest bid after arming.
+                    # Sell only after a larger pullback from that post-arm high.
+                    if lot_meta.get("core_armed", False) and not lot_meta.get("core_done", False):
+                        core_peak = float(lot_meta.get("core_arm_peak") or bid)
+                        if bid > core_peak:
+                            core_peak = float(bid)
+                            lot_meta["core_arm_peak"] = core_peak
+
+                        core_drawdown = max(0.0, (core_peak - bid) / core_peak) if core_peak > 0 else 0.0
+
+                        if core_drawdown >= CORE_TARGET_ARM_DRAWDOWN_PCT:
+                            if can_exit_net_positive(
+                                entry_price=avg_entry_price,
+                                exit_price=bid,
+                                taker_fee_bps=self._exit_fee_bps_for_mode(),
+                                est_slippage_bps=EST_SLIPPAGE_BPS,
+                                est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                                min_net_profit_bps=max(
+                                    MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                                    MIN_NET_GAIN_AFTER_FEES_BPS,
+                                ),
+                            ):
+                                sell_qty = max(sell_qty, position_qty * exit_plan["core_frac"])
+                                exit_reason = (
+                                    f"core_armed_pullback peak={core_peak:.8f} "
+                                    f"drawdown={core_drawdown:.4%}"
+                                )
+                                exit_role = "core_armed_release"
+                                lot_meta["core_done"] = True
+                                lot_meta["core_armed"] = False
 
                     remaining_qty = sum(l.qty for l in self.positions.get(product_id, []))
                     peak_bid = float(self.peak_bid.get(product_id) or bid)
@@ -5224,7 +5370,7 @@ class TradingBot:
                     peak_profit = max(0.0, (peak_bid - avg_entry_price) / avg_entry_price) if peak_bid and avg_entry_price > 0 else 0.0
 
                     # True stop-loss / protective exit: always allowed
-                    if drawdown_from_peak >= HARD_PEAK_STOP_PCT:
+                    if ENABLE_HARD_PEAK_STOP and drawdown_from_peak >= HARD_PEAK_STOP_PCT:
                         sell_qty = remaining_qty
                         exit_reason = "hard_peak_stop"
                         exit_role = "hard_peak_stop"
@@ -5249,17 +5395,21 @@ class TradingBot:
                         age_sec = ts_now - float(pos_start)
                         unrealized_bps = ((bid / avg_entry_price) - 1.0) * 10000.0
 
-                        if age_sec >= NO_PROGRESS_STOP_SEC and unrealized_bps < MIN_PROGRESS_BPS_BEFORE_TIME_STOP:
+                        if (
+                            ENABLE_NO_PROGRESS_STOP
+                            and age_sec >= NO_PROGRESS_STOP_SEC
+                            and unrealized_bps < MIN_PROGRESS_BPS_BEFORE_TIME_STOP
+                        ):
                             exit_reason = f"no_progress_stop age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
                             exit_role = "no_progress_stop"
                             sell_qty = position_qty
 
-                        if age_sec >= TIME_STOP_SEC:
+                        if ENABLE_TIME_STOP and age_sec >= TIME_STOP_SEC:
                             exit_reason = f"time_stop age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
                             exit_role = "time_stop"
                             sell_qty = position_qty
 
-                        if levels_day and getattr(levels_day, "support_zone_low", 0) > 0:
+                        if ENABLE_INVALIDATION_STOP and levels_day and getattr(levels_day, "support_zone_low", 0) > 0:
                             invalidation_px = float(levels_day.support_zone_low) * bps_to_mult(-INVALIDATION_BUFFER_BPS)
                             if bid < invalidation_px:
                                 exit_reason = f"invalidation_stop bid<{invalidation_px:.8f}"
@@ -5533,6 +5683,15 @@ class TradingBot:
                     lot_meta = {
                         "scalp_done": False,
                         "core_done": False,
+
+                        # Armed target state.
+                        "scalp_armed": False,
+                        "core_armed": False,
+                        "scalp_arm_price": None,
+                        "core_arm_price": None,
+                        "scalp_arm_peak": None,
+                        "core_arm_peak": None,
+
                         "estimated_prob_up": float(candidate.get("estimated_prob_up", 0.0)),
                         "position_pct": float(candidate.get("position_pct", 0.0)),
                         "target_bps": float(candidate.get("target_bps", 0.0)),

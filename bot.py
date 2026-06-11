@@ -221,6 +221,21 @@ MIN_REQUIRED_NET_EDGE_BPS: float = 35.0
 MIN_TARGET_TO_COST_MULT: float = 2.75
 ROUND_TRIP_SAFETY_BPS: float = 8.0
 
+# Buy gate behavior.
+# If True, the old strict dip/reversal gate must pass before buying.
+# If False, a calibrated high-EV setup may buy as long as score/probability/EV,
+# fee, spread, and target-cost gates pass.
+REQUIRE_STRICT_DIP_GATE_FOR_BUY: bool = False
+
+# If strict dip gate is not required, still require basic reversal quality.
+# This prevents buying purely because calibration numbers pass while price is falling.
+REQUIRE_BASIC_REVERSAL_CONFIRMATION_FOR_CALIBRATED_BUY: bool = True
+
+# Basic reversal fallback requirements when strict_entry.ok is false.
+BASIC_REVERSAL_MIN_SCORE: float = 45.0
+BASIC_REVERSAL_MIN_ROOM_SCORE: float = 35.0
+BASIC_REVERSAL_MIN_SUPPORT_SCORE: float = 35.0
+
 # Order logging / safety
 LOG_ORDER_ATTEMPTS: bool = True
 REQUIRE_CONFIRMED_FILL_FOR_TRADE_LOG: bool = True
@@ -1331,7 +1346,11 @@ class MarketLogger:
                 "calibrated_time_to_min_profit_minutes", "calibrated_forward_window_minutes",
                 "current_maker_fee_bps", "current_taker_fee_bps", "fee_tier_reason",
                 "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
-                "room_score", "regime_score", "spread_penalty", "cost_penalty"
+                "room_score", "regime_score", "spread_penalty", "cost_penalty",
+                "buy_gate_score_ok", "buy_gate_prob_ok", "buy_gate_ev_ok",
+                "buy_gate_fee_ok", "buy_gate_strict_ok", "buy_gate_target_cost_ok",
+                "buy_gate_spread_ok", "buy_gate_calibrated_ok",
+                "buy_gate_tradeable", "buy_gate_blocker"
             ])
 
     def log_snapshot(
@@ -1375,6 +1394,16 @@ class MarketLogger:
         regime_score: Optional[float] = None,
         spread_penalty: Optional[float] = None,
         cost_penalty: Optional[float] = None,
+        buy_gate_score_ok: Optional[bool] = None,
+        buy_gate_prob_ok: Optional[bool] = None,
+        buy_gate_ev_ok: Optional[bool] = None,
+        buy_gate_fee_ok: Optional[bool] = None,
+        buy_gate_strict_ok: Optional[bool] = None,
+        buy_gate_target_cost_ok: Optional[bool] = None,
+        buy_gate_spread_ok: Optional[bool] = None,
+        buy_gate_calibrated_ok: Optional[bool] = None,
+        buy_gate_tradeable: Optional[bool] = None,
+        buy_gate_blocker: str = "",
     ) -> None:
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -1410,7 +1439,17 @@ class MarketLogger:
                 "" if room_score is None else f"{room_score:.6f}",
                 "" if regime_score is None else f"{regime_score:.6f}",
                 "" if spread_penalty is None else f"{spread_penalty:.6f}",
-                "" if cost_penalty is None else f"{cost_penalty:.6f}"
+                "" if cost_penalty is None else f"{cost_penalty:.6f}",
+                "" if buy_gate_score_ok is None else str(bool(buy_gate_score_ok)),
+                "" if buy_gate_prob_ok is None else str(bool(buy_gate_prob_ok)),
+                "" if buy_gate_ev_ok is None else str(bool(buy_gate_ev_ok)),
+                "" if buy_gate_fee_ok is None else str(bool(buy_gate_fee_ok)),
+                "" if buy_gate_strict_ok is None else str(bool(buy_gate_strict_ok)),
+                "" if buy_gate_target_cost_ok is None else str(bool(buy_gate_target_cost_ok)),
+                "" if buy_gate_spread_ok is None else str(bool(buy_gate_spread_ok)),
+                "" if buy_gate_calibrated_ok is None else str(bool(buy_gate_calibrated_ok)),
+                "" if buy_gate_tradeable is None else str(bool(buy_gate_tradeable)),
+                buy_gate_blocker,
             ])
 
 
@@ -1960,6 +1999,16 @@ class LiveSignal:
     trend_reason: str = ""
     vwap_reason: str = ""
     higher_low_reason: str = ""
+    buy_gate_score_ok: bool = False
+    buy_gate_prob_ok: bool = False
+    buy_gate_ev_ok: bool = False
+    buy_gate_fee_ok: bool = False
+    buy_gate_strict_ok: bool = False
+    buy_gate_target_cost_ok: bool = False
+    buy_gate_spread_ok: bool = False
+    buy_gate_calibrated_ok: bool = False
+    buy_gate_tradeable: bool = False
+    buy_gate_blocker: str = ""
 
 
 @dataclass
@@ -5368,16 +5417,76 @@ class TradingBot:
         calib_min_probability = float(profile.min_probability)
         calib_min_ev = float(profile.min_expected_value_bps)
 
-        ok_to_trade = (
-            fee_available
-            and round_trip_cost_bps is not None
-            and strict_entry.ok
-            and score >= calib_min_score
-            and estimated_prob_up >= calib_min_probability
-            and expected_net_edge_bps >= max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev)
-            and target_bps >= cost_bps * float(MIN_TARGET_TO_COST_MULT)
-            and spread_bps <= float(MAX_SPREAD_BPS)
+        # Individual buy-gate checks.
+        buy_gate_fee_ok = bool(fee_available and round_trip_cost_bps is not None)
+        buy_gate_score_ok = bool(score >= calib_min_score)
+        buy_gate_prob_ok = bool(estimated_prob_up >= calib_min_probability)
+        buy_gate_ev_ok = bool(
+            expected_net_edge_bps >= max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev)
         )
+        buy_gate_target_cost_ok = bool(
+            cost_bps > 0
+            and target_bps >= cost_bps * float(MIN_TARGET_TO_COST_MULT)
+        )
+        buy_gate_spread_ok = bool(spread_bps <= float(MAX_SPREAD_BPS))
+        buy_gate_strict_ok = bool(strict_entry.ok)
+
+        basic_reversal_ok = (
+            score >= float(BASIC_REVERSAL_MIN_SCORE)
+            and room_score >= float(BASIC_REVERSAL_MIN_ROOM_SCORE)
+            and support_score >= float(BASIC_REVERSAL_MIN_SUPPORT_SCORE)
+            and not bool(trending_down)
+        )
+
+        if REQUIRE_STRICT_DIP_GATE_FOR_BUY:
+            buy_gate_setup_ok = buy_gate_strict_ok
+            setup_blocker = f"strict_entry_blocked:{strict_entry.reason}"
+        else:
+            if buy_gate_strict_ok:
+                buy_gate_setup_ok = True
+                setup_blocker = "strict_entry_passed"
+            elif REQUIRE_BASIC_REVERSAL_CONFIRMATION_FOR_CALIBRATED_BUY:
+                buy_gate_setup_ok = bool(basic_reversal_ok)
+                setup_blocker = (
+                    "basic_reversal_passed"
+                    if basic_reversal_ok
+                    else f"basic_reversal_blocked:{strict_entry.reason}"
+                )
+            else:
+                buy_gate_setup_ok = True
+                setup_blocker = "strict_entry_not_required"
+
+        buy_gate_calibrated_ok = bool(
+            buy_gate_score_ok
+            and buy_gate_prob_ok
+            and buy_gate_ev_ok
+        )
+
+        ok_to_trade = bool(
+            buy_gate_fee_ok
+            and buy_gate_setup_ok
+            and buy_gate_calibrated_ok
+            and buy_gate_target_cost_ok
+            and buy_gate_spread_ok
+        )
+
+        blockers = []
+        if not buy_gate_fee_ok:
+            blockers.append("fee_not_ready")
+        if not buy_gate_score_ok:
+            blockers.append("score_below_target")
+        if not buy_gate_prob_ok:
+            blockers.append("probability_below_target")
+        if not buy_gate_ev_ok:
+            blockers.append("ev_below_target")
+        if not buy_gate_target_cost_ok:
+            blockers.append("target_to_cost_failed")
+        if not buy_gate_spread_ok:
+            blockers.append("spread_too_wide")
+        if not buy_gate_setup_ok:
+            blockers.append(setup_blocker)
+
+        buy_gate_blocker = "BUY_READY" if ok_to_trade else ";".join(blockers)
 
         if not ok_to_trade:
             position_pct = 0.0
@@ -5389,6 +5498,7 @@ class TradingBot:
             f"calib_min_score={calib_min_score:.1f}; "
             f"calib_min_prob={calib_min_probability:.3f}; "
             f"calib_ev={calib_min_ev:.2f}; "
+            f"buy_gate={buy_gate_blocker}; "
             f"{fee_state}; strict={strict_entry.reason}; edge={expected_net_edge_bps:.1f}; "
             f"target={target_bps:.1f}; projected_forward={calibrated_forward_gain_bps:.1f}; "
             f"cost={cost_bps:.1f}; projected_net={expected_net_edge_bps:.1f}; "
@@ -5421,6 +5531,16 @@ class TradingBot:
             trend_reason=trend_reason,
             vwap_reason=vwap_reason,
             higher_low_reason=higher_low_reason,
+            buy_gate_score_ok=buy_gate_score_ok,
+            buy_gate_prob_ok=buy_gate_prob_ok,
+            buy_gate_ev_ok=buy_gate_ev_ok,
+            buy_gate_fee_ok=buy_gate_fee_ok,
+            buy_gate_strict_ok=buy_gate_strict_ok,
+            buy_gate_target_cost_ok=buy_gate_target_cost_ok,
+            buy_gate_spread_ok=buy_gate_spread_ok,
+            buy_gate_calibrated_ok=buy_gate_calibrated_ok,
+            buy_gate_tradeable=bool(ok_to_trade),
+            buy_gate_blocker=buy_gate_blocker,
         )
 
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
@@ -6957,6 +7077,16 @@ class TradingBot:
                     regime_score=scored.regime_score,
                     spread_penalty=scored.spread_penalty,
                     cost_penalty=scored.cost_penalty,
+                    buy_gate_score_ok=live_signal.buy_gate_score_ok,
+                    buy_gate_prob_ok=live_signal.buy_gate_prob_ok,
+                    buy_gate_ev_ok=live_signal.buy_gate_ev_ok,
+                    buy_gate_fee_ok=live_signal.buy_gate_fee_ok,
+                    buy_gate_strict_ok=live_signal.buy_gate_strict_ok,
+                    buy_gate_target_cost_ok=live_signal.buy_gate_target_cost_ok,
+                    buy_gate_spread_ok=live_signal.buy_gate_spread_ok,
+                    buy_gate_calibrated_ok=live_signal.buy_gate_calibrated_ok,
+                    buy_gate_tradeable=live_signal.buy_gate_tradeable,
+                    buy_gate_blocker=live_signal.buy_gate_blocker,
                 )
 
             candidates.sort(
@@ -6967,6 +7097,16 @@ class TradingBot:
                 ),
                 reverse=True,
             )
+            if candidates:
+                top = candidates[0]
+                log(
+                    f"[buy-candidates] count={len(candidates)} top={top['product_id']} "
+                    f"score={float(top.get('score', 0.0)):.2f} "
+                    f"prob={float(top.get('estimated_prob_up', 0.0)):.3f} "
+                    f"ev={float(top.get('expected_net_edge_bps', 0.0)):.2f} "
+                    f"pos_pct={float(top.get('position_pct', 0.0)):.3f}"
+                )
+
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
 
             for candidate in candidates[:MAX_NEW_ENTRIES_PER_EVAL]:
@@ -7036,6 +7176,12 @@ class TradingBot:
                 min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
 
                 if entry_notional < min_order:
+                    log(
+                        f"[buy-skip] {product_id} entry_notional={entry_notional:.2f} "
+                        f"below_min_order={min_order:.2f} "
+                        f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f} "
+                        f"score={float(candidate.get('score', 0.0)):.2f}"
+                    )
                     continue
 
                 entry_fee_bps = self._entry_fee_bps_for_mode()
@@ -7069,7 +7215,12 @@ class TradingBot:
                     can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
 
                 if not can_afford:
-                    # Do not place buy orders when available funds are insufficient.
+                    log(
+                        f"[buy-skip] {product_id} cannot_afford "
+                        f"entry_notional={entry_notional:.2f} "
+                        f"cash_usd={cash_usd:.2f} "
+                        f"entry_fee_bps={entry_fee_bps:.2f}"
+                    )
                     continue
 
                 bid, ask = candidate["bid"], candidate["ask"]
@@ -7082,6 +7233,7 @@ class TradingBot:
                 )
 
                 if fill is None:
+                    log(f"[buy-failed] {product_id} Coinbase buy returned no fill")
                     continue
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
@@ -7381,6 +7533,16 @@ class TradingBot:
                         regime_score=0.0,
                         spread_penalty=0.0,
                         cost_penalty=0.0,
+                        buy_gate_score_ok=False,
+                        buy_gate_prob_ok=False,
+                        buy_gate_ev_ok=False,
+                        buy_gate_fee_ok=False,
+                        buy_gate_strict_ok=False,
+                        buy_gate_target_cost_ok=False,
+                        buy_gate_spread_ok=False,
+                        buy_gate_calibrated_ok=False,
+                        buy_gate_tradeable=False,
+                        buy_gate_blocker="signal_error_or_fallback",
                     )
 
                 self.mlog.log_snapshot(
@@ -7422,6 +7584,16 @@ class TradingBot:
                     regime_score=live_signal.regime_score,
                     spread_penalty=live_signal.spread_penalty,
                     cost_penalty=live_signal.cost_penalty,
+                    buy_gate_score_ok=live_signal.buy_gate_score_ok,
+                    buy_gate_prob_ok=live_signal.buy_gate_prob_ok,
+                    buy_gate_ev_ok=live_signal.buy_gate_ev_ok,
+                    buy_gate_fee_ok=live_signal.buy_gate_fee_ok,
+                    buy_gate_strict_ok=live_signal.buy_gate_strict_ok,
+                    buy_gate_target_cost_ok=live_signal.buy_gate_target_cost_ok,
+                    buy_gate_spread_ok=live_signal.buy_gate_spread_ok,
+                    buy_gate_calibrated_ok=live_signal.buy_gate_calibrated_ok,
+                    buy_gate_tradeable=live_signal.buy_gate_tradeable,
+                    buy_gate_blocker=live_signal.buy_gate_blocker,
                 )
             try:
                 self._write_position_targets_snapshot()

@@ -294,6 +294,14 @@ def numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     return df
 
 
+def truthy_cell(value: Any) -> bool:
+    return str(value).strip().lower() in ("true", "1", "yes", "y")
+
+
+def pass_wait_label(value: Any) -> str:
+    return "PASS" if truthy_cell(value) else "waiting"
+
+
 def to_dt_mst(ts_series: pd.Series) -> pd.Series:
     dt = pd.to_datetime(pd.to_numeric(ts_series, errors="coerce"), unit="s", utc=True)
     return dt.dt.tz_convert(TZ)
@@ -1140,6 +1148,32 @@ def render_live_dashboard() -> None:
                 f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}",
                 "PASS" if ev_ok else "waiting",
             )
+
+        st.markdown(
+            f'<div class="cb-section">{product} full buy gate</div>',
+            unsafe_allow_html=True,
+        )
+
+        gate_items = [
+            ("Score target", latest_row.get("buy_gate_score_ok", False)),
+            ("Probability target", latest_row.get("buy_gate_prob_ok", False)),
+            ("EV target", latest_row.get("buy_gate_ev_ok", False)),
+            ("Fee tier ready", latest_row.get("buy_gate_fee_ok", False)),
+            ("Setup/reversal gate", latest_row.get("buy_gate_strict_ok", False)),
+            ("Target-to-cost gate", latest_row.get("buy_gate_target_cost_ok", False)),
+            ("Spread gate", latest_row.get("buy_gate_spread_ok", False)),
+            ("Calibrated gate", latest_row.get("buy_gate_calibrated_ok", False)),
+            ("Tradeable signal", latest_row.get("buy_gate_tradeable", False)),
+        ]
+
+        gcols = st.columns(3)
+        for idx, (label, val) in enumerate(gate_items):
+            with gcols[idx % 3]:
+                mini_card(label, "PASS" if truthy_cell(val) else "BLOCKED", "")
+
+        blocker = latest_row.get("buy_gate_blocker", "")
+        if pd.notna(blocker) and str(blocker).strip():
+            st.caption(f"Buy gate blocker: {blocker}")
 
         current_projected_forward = latest_row.get("projected_forward_gain_bps", np.nan)
         current_cost = latest_row.get("cost_bps", np.nan)

@@ -330,6 +330,28 @@ DEFAULT_CALIB_MIN_SCORE: float = 60.0
 DEFAULT_CALIB_MIN_PROB: float = 0.58
 DEFAULT_CALIB_MIN_EV_BPS: float = 2.0
 
+# Calibration threshold behavior.
+# These are safety bounds, not forced default targets.
+CALIB_MIN_ALLOWED_SCORE: float = 45.0
+CALIB_MAX_ALLOWED_SCORE: float = 82.0
+CALIB_MIN_ALLOWED_PROB: float = 0.50
+CALIB_MAX_ALLOWED_PROB: float = 0.78
+
+# If no positive bucket exists, derive a product-specific fallback from recent
+# observations instead of giving every product the same default.
+CALIB_FALLBACK_SCORE_QUANTILE: float = 0.65
+CALIB_FALLBACK_PROB_QUANTILE: float = 0.65
+
+# Live recalibration can be CPU-heavy. Do it less often and off the event loop.
+LIVE_RECALIBRATION_EVERY_SEC: float = 5 * 60
+LIVE_RECALIBRATION_MIN_ROWS: int = 240
+
+# Event loop lag diagnostics.
+EVENT_LOOP_LAG_WARN_SEC: float = 3.0
+
+# Account snapshot cache for telemetry.
+TELEMETRY_ACCOUNT_REFRESH_TTL_SEC: float = 5.0
+
 # Candidate pullbacks tested during sell calibration.
 CALIB_SCALP_PULLBACK_CANDIDATES: List[float] = [0.0005, 0.0010, 0.0015, 0.0020]
 CALIB_CORE_PULLBACK_CANDIDATES: List[float] = [0.0010, 0.0020, 0.0030, 0.0040]
@@ -3325,6 +3347,10 @@ class TradingBot:
             p: ProductCalibrationProfile(product_id=p) for p in PRODUCTS
         }
         self.last_live_calibration_ts: float = 0.0
+        self.live_recalibration_running: bool = False
+        self.last_loop_lag_check_ts: float = now_ts()
+        self.cached_account_snapshot: Optional[Dict[str, Dict[str, float]]] = None
+        self.cached_account_snapshot_ts: float = 0.0
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
         # parallel metadata for lots (so we can do tranche-specific exits without changing CSV schema)
@@ -4463,6 +4489,12 @@ class TradingBot:
         wins = sum(1 for observation in observations if observation.reached_min_profit)
         return float(wins / len(observations))
 
+    def _safe_quantile(self, values: List[float], q: float, default: float) -> float:
+        clean = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+        if not clean:
+            return float(default)
+        return float(np.quantile(clean, clamp_float(float(q), 0.0, 1.0)))
+
     def _build_calibration_profile(
         self,
         *,
@@ -4470,19 +4502,31 @@ class TradingBot:
         day_obs: List[CalibrationObservation],
         week_obs: List[CalibrationObservation],
     ) -> ProductCalibrationProfile:
-        """Select per-product buy thresholds from replayed outcomes."""
+        """
+        Build per-product thresholds from walk-forward observations.
+
+        Important:
+        - Do not force every product back to the same default score/probability.
+        - Defaults are only used when data is missing.
+        - When positive buckets are unavailable, use product-specific quantiles.
+        """
         all_obs = list(day_obs) + list(week_obs)
+
         if len(all_obs) < CALIB_MIN_PRODUCT_SAMPLES:
             return ProductCalibrationProfile(
                 product_id=product_id,
+                min_score=DEFAULT_CALIB_MIN_SCORE,
+                min_probability=DEFAULT_CALIB_MIN_PROB,
+                min_expected_value_bps=DEFAULT_CALIB_MIN_EV_BPS,
                 day_sample_count=len(day_obs),
                 week_sample_count=len(week_obs),
                 day_win_rate=self._win_rate(day_obs),
                 week_win_rate=self._win_rate(week_obs),
-                reason=f"insufficient_samples total={len(all_obs)}",
+                reason=f"insufficient_samples total={len(all_obs)} using_defaults",
             )
 
         buckets: Dict[Tuple[float, float], List[CalibrationObservation]] = {}
+
         for observation in all_obs:
             key = (
                 self._score_bucket(observation.score),
@@ -4491,51 +4535,111 @@ class TradingBot:
             buckets.setdefault(key, []).append(observation)
 
         candidates: List[Tuple[float, float, float, float, float, int, float]] = []
+
         for (score_bucket, prob_bucket), observations in buckets.items():
             if len(observations) < CALIB_MIN_BUCKET_SAMPLES:
                 continue
+
             wins = [o for o in observations if o.reached_min_profit]
             losses = [o for o in observations if not o.reached_min_profit]
-            win_rate = len(wins) / len(observations)
+
+            win_rate = len(wins) / max(1, len(observations))
             avg_win = float(np.mean([o.win_bps for o in wins])) if wins else 0.0
             avg_loss = float(np.mean([o.loss_bps for o in losses])) if losses else 0.0
             expected_value = win_rate * avg_win - (1.0 - win_rate) * avg_loss
-            if win_rate < CALIB_MIN_WIN_RATE or expected_value < CALIB_MIN_EXPECTED_VALUE_BPS:
+
+            if win_rate < CALIB_MIN_WIN_RATE:
                 continue
+
+            if expected_value < CALIB_MIN_EXPECTED_VALUE_BPS:
+                continue
+
             candidates.append((
-                expected_value, win_rate, avg_win, avg_loss,
-                score_bucket, len(observations), prob_bucket,
+                expected_value,
+                win_rate,
+                avg_win,
+                avg_loss,
+                float(score_bucket),
+                len(observations),
+                float(prob_bucket),
             ))
 
+        wins_all = [o for o in all_obs if o.reached_min_profit]
+        losses_all = [o for o in all_obs if not o.reached_min_profit]
+        blended_win_rate = len(wins_all) / max(1, len(all_obs))
+        avg_win_all = float(np.mean([o.win_bps for o in wins_all])) if wins_all else 0.0
+        avg_loss_all = float(np.mean([o.loss_bps for o in losses_all])) if losses_all else 0.0
+        blended_ev = blended_win_rate * avg_win_all - (1.0 - blended_win_rate) * avg_loss_all
+
         if not candidates:
-            wins = [o for o in all_obs if o.reached_min_profit]
-            losses = [o for o in all_obs if not o.reached_min_profit]
-            win_rate = len(wins) / len(all_obs)
-            avg_win = float(np.mean([o.win_bps for o in wins])) if wins else 0.0
-            avg_loss = float(np.mean([o.loss_bps for o in losses])) if losses else 0.0
-            expected_value = win_rate * avg_win - (1.0 - win_rate) * avg_loss
+            # Adaptive fallback:
+            # Use this product's own recent score/probability distribution instead of
+            # assigning every product the same default target.
+            product_scores = [o.score for o in all_obs]
+            product_probs = [o.probability for o in all_obs]
+
+            fallback_score = self._safe_quantile(
+                product_scores,
+                CALIB_FALLBACK_SCORE_QUANTILE,
+                DEFAULT_CALIB_MIN_SCORE,
+            )
+            fallback_prob = self._safe_quantile(
+                product_probs,
+                CALIB_FALLBACK_PROB_QUANTILE,
+                DEFAULT_CALIB_MIN_PROB,
+            )
+
+            fallback_score = clamp_float(
+                fallback_score,
+                CALIB_MIN_ALLOWED_SCORE,
+                CALIB_MAX_ALLOWED_SCORE,
+            )
+            fallback_prob = clamp_float(
+                fallback_prob,
+                CALIB_MIN_ALLOWED_PROB,
+                CALIB_MAX_ALLOWED_PROB,
+            )
+
             return ProductCalibrationProfile(
                 product_id=product_id,
-                min_expected_value_bps=max(
-                    DEFAULT_CALIB_MIN_EV_BPS, CALIB_MIN_EXPECTED_VALUE_BPS
-                ),
+                min_score=float(fallback_score),
+                min_probability=float(fallback_prob),
+                min_expected_value_bps=max(DEFAULT_CALIB_MIN_EV_BPS, CALIB_MIN_EXPECTED_VALUE_BPS),
                 day_sample_count=len(day_obs),
                 week_sample_count=len(week_obs),
                 day_win_rate=self._win_rate(day_obs),
                 week_win_rate=self._win_rate(week_obs),
-                blended_win_rate=win_rate,
-                avg_win_bps=avg_win,
-                avg_loss_bps=avg_loss,
-                expected_value_bps=expected_value,
-                reason=f"no_positive_bucket fallback total={len(all_obs)} ev={expected_value:.2f}",
+                blended_win_rate=blended_win_rate,
+                avg_win_bps=avg_win_all,
+                avg_loss_bps=avg_loss_all,
+                expected_value_bps=blended_ev,
+                reason=(
+                    f"adaptive_fallback no_positive_bucket total={len(all_obs)} "
+                    f"q_score={fallback_score:.1f} q_prob={fallback_prob:.3f} "
+                    f"ev={blended_ev:.2f}"
+                ),
             )
 
+        # Choose best bucket by expected value first, then win rate, then sample count.
         candidates.sort(key=lambda item: (item[0], item[1], item[5]), reverse=True)
         best_ev, best_wr, best_avg_win, best_avg_loss, best_score, best_n, best_prob = candidates[0]
+
+        # Do not force thresholds to the same default. Bound them within safe rails.
+        calibrated_score = clamp_float(
+            float(best_score),
+            CALIB_MIN_ALLOWED_SCORE,
+            CALIB_MAX_ALLOWED_SCORE,
+        )
+        calibrated_prob = clamp_float(
+            float(best_prob),
+            CALIB_MIN_ALLOWED_PROB,
+            CALIB_MAX_ALLOWED_PROB,
+        )
+
         return ProductCalibrationProfile(
             product_id=product_id,
-            min_score=max(float(best_score), DEFAULT_CALIB_MIN_SCORE),
-            min_probability=max(float(best_prob), DEFAULT_CALIB_MIN_PROB),
+            min_score=float(calibrated_score),
+            min_probability=float(calibrated_prob),
             min_expected_value_bps=max(float(best_ev) * 0.35, CALIB_MIN_EXPECTED_VALUE_BPS),
             day_sample_count=len(day_obs),
             week_sample_count=len(week_obs),
@@ -4545,7 +4649,11 @@ class TradingBot:
             avg_win_bps=float(best_avg_win),
             avg_loss_bps=float(best_avg_loss),
             expected_value_bps=float(best_ev),
-            reason=f"best_bucket score>={best_score:.1f} prob>={best_prob:.3f} samples={best_n}",
+            reason=(
+                f"best_bucket score>={calibrated_score:.1f} "
+                f"prob>={calibrated_prob:.3f} samples={best_n} "
+                f"ev={best_ev:.2f} wr={best_wr:.3f}"
+            ),
         )
 
     def _simulate_armed_exit_net_bps(
@@ -4738,6 +4846,11 @@ class TradingBot:
                     forward_bars=CALIB_FORWARD_BARS_15M,
                     spread_bps=spread_bps,
                 ) if week_candles else []
+                log(
+                    f"[calibration] {product} observations "
+                    f"day={len(day_obs)} week={len(week_obs)} "
+                    f"spread_bps={spread_bps:.2f}"
+                )
                 profile = self._build_calibration_profile(
                     product_id=product,
                     day_obs=day_obs,
@@ -4775,7 +4888,10 @@ class TradingBot:
         """Smooth buy thresholds using completed rolling one-minute candles."""
         for product in PRODUCTS:
             live_rows = self.live_1m[product].export_rows(product)
-            minimum_rows = CALIB_MIN_PREFIX_CANDLES_1M + CALIB_FORWARD_MINUTES_1M
+            minimum_rows = max(
+                LIVE_RECALIBRATION_MIN_ROWS,
+                CALIB_MIN_PREFIX_CANDLES_1M + CALIB_FORWARD_MINUTES_1M,
+            )
             if len(live_rows) < minimum_rows:
                 continue
             live_candles = [
@@ -5687,6 +5803,9 @@ class TradingBot:
         log("[run] starting websocket task first")
         ws_task = asyncio.create_task(self.ws_loop())
 
+        log("[run] waiting for initial top-of-book data")
+        await self._wait_for_tob_ready(timeout_sec=20.0)
+
         await self._refresh_coinbase_fee_tier_if_needed(force=True)
 
         log("[run] calibrating products before live trading")
@@ -5715,6 +5834,8 @@ class TradingBot:
                     WS_MARKET_URL,
                     ping_interval=WS_PING_INTERVAL,
                     ping_timeout=WS_PING_TIMEOUT,
+                    close_timeout=5,
+                    max_queue=1024,
                 ) as ws:
                     # authenticate and subscribe to ticker and heartbeats
                     jwt_token = jwt_generator.build_ws_jwt(self.api_key, self.pem_secret)
@@ -5731,7 +5852,9 @@ class TradingBot:
                         "jwt": jwt_token
                     }))
                     print("Subscribed to Coinbase WS ticker for", PRODUCTS)
+                    last_msg_ts = now_ts()
                     async for message in ws:
+                        last_msg_ts = now_ts()
                         if self._stop_event.is_set():
                             break
                         try:
@@ -6179,6 +6302,10 @@ class TradingBot:
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
+            loop_gap = ts_now - float(self.last_loop_lag_check_ts or ts_now)
+            if loop_gap > EVENT_LOOP_LAG_WARN_SEC:
+                log(f"[lag] eval_loop gap={loop_gap:.2f}s; possible blocking work or REST delay")
+            self.last_loop_lag_check_ts = ts_now
             try:
                 await self._refresh_coinbase_fee_tier_if_needed(force=False)
             except Exception as e:
@@ -6188,13 +6315,21 @@ class TradingBot:
 
             if (
                 ENABLE_WALK_FORWARD_CALIBRATION
-                and ts_now - self.last_live_calibration_ts >= 60.0
+                and not self.live_recalibration_running
+                and ts_now - self.last_live_calibration_ts >= LIVE_RECALIBRATION_EVERY_SEC
             ):
                 self.last_live_calibration_ts = ts_now
-                try:
-                    self._run_live_recalibration()
-                except Exception as e:
-                    log(f"[calibration] live recalibration failed: {e}")
+                self.live_recalibration_running = True
+
+                async def _recalibrate_in_thread() -> None:
+                    try:
+                        await asyncio.to_thread(self._run_live_recalibration)
+                    except Exception as e:
+                        log(f"[calibration] live recalibration failed: {e}")
+                    finally:
+                        self.live_recalibration_running = False
+
+                asyncio.create_task(_recalibrate_in_thread())
 
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:
@@ -6893,7 +7028,19 @@ class TradingBot:
         while not self._stop_event.is_set():
             ts_now = now_ts_i()
             try:
-                snap_live = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
+                if (
+                    self.cached_account_snapshot is None
+                    or now_ts() - float(self.cached_account_snapshot_ts or 0.0)
+                    >= TELEMETRY_ACCOUNT_REFRESH_TTL_SEC
+                ):
+                    self.cached_account_snapshot = await asyncio.to_thread(
+                        self.portfolio.refresh_snapshot,
+                        True,
+                        0.0,
+                    )
+                    self.cached_account_snapshot_ts = now_ts()
+
+                snap_live = self.cached_account_snapshot
                 cash_usd = self.portfolio.get_tradable_usd(snapshot=snap_live)
                 equity_usd = self.portfolio.compute_equity_usd(
                     mid_by_product=self._live_mid_by_product(),
@@ -6914,14 +7061,16 @@ class TradingBot:
                 positions = self.positions[product]
 
                 try:
-                    snap_live_product = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
-                    position_qty = self.portfolio.get_product_total_qty(product, snapshot=snap_live_product)
+                    position_qty = self.portfolio.get_product_total_qty(
+                        product, snapshot=snap_live or {}
+                    )
                     exposures_usd = float(position_qty) * float(mid)
+
                     local_qty = sum(lot.qty for lot in positions)
                     local_cost = sum(lot.qty * lot.price for lot in positions)
                     avg_entry_price = (local_cost / local_qty) if local_qty > 0 else None
                 except Exception as e:
-                    log(f"[telemetry] Coinbase position refresh failed for {product}: {e}")
+                    log(f"[telemetry] Coinbase position read failed for {product}: {e}")
                     exposures_usd = 0.0
                     position_qty = 0.0
                     avg_entry_price = None

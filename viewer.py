@@ -1123,6 +1123,8 @@ def render_live_dashboard() -> None:
         with b3:
             mini_card("Buy EV requirement", f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}", "PASS" if ev_ok else "waiting")
 
+        st.caption(f"Calibration reason: {selected_cal.get('reason', '—')}")
+
     selected_pt = latest_position_target_for_product(pt, product)
     st.markdown(f'<div class="cb-section">{product} sell plan</div>', unsafe_allow_html=True)
     if selected_pt is None:

@@ -36,13 +36,6 @@ TZ = ZoneInfo(TZ_NAME)
 # CONFIGURATION
 # ============================================================
 
-# Paper trading mode. If True, no real orders are sent on Coinbase.
-PAPER_TRADING: bool = True
-
-# Starting account balance in USD (paper mode)
-STARTING_CASH_USD: float = 100.0
-
-
 # If True, treat USD 'hold' as tradable buying power (useful for instant-deposit trading).
 # Coinbase may allow trading immediately while keeping deposits on a withdrawal hold; in that case
 # available_balance can be 0 while hold is positive. Enabling this will use available_balance + hold.
@@ -173,10 +166,10 @@ ROTATION_MIN_NET_PROFIT_BPS: float = 15.0
 ROTATION_SELL_FRACTION: float = 1.0
 
 # Coinbase fee-tier auto-refresh.
+# This bot requires real Coinbase-provided maker/taker fee rates before trading.
 AUTO_REFRESH_COINBASE_FEE_TIER: bool = True
 FEE_TIER_REFRESH_SEC: float = 60 * 60
-FEE_TIER_FALLBACK_MAKER_BPS: float = 40.0
-FEE_TIER_FALLBACK_TAKER_BPS: float = 60.0
+REQUIRE_COINBASE_FEE_TIER: bool = True
 
 # Coinbase portfolio source-of-truth behavior.
 # In live mode, Coinbase balances and fills should be treated as authoritative.
@@ -217,8 +210,6 @@ EXIT_EXECUTION_MODE: str = "LIMIT_THEN_MARKET"
 # Execution friction
 MAX_SPREAD_BPS: float = 18.0
 SCALP_MAX_SPREAD_BPS: float = 10.0
-MAKER_FEE_BPS: float = 6.0
-TAKER_FEE_BPS: float = 10.0
 EST_SLIPPAGE_BPS: float = 6.0
 EST_ADVERSE_FILL_BPS: float = 6.0
 
@@ -1166,6 +1157,8 @@ class MarketLogger:
                 "anchored_vwap", "fair_value", "sigma_bps", "weekly_bias",
                 "state", "cash_usd", "equity_usd",
                 "entry_score", "entry_tier", "entry_reason", "expected_net_edge_bps",
+                "estimated_prob_up", "position_pct", "target_bps", "cost_bps",
+                "current_maker_fee_bps", "current_taker_fee_bps", "fee_tier_reason",
                 "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
                 "room_score", "regime_score", "spread_penalty", "cost_penalty"
             ])
@@ -1193,6 +1186,13 @@ class MarketLogger:
         entry_tier: Optional[int] = None,
         entry_reason: str = "",
         expected_net_edge_bps: Optional[float] = None,
+        estimated_prob_up: Optional[float] = None,
+        position_pct: Optional[float] = None,
+        target_bps: Optional[float] = None,
+        cost_bps: Optional[float] = None,
+        current_maker_fee_bps: Optional[float] = None,
+        current_taker_fee_bps: Optional[float] = None,
+        fee_tier_reason: str = "",
         dip_depth_score: Optional[float] = None,
         dip_speed_score: Optional[float] = None,
         reversal_score: Optional[float] = None,
@@ -1219,6 +1219,13 @@ class MarketLogger:
                 "" if entry_tier is None else str(entry_tier),
                 entry_reason,
                 "" if expected_net_edge_bps is None else f"{expected_net_edge_bps:.6f}",
+                "" if estimated_prob_up is None else f"{estimated_prob_up:.6f}",
+                "" if position_pct is None else f"{position_pct:.6f}",
+                "" if target_bps is None else f"{target_bps:.6f}",
+                "" if cost_bps is None else f"{cost_bps:.6f}",
+                "" if current_maker_fee_bps is None else f"{current_maker_fee_bps:.6f}",
+                "" if current_taker_fee_bps is None else f"{current_taker_fee_bps:.6f}",
+                fee_tier_reason,
                 "" if dip_depth_score is None else f"{dip_depth_score:.6f}",
                 "" if dip_speed_score is None else f"{dip_speed_score:.6f}",
                 "" if reversal_score is None else f"{reversal_score:.6f}",
@@ -1801,17 +1808,24 @@ def _room_score(mid: float, day: Optional['MacroLevels'], week: Optional['MacroL
     return 0.0, reason
 
 
-def _estimate_net_edge_bps(score_room: float, spread_bps: float, tier_hint: int) -> float:
+def _estimate_net_edge_bps(
+    score_room: float,
+    spread_bps: float,
+    tier_hint: int,
+    round_trip_cost_bps: float,
+) -> float:
+    """
+    Estimate edge using a caller-provided round-trip cost.
+    The caller must pass a cost built from real Coinbase fee-tier values.
+    """
     gross_target_bps = {
         TIER_LOW: 24.0,
         TIER_MID: 45.0,
         TIER_HIGH: 85.0,
     }.get(tier_hint, 24.0)
 
-    friction = spread_bps + TAKER_FEE_BPS + EST_SLIPPAGE_BPS + EST_ADVERSE_FILL_BPS
     room_bonus = (score_room / 100.0) * 12.0
-    return float(gross_target_bps + room_bonus - friction)
-
+    return float(gross_target_bps + room_bonus - float(round_trip_cost_bps))
 
 def score_entry_candidate(
     *,
@@ -1823,6 +1837,7 @@ def score_entry_candidate(
     weekly_bias: Optional[float],
     trending_down: bool,
     resist_buffer_bps: float,
+    round_trip_cost_bps: float,
 ) -> EntryScore:
     if mid <= 0:
         return EntryScore(False, 0.0, 0, "bad_mid", 0, 0, 0, 0, 0, 0, 0, 0, -999.0)
@@ -1859,7 +1874,7 @@ def score_entry_candidate(
         regime_score = min(regime_score, 30.0)
 
     spread_penalty = max(0.0, spread_bps - 6.0) * (SCORE_SPREAD_PENALTY_W / 20.0)
-    cost_penalty = (TAKER_FEE_BPS + EST_SLIPPAGE_BPS + EST_ADVERSE_FILL_BPS) * (SCORE_COST_PENALTY_W / 25.0)
+    cost_penalty = float(round_trip_cost_bps) * (SCORE_COST_PENALTY_W / 25.0)
 
     raw_score = (
         (dip_depth_score / 100.0) * SCORE_DIP_DEPTH_W
@@ -1874,7 +1889,12 @@ def score_entry_candidate(
 
     final_score = _clip_score(raw_score)
     tier = _score_to_tier(final_score)
-    edge_bps = _estimate_net_edge_bps(room_score, spread_bps, max(tier, TIER_LOW))
+    edge_bps = _estimate_net_edge_bps(
+        room_score,
+        spread_bps,
+        max(tier, TIER_LOW),
+        round_trip_cost_bps=float(round_trip_cost_bps),
+    )
 
     if not rev_ok:
         return EntryScore(False, final_score, tier, f"reversal_fail {rev_reason}", dip_depth_score, dip_speed_score, reversal_score, support_score, room_score, regime_score, spread_penalty, cost_penalty, edge_bps)
@@ -1939,6 +1959,7 @@ def tiered_entry_gate(
     trending_down: bool,
     support_buffer_bps: float,
     resist_buffer_bps: float,
+    round_trip_cost_bps: float,
 ) -> Tuple[bool, int, str]:
     scored = score_entry_candidate(
         mid=mid,
@@ -1949,6 +1970,7 @@ def tiered_entry_gate(
         weekly_bias=weekly_bias,
         trending_down=trending_down,
         resist_buffer_bps=resist_buffer_bps,
+        round_trip_cost_bps=round_trip_cost_bps,
     )
     return scored.ok, scored.tier, scored.reason
 
@@ -1975,27 +1997,6 @@ def get_exit_targets(entry_price: float, sigma_bps: float, tier: int) -> Dict[st
 # ------------------------------------------------------------
 # Portfolio management
 # ------------------------------------------------------------
-
-class PaperPortfolio:
-    """Simple portfolio holding only USD. Tracks available cash."""
-    def __init__(self, starting_cash: float) -> None:
-        self.cash_usd: float = float(starting_cash)
-
-    def can_afford(self, notional_usd: float, fee_bps: float) -> bool:
-        total_cost = notional_usd + fee_usd(notional_usd, fee_bps)
-        return self.cash_usd >= total_cost
-
-    def debit(self, notional_usd: float, fee_bps: float) -> float:
-        fee_val = fee_usd(notional_usd, fee_bps)
-        self.cash_usd -= (notional_usd + fee_val)
-        return fee_val
-
-    def credit(self, notional_usd: float, fee_bps: float) -> float:
-        fee_val = fee_usd(notional_usd, fee_bps)
-        self.cash_usd += (notional_usd - fee_val)
-        return fee_val
-
-
 
 @dataclass
 class ExecutionResult:
@@ -2342,7 +2343,7 @@ class LivePortfolio:
             time.sleep(float(sleep_sec))
 
     # ---------------------------
-    # PaperPortfolio-compatible API
+    # Live balance refresh helpers
     # ---------------------------
 
     def refresh_cash(self) -> float:
@@ -2957,7 +2958,7 @@ class TradingBot:
         # Price-based re-entry gating (prevents rapid churn without using time)
         self.rearm_required: Dict[str, bool] = {p: False for p in PRODUCTS}
         # portfolio
-        self.portfolio = PaperPortfolio(STARTING_CASH_USD) if PAPER_TRADING else LivePortfolio(rest)
+        self.portfolio = LivePortfolio(rest)
         # last macro update time
         self.last_macro_update: float = 0.0
         # stop event
@@ -2977,8 +2978,10 @@ class TradingBot:
 
         # Dynamic Coinbase fee state.
         # Defaults are conservative until Coinbase fee tier is successfully detected.
-        self.current_maker_fee_bps: float = float(FEE_TIER_FALLBACK_MAKER_BPS)
-        self.current_taker_fee_bps: float = float(FEE_TIER_FALLBACK_TAKER_BPS)
+        # Dynamic Coinbase fee state.
+        # None means the bot is not allowed to trade yet.
+        self.current_maker_fee_bps: Optional[float] = None
+        self.current_taker_fee_bps: Optional[float] = None
         self.last_fee_tier_refresh_ts: float = 0.0
         self.last_fee_tier_reason: str = "not_refreshed_yet"
 
@@ -3161,70 +3164,53 @@ class TradingBot:
         return removed_qty, avg_entry
 
     async def _sell_partial(self, product: str, qty_to_sell: float, note: str) -> Optional[Tuple[float, float, float]]:
-        """Sell qty_to_sell and return (sold_qty, exec_price, fee_usd) if filled."""
+        """Sell qty_to_sell on Coinbase and return (sold_qty, exec_price, fee_usd) if filled."""
         tob = self.tob.get(product)
         if not tob:
             return None
-        bid = tob.bid
-        ask = tob.ask
 
         qty_to_sell = float(qty_to_sell)
         if qty_to_sell <= 1e-12:
             return None
 
-        exec_price = float(bid)
-        fee = 0.0
-        sold_qty = qty_to_sell
+        fill = await self._execute_live_sell(
+            product_id=product,
+            base_qty=qty_to_sell,
+            bid=float(tob.bid),
+            ask=float(tob.ask),
+            reason=note or "partial_sell",
+        )
+        if fill is None:
+            return None
 
-        if isinstance(self.portfolio, LivePortfolio):
-            r = await self._live_sell_maker(product_id=product, base_qty=qty_to_sell, ask=ask)
-            fill = self._require_live_fill(r, product_id=product, side="SELL")
-            if fill is None:
-                return None
-            filled_qty, avg_px, fee_val, filled_notional, order_id = fill
-            exec_price = float(avg_px)
-            fee = float(fee_val)
-            sold_qty = float(min(qty_to_sell, filled_qty))
-            try:
-                self.portfolio.cash_usd = float(await self._live_refresh_cash())
-            except Exception:
-                pass
-        else:
-            if self.portfolio:
-                self.portfolio.credit(sold_qty * exec_price, self._exit_fee_bps_for_mode())
-
-        return sold_qty, exec_price, fee
+        filled_qty, avg_px, fee_val, _filled_notional, _order_id = fill
+        sold_qty = float(min(qty_to_sell, filled_qty))
+        return sold_qty, float(avg_px), float(fee_val)
 
     async def _force_sell_product(self, product: str, note: str = "") -> None:
         tob = self.tob.get(product)
         if not tob:
             return
-        bid = tob.bid
 
         lots = self.positions.get(product, [])
         qty = sum(l.qty for l in lots) if lots else 0.0
         if qty <= 0:
             return
 
-        if isinstance(self.portfolio, LivePortfolio):
-            r = await self._live_sell_maker(product_id=product, base_qty=float(qty), ask=tob.ask)
-            fill = self._require_live_fill(r, product_id=product, side="SELL")
-            if fill is None:
-                return
-            filled_qty, avg_px, fee_val, filled_notional, order_id = fill
-            exec_price = float(avg_px)
-            fee = float(fee_val)
-            qty_sold = float(min(qty, filled_qty))
-            try:
-                self.portfolio.cash_usd = float(await self._live_refresh_cash())
-            except Exception:
-                pass
-        else:
-            exec_price = float(bid)
-            fee = 0.0
-            qty_sold = float(qty)
-            if self.portfolio:
-                self.portfolio.credit(qty_sold * exec_price, self._exit_fee_bps_for_mode())
+        fill = await self._execute_live_sell(
+            product_id=product,
+            base_qty=float(qty),
+            bid=float(tob.bid),
+            ask=float(tob.ask),
+            reason=note or "force_sell",
+        )
+        if fill is None:
+            return
+
+        filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+        exec_price = float(avg_px)
+        fee = float(fee_val)
+        qty_sold = float(min(qty, filled_qty))
 
         self.tlog.log_trade(
             event="SELL",
@@ -3239,12 +3225,13 @@ class TradingBot:
             exit_price=exec_price,
             weekly_bias=self.macro.compute_weekly_bias(product, tob.mid),
             note=note,
-            filled_notional_usd=(float(filled_notional) if isinstance(self.portfolio, LivePortfolio) and filled_notional is not None else None),
+            filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
         )
 
         ts_now = now_ts()
-        self.positions[product] = []
-        self.lot_tags[product] = []
+        self._fifo_reduce_lots(product, qty_sold)
+        if self.positions.get(product):
+            return
         self.ladder_plan[product] = None
         self.peak_bid[product] = None
         self.trailing_active[product] = False
@@ -3436,48 +3423,58 @@ class TradingBot:
 
     async def _refresh_coinbase_fee_tier_if_needed(self, *, force: bool = False) -> None:
         """
-        Refresh Coinbase maker/taker fee bps from transaction_summary when available.
-        Falls back to conservative configured values if unavailable.
+        Refresh Coinbase maker/taker fee bps from transaction_summary.
+
+        This bot is live-only and fee-strict:
+        - If Coinbase fee tier cannot be detected, trading is blocked.
+        - No hardcoded maker/taker fallback is used.
         """
         if not AUTO_REFRESH_COINBASE_FEE_TIER:
-            return
+            raise RuntimeError("AUTO_REFRESH_COINBASE_FEE_TIER must remain True for live-only fee-strict mode.")
+
+        if not REQUIRE_COINBASE_FEE_TIER:
+            raise RuntimeError("REQUIRE_COINBASE_FEE_TIER must remain True for live-only fee-strict mode.")
+
         if not isinstance(self.portfolio, LivePortfolio):
-            return
+            raise RuntimeError("Live-only bot requires LivePortfolio.")
 
         t = now_ts()
-        if (not force) and (t - float(self.last_fee_tier_refresh_ts or 0.0)) < float(FEE_TIER_REFRESH_SEC):
+        if (
+            not force
+            and self.current_maker_fee_bps is not None
+            and self.current_taker_fee_bps is not None
+            and (t - float(self.last_fee_tier_refresh_ts or 0.0)) < float(FEE_TIER_REFRESH_SEC)
+        ):
             return
 
-        try:
-            maker_bps, taker_bps, reason = await asyncio.to_thread(self.portfolio.get_fee_tier_bps)
-            if maker_bps is not None and taker_bps is not None:
-                self.current_maker_fee_bps = float(maker_bps)
-                self.current_taker_fee_bps = float(taker_bps)
-                self.last_fee_tier_reason = reason
-                log(f"[fee-tier] refreshed {reason}")
-            else:
-                self.current_maker_fee_bps = float(FEE_TIER_FALLBACK_MAKER_BPS)
-                self.current_taker_fee_bps = float(FEE_TIER_FALLBACK_TAKER_BPS)
-                self.last_fee_tier_reason = reason
-                log(
-                    f"[fee-tier] using fallback maker={self.current_maker_fee_bps:.2f}bps "
-                    f"taker={self.current_taker_fee_bps:.2f}bps reason={reason}"
-                )
-        except Exception as e:
-            self.current_maker_fee_bps = float(FEE_TIER_FALLBACK_MAKER_BPS)
-            self.current_taker_fee_bps = float(FEE_TIER_FALLBACK_TAKER_BPS)
-            self.last_fee_tier_reason = f"fee_tier_exception: {e}"
-            log(f"[fee-tier] fallback after exception: {e}")
+        maker_bps, taker_bps, reason = await asyncio.to_thread(self.portfolio.get_fee_tier_bps)
 
+        if maker_bps is None or taker_bps is None:
+            self.current_maker_fee_bps = None
+            self.current_taker_fee_bps = None
+            self.last_fee_tier_reason = reason
+            self.last_fee_tier_refresh_ts = t
+            raise RuntimeError(f"Coinbase fee tier is required but unavailable: {reason}")
+
+        self.current_maker_fee_bps = float(maker_bps)
+        self.current_taker_fee_bps = float(taker_bps)
+        self.last_fee_tier_reason = reason
         self.last_fee_tier_refresh_ts = t
+        log(f"[fee-tier] refreshed from Coinbase: {reason}")
 
     def _entry_fee_bps_for_mode(self) -> float:
+        if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
+            raise RuntimeError("Coinbase fee tier has not been loaded; refusing to estimate entry fees.")
+
         mode = str(ENTRY_EXECUTION_MODE).upper().strip()
         if mode in ("MARKET", "LIMIT_THEN_MARKET"):
             return float(self.current_taker_fee_bps)
         return float(self.current_maker_fee_bps)
 
     def _exit_fee_bps_for_mode(self) -> float:
+        if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
+            raise RuntimeError("Coinbase fee tier has not been loaded; refusing to estimate exit fees.")
+
         mode = str(EXIT_EXECUTION_MODE).upper().strip()
         if mode in ("MARKET", "LIMIT_THEN_MARKET"):
             return float(self.current_taker_fee_bps)
@@ -3490,6 +3487,17 @@ class TradingBot:
         exit_mode: Optional[str] = None,
         spread_bps: float = 0.0,
     ) -> float:
+        """
+        Compute the round-trip cost using real Coinbase-provided fee tier values.
+
+        Note:
+        - Coinbase fee tier is real/account-provided.
+        - Spread is real from top-of-book.
+        - Slippage/adverse movement buffers are still risk buffers, not Coinbase fee data.
+        """
+        if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
+            raise RuntimeError("Coinbase fee tier has not been loaded; refusing to compute cost.")
+
         entry_mode = str(entry_mode or ENTRY_EXECUTION_MODE).upper().strip()
         exit_mode = str(exit_mode or EXIT_EXECUTION_MODE).upper().strip()
 
@@ -3766,6 +3774,9 @@ class TradingBot:
             weekly_bias=weekly_bias,
             trending_down=trending_down,
             resist_buffer_bps=float(RESIST_BUFFER_BPS),
+            round_trip_cost_bps=self._round_trip_cost_bps(
+                spread_bps=float(self.tob[product_id].spread_bps) if product_id in self.tob else 0.0
+            ),
         )
         return scored.ok, scored.reason, {"score": scored.score}
 
@@ -3878,9 +3889,10 @@ class TradingBot:
         bid: float,
         ask: float,
         reason: str,
+        mode_override: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
         """Execute a live sell and return only a Coinbase-confirmed fill."""
-        mode = str(EXIT_EXECUTION_MODE).upper().strip()
+        mode = str(mode_override or EXIT_EXECUTION_MODE).upper().strip()
         result = None
 
         try:
@@ -3900,7 +3912,7 @@ class TradingBot:
                     return fill
                 result = await self._live_sell_market(product_id=product_id, base_qty=base_qty)
             else:
-                raise RuntimeError(f"Invalid EXIT_EXECUTION_MODE={EXIT_EXECUTION_MODE}")
+                raise RuntimeError(f"Invalid live sell execution mode={mode}")
 
             fill = self._require_live_fill(result, product_id=product_id, side="SELL")
             if LOG_ORDER_ATTEMPTS:
@@ -3923,7 +3935,7 @@ class TradingBot:
     async def _live_refresh_cash(self) -> float:
         """Refresh live cash snapshot in a thread (API calls can block)."""
         if not isinstance(self.portfolio, LivePortfolio):
-            return float(getattr(self.portfolio, "cash_usd", 0.0)) if self.portfolio else 0.0
+            raise RuntimeError("Live-only bot requires LivePortfolio.")
         return await asyncio.to_thread(self.portfolio.refresh_cash)
 
 
@@ -3939,9 +3951,6 @@ class TradingBot:
         notional_usd = float(max(0.0, notional_usd))
         if notional_usd <= 0:
             return False
-
-        if isinstance(self.portfolio, PaperPortfolio):
-            return bool(self.portfolio.can_afford(notional_usd, float(fee_bps)))
 
         if not isinstance(self.portfolio, LivePortfolio):
             return False
@@ -4125,22 +4134,17 @@ class TradingBot:
             )
 
             try:
-                if STARTUP_LIQUIDATION_USE_MARKET:
-                    r = await asyncio.to_thread(
-                        self.portfolio.sell_market,
-                        product_id,
-                        float(available_qty),
-                    )
-                else:
-                    r = await self._live_sell_maker(
-                        product_id=product_id,
-                        base_qty=float(available_qty),
-                        ask=float(tob.ask),
-                    )
-
-                fill = self._require_live_fill(r, product_id=product_id, side="SELL")
+                startup_exit_mode = "MARKET" if STARTUP_LIQUIDATION_USE_MARKET else EXIT_EXECUTION_MODE
+                fill = await self._execute_live_sell(
+                    product_id=product_id,
+                    base_qty=float(available_qty),
+                    bid=float(tob.bid),
+                    ask=float(tob.ask),
+                    reason="startup_liquidate_existing_coinbase_balance",
+                    mode_override=startup_exit_mode,
+                )
                 if fill is None:
-                    log(f"[startup-liquidation] sell did not fill for {product_id}: {r}")
+                    log(f"[startup-liquidation] sell did not fill for {product_id}")
                     skipped_count += 1
 
                     # If the sell failed, adopt the remaining Coinbase balance so the normal
@@ -4252,7 +4256,7 @@ class TradingBot:
     async def run(self) -> None:
         """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
         log("[run] TradingBot.run() started")
-        log(f"[run] paper_trading={PAPER_TRADING} products={PRODUCTS}")
+        log(f"[run] mode=LIVE_ONLY products={PRODUCTS}")
 
         log("[run] preloading micro history")
         await self.preload_micro_history()
@@ -4260,12 +4264,10 @@ class TradingBot:
         log("[run] starting websocket task first")
         ws_task = asyncio.create_task(self.ws_loop())
 
-        if isinstance(self.portfolio, LivePortfolio) and SOURCE_OF_TRUTH_COINBASE:
-            log("[run] reconciling live Coinbase portfolio before trading")
-            await self._startup_portfolio_reconcile()
+        await self._refresh_coinbase_fee_tier_if_needed(force=True)
 
-        if isinstance(self.portfolio, LivePortfolio):
-            await self._refresh_coinbase_fee_tier_if_needed(force=True)
+        log("[run] reconciling live Coinbase portfolio before trading")
+        await self._startup_portfolio_reconcile()
 
         log("[run] starting macro / evaluation / telemetry tasks")
         tasks = [
@@ -4751,7 +4753,12 @@ class TradingBot:
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
-            await self._refresh_coinbase_fee_tier_if_needed(force=False)
+            try:
+                await self._refresh_coinbase_fee_tier_if_needed(force=False)
+            except Exception as e:
+                log(f"[fee-tier] trading paused because real Coinbase fees are unavailable: {e}")
+                await asyncio.sleep(EVAL_TICK_SEC)
+                continue
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:
                     cash_usd = float(self.portfolio.cash_usd)
@@ -4764,29 +4771,19 @@ class TradingBot:
             warmup_done = (ts_now - self.bot_start_ts) >= FIRST_BUY_DELAY_SEC
 
             snap_live: Optional[Dict[str, Dict[str, float]]] = None
-            if isinstance(self.portfolio, LivePortfolio):
-                try:
-                    snap_live = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                    cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
-                except Exception:
-                    cash_usd = float(self.portfolio.cash_usd)
-            else:
-                cash_usd = float(self.portfolio.cash_usd) if self.portfolio else 0.0
-
-            total_exposure = self._current_total_exposure_usd()
-
-            if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
-                try:
-                    equity_usd = float(
-                        self.portfolio.compute_equity_usd(
-                            mid_by_product=self._live_mid_by_product(),
-                            snapshot=snap_live,
-                        )
+            try:
+                snap_live = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
+                equity_usd = float(
+                    self.portfolio.compute_equity_usd(
+                        mid_by_product=self._live_mid_by_product(),
+                        snapshot=snap_live,
                     )
-                except Exception:
-                    equity_usd = cash_usd + total_exposure
-            else:
-                equity_usd = cash_usd + total_exposure
+                )
+            except Exception as e:
+                log(f"[eval] Coinbase account refresh failed; skipping evaluation: {e}")
+                await asyncio.sleep(EVAL_TICK_SEC)
+                continue
 
             candidates = []
             for product_id in PRODUCTS:
@@ -4900,24 +4897,21 @@ class TradingBot:
                         exec_price = bid
                         fee = 0.0
                         filled_notional = None
-                        if isinstance(self.portfolio, LivePortfolio):
-                            fill = await self._execute_live_sell(
-                                product_id=product_id,
-                                base_qty=sell_qty,
-                                bid=bid,
-                                ask=ask,
-                                reason=exit_reason or "sell",
-                            )
-                            if fill is not None:
-                                filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
-                                sell_qty = min(float(sell_qty), float(filled_qty))
-                                exec_price = float(avg_px)
-                                fee = float(fee_val)
-                                notional_usd = float(filled_notional) if filled_notional is not None else float(sell_qty) * float(avg_px)
-                            else:
-                                sell_qty = 0.0
+                        fill = await self._execute_live_sell(
+                            product_id=product_id,
+                            base_qty=sell_qty,
+                            bid=bid,
+                            ask=ask,
+                            reason=exit_reason or "sell",
+                        )
+                        if fill is not None:
+                            filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                            sell_qty = min(float(sell_qty), float(filled_qty))
+                            exec_price = float(avg_px)
+                            fee = float(fee_val)
+                            notional_usd = float(filled_notional) if filled_notional is not None else float(sell_qty) * float(avg_px)
                         else:
-                            fee = self.portfolio.credit(notional_usd, self._exit_fee_bps_for_mode())
+                            sell_qty = 0.0
 
                         if sell_qty > 0:
                             fifo_cost, fifo_avg_entry = self._fifo_cost_basis(list(lots), sell_qty)
@@ -4938,6 +4932,7 @@ class TradingBot:
                 vwap_ok, vwap_reason = self._micro_vwap_reclaimed(product_id, mid)
                 hl_ok, hl_reason = self._higher_low_confirmed(product_id)
 
+                round_trip_cost_bps_for_score = self._round_trip_cost_bps(spread_bps=spread_bps)
                 scored = score_entry_candidate(
                     mid=mid,
                     spread_bps=spread_bps,
@@ -4947,6 +4942,7 @@ class TradingBot:
                     weekly_bias=weekly_bias,
                     trending_down=trending_down,
                     resist_buffer_bps=RESIST_BUFFER_BPS,
+                    round_trip_cost_bps=round_trip_cost_bps_for_score,
                 )
 
                 fee_edge_bps, target_bps, cost_bps = self._fee_aware_expected_edge_bps(
@@ -5066,6 +5062,13 @@ class TradingBot:
                     entry_tier=scored.tier,
                     entry_reason=scored.reason,
                     expected_net_edge_bps=scored.expected_net_edge_bps,
+                    estimated_prob_up=float(estimated_prob_up),
+                    position_pct=float(position_pct),
+                    target_bps=float(target_bps),
+                    cost_bps=float(cost_bps),
+                    current_maker_fee_bps=self.current_maker_fee_bps,
+                    current_taker_fee_bps=self.current_taker_fee_bps,
+                    fee_tier_reason=self.last_fee_tier_reason,
                     dip_depth_score=scored.dip_depth_score,
                     dip_speed_score=scored.dip_speed_score,
                     reversal_score=scored.reversal_score,
@@ -5160,13 +5163,10 @@ class TradingBot:
 
                 if not can_afford and ENABLE_PROFITABLE_ROTATION:
                     # Refresh real cash before deciding how much is missing.
-                    if isinstance(self.portfolio, LivePortfolio):
-                        snap_before_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                        live_cash_before = self.portfolio.get_tradable_usd(
-                            snapshot=snap_before_rotation or {}
-                        )
-                    else:
-                        live_cash_before = float(self.portfolio.cash_usd if self.portfolio else 0.0)
+                    snap_before_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                    live_cash_before = self.portfolio.get_tradable_usd(
+                        snapshot=snap_before_rotation or {}
+                    )
 
                     required_with_fee = (
                         entry_notional * (1.0 + entry_fee_bps / 10000.0)
@@ -5182,11 +5182,10 @@ class TradingBot:
                         )
 
                     # Re-check affordability after possible profitable rotation.
-                    if isinstance(self.portfolio, LivePortfolio):
-                        snap_after_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                        cash_usd = self.portfolio.get_tradable_usd(
-                            snapshot=snap_after_rotation or {}
-                        )
+                    snap_after_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                    cash_usd = self.portfolio.get_tradable_usd(
+                        snapshot=snap_after_rotation or {}
+                    )
                     can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
 
                 if not can_afford:
@@ -5194,29 +5193,22 @@ class TradingBot:
                     continue
 
                 bid, ask = candidate["bid"], candidate["ask"]
-                fee1 = 0.0
-                filled_notional = None
-                if isinstance(self.portfolio, LivePortfolio):
-                    fill = await self._execute_live_buy(
-                        product_id=product_id,
-                        quote_usd=entry_notional,
-                        bid=bid,
-                        ask=ask,
-                        reason=candidate.get("entry_reason", "score_entry"),
-                    )
-                    if fill is not None:
-                        filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
-                        qty1 = float(filled_qty)
-                        buy_px1 = float(avg_px)
-                        fee1 = float(fee_val)
-                        eff_price1 = float((filled_notional + fee1) / qty1) if qty1 > 0 and filled_notional is not None else buy_px1
-                    else:
-                        continue
-                else:
-                    qty1 = entry_notional / ask
-                    buy_px1 = ask
-                    fee1 = self.portfolio.debit(entry_notional, self._entry_fee_bps_for_mode())
-                    eff_price1 = float((entry_notional + fee1) / qty1) if qty1 > 0 else float(ask)
+                fill = await self._execute_live_buy(
+                    product_id=product_id,
+                    quote_usd=entry_notional,
+                    bid=bid,
+                    ask=ask,
+                    reason=candidate.get("entry_reason", "score_entry"),
+                )
+
+                if fill is None:
+                    continue
+
+                filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                qty1 = float(filled_qty)
+                buy_px1 = float(avg_px)
+                fee1 = float(fee_val)
+                eff_price1 = float((filled_notional + fee1) / qty1) if qty1 > 0 and filled_notional is not None else buy_px1
 
                 if qty1 > 0:
                     lot_meta = {
@@ -5282,27 +5274,18 @@ class TradingBot:
         """
         while not self._stop_event.is_set():
             ts_now = now_ts_i()
-            total_equity = 0.0
-
-            if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
-                try:
-                    snap_live = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
-                    cash_usd = self.portfolio.get_tradable_usd(snapshot=snap_live)
-                    equity_usd = self.portfolio.compute_equity_usd(
-                        mid_by_product=self._live_mid_by_product(),
-                        snapshot=snap_live,
-                    )
-                except Exception:
-                    cash_usd = self.portfolio.cash_usd if self.portfolio else 0.0
-                    equity_usd = cash_usd
-            else:
-                cash_usd = self.portfolio.cash_usd if self.portfolio else 0.0
-                for product, lots in self.positions.items():
-                    tob = self.tob.get(product)
-                    if tob and lots:
-                        mid = (tob.bid + tob.ask) / 2.0
-                        total_equity += sum(lot.qty for lot in lots) * mid
-                equity_usd = cash_usd + total_equity
+            try:
+                snap_live = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
+                cash_usd = self.portfolio.get_tradable_usd(snapshot=snap_live)
+                equity_usd = self.portfolio.compute_equity_usd(
+                    mid_by_product=self._live_mid_by_product(),
+                    snapshot=snap_live,
+                )
+            except Exception as e:
+                log(f"[telemetry] Coinbase equity refresh failed: {e}")
+                snap_live = None
+                cash_usd = 0.0
+                equity_usd = 0.0
             # Log per product snapshot
             for product in PRODUCTS:
                 tob = self.tob.get(product)
@@ -5312,22 +5295,18 @@ class TradingBot:
                 spread_bps = ((tob.ask - tob.bid) / mid) * 10_000.0 if mid > 0 else 0.0
                 positions = self.positions[product]
 
-                if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
-                    try:
-                        snap_live_product = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
-                        position_qty = self.portfolio.get_product_total_qty(product, snapshot=snap_live_product)
-                        exposures_usd = float(position_qty) * float(mid)
-                        local_qty = sum(lot.qty for lot in positions)
-                        local_cost = sum(lot.qty * lot.price for lot in positions)
-                        avg_entry_price = (local_cost / local_qty) if local_qty > 0 else None
-                    except Exception:
-                        exposures_usd = sum(lot.qty * lot.price for lot in positions)
-                        position_qty = sum(lot.qty for lot in positions)
-                        avg_entry_price = (exposures_usd / position_qty) if position_qty > 0 else None
-                else:
-                    exposures_usd = sum(lot.qty * lot.price for lot in positions)
-                    position_qty = sum(lot.qty for lot in positions)
-                    avg_entry_price = (exposures_usd / position_qty) if position_qty > 0 else None
+                try:
+                    snap_live_product = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                    position_qty = self.portfolio.get_product_total_qty(product, snapshot=snap_live_product)
+                    exposures_usd = float(position_qty) * float(mid)
+                    local_qty = sum(lot.qty for lot in positions)
+                    local_cost = sum(lot.qty * lot.price for lot in positions)
+                    avg_entry_price = (local_cost / local_qty) if local_qty > 0 else None
+                except Exception as e:
+                    log(f"[telemetry] Coinbase position refresh failed for {product}: {e}")
+                    exposures_usd = 0.0
+                    position_qty = 0.0
+                    avg_entry_price = None
                 # anchored vwap (24h anchored, always-on)
                 avwap = self._compute_anchored_vwap_24h(product, ts_now)
 
@@ -5456,6 +5435,7 @@ async def main() -> None:
     log(f"[config] Trading products: {PRODUCTS}")
     log("[startup] creating TradingBot instance")
     bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
+    log("[startup] LIVE-ONLY MODE: this bot can place real Coinbase orders.")
 
     if not hasattr(bot, "run"):
         raise RuntimeError("TradingBot instance has no run(); ensure you are running the updated bot.py file.")

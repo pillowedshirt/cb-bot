@@ -1751,8 +1751,95 @@ class EntryScore:
     expected_net_edge_bps: float
 
 
+@dataclass
+class LiveSignal:
+    """
+    Continuous display/trading signal.
+
+    Unlike EntryScore, this should not collapse to zero just because the exact
+    dip-entry pattern is not present. This is the always-on signal that powers
+    the viewer overview, projected buy sizing, and candidate ranking.
+    """
+    ok_to_trade: bool
+    score: float
+    tier: int
+    reason: str
+    estimated_prob_up: float
+    position_pct: float
+    expected_net_edge_bps: float
+    target_bps: float
+    cost_bps: float
+    dip_depth_score: float
+    dip_speed_score: float
+    reversal_score: float
+    support_score: float
+    room_score: float
+    regime_score: float
+    spread_penalty: float
+    cost_penalty: float
+    trend_reason: str = ""
+    vwap_reason: str = ""
+    higher_low_reason: str = ""
+
+
 def _clip_score(x: float) -> float:
     return float(max(0.0, min(100.0, x)))
+
+
+def _score_from_bps(value_bps: float, center_bps: float = 0.0, width_bps: float = 50.0) -> float:
+    """
+    Convert a bps value into a 0-100 score.
+    Around center_bps = 50.
+    Higher is better.
+    """
+    if width_bps <= 0:
+        width_bps = 50.0
+    return _clip_score(50.0 + ((float(value_bps) - float(center_bps)) / float(width_bps)) * 50.0)
+
+
+def _recent_close_momentum_bps(minute_candles: List['MinuteCandle'], lookback: int = 5) -> float:
+    """
+    Recent close-to-close move in basis points.
+    Positive = short-term upward pressure.
+    """
+    if not minute_candles or len(minute_candles) < 2:
+        return 0.0
+
+    candles = list(minute_candles)
+    lookback = max(1, min(int(lookback), len(candles) - 1))
+    first = float(candles[-lookback - 1].close)
+    last = float(candles[-1].close)
+
+    if first <= 0 or last <= 0:
+        return 0.0
+
+    return float((last / first - 1.0) * 10000.0)
+
+
+def _recent_range_position_score(minute_candles: List['MinuteCandle'], lookback: int = 20) -> float:
+    """
+    Score where the latest close sits inside the recent range.
+    0 = near range low.
+    100 = near range high.
+    """
+    if not minute_candles or len(minute_candles) < 3:
+        return 50.0
+
+    candles = list(minute_candles)[-int(lookback):]
+    lows = [float(c.low) for c in candles if float(c.low) > 0]
+    highs = [float(c.high) for c in candles if float(c.high) > 0]
+    close = float(candles[-1].close)
+
+    if not lows or not highs or close <= 0:
+        return 50.0
+
+    lo = min(lows)
+    hi = max(highs)
+
+    if hi <= lo:
+        return 50.0
+
+    return _clip_score(((close - lo) / (hi - lo)) * 100.0)
 
 
 def _score_to_tier(score: float) -> int:
@@ -3646,6 +3733,171 @@ class TradingBot:
         # Keep the output bounded but visibly dynamic.
         return clamp_float(prob, 0.25, 0.88)
 
+    def _build_live_signal(
+        self,
+        *,
+        product_id: str,
+        mid: float,
+        spread_bps: float,
+        levels_day: Optional['MacroLevels'],
+        levels_week: Optional['MacroLevels'],
+        minute_candles: List['MinuteCandle'],
+        weekly_bias: Optional[float],
+        sigma_bps: Optional[float],
+    ) -> LiveSignal:
+        """
+        Build a continuous live signal for every product.
+
+        This is intentionally separate from score_entry_candidate().
+        score_entry_candidate() answers: "Is the strict dip setup tradeable?"
+        _build_live_signal() answers: "How attractive is this product right now?"
+        """
+        try:
+            round_trip_cost_bps = self._round_trip_cost_bps(spread_bps=spread_bps)
+        except Exception:
+            round_trip_cost_bps = 999.0
+
+        target_bps = self._target_move_bps_from_room_and_sigma(
+            mid=mid,
+            product_id=product_id,
+            levels_day=levels_day,
+            levels_week=levels_week,
+            sigma_bps=sigma_bps,
+        )
+        cost_bps = float(round_trip_cost_bps)
+        expected_net_edge_bps = float(target_bps - cost_bps)
+
+        support_score = _support_proximity_score(mid, levels_day, levels_week)
+        room_score, room_reason = _room_score(mid, levels_day, levels_week, RESIST_BUFFER_BPS)
+
+        if weekly_bias is None:
+            regime_score = 55.0
+        else:
+            regime_score = _clip_score((float(weekly_bias) + 1.0) * 50.0)
+
+        trending_down, trend_reason = self._micro_trending_down(product_id)
+        vwap_ok, vwap_reason = self._micro_vwap_reclaimed(product_id, mid)
+        higher_low_ok, higher_low_reason = self._higher_low_confirmed(product_id)
+
+        if trending_down:
+            regime_score = min(regime_score, 35.0)
+
+        dm = _dip_metrics(minute_candles)
+        if dm:
+            dip_pct = float(dm.get("dip_pct", 0.0))
+            dip_rate = float(dm.get("dip_rate_bps_per_min", 0.0))
+            trough_low = float(dm.get("trough_low", 0.0))
+            dip_depth_score = _clip_score((dip_pct / max(DIP_MIN_PCT * 4.0, 1e-9)) * 100.0)
+            dip_speed_score = _clip_score((dip_rate / max(DIP_RATE_MIN_BPS_PER_MIN, 1e-9)) * 50.0)
+            rev_ok, _rev_reason = _dip_reversal_ok(minute_candles, trough_low)
+            reversal_score = 100.0 if rev_ok else 35.0
+        else:
+            dip_depth_score = 35.0
+            dip_speed_score = 35.0
+            reversal_score = 35.0
+
+        momentum_5_bps = _recent_close_momentum_bps(minute_candles, lookback=5)
+        momentum_15_bps = _recent_close_momentum_bps(minute_candles, lookback=15)
+        momentum_score = (
+            _score_from_bps(momentum_5_bps, center_bps=0.0, width_bps=35.0) * 0.60
+            + _score_from_bps(momentum_15_bps, center_bps=0.0, width_bps=65.0) * 0.40
+        )
+        range_position_score = _recent_range_position_score(minute_candles, lookback=20)
+
+        vwap_score = 72.0 if vwap_ok else 38.0
+        higher_low_score = 72.0 if higher_low_ok else 38.0
+        spread_penalty = max(0.0, float(spread_bps) - 6.0) * 0.80
+        cost_penalty = max(0.0, float(cost_bps) - 50.0) * 0.10
+        edge_score = _score_from_bps(
+            expected_net_edge_bps,
+            center_bps=0.0,
+            width_bps=max(35.0, MIN_REQUIRED_NET_EDGE_BPS),
+        )
+
+        raw_score = (
+            support_score * 0.14
+            + room_score * 0.14
+            + regime_score * 0.10
+            + reversal_score * 0.11
+            + dip_depth_score * 0.08
+            + dip_speed_score * 0.05
+            + momentum_score * 0.18
+            + range_position_score * 0.05
+            + vwap_score * 0.07
+            + higher_low_score * 0.06
+            + edge_score * 0.12
+            - spread_penalty
+            - cost_penalty
+        )
+
+        score = _clip_score(raw_score)
+        tier = _score_to_tier(score)
+        estimated_prob_up = self._estimate_prob_up_from_candidate(
+            score=score,
+            expected_net_edge_bps=expected_net_edge_bps,
+            spread_bps=spread_bps,
+            target_bps=target_bps,
+            cost_bps=cost_bps,
+            trending_down=bool(trending_down),
+            vwap_ok=bool(vwap_ok),
+            higher_low_ok=bool(higher_low_ok),
+        )
+        position_pct = self._position_pct_from_probability(estimated_prob_up)
+
+        strict_entry = score_entry_candidate(
+            mid=mid,
+            spread_bps=spread_bps,
+            levels_day=levels_day,
+            levels_week=levels_week,
+            minute_candles=minute_candles,
+            weekly_bias=weekly_bias,
+            trending_down=trending_down,
+            resist_buffer_bps=RESIST_BUFFER_BPS,
+            round_trip_cost_bps=round_trip_cost_bps,
+        )
+
+        ok_to_trade = (
+            strict_entry.ok
+            and estimated_prob_up >= float(PROB_FOR_MIN_SIZE)
+            and expected_net_edge_bps >= float(MIN_REQUIRED_NET_EDGE_BPS)
+            and target_bps >= cost_bps * float(MIN_TARGET_TO_COST_MULT)
+            and spread_bps <= float(MAX_SPREAD_BPS)
+        )
+
+        if not ok_to_trade:
+            position_pct = 0.0
+
+        reason = (
+            f"live_score={score:.1f}; prob={estimated_prob_up:.3f}; "
+            f"strict={strict_entry.reason}; edge={expected_net_edge_bps:.1f}; "
+            f"target={target_bps:.1f}; cost={cost_bps:.1f}; "
+            f"mom5={momentum_5_bps:.1f}; mom15={momentum_15_bps:.1f}; "
+            f"room={room_reason}; {vwap_reason}; {higher_low_reason}; {trend_reason}"
+        )
+
+        return LiveSignal(
+            ok_to_trade=bool(ok_to_trade),
+            score=float(score),
+            tier=int(tier),
+            reason=reason,
+            estimated_prob_up=float(estimated_prob_up),
+            position_pct=float(position_pct),
+            expected_net_edge_bps=float(expected_net_edge_bps),
+            target_bps=float(target_bps),
+            cost_bps=float(cost_bps),
+            dip_depth_score=float(dip_depth_score),
+            dip_speed_score=float(dip_speed_score),
+            reversal_score=float(reversal_score),
+            support_score=float(support_score),
+            room_score=float(room_score),
+            regime_score=float(regime_score),
+            spread_penalty=float(spread_penalty),
+            cost_penalty=float(cost_penalty),
+            trend_reason=trend_reason,
+            vwap_reason=vwap_reason,
+            higher_low_reason=higher_low_reason,
+        )
+
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
         """
         Map estimated probability to a single-buy percentage of total equity.
@@ -4945,105 +5197,40 @@ class TradingBot:
                             self._record_realized_trade_result(pnl_gross - fee)
                             self._fifo_reduce_lots(product_id, sell_qty)
 
-                trending_down, trend_reason = self._micro_trending_down(product_id)
-                vwap_ok, vwap_reason = self._micro_vwap_reclaimed(product_id, mid)
-                hl_ok, hl_reason = self._higher_low_confirmed(product_id)
-
-                round_trip_cost_bps_for_score = self._round_trip_cost_bps(spread_bps=spread_bps)
-                scored = score_entry_candidate(
+                live_signal = self._build_live_signal(
+                    product_id=product_id,
                     mid=mid,
                     spread_bps=spread_bps,
                     levels_day=levels_day,
                     levels_week=levels_week,
                     minute_candles=minute_candles,
                     weekly_bias=weekly_bias,
-                    trending_down=trending_down,
-                    resist_buffer_bps=RESIST_BUFFER_BPS,
-                    round_trip_cost_bps=round_trip_cost_bps_for_score,
-                )
-
-                fee_edge_bps, target_bps, cost_bps = self._fee_aware_expected_edge_bps(
-                    product_id=product_id,
-                    mid=mid,
-                    spread_bps=spread_bps,
-                    levels_day=levels_day,
-                    levels_week=levels_week,
                     sigma_bps=sigma_bps,
                 )
 
-                confirmation_ok = True
-                confirmation_reasons = []
-
-                if REQUIRE_MICRO_VWAP_RECLAIM and not vwap_ok:
-                    confirmation_ok = False
-                    confirmation_reasons.append(vwap_reason)
-
-                if REQUIRE_HIGHER_LOW_CONFIRMATION and not hl_ok:
-                    confirmation_ok = False
-                    confirmation_reasons.append(hl_reason)
-
-                if trending_down and fee_edge_bps < (MIN_REQUIRED_NET_EDGE_BPS * 1.50):
-                    confirmation_ok = False
-                    confirmation_reasons.append(trend_reason)
-
-                if cost_bps > 0 and target_bps < (cost_bps * MIN_TARGET_TO_COST_MULT):
-                    confirmation_ok = False
-                    confirmation_reasons.append(
-                        f"target_to_cost_fail target={target_bps:.1f} cost={cost_bps:.1f}"
-                    )
-
-                if fee_edge_bps < MIN_REQUIRED_NET_EDGE_BPS:
-                    confirmation_ok = False
-                    confirmation_reasons.append(
-                        f"fee_edge_fail net={fee_edge_bps:.1f}<required={MIN_REQUIRED_NET_EDGE_BPS:.1f}"
-                    )
-
-                if not confirmation_ok:
-                    scored = EntryScore(
-                        False,
-                        scored.score,
-                        scored.tier,
-                        "confirm_fail " + "; ".join(confirmation_reasons),
-                        scored.dip_depth_score,
-                        scored.dip_speed_score,
-                        scored.reversal_score,
-                        scored.support_score,
-                        scored.room_score,
-                        scored.regime_score,
-                        scored.spread_penalty,
-                        scored.cost_penalty,
-                        fee_edge_bps,
-                    )
-                else:
-                    scored.expected_net_edge_bps = fee_edge_bps
-                    scored.reason = (
-                        f"{scored.reason}; fee_edge={fee_edge_bps:.1f}; target={target_bps:.1f}; "
-                        f"cost={cost_bps:.1f}; {vwap_reason}; {hl_reason}; {trend_reason}"
-                    )
-
-                estimated_prob_up = self._estimate_prob_up_from_candidate(
-                    score=float(scored.score),
-                    expected_net_edge_bps=float(fee_edge_bps),
-                    spread_bps=float(spread_bps),
-                    target_bps=float(target_bps),
-                    cost_bps=float(cost_bps),
-                    trending_down=bool(trending_down),
-                    vwap_ok=bool(vwap_ok),
-                    higher_low_ok=bool(hl_ok),
+                scored = EntryScore(
+                    ok=live_signal.ok_to_trade,
+                    score=live_signal.score,
+                    tier=live_signal.tier,
+                    reason=live_signal.reason,
+                    dip_depth_score=live_signal.dip_depth_score,
+                    dip_speed_score=live_signal.dip_speed_score,
+                    reversal_score=live_signal.reversal_score,
+                    support_score=live_signal.support_score,
+                    room_score=live_signal.room_score,
+                    regime_score=live_signal.regime_score,
+                    spread_penalty=live_signal.spread_penalty,
+                    cost_penalty=live_signal.cost_penalty,
+                    expected_net_edge_bps=live_signal.expected_net_edge_bps,
                 )
-                # Probability is always shown for monitoring, but position sizing should
-                # only become meaningful when the candidate is actually tradeable.
-                if not scored.ok:
-                    display_position_pct = 0.0
-                else:
-                    display_position_pct = self._position_pct_from_probability(estimated_prob_up)
 
-                position_pct = display_position_pct
-                tradeable_probability = float(estimated_prob_up) >= float(PROB_FOR_MIN_SIZE)
+                estimated_prob_up = live_signal.estimated_prob_up
+                position_pct = live_signal.position_pct
+                target_bps = live_signal.target_bps
+                cost_bps = live_signal.cost_bps
 
                 if (
-                    scored.ok
-                    and tradeable_probability
+                    live_signal.ok_to_trade
                     and warmup_done
                     and not self._risk_pause_active()
                     and self._trade_rate_ok(product_id)
@@ -5136,7 +5323,7 @@ class TradingBot:
                     candidate_score=float(candidate["score"]),
                     open_position_count=open_count,
                     strong_candidate_count=strong_candidate_count,
-                    estimated_prob_up=float(candidate.get("estimated_prob_up", 0.55)),
+                    estimated_prob_up=float(candidate.get("estimated_prob_up", 0.0)),
                 )
 
                 if existing_qty > 1e-12:
@@ -5344,65 +5531,42 @@ class TradingBot:
                 sigma_bps = self._compute_sigma_bps_from_1m(product)
                 weekly_bias = self.macro.compute_weekly_bias(product, mid)
                 state = "long" if position_qty > 0 else "flat"
-                # Compute display-only signal fields for every telemetry row so the
-                # viewer always has fresh probability values, not stale/blank values.
+                # Compute continuous live signal fields for every telemetry row.
                 try:
                     minute_candles = list(self.live_1m.get(product).candles) if self.live_1m.get(product) else []
-                    trending_down, trend_reason = self._micro_trending_down(product)
-                    vwap_ok, vwap_reason = self._micro_vwap_reclaimed(product, mid)
-                    hl_ok, hl_reason = self._higher_low_confirmed(product)
-                    round_trip_cost_bps_for_score = self._round_trip_cost_bps(spread_bps=spread_bps)
 
-                    scored = score_entry_candidate(
+                    live_signal = self._build_live_signal(
+                        product_id=product,
                         mid=mid,
                         spread_bps=spread_bps,
                         levels_day=levels_day,
                         levels_week=levels_week,
                         minute_candles=minute_candles,
                         weekly_bias=weekly_bias,
-                        trending_down=trending_down,
-                        resist_buffer_bps=RESIST_BUFFER_BPS,
-                        round_trip_cost_bps=round_trip_cost_bps_for_score,
-                    )
-
-                    fee_edge_bps, target_bps, cost_bps = self._fee_aware_expected_edge_bps(
-                        product_id=product,
-                        mid=mid,
-                        spread_bps=spread_bps,
-                        levels_day=levels_day,
-                        levels_week=levels_week,
                         sigma_bps=sigma_bps,
                     )
 
-                    estimated_prob_up = self._estimate_prob_up_from_candidate(
-                        score=float(scored.score),
-                        expected_net_edge_bps=float(fee_edge_bps),
-                        spread_bps=float(spread_bps),
-                        target_bps=float(target_bps),
-                        cost_bps=float(cost_bps),
-                        trending_down=bool(trending_down),
-                        vwap_ok=bool(vwap_ok),
-                        higher_low_ok=bool(hl_ok),
-                    )
-
-                    position_pct = self._position_pct_from_probability(estimated_prob_up) if scored.ok else 0.0
-                    scored.expected_net_edge_bps = fee_edge_bps
-                    scored.reason = (
-                        f"{scored.reason}; display_prob={estimated_prob_up:.3f}; "
-                        f"target={target_bps:.1f}; cost={cost_bps:.1f}; "
-                        f"{vwap_reason}; {hl_reason}; {trend_reason}"
-                    )
-
                 except Exception as sig_err:
-                    log(f"[telemetry] signal snapshot failed for {product}: {sig_err}")
-                    scored = EntryScore(
-                        False, 0.0, 0, f"signal_snapshot_error={sig_err}",
-                        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    log(f"[telemetry] live signal failed for {product}: {sig_err}")
+                    live_signal = LiveSignal(
+                        ok_to_trade=False,
+                        score=0.0,
+                        tier=0,
+                        reason=f"live_signal_error={sig_err}",
+                        estimated_prob_up=0.0,
+                        position_pct=0.0,
+                        expected_net_edge_bps=0.0,
+                        target_bps=0.0,
+                        cost_bps=0.0,
+                        dip_depth_score=0.0,
+                        dip_speed_score=0.0,
+                        reversal_score=0.0,
+                        support_score=0.0,
+                        room_score=0.0,
+                        regime_score=0.0,
+                        spread_penalty=0.0,
+                        cost_penalty=0.0,
                     )
-                    estimated_prob_up = None
-                    position_pct = None
-                    target_bps = None
-                    cost_bps = None
 
                 self.mlog.log_snapshot(
                     ts=ts_now,
@@ -5421,25 +5585,25 @@ class TradingBot:
                     state=state,
                     cash_usd=cash_usd,
                     equity_usd=equity_usd,
-                    entry_score=scored.score,
-                    entry_tier=scored.tier,
-                    entry_reason=scored.reason,
-                    expected_net_edge_bps=scored.expected_net_edge_bps,
-                    estimated_prob_up=estimated_prob_up,
-                    position_pct=position_pct,
-                    target_bps=target_bps,
-                    cost_bps=cost_bps,
+                    entry_score=live_signal.score,
+                    entry_tier=live_signal.tier,
+                    entry_reason=live_signal.reason,
+                    expected_net_edge_bps=live_signal.expected_net_edge_bps,
+                    estimated_prob_up=live_signal.estimated_prob_up,
+                    position_pct=live_signal.position_pct,
+                    target_bps=live_signal.target_bps,
+                    cost_bps=live_signal.cost_bps,
                     current_maker_fee_bps=self.current_maker_fee_bps,
                     current_taker_fee_bps=self.current_taker_fee_bps,
                     fee_tier_reason=self.last_fee_tier_reason,
-                    dip_depth_score=scored.dip_depth_score,
-                    dip_speed_score=scored.dip_speed_score,
-                    reversal_score=scored.reversal_score,
-                    support_score=scored.support_score,
-                    room_score=scored.room_score,
-                    regime_score=scored.regime_score,
-                    spread_penalty=scored.spread_penalty,
-                    cost_penalty=scored.cost_penalty,
+                    dip_depth_score=live_signal.dip_depth_score,
+                    dip_speed_score=live_signal.dip_speed_score,
+                    reversal_score=live_signal.reversal_score,
+                    support_score=live_signal.support_score,
+                    room_score=live_signal.room_score,
+                    regime_score=live_signal.regime_score,
+                    spread_penalty=live_signal.spread_penalty,
+                    cost_penalty=live_signal.cost_penalty,
                 )
             await asyncio.sleep(EVAL_TICK_SEC)
 

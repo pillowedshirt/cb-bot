@@ -138,6 +138,8 @@ m = numeric(m, [
     "anchored_vwap", "fair_value", "sigma_bps", "weekly_bias",
     "cash_usd", "equity_usd",
     "entry_score", "entry_tier", "expected_net_edge_bps",
+    "estimated_prob_up", "position_pct", "target_bps", "cost_bps",
+    "current_maker_fee_bps", "current_taker_fee_bps",
     "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
     "room_score", "regime_score", "spread_penalty", "cost_penalty"
 ])
@@ -189,16 +191,50 @@ with colB:
 m_prod = m_view[m_view["product_id"] == product].dropna(subset=["ts", "mid"]).copy()
 m_prod["dt"] = to_dt_mst(m_prod["ts"])
 
-latest_row = m_prod.iloc[-1] if not m_prod.empty else None
+scored_rows = m_prod.dropna(subset=["entry_score"]) if "entry_score" in m_prod.columns else pd.DataFrame()
+latest_row = scored_rows.iloc[-1] if not scored_rows.empty else (m_prod.iloc[-1] if not m_prod.empty else None)
 if latest_row is not None:
+    prob = latest_row.get("estimated_prob_up", np.nan)
+    pos_pct = latest_row.get("position_pct", np.nan)
+    target_bps = latest_row.get("target_bps", np.nan)
+    cost_bps = latest_row.get("cost_bps", np.nan)
+    maker_bps = latest_row.get("current_maker_fee_bps", np.nan)
+    taker_bps = latest_row.get("current_taker_fee_bps", np.nan)
+    fee_reason = latest_row.get("fee_tier_reason", "")
+
     st.markdown(
         f"""
 **Entry score:** {latest_row.get('entry_score', np.nan):.1f}  
 **Tier:** {latest_row.get('entry_tier', '')}  
-**Expected net edge (bps):** {latest_row.get('expected_net_edge_bps', np.nan):.1f}  
+**Expected net edge (bps):** {latest_row.get('expected_net_edge_bps', np.nan):.1f}<br>
+**Estimated probability up:** {prob * 100.0 if pd.notna(prob) else np.nan:.1f}%<br>
+**Probability-sized position:** {pos_pct * 100.0 if pd.notna(pos_pct) else np.nan:.1f}% of total equity<br>
+**Target move (bps):** {target_bps:.1f}<br>
+**Cost model (bps):** {cost_bps:.1f}<br>
+**Coinbase maker fee:** {maker_bps:.2f} bps<br>
+**Coinbase taker fee:** {taker_bps:.2f} bps<br>
+**Fee source:** {fee_reason}<br>
 **Reason:** {latest_row.get('entry_reason', '')}
 """
     )
+
+if latest_row is not None:
+    st.subheader("Probability sizing")
+    c1, c2, c3, c4 = st.columns(4)
+
+    equity = latest_row.get("equity_usd", np.nan)
+    pos_pct = latest_row.get("position_pct", np.nan)
+    prob = latest_row.get("estimated_prob_up", np.nan)
+    cash = latest_row.get("cash_usd", np.nan)
+
+    projected_size = np.nan
+    if pd.notna(equity) and pd.notna(pos_pct):
+        projected_size = float(equity) * float(pos_pct)
+
+    c1.metric("Estimated probability up", "—" if pd.isna(prob) else f"{float(prob) * 100.0:.1f}%")
+    c2.metric("Position % of equity", "—" if pd.isna(pos_pct) else f"{float(pos_pct) * 100.0:.1f}%")
+    c3.metric("Projected buy size", "—" if pd.isna(projected_size) else f"${float(projected_size):.2f}")
+    c4.metric("Available cash", "—" if pd.isna(cash) else f"${float(cash):.2f}")
 
 
 if not t.empty and all(c in t.columns for c in ["ts", "product_id", "side", "price"]):
@@ -259,7 +295,7 @@ axp.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=4, fontsize=9, 
 figp.set_size_inches(12, micro_height / 100.0)
 st.pyplot(figp, clear_figure=True)
 
-st.subheader("Account (paper mode)")
+st.subheader("Coinbase account (live)")
 c1, c2, c3 = st.columns(3)
 last_row = m_prod.dropna(subset=["cash_usd", "equity_usd"]).tail(1)
 if not last_row.empty:

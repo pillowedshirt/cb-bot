@@ -26,6 +26,7 @@ CALIBRATION_CSV = os.path.join(BASE_DIR, "calibration.csv")
 MICRO_HISTORY_CSV = os.path.join(BASE_DIR, "micro_history.csv")
 POSITION_TARGETS_CSV = os.path.join(BASE_DIR, "position_targets.csv")
 CANDIDATE_REPLAY_CSV = os.path.join(BASE_DIR, "candidate_replay.csv")
+PRODUCTS_ACTIVE_CSV = os.path.join(BASE_DIR, "products_active.csv")
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -333,6 +334,24 @@ def fmt_pct(x: Any, digits: int = 1) -> str:
         return f"{float(x) * 100.0:.{digits}f}%"
     except Exception:
         return "—"
+
+
+def valid_target_number(value: Any) -> bool:
+    """Return True only for finite, strictly positive calibration targets."""
+    try:
+        target = float(value)
+        return bool(np.isfinite(target) and target > 0.0)
+    except Exception:
+        return False
+
+
+def display_target_value(row: pd.Series, column: str, formatter: Any) -> str:
+    if not bool(row.get("Calibrated", False)):
+        return "Awaiting calibration"
+    value = row.get(column, np.nan)
+    if not valid_target_number(value):
+        return "Awaiting calibration"
+    return formatter(value)
 
 
 def safe_float(x: Any, default: float = np.nan) -> float:
@@ -763,6 +782,7 @@ def render_live_dashboard() -> None:
     hist = load_csv(MICRO_HISTORY_CSV)
     pt = load_csv(POSITION_TARGETS_CSV)
     cr = load_csv(CANDIDATE_REPLAY_CSV)
+    active_products_df = load_csv(PRODUCTS_ACTIVE_CSV)
 
     st.markdown(
         """
@@ -845,6 +865,18 @@ def render_live_dashboard() -> None:
         "breakout", "range_low", "range_high", "prev_low", "prev_high", "vwap", "val", "vah", "price_now"
     ])
 
+    configured_products = []
+    if not active_products_df.empty and "product_id" in active_products_df.columns:
+        configured_products = [
+            str(x) for x in active_products_df["product_id"].dropna().tolist()
+        ]
+
+    if not configured_products:
+        # Display fallback until bot.py publishes products_active.csv.
+        configured_products = [
+            "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD"
+        ]
+
     if not o.empty:
         o = numeric(o, [
             "ts", "requested_quote_usd", "requested_base_qty",
@@ -859,11 +891,42 @@ def render_live_dashboard() -> None:
     # =============================================================================
 
     latest_all = latest_by_product(m_eval)
-    previous_map = previous_by_product(m_chart, overview_lookback_rows)
 
+    # Build the overview from configured products, not only products with eval rows.
+    eval_products = (
+        sorted(set(str(x) for x in latest_all["product_id"].dropna().tolist()))
+        if not latest_all.empty and "product_id" in latest_all.columns
+        else []
+    )
+    cal_products = (
+        sorted(set(str(x) for x in cal["product_id"].dropna().tolist()))
+        if not cal.empty and "product_id" in cal.columns
+        else []
+    )
+    market_products = (
+        sorted(set(str(x) for x in m["product_id"].dropna().tolist()))
+        if not m.empty and "product_id" in m.columns
+        else []
+    )
+    all_products_for_overview = sorted(
+        set(configured_products + eval_products + cal_products + market_products)
+    )
+
+    previous_map = previous_by_product(m_chart, overview_lookback_rows)
     overview_rows = []
-    for _, r in latest_all.iterrows():
-        product_id = str(r.get("product_id", ""))
+    latest_all_product_ids = (
+        set(latest_all["product_id"].astype(str).tolist())
+        if not latest_all.empty and "product_id" in latest_all.columns
+        else set()
+    )
+
+    for product_id in all_products_for_overview:
+        if product_id in latest_all_product_ids:
+            r = latest_all[
+                latest_all["product_id"].astype(str) == product_id
+            ].iloc[-1]
+        else:
+            r = pd.Series({"product_id": product_id})
         prev = previous_map.get(product_id)
 
         mid = safe_float(r.get("mid"))
@@ -879,9 +942,46 @@ def render_live_dashboard() -> None:
 
         product_rows = m[m["product_id"] == product_id] if "product_id" in m.columns else pd.DataFrame()
         calibration = latest_calibration_for_product(cal, product_id)
-        buy_score_target = calibration.get("min_score", np.nan) if calibration is not None else np.nan
-        buy_prob_target = calibration.get("min_probability", np.nan) if calibration is not None else np.nan
-        buy_ev_target = calibration.get("min_expected_value_bps", np.nan) if calibration is not None else np.nan
+        is_product_calibrated = False
+        calibration_status = "awaiting_calibration"
+        calibration_reason = "No calibration row yet"
+
+        if calibration is not None:
+            is_product_calibrated = truthy_cell(
+                calibration.get("is_calibrated", False)
+            )
+            calibration_status = str(
+                calibration.get("calibration_status", "unknown")
+            )
+            calibration_reason = str(calibration.get("reason", ""))
+
+        raw_score_target = (
+            calibration.get("min_score", np.nan)
+            if calibration is not None else np.nan
+        )
+        raw_prob_target = (
+            calibration.get("min_probability", np.nan)
+            if calibration is not None else np.nan
+        )
+        raw_ev_target = (
+            calibration.get("min_expected_value_bps", np.nan)
+            if calibration is not None else np.nan
+        )
+        targets_are_valid = bool(
+            is_product_calibrated
+            and valid_target_number(raw_score_target)
+            and valid_target_number(raw_prob_target)
+            and valid_target_number(raw_ev_target)
+        )
+
+        if targets_are_valid:
+            buy_score_target = raw_score_target
+            buy_prob_target = raw_prob_target
+            buy_ev_target = raw_ev_target
+        else:
+            buy_score_target = np.nan
+            buy_prob_target = np.nan
+            buy_ev_target = np.nan
 
         overview_rows.append({
             "Product": product_id,
@@ -892,6 +992,9 @@ def render_live_dashboard() -> None:
             "Buy Score Target": buy_score_target,
             "Buy Prob Target": buy_prob_target,
             "Buy EV Target": buy_ev_target,
+            "Calibrated": targets_are_valid,
+            "Calibration Status": calibration_status,
+            "Calibration Reason": calibration_reason,
             "Mid": mid,
             "Δ bps": mid_change_bps,
             "Spread": safe_float(r.get("spread_bps")),
@@ -998,6 +1101,29 @@ def render_live_dashboard() -> None:
                 projected_val = row.get("Projected", np.nan)
                 exposure_val = row.get("Exposure", np.nan)
                 rows_val = row.get("Rows", "—")
+                is_row_calibrated = bool(row.get("Calibrated", False))
+
+                buy_score_display = (
+                    fmt_num(row.get("Buy Score Target", np.nan), 3)
+                    if is_row_calibrated
+                    and valid_target_number(row.get("Buy Score Target", np.nan))
+                    else "Awaiting calibration"
+                )
+                buy_prob_display = (
+                    fmt_pct(row.get("Buy Prob Target", np.nan), 3)
+                    if is_row_calibrated
+                    and valid_target_number(row.get("Buy Prob Target", np.nan))
+                    else "Awaiting calibration"
+                )
+                buy_ev_display = (
+                    fmt_num(row.get("Buy EV Target", np.nan), 1, " bps")
+                    if is_row_calibrated
+                    and valid_target_number(row.get("Buy EV Target", np.nan))
+                    else "Awaiting calibration"
+                )
+                calibration_display = (
+                    "READY" if is_row_calibrated else "AWAITING"
+                )
 
                 body = f"""
     <div class="cb-card">
@@ -1008,9 +1134,10 @@ def render_live_dashboard() -> None:
       <div class="cb-kv" style="margin-top:0.35rem;">
         <div class="k">Probability</div><div class="v">{fmt_pct(prob_val)}</div>
         <div class="k">Score</div><div class="v">{fmt_num(score_val, 1)}</div>
-        <div class="k">Buy score target</div><div class="v">{fmt_num(row.get("Buy Score Target", np.nan), 3)}</div>
-        <div class="k">Buy prob target</div><div class="v">{fmt_pct(row.get("Buy Prob Target", np.nan), 3)}</div>
-        <div class="k">Buy EV target</div><div class="v">{fmt_num(row.get("Buy EV Target", np.nan), 1, " bps")}</div>
+        <div class="k">Calibration</div><div class="v">{calibration_display}</div>
+        <div class="k">Buy score target</div><div class="v">{buy_score_display}</div>
+        <div class="k">Buy prob target</div><div class="v">{buy_prob_display}</div>
+        <div class="k">Buy EV target</div><div class="v">{buy_ev_display}</div>
         <div class="k">Mid</div><div class="v">{fmt_num(mid_val, 6)}</div>
         <div class="k">Change</div><div class="v">{fmt_num(change_val, 1, ' bps')}</div>
         <div class="k">Spread</div><div class="v">{fmt_num(spread_val, 1, ' bps')}</div>
@@ -1026,9 +1153,24 @@ def render_live_dashboard() -> None:
             display_overview = overview.copy()
             display_overview["Prob"] = display_overview["Prob"].map(lambda x: fmt_pct(x))
             display_overview["Score"] = display_overview["Score"].map(lambda x: fmt_num(x, 1))
-            display_overview["Buy Score Target"] = display_overview["Buy Score Target"].map(lambda x: fmt_num(x, 3))
-            display_overview["Buy Prob Target"] = display_overview["Buy Prob Target"].map(lambda x: fmt_pct(x, 3))
-            display_overview["Buy EV Target"] = display_overview["Buy EV Target"].map(lambda x: fmt_num(x, 1, " bps"))
+            display_overview["Buy Score Target"] = display_overview.apply(
+                lambda row: display_target_value(
+                    row, "Buy Score Target", lambda x: fmt_num(x, 3)
+                ),
+                axis=1,
+            )
+            display_overview["Buy Prob Target"] = display_overview.apply(
+                lambda row: display_target_value(
+                    row, "Buy Prob Target", lambda x: fmt_pct(x, 3)
+                ),
+                axis=1,
+            )
+            display_overview["Buy EV Target"] = display_overview.apply(
+                lambda row: display_target_value(
+                    row, "Buy EV Target", lambda x: fmt_num(x, 1, " bps")
+                ),
+                axis=1,
+            )
             display_overview["Mid"] = display_overview["Mid"].map(lambda x: fmt_num(x, 6))
             display_overview["Δ bps"] = display_overview["Δ bps"].map(lambda x: fmt_num(x, 1))
             display_overview["Spread"] = display_overview["Spread"].map(lambda x: fmt_num(x, 1))
@@ -1044,6 +1186,83 @@ def render_live_dashboard() -> None:
                 hide_index=True,
                 height=210,
             )
+
+
+    st.markdown(
+        '<div class="cb-section">Live calibration targets by coin</div>',
+        unsafe_allow_html=True,
+    )
+    target_rows = []
+
+    for product_id in all_products_for_overview:
+        calibration = latest_calibration_for_product(cal, product_id)
+        latest_eval = (
+            latest_all[
+                latest_all["product_id"].astype(str) == product_id
+            ].iloc[-1]
+            if product_id in latest_all_product_ids
+            else pd.Series({"product_id": product_id})
+        )
+        is_calibrated = bool(
+            calibration is not None
+            and truthy_cell(calibration.get("is_calibrated", False))
+        )
+        min_score = (
+            calibration.get("min_score", np.nan)
+            if calibration is not None else np.nan
+        )
+        min_prob = (
+            calibration.get("min_probability", np.nan)
+            if calibration is not None else np.nan
+        )
+        min_ev = (
+            calibration.get("min_expected_value_bps", np.nan)
+            if calibration is not None else np.nan
+        )
+        valid_targets = bool(
+            is_calibrated
+            and valid_target_number(min_score)
+            and valid_target_number(min_prob)
+            and valid_target_number(min_ev)
+        )
+
+        target_rows.append({
+            "Product": product_id,
+            "Calibration": "READY" if valid_targets else "AWAITING",
+            "Current Score": fmt_num(latest_eval.get("entry_score", np.nan), 3),
+            "Score Target": (
+                fmt_num(min_score, 3)
+                if valid_targets else "Awaiting calibration"
+            ),
+            "Current Prob": fmt_pct(
+                latest_eval.get("estimated_prob_up", np.nan), 3
+            ),
+            "Prob Target": (
+                fmt_pct(min_prob, 3)
+                if valid_targets else "Awaiting calibration"
+            ),
+            "Current EV": fmt_num(
+                latest_eval.get("expected_net_edge_bps", np.nan), 1, " bps"
+            ),
+            "EV Target": (
+                fmt_num(min_ev, 1, " bps")
+                if valid_targets else "Awaiting calibration"
+            ),
+            "Projected Forward": fmt_num(
+                latest_eval.get("projected_forward_gain_bps", np.nan),
+                1,
+                " bps",
+            ),
+            "Modeled Cost": fmt_num(
+                latest_eval.get("cost_bps", np.nan), 1, " bps"
+            ),
+            "Status": (
+                str(calibration.get("calibration_status", "no row"))
+                if calibration is not None else "no row"
+            ),
+        })
+
+    st.dataframe(pd.DataFrame(target_rows), width="stretch", hide_index=True)
 
 
     # =============================================================================
@@ -1191,7 +1410,14 @@ def render_live_dashboard() -> None:
             latest_row.get("buy_gate_ev_ok", False)
         )
 
-        if is_calibrated:
+        targets_are_valid = bool(
+            is_calibrated
+            and valid_target_number(min_score)
+            and valid_target_number(min_prob)
+            and valid_target_number(min_ev)
+        )
+
+        if targets_are_valid:
             score_display = (
                 f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}"
             )
@@ -1203,28 +1429,28 @@ def render_live_dashboard() -> None:
                 f"{fmt_num(min_ev, 1, ' bps')}"
             )
         else:
-            score_display = "Not calibrated"
-            prob_display = "Not calibrated"
-            ev_display = "Not calibrated"
+            score_display = "Awaiting calibration"
+            prob_display = "Awaiting calibration"
+            ev_display = "Awaiting calibration"
 
         b1, b2, b3 = st.columns(3)
         with b1:
             mini_card(
                 "Calibrated buy score target",
                 score_display,
-                "PASS" if score_target_ok and is_calibrated else "waiting",
+                "PASS" if score_target_ok and targets_are_valid else "waiting",
             )
         with b2:
             mini_card(
                 "Calibrated buy probability target",
                 prob_display,
-                "PASS" if prob_target_ok and is_calibrated else "waiting",
+                "PASS" if prob_target_ok and targets_are_valid else "waiting",
             )
         with b3:
             mini_card(
                 "Projected net edge",
                 ev_display,
-                "PASS" if ev_target_ok and is_calibrated else "waiting",
+                "PASS" if ev_target_ok and targets_are_valid else "waiting",
             )
 
         st.markdown(

@@ -50,7 +50,11 @@ SESSION_ALLOWED_UTC_HOURS: Optional[List[int]] = list(range(13, 23))  # 13:00–
 # Products to trade. High liquidity pairs only.
 # If AUTO_SELECT_PRODUCTS is True, this list is treated as a fallback default.
 PRODUCTS_DEFAULT: List[str] = [
-    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD"
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "XRP-USD",
+    "BNB-USD",
 ]
 
 # Auto-selection (diversify volatility + liquidity):
@@ -87,6 +91,7 @@ MICRO_HISTORY_CSV_PATH: str = os.path.join(BASE_DIR, "micro_history.csv")
 POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
+PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
 DEBUG_LOG_ENABLED: bool = True
 DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
@@ -2330,6 +2335,24 @@ class MicroHistoryLogger:
         os.replace(tmp, self.path)
 
 
+class ActiveProductsLogger:
+    """Atomically publishes the products monitored by the running bot."""
+
+    columns = ["product_id"]
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def write_products(self, products: List[str]) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(self.columns)
+            for product in products:
+                w.writerow([product])
+        os.replace(tmp, self.path)
+
+
 class PositionTargetsLogger:
     """Atomically writes the current open-position sell plan for the viewer."""
 
@@ -3609,6 +3632,7 @@ class TradingBot:
         self.micro_history_log = MicroHistoryLogger(MICRO_HISTORY_CSV_PATH)
         self.position_targets_log = PositionTargetsLogger(POSITION_TARGETS_CSV_PATH)
         self.candidate_replay_log = CandidateReplayLogger(CANDIDATE_REPLAY_CSV_PATH)
+        self.active_products_log = ActiveProductsLogger(PRODUCTS_ACTIVE_CSV_PATH)
         self.mlog = MarketLogger(MARKET_CSV_PATH)
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
@@ -5671,9 +5695,28 @@ class TradingBot:
             product_id,
             ProductCalibrationProfile(product_id=product_id),
         )
-        buy_gate_calibration_ready = bool(
-            getattr(profile, "is_calibrated", False)
+        profile_is_calibrated = bool(getattr(profile, "is_calibrated", False))
+        raw_calib_min_score = float(profile.min_score)
+        raw_calib_min_probability = float(profile.min_probability)
+        raw_calib_min_ev = float(profile.min_expected_value_bps)
+        calibration_targets_valid = bool(
+            np.isfinite(raw_calib_min_score)
+            and raw_calib_min_score > 0.0
+            and np.isfinite(raw_calib_min_probability)
+            and raw_calib_min_probability > 0.0
+            and np.isfinite(raw_calib_min_ev)
+            and raw_calib_min_ev > 0.0
         )
+        buy_gate_calibration_ready = bool(
+            profile_is_calibrated and calibration_targets_valid
+        )
+
+        if not buy_gate_calibration_ready:
+            log(
+                f"[calibration-status] {product_id} AWAITING_CALIBRATION "
+                f"status={profile.calibration_status} reason={profile.reason}"
+            )
+
         calibrated_forward_gain_bps = float(profile.calibrated_projected_gross_bps or 0.0)
         # Before calibration is available, fall back to the structure target.
         if calibrated_forward_gain_bps <= 0:
@@ -5794,17 +5837,25 @@ class TradingBot:
                 0.0,
             )
 
-        calib_min_score = float(profile.min_score)
-        calib_min_probability = float(profile.min_probability)
-        calib_min_ev = float(profile.min_expected_value_bps)
+        if buy_gate_calibration_ready:
+            calib_min_score = raw_calib_min_score
+            calib_min_probability = raw_calib_min_probability
+            calib_min_ev = raw_calib_min_ev
+        else:
+            calib_min_score = math.nan
+            calib_min_probability = math.nan
+            calib_min_ev = math.nan
 
         # Individual buy-gate checks.
         buy_gate_fee_ok = bool(fee_available and round_trip_cost_bps is not None)
         buy_gate_score_target_ok = bool(
-            buy_gate_calibration_ready and score >= calib_min_score
+            buy_gate_calibration_ready
+            and np.isfinite(calib_min_score)
+            and score >= calib_min_score
         )
         buy_gate_prob_target_ok = bool(
             buy_gate_calibration_ready
+            and np.isfinite(calib_min_probability)
             and estimated_prob_up >= calib_min_probability
         )
 
@@ -5814,12 +5865,15 @@ class TradingBot:
             estimated_prob_up >= float(EV_PRIMARY_MIN_PROB_FLOOR)
         )
 
+        required_min_ev = (
+            max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev)
+            if buy_gate_calibration_ready and np.isfinite(calib_min_ev)
+            else math.nan
+        )
         buy_gate_ev_ok = bool(
             buy_gate_calibration_ready
-            and expected_net_edge_bps >= max(
-                float(MIN_REQUIRED_NET_EDGE_BPS),
-                calib_min_ev,
-            )
+            and np.isfinite(calib_min_ev)
+            and expected_net_edge_bps >= required_min_ev
         )
 
         # Actual buy permission must use calibrated targets only.
@@ -5986,7 +6040,7 @@ class TradingBot:
                 f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
                 f"ev_primary_floor={EV_PRIMARY_MIN_PROJECTED_NET_BPS:.3f} "
                 f"ev={expected_net_edge_bps:.3f} "
-                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} "
+                f"min_ev={required_min_ev:.3f} "
                 f"ev_ok={buy_gate_ev_ok} "
                 f"target={target_bps:.3f} "
                 f"projected_forward={calibrated_forward_gain_bps:.3f} "
@@ -6010,7 +6064,7 @@ class TradingBot:
                 f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
                 f"ev_primary_floor={EV_PRIMARY_MIN_PROJECTED_NET_BPS:.3f} "
                 f"ev={expected_net_edge_bps:.3f} "
-                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} ev_ok={buy_gate_ev_ok} "
+                f"min_ev={required_min_ev:.3f} ev_ok={buy_gate_ev_ok} "
                 f"target={target_bps:.3f} "
                 f"projected_forward={calibrated_forward_gain_bps:.3f} "
                 f"cost={cost_bps:.3f} "
@@ -6704,6 +6758,8 @@ class TradingBot:
         """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
         log("[run] TradingBot.run() started")
         log(f"[run] mode=LIVE_ONLY products={PRODUCTS}")
+        self.active_products_log.write_products(PRODUCTS)
+        log(f"[startup] active products written: {PRODUCTS}")
 
         log("[run] preloading micro history")
         await self.preload_micro_history()

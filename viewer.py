@@ -1125,28 +1125,36 @@ def render_live_dashboard() -> None:
         min_score = selected_cal.get("min_score", np.nan)
         min_prob = selected_cal.get("min_probability", np.nan)
         min_ev = selected_cal.get("min_expected_value_bps", np.nan)
-        score_ok = pd.notna(current_score) and pd.notna(min_score) and float(current_score) >= float(min_score)
-        prob_ok = pd.notna(current_prob) and pd.notna(min_prob) and float(current_prob) >= float(min_prob)
-        ev_ok = pd.notna(current_ev) and pd.notna(min_ev) and float(current_ev) >= float(min_ev)
+        # Use the exact persisted booleans from the bot's live buy decision.
+        # Recomputing these in the viewer can drift from operational thresholds.
+        score_target_ok = truthy_cell(
+            latest_row.get("buy_gate_score_ok", False)
+        )
+        prob_target_ok = truthy_cell(
+            latest_row.get("buy_gate_prob_ok", False)
+        )
+        ev_target_ok = truthy_cell(
+            latest_row.get("buy_gate_ev_ok", False)
+        )
 
         b1, b2, b3 = st.columns(3)
         with b1:
             mini_card(
                 "Calibrated buy score target",
                 f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}",
-                "PASS" if score_ok else "waiting",
+                "PASS" if score_target_ok else "waiting",
             )
         with b2:
             mini_card(
                 "Calibrated buy probability target",
                 f"{fmt_pct(current_prob, 3)} / {fmt_pct(min_prob, 3)}",
-                "PASS" if prob_ok else "waiting",
+                "PASS" if prob_target_ok else "waiting",
             )
         with b3:
             mini_card(
                 "Projected net edge",
                 f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}",
-                "PASS" if ev_ok else "waiting",
+                "PASS" if ev_target_ok else "waiting",
             )
 
         st.markdown(
@@ -1155,9 +1163,9 @@ def render_live_dashboard() -> None:
         )
 
         gate_items = [
-            ("Score target", latest_row.get("buy_gate_score_ok", False)),
-            ("Probability target", latest_row.get("buy_gate_prob_ok", False)),
-            ("EV target", latest_row.get("buy_gate_ev_ok", False)),
+            ("Score target", score_target_ok),
+            ("Probability target", prob_target_ok),
+            ("EV target", ev_target_ok),
         ]
 
         gcols = st.columns(3)

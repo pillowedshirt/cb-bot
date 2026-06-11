@@ -245,16 +245,13 @@ FEE_DATA_REQUIRED_FOR_LIVE_BUY: bool = True
 # The new EV system should use calibrated projected forward gain instead.
 USE_CALIBRATED_FORWARD_GAIN_FOR_TARGET_COST_GATE: bool = True
 
-# EV-primary buy behavior.
-# When projected EV and cost coverage pass, score/probability targets are treated
-# as ideal targets, not absolute blockers.
-USE_EV_PRIMARY_BUY_GATE: bool = True
+# EV-primary buy behavior is disabled. Calibrated score, probability, and EV
+# targets are all mandatory for actual buy permission.
+USE_EV_PRIMARY_BUY_GATE: bool = False
 
-# Hard minimums prevent extremely weak signals from buying.
+# Legacy EV-primary floors are retained for diagnostic logging only.
 EV_PRIMARY_MIN_SCORE_FLOOR: float = 25.0
 EV_PRIMARY_MIN_PROB_FLOOR: float = 0.35
-
-# Strong EV can override conservative fallback score/probability targets.
 EV_PRIMARY_MIN_PROJECTED_NET_BPS: float = 35.0
 
 # Require projected forward gain to cover modeled cost plus minimum gain.
@@ -5535,6 +5532,7 @@ class TradingBot:
         buy_gate_score_target_ok = bool(score >= calib_min_score)
         buy_gate_prob_target_ok = bool(estimated_prob_up >= calib_min_probability)
 
+        # Floors are diagnostic only. They do not authorize buys.
         buy_gate_score_floor_ok = bool(score >= float(EV_PRIMARY_MIN_SCORE_FLOOR))
         buy_gate_prob_floor_ok = bool(
             estimated_prob_up >= float(EV_PRIMARY_MIN_PROB_FLOOR)
@@ -5544,23 +5542,12 @@ class TradingBot:
             expected_net_edge_bps >= max(
                 float(MIN_REQUIRED_NET_EDGE_BPS),
                 calib_min_ev,
-                float(EV_PRIMARY_MIN_PROJECTED_NET_BPS),
             )
         )
 
-        # The calibrated targets should remain the real displayed target.
-        # EV-primary mode may be used as a secondary permissive mode,
-        # but it should not hide broken calibration or replace the repaired target.
-        if USE_EV_PRIMARY_BUY_GATE and buy_gate_ev_ok:
-            buy_gate_score_ok = bool(
-                buy_gate_score_target_ok or buy_gate_score_floor_ok
-            )
-            buy_gate_prob_ok = bool(
-                buy_gate_prob_target_ok or buy_gate_prob_floor_ok
-            )
-        else:
-            buy_gate_score_ok = buy_gate_score_target_ok
-            buy_gate_prob_ok = buy_gate_prob_target_ok
+        # Actual buy permission must use calibrated targets only.
+        buy_gate_score_ok = buy_gate_score_target_ok
+        buy_gate_prob_ok = buy_gate_prob_target_ok
         # Target/cost gate:
         # Use calibrated projected forward gain, not the small structural target_bps.
         # The structural target is often only a few bps and was blocking every buy.
@@ -5611,8 +5598,8 @@ class TradingBot:
                 )
 
         buy_gate_calibrated_ok = bool(
-            buy_gate_score_ok
-            and buy_gate_prob_ok
+            buy_gate_score_target_ok
+            and buy_gate_prob_target_ok
             and buy_gate_ev_ok
         )
 
@@ -5620,8 +5607,8 @@ class TradingBot:
             # The actual strategy decision:
             # Buy when the three core calibrated requirements pass.
             three_requirement_signal_ok = bool(
-                buy_gate_score_ok
-                and buy_gate_prob_ok
+                buy_gate_score_target_ok
+                and buy_gate_prob_target_ok
                 and buy_gate_ev_ok
             )
 
@@ -5651,10 +5638,10 @@ class TradingBot:
             if FEE_DATA_REQUIRED_FOR_LIVE_BUY and not buy_gate_fee_ok:
                 blockers.append("fee_data_not_ready")
 
-            if not buy_gate_score_ok:
+            if not buy_gate_score_target_ok:
                 blockers.append("score_below_calibrated_target")
 
-            if not buy_gate_prob_ok:
+            if not buy_gate_prob_target_ok:
                 blockers.append("probability_below_calibrated_target")
 
             if not buy_gate_ev_ok:
@@ -5702,14 +5689,16 @@ class TradingBot:
                 f"mode={buy_gate_mode} "
                 f"diagnostics={diagnostic_note} "
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
-                f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_ok={buy_gate_score_ok} "
-                f"score_target_ok={buy_gate_score_target_ok} "
+                f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
+                f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
-                f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_ok={buy_gate_prob_ok} "
-                f"prob_target_ok={buy_gate_prob_target_ok} "
+                f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_floor_ok={buy_gate_prob_floor_ok} "
+                f"prob_ok={buy_gate_prob_ok} prob_target_ok={buy_gate_prob_target_ok} "
                 f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
+                f"ev_primary_floor={EV_PRIMARY_MIN_PROJECTED_NET_BPS:.3f} "
                 f"ev={expected_net_edge_bps:.3f} "
-                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev, float(EV_PRIMARY_MIN_PROJECTED_NET_BPS)):.3f} "
+                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} "
+                f"ev_ok={buy_gate_ev_ok} "
                 f"target={target_bps:.3f} "
                 f"projected_forward={calibrated_forward_gain_bps:.3f} "
                 f"cost={cost_bps:.3f} "
@@ -5722,14 +5711,15 @@ class TradingBot:
                 f"blocker={buy_gate_blocker} "
                 f"diagnostics={diagnostic_note} "
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
-                f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_ok={buy_gate_score_ok} "
-                f"score_target_ok={buy_gate_score_target_ok} "
+                f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
+                f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
-                f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_ok={buy_gate_prob_ok} "
-                f"prob_target_ok={buy_gate_prob_target_ok} "
+                f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_floor_ok={buy_gate_prob_floor_ok} "
+                f"prob_ok={buy_gate_prob_ok} prob_target_ok={buy_gate_prob_target_ok} "
                 f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
+                f"ev_primary_floor={EV_PRIMARY_MIN_PROJECTED_NET_BPS:.3f} "
                 f"ev={expected_net_edge_bps:.3f} "
-                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev, float(EV_PRIMARY_MIN_PROJECTED_NET_BPS)):.3f} ev_ok={buy_gate_ev_ok} "
+                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} ev_ok={buy_gate_ev_ok} "
                 f"target={target_bps:.3f} "
                 f"projected_forward={calibrated_forward_gain_bps:.3f} "
                 f"cost={cost_bps:.3f} "

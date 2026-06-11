@@ -1132,13 +1132,13 @@ def render_live_dashboard() -> None:
         b1, b2, b3 = st.columns(3)
         with b1:
             mini_card(
-                "Buy score requirement",
+                "Calibrated buy score target",
                 f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}",
                 "PASS" if score_ok else "waiting",
             )
         with b2:
             mini_card(
-                "Buy probability requirement",
+                "Calibrated buy probability target",
                 f"{fmt_pct(current_prob, 3)} / {fmt_pct(min_prob, 3)}",
                 "PASS" if prob_ok else "waiting",
             )

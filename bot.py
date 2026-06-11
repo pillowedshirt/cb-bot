@@ -380,10 +380,20 @@ DEFAULT_CALIB_MIN_SCORE: float = 60.0
 DEFAULT_CALIB_MIN_PROB: float = 0.58
 DEFAULT_CALIB_MIN_EV_BPS: float = 2.0
 
-# If no positive threshold is found, pick a product-specific fallback from the
-# product's own winning observations instead of assigning all products the same value.
-CALIB_FALLBACK_SCORE_QUANTILE: float = 0.55
-CALIB_FALLBACK_PROB_QUANTILE: float = 0.55
+# Calibration repair:
+# These are only emergency safety floors, not default targets.
+# They prevent absurd values while preserving product-specific calibration.
+CALIB_ABSOLUTE_MIN_SCORE: float = 20.0
+CALIB_ABSOLUTE_MIN_PROB: float = 0.20
+
+# If fallback uses winning observations, use these quantiles from actual winners.
+# This keeps targets based on setups that reached the minimum gain after fees.
+CALIB_WINNER_SCORE_QUANTILE: float = 0.55
+CALIB_WINNER_PROB_QUANTILE: float = 0.55
+
+# If no exact positive-EV threshold is found, still choose product-specific
+# thresholds from historical winners instead of defaulting every product.
+ALLOW_WINNER_BASED_FALLBACK_THRESHOLDS: bool = True
 
 # Live recalibration can be CPU-heavy. Do it less often and off the event loop.
 LIVE_RECALIBRATION_EVERY_SEC: float = 5 * 60
@@ -4930,40 +4940,46 @@ class TradingBot:
                 ),
             )
 
-        # Product-specific fallback:
-        # If no exact threshold passes win-rate/EV requirements, choose from this
-        # product's winning observations, not global static floors.
         winning_obs = [o for o in all_obs if o.reached_min_profit]
 
-        if winning_obs:
+        if winning_obs and ALLOW_WINNER_BASED_FALLBACK_THRESHOLDS:
+            # Product-specific fallback:
+            # Use this product's actual historical winners.
+            # A "winner" means the future candles reached the minimum required
+            # net gain after fees/costs.
             fallback_score = self._safe_quantile(
                 [o.score for o in winning_obs],
-                CALIB_FALLBACK_SCORE_QUANTILE,
+                CALIB_WINNER_SCORE_QUANTILE,
                 DEFAULT_CALIB_MIN_SCORE,
             )
             fallback_prob = self._safe_quantile(
                 [o.probability for o in winning_obs],
-                CALIB_FALLBACK_PROB_QUANTILE,
+                CALIB_WINNER_PROB_QUANTILE,
                 DEFAULT_CALIB_MIN_PROB,
             )
-            _, fallback_avg_win, fallback_avg_loss, _, _ = self._observation_ev_stats(winning_obs)
+
+            # Safety only. Do not force back to 60 / 58%.
+            fallback_score = max(float(fallback_score), float(CALIB_ABSOLUTE_MIN_SCORE))
+            fallback_prob = max(float(fallback_prob), float(CALIB_ABSOLUTE_MIN_PROB))
+
+            fallback_wr, fallback_avg_win, fallback_avg_loss, fallback_ev, fallback_n = (
+                self._observation_ev_stats(winning_obs)
+            )
+
             (
                 fallback_projected_gross,
                 fallback_time_to_profit,
                 fallback_window,
             ) = self._projection_stats_from_observations(winning_obs)
 
-            # If the product's overall expectancy is negative, do not let fallback
-            # thresholds become extremely permissive. Use conservative defaults.
-            if blended_ev < 0:
-                fallback_score = max(float(fallback_score), DEFAULT_CALIB_MIN_SCORE)
-                fallback_prob = max(float(fallback_prob), DEFAULT_CALIB_MIN_PROB)
-
             return ProductCalibrationProfile(
                 product_id=product_id,
                 min_score=float(fallback_score),
                 min_probability=float(fallback_prob),
-                min_expected_value_bps=max(DEFAULT_CALIB_MIN_EV_BPS, CALIB_MIN_EXPECTED_VALUE_BPS),
+                min_expected_value_bps=max(
+                    DEFAULT_CALIB_MIN_EV_BPS,
+                    CALIB_MIN_EXPECTED_VALUE_BPS,
+                ),
                 day_sample_count=len(day_obs),
                 week_sample_count=len(week_obs),
                 day_win_rate=self._win_rate(day_obs),
@@ -4977,15 +4993,15 @@ class TradingBot:
                 calibrated_time_to_min_profit_minutes=float(fallback_time_to_profit),
                 calibrated_forward_window_minutes=float(fallback_window),
                 reason=(
-                    f"winning_observation_fallback product={product_id} "
+                    f"winner_based_product_fallback product={product_id} "
                     f"winning_samples={len(winning_obs)} "
                     f"score_q={fallback_score:.6f} "
                     f"prob_q={fallback_prob:.6f} "
-                    f"overall_ev={blended_ev:.6f}"
+                    f"overall_ev={blended_ev:.6f} "
+                    f"note=targets_from_actual_min_gain_winners"
                 ),
             )
 
-        # Last resort only: no historical winning examples at all.
         return ProductCalibrationProfile(
             product_id=product_id,
             min_score=DEFAULT_CALIB_MIN_SCORE,
@@ -5520,9 +5536,16 @@ class TradingBot:
             )
         )
 
+        # The calibrated targets should remain the real displayed target.
+        # EV-primary mode may be used as a secondary permissive mode,
+        # but it should not hide broken calibration or replace the repaired target.
         if USE_EV_PRIMARY_BUY_GATE and buy_gate_ev_ok:
-            buy_gate_score_ok = buy_gate_score_floor_ok
-            buy_gate_prob_ok = buy_gate_prob_floor_ok
+            buy_gate_score_ok = bool(
+                buy_gate_score_target_ok or buy_gate_score_floor_ok
+            )
+            buy_gate_prob_ok = bool(
+                buy_gate_prob_target_ok or buy_gate_prob_floor_ok
+            )
         else:
             buy_gate_score_ok = buy_gate_score_target_ok
             buy_gate_prob_ok = buy_gate_prob_target_ok
@@ -5626,7 +5649,7 @@ class TradingBot:
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
                 f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_ok={buy_gate_prob_ok} "
                 f"prob_target_ok={buy_gate_prob_target_ok} "
-                f"ev_primary={USE_EV_PRIMARY_BUY_GATE and buy_gate_ev_ok} "
+                f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
                 f"ev={expected_net_edge_bps:.3f} "
                 f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev, float(EV_PRIMARY_MIN_PROJECTED_NET_BPS)):.3f} "
                 f"target={target_bps:.3f} "
@@ -5644,7 +5667,7 @@ class TradingBot:
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
                 f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_ok={buy_gate_prob_ok} "
                 f"prob_target_ok={buy_gate_prob_target_ok} "
-                f"ev_primary={USE_EV_PRIMARY_BUY_GATE and buy_gate_ev_ok} "
+                f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
                 f"ev={expected_net_edge_bps:.3f} "
                 f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev, float(EV_PRIMARY_MIN_PROJECTED_NET_BPS)):.3f} ev_ok={buy_gate_ev_ok} "
                 f"target={target_bps:.3f} "
@@ -5652,7 +5675,8 @@ class TradingBot:
                 f"cost={cost_bps:.3f} "
                 f"target_cost_ok={buy_gate_target_cost_ok} "
                 f"spread={spread_bps:.3f} spread_ok={buy_gate_spread_ok} "
-                f"fee_ok={buy_gate_fee_ok} setup_ok={buy_gate_setup_ok} strict_ok={buy_gate_strict_ok}"
+                f"fee_ok={buy_gate_fee_ok} setup_ok={buy_gate_setup_ok} strict_ok={buy_gate_strict_ok} "
+                f"calib_reason={profile.reason}"
             )
 
         if not ok_to_trade:

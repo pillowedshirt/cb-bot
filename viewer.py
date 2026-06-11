@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import plotly.graph_objects as go
 import streamlit as st
 
 if importlib.util.find_spec("streamlit_autorefresh") is not None:
@@ -473,6 +474,126 @@ def plot_price(ax, d: pd.DataFrame, *, title: str, show_bid_ask: bool, trades: p
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=5, fontsize=7, frameon=False, labelcolor="#CBD5E1")
 
 
+def plot_price_plotly(d: pd.DataFrame, *, title: str, show_bid_ask: bool, trades: pd.DataFrame):
+    """
+    Live chart rendered with Plotly instead of st.pyplot.
+
+    This avoids Streamlit temporary PNG media-file errors during rapid auto-refresh.
+    """
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=d["dt"],
+        y=d["mid"],
+        mode="lines",
+        name="mid",
+        line=dict(width=2),
+        hovertemplate="mid=%{y}<br>%{x}<extra></extra>",
+    ))
+
+    if show_bid_ask and "bid" in d.columns and "ask" in d.columns:
+        fig.add_trace(go.Scatter(
+            x=d["dt"],
+            y=d["bid"],
+            mode="lines",
+            name="bid",
+            line=dict(width=1),
+            hovertemplate="bid=%{y}<br>%{x}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=d["dt"],
+            y=d["ask"],
+            mode="lines",
+            name="ask",
+            line=dict(width=1),
+            hovertemplate="ask=%{y}<br>%{x}<extra></extra>",
+        ))
+
+    if "anchored_vwap" in d.columns and not d["anchored_vwap"].isna().all():
+        fig.add_trace(go.Scatter(
+            x=d["dt"],
+            y=d["anchored_vwap"],
+            mode="lines",
+            name="VWAP",
+            line=dict(width=1, dash="dash"),
+            hovertemplate="VWAP=%{y}<br>%{x}<extra></extra>",
+        ))
+
+    if "fair_value" in d.columns and not d["fair_value"].isna().all():
+        fig.add_trace(go.Scatter(
+            x=d["dt"],
+            y=d["fair_value"],
+            mode="lines",
+            name="fair",
+            line=dict(width=1, dash="dash"),
+            hovertemplate="fair=%{y}<br>%{x}<extra></extra>",
+        ))
+
+    if trades is not None and not trades.empty:
+        buys = pd.DataFrame()
+        sells = pd.DataFrame()
+
+        if "event" in trades.columns:
+            buys = trades[(trades["event"] == "BUY") & (trades["side"] == "BUY")]
+            sells = trades[(trades["event"].isin(["SELL", "STARTUP_LIQUIDATION"])) & (trades["side"] == "SELL")]
+        elif "side" in trades.columns:
+            buys = trades[trades["side"] == "BUY"]
+            sells = trades[trades["side"] == "SELL"]
+
+        if not buys.empty:
+            fig.add_trace(go.Scatter(
+                x=buys["dt"],
+                y=buys["price"],
+                mode="markers+text",
+                name="BUY",
+                text=["BUY"] * len(buys),
+                textposition="top center",
+                marker=dict(symbol="triangle-up", size=12, line=dict(width=1)),
+                hovertemplate="BUY<br>price=%{y}<br>%{x}<extra></extra>",
+            ))
+
+        if not sells.empty:
+            fig.add_trace(go.Scatter(
+                x=sells["dt"],
+                y=sells["price"],
+                mode="markers+text",
+                name="SELL",
+                text=["SELL"] * len(sells),
+                textposition="bottom center",
+                marker=dict(symbol="triangle-down", size=12, line=dict(width=1)),
+                hovertemplate="SELL<br>price=%{y}<br>%{x}<extra></extra>",
+            ))
+
+    fig.update_layout(
+        title=title,
+        height=305,
+        margin=dict(l=8, r=8, t=36, b=8),
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#09111F",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.28,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=10),
+        ),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(148,163,184,0.13)",
+            zeroline=False,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(148,163,184,0.13)",
+            zeroline=False,
+        ),
+    )
+
+    return fig
+
+
 def plot_macro(ax, df: pd.DataFrame, levels: dict, title: str):
     d = df.dropna(subset=["ts", "close"]).copy()
     d["dt"] = to_dt_mst(d["ts"])
@@ -531,7 +652,7 @@ with st.sidebar:
     window_minutes = st.slider("Micro chart window", 5, 1440, 1440)
     overview_lookback_rows = st.slider("Overview change lookback rows", 2, 120, 120)
     show_bid_ask = st.checkbox("Show bid/ask lines", value=True)
-    show_macro = st.checkbox("Show macro tabs", value=True)
+    show_macro = st.checkbox("Show macro tabs", value=False)
     show_debug_tables = st.checkbox("Show debug telemetry table", value=False)
 
 # Keep a viewer session start time so the display does not feel like it resets.
@@ -917,10 +1038,13 @@ def render_live_dashboard() -> None:
     # =============================================================================
 
     st.markdown(f'<div class="cb-section">{product} live chart with buy/sell overlays</div>', unsafe_allow_html=True)
-    fig = plt.figure(figsize=(7.5, 2.75), facecolor="#050814")
-    ax = plt.gca()
-    plot_price(ax, m_prod, title=f"{product} · last {window_minutes} min", show_bid_ask=show_bid_ask, trades=t_prod)
-    st.pyplot(fig, clear_figure=True, width="stretch")
+    fig = plot_price_plotly(
+        m_prod,
+        title=f"{product} · last {window_minutes} min",
+        show_bid_ask=show_bid_ask,
+        trades=t_prod,
+    )
+    st.plotly_chart(fig, width="stretch", key=f"live_price_chart_{product}")
 
 
     # =============================================================================

@@ -973,8 +973,8 @@ def render_live_dashboard() -> None:
       <div class="cb-kv" style="margin-top:0.35rem;">
         <div class="k">Probability</div><div class="v">{fmt_pct(prob_val)}</div>
         <div class="k">Score</div><div class="v">{fmt_num(score_val, 1)}</div>
-        <div class="k">Buy score target</div><div class="v">{fmt_num(row.get("Buy Score Target", np.nan), 1)}</div>
-        <div class="k">Buy prob target</div><div class="v">{fmt_pct(row.get("Buy Prob Target", np.nan))}</div>
+        <div class="k">Buy score target</div><div class="v">{fmt_num(row.get("Buy Score Target", np.nan), 3)}</div>
+        <div class="k">Buy prob target</div><div class="v">{fmt_pct(row.get("Buy Prob Target", np.nan), 3)}</div>
         <div class="k">Buy EV target</div><div class="v">{fmt_num(row.get("Buy EV Target", np.nan), 1, " bps")}</div>
         <div class="k">Mid</div><div class="v">{fmt_num(mid_val, 6)}</div>
         <div class="k">Change</div><div class="v">{fmt_num(change_val, 1, ' bps')}</div>
@@ -991,8 +991,8 @@ def render_live_dashboard() -> None:
             display_overview = overview.copy()
             display_overview["Prob"] = display_overview["Prob"].map(lambda x: fmt_pct(x))
             display_overview["Score"] = display_overview["Score"].map(lambda x: fmt_num(x, 1))
-            display_overview["Buy Score Target"] = display_overview["Buy Score Target"].map(lambda x: fmt_num(x, 1))
-            display_overview["Buy Prob Target"] = display_overview["Buy Prob Target"].map(lambda x: fmt_pct(x))
+            display_overview["Buy Score Target"] = display_overview["Buy Score Target"].map(lambda x: fmt_num(x, 3))
+            display_overview["Buy Prob Target"] = display_overview["Buy Prob Target"].map(lambda x: fmt_pct(x, 3))
             display_overview["Buy EV Target"] = display_overview["Buy EV Target"].map(lambda x: fmt_num(x, 1, " bps"))
             display_overview["Mid"] = display_overview["Mid"].map(lambda x: fmt_num(x, 6))
             display_overview["Δ bps"] = display_overview["Δ bps"].map(lambda x: fmt_num(x, 1))
@@ -1117,9 +1117,9 @@ def render_live_dashboard() -> None:
 
         b1, b2, b3 = st.columns(3)
         with b1:
-            mini_card("Buy score requirement", f"{fmt_num(current_score, 1)} / {fmt_num(min_score, 1)}", "PASS" if score_ok else "waiting")
+            mini_card("Buy score requirement", f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}", "PASS" if score_ok else "waiting")
         with b2:
-            mini_card("Buy probability requirement", f"{fmt_pct(current_prob)} / {fmt_pct(min_prob)}", "PASS" if prob_ok else "waiting")
+            mini_card("Buy probability requirement", f"{fmt_pct(current_prob, 3)} / {fmt_pct(min_prob, 3)}", "PASS" if prob_ok else "waiting")
         with b3:
             mini_card("Buy EV requirement", f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}", "PASS" if ev_ok else "waiting")
 

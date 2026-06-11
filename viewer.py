@@ -251,10 +251,35 @@ hr {
 # Data helpers
 # =============================================================================
 
-def load_csv(path: str) -> pd.DataFrame:
+def load_csv(path: str, required_cols: list[str] | None = None) -> pd.DataFrame:
+    """
+    Load CSV safely.
+
+    If the file is missing, empty, partially written, or missing required columns,
+    return an empty dataframe instead of crashing the viewer.
+    """
     try:
-        return pd.read_csv(path)
-    except Exception:
+        if not os.path.exists(path):
+            return pd.DataFrame()
+
+        df = pd.read_csv(path)
+
+        if df.empty:
+            return pd.DataFrame()
+
+        if required_cols:
+            missing = [column for column in required_cols if column not in df.columns]
+            if missing:
+                st.warning(
+                    f"{os.path.basename(path)} is missing required columns {missing}. "
+                    f"Detected columns: {list(df.columns)}. "
+                    "Restart bot.py or clear the old CSV so it can regenerate."
+                )
+                return pd.DataFrame()
+
+        return df
+    except Exception as exc:
+        st.warning(f"Could not read {os.path.basename(path)}: {exc}")
         return pd.DataFrame()
 
 
@@ -532,7 +557,7 @@ if live_update:
 # Load data every rerun
 # =============================================================================
 
-m = load_csv(MARKET_CSV)
+m = load_csv(MARKET_CSV, required_cols=["ts", "product_id", "mid"])
 t = clean_trades(load_csv(TRADES_CSV))
 o = load_csv(ORDERS_CSV)
 ml = load_csv(MACRO_LEVELS_CSV)
@@ -553,7 +578,10 @@ st.markdown(
 )
 
 if m.empty:
-    st.info("Waiting for market.csv. Start bot.py and let it write telemetry.")
+    st.info(
+        "Waiting for a valid market.csv. Start bot.py and let it write telemetry. "
+        "If bot.py is already running, delete/rename the old market.csv and restart bot.py."
+    )
     st.stop()
 
 m = numeric(m, [

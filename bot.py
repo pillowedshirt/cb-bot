@@ -421,10 +421,27 @@ CALIB_MAX_EXACT_PROB_CANDIDATES: int = 80
 CALIB_MIN_WIN_RATE: float = 0.54
 CALIB_MIN_EXPECTED_VALUE_BPS: float = 2.0
 
-# Live recalibration can be CPU-heavy. Do it less often and off the event loop.
-LIVE_RECALIBRATION_EVERY_SEC: float = 5 * 60
-UNCALIBRATED_RETRY_EVERY_SEC: float = 60.0
-LIVE_RECALIBRATION_MIN_ROWS: int = 240
+# Calibration bank behavior.
+# Startup builds the base bank. Hourly updates append new observations.
+# Profiles are rebuilt from the accumulated bank, not from a tiny live-only window.
+ENABLE_CALIBRATION_BANK: bool = True
+CALIBRATION_UPDATE_EVERY_SEC: float = 60 * 60
+CALIBRATION_BANK_MAX_OBSERVATIONS_PER_PRODUCT: int = 8000
+
+# A profile should always be learned from data if any observations exist.
+# Exact threshold is preferred, but best-available learned targets are used if exact fails.
+ALLOW_BEST_AVAILABLE_LEARNED_PROFILE: bool = True
+
+# Best-available learned targets use real observation distributions, not static defaults.
+BEST_AVAILABLE_SCORE_QUANTILE: float = 0.55
+BEST_AVAILABLE_PROB_QUANTILE: float = 0.55
+BEST_AVAILABLE_EV_QUANTILE: float = 0.55
+
+# If winners exist, use winners first. If no winners exist, use top-motion observations.
+BEST_AVAILABLE_TOP_MOTION_FRACTION: float = 0.25
+
+# Avoid zero targets while still not using static score/probability defaults.
+MIN_LEARNED_TARGET_EPSILON: float = 1e-9
 
 # Event loop lag diagnostics.
 EVENT_LOOP_LAG_WARN_SEC: float = 3.0
@@ -3647,7 +3664,10 @@ class TradingBot:
         self.calibration_profiles: Dict[str, ProductCalibrationProfile] = {
             p: ProductCalibrationProfile(product_id=p) for p in PRODUCTS
         }
-        self.last_live_calibration_ts: float = 0.0
+        self.calibration_observation_bank: Dict[str, List[CalibrationObservation]] = {
+            product: [] for product in PRODUCTS
+        }
+        self.last_hourly_calibration_update_ts: float = 0.0
         self.live_recalibration_running: bool = False
         self.last_loop_lag_check_ts: float = now_ts()
         self.cached_account_snapshot: Optional[Dict[str, Dict[str, float]]] = None
@@ -5024,6 +5044,199 @@ class TradingBot:
             favorable, times, windows, selected_windows, extra, adverse,
         ))
 
+    def _append_calibration_observations(
+        self,
+        *,
+        product_id: str,
+        observations: List[CalibrationObservation],
+    ) -> None:
+        """
+        Append observations to the product's calibration bank.
+
+        Startup observations remain the base while hourly updates add new
+        information instead of replacing the profile with a tiny live window.
+        """
+        if not ENABLE_CALIBRATION_BANK:
+            return
+
+        if product_id not in self.calibration_observation_bank:
+            self.calibration_observation_bank[product_id] = []
+
+        self.calibration_observation_bank[product_id].extend(observations)
+
+        max_n = int(CALIBRATION_BANK_MAX_OBSERVATIONS_PER_PRODUCT)
+        if len(self.calibration_observation_bank[product_id]) > max_n:
+            self.calibration_observation_bank[product_id] = (
+                self.calibration_observation_bank[product_id][-max_n:]
+            )
+
+    def _observations_for_profile(
+        self,
+        *,
+        product_id: str,
+        fallback: List[CalibrationObservation],
+    ) -> List[CalibrationObservation]:
+        """Return accumulated observations, or the provided fallback."""
+        banked = self.calibration_observation_bank.get(product_id, [])
+        return list(banked) if banked else list(fallback)
+
+    def _build_best_available_learned_profile(
+        self,
+        *,
+        product_id: str,
+        observations: List[CalibrationObservation],
+        day_obs: List[CalibrationObservation],
+        week_obs: List[CalibrationObservation],
+        status: str,
+    ) -> ProductCalibrationProfile:
+        """Build data-derived targets when no exact threshold qualifies."""
+        observations = list(observations)
+
+        if not observations:
+            return ProductCalibrationProfile(
+                product_id=product_id,
+                is_calibrated=False,
+                calibration_status="no_observations",
+                min_score=float("nan"),
+                min_probability=float("nan"),
+                min_expected_value_bps=float("nan"),
+                day_sample_count=len(day_obs),
+                week_sample_count=len(week_obs),
+                reason="NO LEARNED TARGETS: no observations available",
+            )
+
+        winners = [
+            observation
+            for observation in observations
+            if bool(observation.reached_min_profit)
+            and bool(observation.survived_to_profit)
+        ]
+
+        if winners:
+            source = winners
+            source_label = "survived_winners"
+        else:
+            sorted_by_motion = sorted(
+                observations,
+                key=lambda observation: float(
+                    observation.max_favorable_bps or 0.0
+                ),
+                reverse=True,
+            )
+            take_n = max(
+                1,
+                int(
+                    len(sorted_by_motion)
+                    * float(BEST_AVAILABLE_TOP_MOTION_FRACTION)
+                ),
+            )
+            source = sorted_by_motion[:take_n]
+            source_label = "top_motion_no_winners"
+
+        def q(
+            values: List[float],
+            quantile: float,
+            fallback: float = MIN_LEARNED_TARGET_EPSILON,
+        ) -> float:
+            clean = [
+                float(value)
+                for value in values
+                if value is not None and np.isfinite(float(value))
+            ]
+            value = (
+                float(np.quantile(clean, float(quantile)))
+                if clean
+                else float(fallback)
+            )
+            if value <= MIN_LEARNED_TARGET_EPSILON:
+                value = MIN_LEARNED_TARGET_EPSILON
+            return value
+
+        learned_score = q(
+            [observation.score for observation in source],
+            BEST_AVAILABLE_SCORE_QUANTILE,
+        )
+        learned_prob = q(
+            [observation.probability for observation in source],
+            BEST_AVAILABLE_PROB_QUANTILE,
+        )
+        learned_ev = q(
+            [
+                float(observation.expected_value_bps)
+                for observation in source
+                if np.isfinite(float(observation.expected_value_bps))
+            ],
+            BEST_AVAILABLE_EV_QUANTILE,
+        )
+
+        # Do not authorize negative-EV buys, but keep the measured EV in the
+        # profile statistics and reason for inspection.
+        learned_ev_target = max(
+            float(learned_ev),
+            float(CALIB_MIN_EXPECTED_VALUE_BPS),
+            float(MIN_LEARNED_TARGET_EPSILON),
+        )
+
+        win_rate, avg_win, avg_loss, ev, _ = self._observation_ev_stats(
+            observations
+        )
+        (
+            projected_gross_bps,
+            median_time_to_min_profit,
+            median_forward_window,
+            median_selected_window,
+            median_post_profit_extra_gain,
+            median_adverse_before_profit,
+        ) = self._projection_stats_from_observations(source)
+
+        return ProductCalibrationProfile(
+            product_id=product_id,
+            is_calibrated=True,
+            calibration_status=f"best_available_{source_label}",
+            min_score=float(learned_score),
+            min_probability=float(learned_prob),
+            min_expected_value_bps=float(learned_ev_target),
+            day_sample_count=len(day_obs),
+            week_sample_count=len(week_obs),
+            day_win_rate=self._win_rate(day_obs),
+            week_win_rate=self._win_rate(week_obs),
+            blended_win_rate=float(win_rate),
+            avg_win_bps=float(avg_win),
+            avg_loss_bps=float(avg_loss),
+            expected_value_bps=float(ev),
+            calibrated_projected_gross_bps=float(projected_gross_bps),
+            calibrated_projected_net_bps=float(ev),
+            calibrated_time_to_min_profit_minutes=float(
+                median_time_to_min_profit
+            ),
+            calibrated_forward_window_minutes=float(median_forward_window),
+            calibrated_selected_window_minutes=float(median_selected_window),
+            calibrated_post_profit_breathing_minutes=float(
+                CALIB_POST_PROFIT_BREATHING_MINUTES
+            ),
+            calibrated_post_profit_extra_gain_bps=float(
+                median_post_profit_extra_gain
+            ),
+            calibrated_max_adverse_before_profit_bps=float(
+                median_adverse_before_profit
+            ),
+            calibrated_expected_bps_per_minute=(
+                float(ev)
+                / max(1.0, float(median_time_to_min_profit or 1.0))
+            ),
+            reason=(
+                f"learned_profile product={product_id} status={status} "
+                f"source={source_label} source_n={len(source)} "
+                f"total_n={len(observations)} score_q={learned_score:.6f} "
+                f"prob_q={learned_prob:.6f} "
+                f"ev_target={learned_ev_target:.6f} "
+                f"learned_ev={learned_ev:.6f} "
+                f"projected_gross={projected_gross_bps:.6f} "
+                f"time_to_profit={median_time_to_min_profit:.3f} "
+                f"window={median_forward_window:.3f}"
+            ),
+        )
+
     def _uncalibrated_profile(
         self,
         *,
@@ -5086,10 +5299,22 @@ class TradingBot:
         all_obs = list(day_obs) + list(week_obs)
 
         if len(all_obs) < CALIB_MIN_PRODUCT_SAMPLES:
+            if ALLOW_BEST_AVAILABLE_LEARNED_PROFILE and all_obs:
+                return self._build_best_available_learned_profile(
+                    product_id=product_id,
+                    observations=all_obs,
+                    day_obs=day_obs,
+                    week_obs=week_obs,
+                    status=(
+                        f"insufficient_samples total={len(all_obs)} "
+                        f"required={CALIB_MIN_PRODUCT_SAMPLES}"
+                    ),
+                )
+
             return self._uncalibrated_profile(
                 product_id=product_id,
                 status=(
-                    f"insufficient_samples total={len(all_obs)} "
+                    f"no_observations total={len(all_obs)} "
                     f"required={CALIB_MIN_PRODUCT_SAMPLES}"
                 ),
                 day_obs=day_obs,
@@ -5200,8 +5425,14 @@ class TradingBot:
                 product_id=product_id,
                 is_calibrated=True,
                 calibration_status="exact_threshold",
-                min_score=float(best["score_threshold"]),
-                min_probability=float(best["prob_threshold"]),
+                min_score=max(
+                    float(best["score_threshold"]),
+                    float(MIN_LEARNED_TARGET_EPSILON),
+                ),
+                min_probability=max(
+                    float(best["prob_threshold"]),
+                    float(MIN_LEARNED_TARGET_EPSILON),
+                ),
                 min_expected_value_bps=max(float(best["ev"]) * 0.35, CALIB_MIN_EXPECTED_VALUE_BPS),
                 day_sample_count=len(day_obs),
                 week_sample_count=len(week_obs),
@@ -5239,28 +5470,28 @@ class TradingBot:
 
         winning_obs = [o for o in all_obs if o.reached_min_profit]
 
-        if winning_obs:
-            blended_wr, blended_avg_win, blended_avg_loss, blended_ev, _ = (
-                self._observation_ev_stats(all_obs)
+        if ALLOW_BEST_AVAILABLE_LEARNED_PROFILE and all_obs:
+            status = (
+                f"exact_threshold_not_found winners_exist={len(winning_obs)} "
+                f"using_best_available_learned_profile"
+                if winning_obs
+                else (
+                    f"no_winning_observations total={len(all_obs)} "
+                    f"using_top_motion_learned_profile"
+                )
             )
-
-            return self._uncalibrated_profile(
+            return self._build_best_available_learned_profile(
                 product_id=product_id,
-                status=(
-                    f"exact_threshold_not_found winners_exist={len(winning_obs)} "
-                    f"but_no_threshold_met_winrate_ev_rules"
-                ),
+                observations=all_obs,
                 day_obs=day_obs,
                 week_obs=week_obs,
-                blended_ev=blended_ev,
-                avg_win_bps=blended_avg_win,
-                avg_loss_bps=blended_avg_loss,
+                status=status,
             )
 
         return self._uncalibrated_profile(
             product_id=product_id,
             status=(
-                f"no_winning_observations total={len(all_obs)} "
+                f"no_observations_available total={len(all_obs)} "
                 f"overall_ev={blended_ev:.6f}"
             ),
             day_obs=day_obs,
@@ -5442,11 +5673,14 @@ class TradingBot:
                 week_candles = await self.fetcher.fetch_chunked(
                     product, start_week, end_ts, CALIB_WEEK_GRANULARITY
                 )
-                if not day_candles:
-                    log(f"[calibration] no day candles for {product}; product uncalibrated")
+                if not day_candles and not week_candles:
+                    log(
+                        f"[calibration] no historical candles for {product}; "
+                        f"product remains uncalibrated"
+                    )
                     profile = self._uncalibrated_profile(
                         product_id=product,
-                        status="no_day_candles",
+                        status="no_historical_candles",
                     )
                     self.calibration_profiles[product] = profile
                     self.clog.log_profile(profile)
@@ -5465,7 +5699,7 @@ class TradingBot:
                     min_prefix=CALIB_MIN_PREFIX_CANDLES_1M,
                     forward_windows=CALIB_FORWARD_WINDOWS_1M,
                     spread_bps=spread_bps,
-                )
+                ) if day_candles else []
                 week_obs = self._walk_forward_observations_multi_window(
                     product_id=product,
                     candles=week_candles,
@@ -5479,6 +5713,10 @@ class TradingBot:
                     f"[calibration-debug] {product} "
                     f"day_obs={len(day_obs)} week_obs={len(week_obs)} "
                     f"spread_bps={spread_bps:.3f}"
+                )
+                self._append_calibration_observations(
+                    product_id=product,
+                    observations=day_obs + week_obs,
                 )
                 profile = self._build_calibration_profile(
                     product_id=product,
@@ -5520,111 +5758,120 @@ class TradingBot:
                 self.clog.log_profile(profile)
         log("[calibration] startup walk-forward calibration finished")
 
-    def _run_live_recalibration(self) -> None:
-        """Smooth buy thresholds using completed rolling one-minute candles."""
+    def _run_hourly_banked_recalibration(self) -> None:
+        """Append recent observations and rebuild profiles from the full bank."""
         for product in PRODUCTS:
-            live_rows = self.live_1m[product].export_rows(product)
-            minimum_rows = max(
-                LIVE_RECALIBRATION_MIN_ROWS,
-                CALIB_MIN_PREFIX_CANDLES_1M + max(CALIB_FORWARD_WINDOWS_1M),
-            )
-            if len(live_rows) < minimum_rows:
-                continue
-            live_candles = [
-                Candle(
-                    ts=int(row["ts"]),
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    volume=float(row.get("volume", 0.0)),
-                )
-                for row in live_rows
-            ]
-            old_profile = self.calibration_profiles.get(
-                product, ProductCalibrationProfile(product_id=product)
-            )
-            tob = self.tob.get(product)
-            spread_bps = (
-                float(tob.spread_bps)
-                if tob and tob.spread_bps > 0
-                else float(MAX_SPREAD_BPS)
-            )
-            forward_windows = [
-                window for window in CALIB_FORWARD_WINDOWS_1M
-                if window <= max(5, len(live_candles) // 3)
-            ]
-            day_obs = self._walk_forward_observations_multi_window(
-                product_id=product,
-                candles=live_candles,
-                weekly_candles=live_candles,
-                timeframe="live_rolling_1m",
-                min_prefix=CALIB_MIN_PREFIX_CANDLES_1M,
-                forward_windows=forward_windows,
-                spread_bps=spread_bps,
-            )
-            if len(day_obs) < CALIB_MIN_PRODUCT_SAMPLES:
-                continue
-            new_profile = self._build_calibration_profile(
-                product_id=product,
-                day_obs=day_obs,
-                week_obs=[],
-            )
             try:
-                self.candidate_replay_log.log_observations(day_obs)
-            except Exception as replay_error:
-                log(f"[candidate-replay] failed to log live replay for {product}: {replay_error}")
-
-            if REQUIRE_VALID_LIVE_RECALIBRATION_PROFILE:
-                if not new_profile.is_calibrated:
-                    log(f"[calibration] skip live smoothing for {product}: new profile not calibrated status={new_profile.calibration_status}")
+                live_rows = self.live_1m[product].export_rows(product)
+                minimum_rows = (
+                    CALIB_MIN_PREFIX_CANDLES_1M
+                    + max(CALIB_FORWARD_WINDOWS_1M)
+                    + 5
+                )
+                if len(live_rows) < minimum_rows:
+                    log(
+                        f"[calibration-hourly] {product} skipped: "
+                        f"live_rows={len(live_rows)} required={minimum_rows}; "
+                        f"keeping existing profile"
+                    )
                     continue
-                if new_profile.calibrated_projected_gross_bps < LIVE_RECALIBRATION_PROJECTED_GROSS_MIN_BPS:
-                    log(f"[calibration] skip live smoothing for {product}: projected gross too low {new_profile.calibrated_projected_gross_bps:.3f}")
-                    continue
-                if new_profile.min_score <= 0 or new_profile.min_probability <= 0:
-                    log(f"[calibration] skip live smoothing for {product}: invalid threshold")
-                    continue
-            elif not new_profile.is_calibrated:
-                continue
 
-            if not old_profile.is_calibrated:
-                self.calibration_profiles[product] = new_profile
-                self.clog.log_profile(new_profile)
-                continue
+                live_candles = [
+                    Candle(
+                        ts=int(row["ts"]),
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row.get("volume", 0.0)),
+                    )
+                    for row in live_rows
+                ]
 
-            # Preserve startup calibration and blend only a validated live profile.
-            old_profile.min_score = old_profile.min_score * 0.85 + new_profile.min_score * 0.15
-            old_profile.min_probability = old_profile.min_probability * 0.85 + new_profile.min_probability * 0.15
-            old_profile.min_expected_value_bps = old_profile.min_expected_value_bps * 0.85 + new_profile.min_expected_value_bps * 0.15
-            old_profile.day_sample_count = new_profile.day_sample_count
-            old_profile.day_win_rate = new_profile.day_win_rate
-            old_profile.blended_win_rate = new_profile.blended_win_rate
-            old_profile.avg_win_bps = new_profile.avg_win_bps
-            old_profile.avg_loss_bps = new_profile.avg_loss_bps
-            old_profile.expected_value_bps = new_profile.expected_value_bps
-            for field_name in (
-                "calibrated_projected_gross_bps",
-                "calibrated_projected_net_bps",
-                "calibrated_time_to_min_profit_minutes",
-                "calibrated_forward_window_minutes",
-                "calibrated_selected_window_minutes",
-                "calibrated_post_profit_extra_gain_bps",
-                "calibrated_max_adverse_before_profit_bps",
-                "calibrated_expected_bps_per_minute",
-            ):
-                old_value = float(getattr(old_profile, field_name, 0.0))
-                new_value = float(getattr(new_profile, field_name, 0.0))
-                setattr(old_profile, field_name, old_value * 0.90 + new_value * 0.10)
-            old_profile.calibrated_post_profit_breathing_minutes = float(CALIB_POST_PROFIT_BREATHING_MINUTES)
-            old_profile.calibration_status = "smoothed_valid_live_recalibration"
-            old_profile.is_calibrated = True
-            old_profile.reason = (
-                f"smoothed_valid_live_recalibration from={new_profile.calibration_status} "
-                f"new_reason={new_profile.reason}"
-            )
-            self.calibration_profiles[product] = old_profile
-            self.clog.log_profile(old_profile)
+                tob = self.tob.get(product)
+                spread_bps = (
+                    float(tob.spread_bps)
+                    if tob and tob.spread_bps > 0
+                    else float(MAX_SPREAD_BPS)
+                )
+
+                recent_candles = live_candles[-max(360, minimum_rows):]
+                forward_windows = [
+                    window
+                    for window in CALIB_FORWARD_WINDOWS_1M
+                    if window <= max(5, len(recent_candles) // 3)
+                ]
+                new_obs = self._walk_forward_observations_multi_window(
+                    product_id=product,
+                    candles=recent_candles,
+                    weekly_candles=live_candles,
+                    timeframe="live_rolling_1m",
+                    min_prefix=CALIB_MIN_PREFIX_CANDLES_1M,
+                    forward_windows=forward_windows,
+                    spread_bps=spread_bps,
+                )
+
+                if not new_obs:
+                    log(
+                        f"[calibration-hourly] {product} no new observations; "
+                        f"keeping existing profile"
+                    )
+                    continue
+
+                self._append_calibration_observations(
+                    product_id=product,
+                    observations=new_obs,
+                )
+
+                try:
+                    self.candidate_replay_log.log_observations(new_obs)
+                except Exception as replay_error:
+                    log(
+                        f"[candidate-replay] failed to log hourly replay for "
+                        f"{product}: {replay_error}"
+                    )
+
+                bank_obs = self._observations_for_profile(
+                    product_id=product,
+                    fallback=new_obs,
+                )
+                if not bank_obs:
+                    log(
+                        f"[calibration-hourly] {product} bank empty after append; "
+                        f"keeping existing profile"
+                    )
+                    continue
+
+                profile_new = self._build_calibration_profile(
+                    product_id=product,
+                    day_obs=bank_obs,
+                    week_obs=[],
+                )
+
+                if not profile_new.is_calibrated:
+                    log(
+                        f"[calibration-hourly] {product} rebuilt profile not "
+                        f"calibrated; keeping existing profile "
+                        f"status={profile_new.calibration_status}"
+                    )
+                    continue
+
+                self.calibration_profiles[product] = profile_new
+                self.clog.log_profile(profile_new)
+
+                log(
+                    f"[calibration-hourly] {product} updated "
+                    f"score={profile_new.min_score:.6f} "
+                    f"prob={profile_new.min_probability:.6f} "
+                    f"ev={profile_new.min_expected_value_bps:.6f} "
+                    f"status={profile_new.calibration_status} "
+                    f"bank_n={len(bank_obs)}"
+                )
+            except Exception as exc:
+                log_exception(
+                    f"[calibration-hourly] failed for {product}",
+                    exc,
+                )
 
 
     def _latest_live_signal_for_product(self, product_id: str) -> Optional[LiveSignal]:
@@ -7279,31 +7526,31 @@ class TradingBot:
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
 
-            retry_sec = (
-                UNCALIBRATED_RETRY_EVERY_SEC
-                if any(
-                    not profile.is_calibrated
-                    for profile in self.calibration_profiles.values()
-                )
-                else LIVE_RECALIBRATION_EVERY_SEC
-            )
             if (
                 ENABLE_WALK_FORWARD_CALIBRATION
                 and not self.live_recalibration_running
-                and ts_now - self.last_live_calibration_ts >= retry_sec
+                and (
+                    ts_now - self.last_hourly_calibration_update_ts
+                    >= CALIBRATION_UPDATE_EVERY_SEC
+                )
             ):
-                self.last_live_calibration_ts = ts_now
+                self.last_hourly_calibration_update_ts = ts_now
                 self.live_recalibration_running = True
 
-                async def _recalibrate_in_thread() -> None:
+                async def _hourly_calibrate_in_thread() -> None:
                     try:
-                        await asyncio.to_thread(self._run_live_recalibration)
+                        await asyncio.to_thread(
+                            self._run_hourly_banked_recalibration
+                        )
                     except Exception as e:
-                        log(f"[calibration] live recalibration failed: {e}")
+                        log(
+                            f"[calibration] hourly banked recalibration "
+                            f"failed: {e}"
+                        )
                     finally:
                         self.live_recalibration_running = False
 
-                asyncio.create_task(_recalibrate_in_thread())
+                asyncio.create_task(_hourly_calibrate_in_thread())
 
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:

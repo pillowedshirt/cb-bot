@@ -382,12 +382,29 @@ def previous_by_product(m: pd.DataFrame, lookback_rows: int = 20) -> Dict[str, p
 
 
 def latest_calibration_for_product(cal: pd.DataFrame, product: str) -> pd.Series | None:
+    """Return the latest active learned profile, then fall back to the latest row."""
     if cal.empty or "product_id" not in cal.columns or "ts" not in cal.columns:
         return None
-    rows = cal[cal["product_id"] == product].copy()
+    rows = cal[cal["product_id"].astype(str) == str(product)].copy()
     if rows.empty:
         return None
-    return rows.sort_values("ts").iloc[-1]
+    rows = rows.sort_values("ts")
+    learned_rows = rows[
+        rows.apply(
+            lambda row: (
+                truthy_cell(row.get("is_calibrated", False))
+                and valid_target_number(row.get("min_score", np.nan))
+                and valid_target_number(row.get("min_probability", np.nan))
+                and valid_target_number(
+                    row.get("min_expected_value_bps", np.nan)
+                )
+            ),
+            axis=1,
+        )
+    ]
+    if not learned_rows.empty:
+        return learned_rows.iloc[-1]
+    return rows.iloc[-1]
 
 
 def latest_position_target_for_product(pt: pd.DataFrame, product: str) -> pd.Series | None:
@@ -1228,7 +1245,7 @@ def render_live_dashboard() -> None:
 
         target_rows.append({
             "Product": product_id,
-            "Calibration": "READY" if valid_targets else "AWAITING",
+            "Calibration": "LEARNED" if valid_targets else "AWAITING",
             "Current Score": fmt_num(latest_eval.get("entry_score", np.nan), 3),
             "Score Target": (
                 fmt_num(min_score, 3)

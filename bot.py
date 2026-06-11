@@ -82,6 +82,7 @@ MARKET_CSV_PATH: str = os.path.join(BASE_DIR, "market.csv")
 MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
 MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
+CALIBRATION_CSV_PATH: str = os.path.join(BASE_DIR, "calibration.csv")
 
 # Cadence for macro refresh
 MACRO_REFRESH_EVERY_SEC: int = 3 * 60  # every 3 minutes
@@ -290,6 +291,52 @@ HARD_PEAK_STOP_PCT: float = 0.0040
 SCALP_TARGET_ARM_DRAWDOWN_PCT: float = 0.0010  # 0.10%
 CORE_TARGET_ARM_DRAWDOWN_PCT: float = 0.0020   # 0.20%
 RUNNER_TARGET_ARM_DRAWDOWN_PCT: float = 0.0030 # 0.30%
+
+# Walk-forward calibration
+ENABLE_WALK_FORWARD_CALIBRATION: bool = True
+
+# Past day calibration: 1-minute candles.
+CALIB_DAY_LOOKBACK_MINUTES: int = 24 * 60
+CALIB_DAY_GRANULARITY: str = "ONE_MINUTE"
+
+# Past week calibration: 15-minute candles.
+CALIB_WEEK_LOOKBACK_MINUTES: int = 7 * 24 * 60
+CALIB_WEEK_GRANULARITY: str = "FIFTEEN_MINUTE"
+
+# Minimum candle history needed before scoring a historical moment.
+CALIB_MIN_PREFIX_CANDLES_1M: int = 90
+CALIB_MIN_PREFIX_CANDLES_15M: int = 32
+
+# Future windows used to judge whether the signal worked.
+CALIB_FORWARD_MINUTES_1M: int = 60
+CALIB_FORWARD_BARS_15M: int = 16
+
+# Historical bucket requirements.
+CALIB_MIN_BUCKET_SAMPLES: int = 8
+CALIB_MIN_PRODUCT_SAMPLES: int = 25
+
+# Calibration buckets.
+CALIB_SCORE_BUCKET_SIZE: float = 5.0
+CALIB_PROB_BUCKET_SIZE: float = 0.025
+
+# Minimum acceptable calibrated behavior.
+CALIB_MIN_WIN_RATE: float = 0.54
+CALIB_MIN_EXPECTED_VALUE_BPS: float = 2.0
+
+# Defaults if calibration has insufficient data.
+DEFAULT_CALIB_MIN_SCORE: float = 60.0
+DEFAULT_CALIB_MIN_PROB: float = 0.58
+DEFAULT_CALIB_MIN_EV_BPS: float = 2.0
+
+# Candidate pullbacks tested during sell calibration.
+CALIB_SCALP_PULLBACK_CANDIDATES: List[float] = [0.0005, 0.0010, 0.0015, 0.0020]
+CALIB_CORE_PULLBACK_CANDIDATES: List[float] = [0.0010, 0.0020, 0.0030, 0.0040]
+
+# Keep calibrated values inside safe bounds.
+CALIB_MIN_SCALP_PULLBACK: float = 0.0005
+CALIB_MAX_SCALP_PULLBACK: float = 0.0030
+CALIB_MIN_CORE_PULLBACK: float = 0.0010
+CALIB_MAX_CORE_PULLBACK: float = 0.0060
 
 # Minimum realized net gain required for discretionary profit exits.
 # 1 basis point = 0.01%.
@@ -1838,6 +1885,88 @@ class LiveSignal:
     higher_low_reason: str = ""
 
 
+@dataclass
+class CalibrationObservation:
+    product_id: str
+    timeframe: str
+    ts: int
+    score: float
+    probability: float
+    expected_net_edge_bps: float
+    target_bps: float
+    cost_bps: float
+    spread_bps: float
+    max_favorable_bps: float
+    max_adverse_bps: float
+    reached_min_profit: bool
+    reached_target: bool
+    expected_value_bps: float
+    win_bps: float
+    loss_bps: float
+
+
+@dataclass
+class ProductCalibrationProfile:
+    product_id: str
+    min_score: float = DEFAULT_CALIB_MIN_SCORE
+    min_probability: float = DEFAULT_CALIB_MIN_PROB
+    min_expected_value_bps: float = DEFAULT_CALIB_MIN_EV_BPS
+    scalp_pullback_pct: float = SCALP_TARGET_ARM_DRAWDOWN_PCT
+    core_pullback_pct: float = CORE_TARGET_ARM_DRAWDOWN_PCT
+    day_sample_count: int = 0
+    week_sample_count: int = 0
+    day_win_rate: float = 0.0
+    week_win_rate: float = 0.0
+    blended_win_rate: float = 0.0
+    avg_win_bps: float = 0.0
+    avg_loss_bps: float = 0.0
+    expected_value_bps: float = 0.0
+    reason: str = "default_profile"
+
+
+class CalibrationLogger:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._ensure_header()
+
+    def _ensure_header(self) -> None:
+        if os.path.exists(self.path):
+            return
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "ts", "dt_mst", "product_id",
+                "min_score", "min_probability", "min_expected_value_bps",
+                "scalp_pullback_pct", "core_pullback_pct",
+                "day_sample_count", "week_sample_count",
+                "day_win_rate", "week_win_rate", "blended_win_rate",
+                "avg_win_bps", "avg_loss_bps", "expected_value_bps",
+                "reason",
+            ])
+
+    def log_profile(self, profile: ProductCalibrationProfile) -> None:
+        tsv = now_ts()
+        dt_mst = datetime.fromtimestamp(tsv, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                f"{tsv:.6f}", dt_mst, profile.product_id,
+                f"{profile.min_score:.6f}",
+                f"{profile.min_probability:.6f}",
+                f"{profile.min_expected_value_bps:.6f}",
+                f"{profile.scalp_pullback_pct:.8f}",
+                f"{profile.core_pullback_pct:.8f}",
+                profile.day_sample_count, profile.week_sample_count,
+                f"{profile.day_win_rate:.6f}",
+                f"{profile.week_win_rate:.6f}",
+                f"{profile.blended_win_rate:.6f}",
+                f"{profile.avg_win_bps:.6f}",
+                f"{profile.avg_loss_bps:.6f}",
+                f"{profile.expected_value_bps:.6f}",
+                profile.reason,
+            ])
+
+
 def _clip_score(x: float) -> float:
     return float(max(0.0, min(100.0, x)))
 
@@ -3046,6 +3175,7 @@ class TradingBot:
         self.macro = MacroManager()
         self.tlog = TradeLogger(TRADES_CSV_PATH)
         self.olog = OrderLogger(ORDERS_CSV_PATH)
+        self.clog = CalibrationLogger(CALIBRATION_CSV_PATH)
         self.mlog = MarketLogger(MARKET_CSV_PATH)
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
@@ -3056,6 +3186,11 @@ class TradingBot:
         self.mid_series: Dict[str, RollingMidSeries] = {p: RollingMidSeries() for p in PRODUCTS}
         # 1m candle series per product
         self.live_1m: Dict[str, LiveMinuteCandleSeries] = {p: LiveMinuteCandleSeries() for p in PRODUCTS}
+        # Per-product walk-forward calibration profiles.
+        self.calibration_profiles: Dict[str, ProductCalibrationProfile] = {
+            p: ProductCalibrationProfile(product_id=p) for p in PRODUCTS
+        }
+        self.last_live_calibration_ts: float = 0.0
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
         # parallel metadata for lots (so we can do tranche-specific exits without changing CSV schema)
@@ -3858,6 +3993,694 @@ class TradingBot:
         # Keep the output bounded but visibly dynamic.
         return clamp_float(prob, 0.25, 0.88)
 
+    def _build_historical_signal_from_candles(
+        self,
+        *,
+        product_id: str,
+        candles: List[Candle],
+        weekly_candles: Optional[List[Candle]],
+        spread_bps: float,
+    ) -> LiveSignal:
+        """Build a signal using only candles available at a replay point."""
+        if not candles:
+            raise ValueError("No candles supplied for historical signal.")
+
+        mid = float(candles[-1].close)
+        levels_day = compute_macro_levels(candles)
+        levels_week = compute_macro_levels(weekly_candles or candles)
+
+        weekly_bias = None
+        if levels_week and levels_week.range_low > 0 and levels_week.range_high > levels_week.range_low:
+            weekly_bias = (
+                (mid - levels_week.range_low)
+                / (levels_week.range_high - levels_week.range_low)
+            ) * 2.0 - 1.0
+
+        closes = [float(c.close) for c in candles if float(c.close) > 0]
+        sigma_bps = None
+        if len(closes) >= 20:
+            rets = [
+                (closes[i] / closes[i - 1] - 1.0) * 10000.0
+                for i in range(1, len(closes))
+                if closes[i - 1] > 0
+            ]
+            if rets:
+                sigma_bps = float(np.std(rets[-60:])) if len(rets) >= 2 else 0.0
+
+        target_bps = self._target_move_bps_from_room_and_sigma(
+            mid=mid,
+            product_id=product_id,
+            levels_day=levels_day,
+            levels_week=levels_week,
+            sigma_bps=sigma_bps,
+        )
+        fee_available = (
+            self.current_maker_fee_bps is not None
+            and self.current_taker_fee_bps is not None
+        )
+        if fee_available:
+            try:
+                cost_bps = self._round_trip_cost_bps(spread_bps=spread_bps)
+            except Exception:
+                cost_bps = 0.0
+        else:
+            cost_bps = 0.0
+        expected_net_edge_bps = float(target_bps - cost_bps) if fee_available else 0.0
+
+        support_score = _support_proximity_score(mid, levels_day, levels_week)
+        room_score, room_reason = _room_score(mid, levels_day, levels_week, RESIST_BUFFER_BPS)
+        regime_score = (
+            55.0
+            if weekly_bias is None
+            else _clip_score((float(weekly_bias) + 1.0) * 50.0)
+        )
+
+        momentum_5_bps = _recent_close_momentum_bps(candles, lookback=5)
+        momentum_15_bps = _recent_close_momentum_bps(candles, lookback=15)
+        trending_down = False
+        trend_reason = "hist_trend_ok"
+        if len(closes) >= MICRO_TREND_LOOKBACK_MIN:
+            first = closes[-MICRO_TREND_LOOKBACK_MIN]
+            last = closes[-1]
+            move_bps = ((last / first) - 1.0) * 10000.0 if first > 0 else 0.0
+            trending_down = move_bps <= MICRO_TREND_DOWN_BPS
+            trend_reason = f"hist_trend move_bps={move_bps:.1f}"
+            if trending_down:
+                regime_score = min(regime_score, 35.0)
+
+        total_pv = 0.0
+        total_v = 0.0
+        for candle in candles[-1440:]:
+            volume = max(0.0, float(candle.volume))
+            typical = (float(candle.high) + float(candle.low) + float(candle.close)) / 3.0
+            total_pv += typical * volume
+            total_v += volume
+        hist_vwap = total_pv / total_v if total_v > 0 else None
+        if hist_vwap is None or hist_vwap <= 0:
+            vwap_ok = True
+            vwap_reason = "hist_vwap_unknown"
+        else:
+            required_vwap = float(hist_vwap) * bps_to_mult(VWAP_RECLAIM_BUFFER_BPS)
+            vwap_ok = mid >= required_vwap
+            vwap_reason = "hist_vwap_reclaim" if vwap_ok else "hist_below_vwap"
+
+        higher_low_ok = False
+        higher_low_reason = "hist_higher_low_unknown"
+        if len(candles) >= 8:
+            recent = candles[-8:]
+            lows = [float(c.low) for c in recent]
+            recent_closes = [float(c.close) for c in recent]
+            recent_low = min(lows[-3:])
+            prior_low = min(lows[:5])
+            close_strength = recent_closes[-1] > recent_closes[-2] >= recent_closes[-3]
+            higher_low_ok = recent_low > prior_low and close_strength
+            higher_low_reason = (
+                "hist_higher_low_confirmed"
+                if higher_low_ok
+                else "hist_higher_low_not_confirmed"
+            )
+
+        dip_metrics = _dip_metrics(candles)
+        if dip_metrics:
+            dip_pct = float(dip_metrics.get("dip_pct", 0.0))
+            dip_rate = float(dip_metrics.get("dip_rate_bps_per_min", 0.0))
+            trough_low = float(dip_metrics.get("trough_low", 0.0))
+            dip_depth_score = _clip_score(
+                (dip_pct / max(DIP_MIN_PCT * 4.0, 1e-9)) * 100.0
+            )
+            dip_speed_score = _clip_score(
+                (dip_rate / max(DIP_RATE_MIN_BPS_PER_MIN, 1e-9)) * 50.0
+            )
+            reversal_ok, reversal_reason = _dip_reversal_ok(candles, trough_low)
+            reversal_score = 100.0 if reversal_ok else 35.0
+        else:
+            dip_depth_score = 35.0
+            dip_speed_score = 35.0
+            reversal_score = 35.0
+            reversal_reason = "hist_dip_neutral"
+
+        momentum_score = (
+            _score_from_bps(momentum_5_bps, center_bps=0.0, width_bps=35.0) * 0.60
+            + _score_from_bps(momentum_15_bps, center_bps=0.0, width_bps=65.0) * 0.40
+        )
+        range_position_score = _recent_range_position_score(candles, lookback=20)
+        vwap_score = 72.0 if vwap_ok else 38.0
+        higher_low_score = 72.0 if higher_low_ok else 38.0
+        spread_penalty = max(0.0, float(spread_bps) - 6.0) * 0.80
+        cost_penalty = max(0.0, float(cost_bps) - 50.0) * 0.10
+        edge_score = _score_from_bps(
+            expected_net_edge_bps,
+            center_bps=0.0,
+            width_bps=max(35.0, MIN_REQUIRED_NET_EDGE_BPS),
+        )
+        raw_score = (
+            support_score * 0.14
+            + room_score * 0.14
+            + regime_score * 0.10
+            + reversal_score * 0.11
+            + dip_depth_score * 0.08
+            + dip_speed_score * 0.05
+            + momentum_score * 0.18
+            + range_position_score * 0.05
+            + vwap_score * 0.07
+            + higher_low_score * 0.06
+            + edge_score * 0.12
+            - spread_penalty
+            - cost_penalty
+        )
+        score = _clip_score(raw_score)
+        tier = _score_to_tier(score)
+        estimated_prob_up = self._estimate_display_prob_up(
+            score=score,
+            spread_bps=spread_bps,
+            momentum_5_bps=momentum_5_bps,
+            momentum_15_bps=momentum_15_bps,
+            support_score=support_score,
+            room_score=room_score,
+            regime_score=regime_score,
+            vwap_ok=bool(vwap_ok),
+            higher_low_ok=bool(higher_low_ok),
+            trending_down=bool(trending_down),
+            target_bps=target_bps,
+            cost_bps=cost_bps,
+            fee_available=fee_available,
+        )
+        position_pct = self._position_pct_from_probability(estimated_prob_up)
+        reason = (
+            f"historical_score={score:.1f}; prob={estimated_prob_up:.3f}; "
+            f"edge={expected_net_edge_bps:.1f}; target={target_bps:.1f}; cost={cost_bps:.1f}; "
+            f"mom5={momentum_5_bps:.1f}; mom15={momentum_15_bps:.1f}; "
+            f"room={room_reason}; {vwap_reason}; {higher_low_reason}; "
+            f"{trend_reason}; {reversal_reason}"
+        )
+        return LiveSignal(
+            ok_to_trade=False,
+            score=float(score),
+            tier=int(tier),
+            reason=reason,
+            estimated_prob_up=float(estimated_prob_up),
+            position_pct=float(position_pct),
+            expected_net_edge_bps=float(expected_net_edge_bps),
+            target_bps=float(target_bps),
+            cost_bps=float(cost_bps),
+            dip_depth_score=float(dip_depth_score),
+            dip_speed_score=float(dip_speed_score),
+            reversal_score=float(reversal_score),
+            support_score=float(support_score),
+            room_score=float(room_score),
+            regime_score=float(regime_score),
+            spread_penalty=float(spread_penalty),
+            cost_penalty=float(cost_penalty),
+            trend_reason=trend_reason,
+            vwap_reason=vwap_reason,
+            higher_low_reason=higher_low_reason,
+        )
+
+    def _evaluate_forward_outcome(
+        self,
+        *,
+        entry_price: float,
+        future_candles: List[Candle],
+        target_bps: float,
+        cost_bps: float,
+        min_net_gain_bps: float,
+    ) -> Tuple[float, float, bool, bool, float, float, float]:
+        """Evaluate favorable and adverse movement after a replayed signal."""
+        if entry_price <= 0 or not future_candles:
+            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0
+        highs = [float(c.high) for c in future_candles if float(c.high) > 0]
+        lows = [float(c.low) for c in future_candles if float(c.low) > 0]
+        if not highs or not lows:
+            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0
+        max_favorable_bps = ((max(highs) / entry_price) - 1.0) * 10000.0
+        max_adverse_bps = ((entry_price / min(lows)) - 1.0) * 10000.0
+        required_profit_bps = float(cost_bps) + float(min_net_gain_bps)
+        reached_min_profit = max_favorable_bps >= required_profit_bps
+        reached_target = max_favorable_bps >= max(float(target_bps), required_profit_bps)
+        win_bps = max(0.0, max_favorable_bps - float(cost_bps))
+        loss_bps = max(0.0, max_adverse_bps)
+        return (
+            float(max_favorable_bps), float(max_adverse_bps),
+            bool(reached_min_profit), bool(reached_target),
+            float(win_bps), float(loss_bps), 0.0,
+        )
+
+    def _score_bucket(self, score: float) -> float:
+        return math.floor(float(score) / CALIB_SCORE_BUCKET_SIZE) * CALIB_SCORE_BUCKET_SIZE
+
+    def _prob_bucket(self, probability: float) -> float:
+        return math.floor(float(probability) / CALIB_PROB_BUCKET_SIZE) * CALIB_PROB_BUCKET_SIZE
+
+    def _walk_forward_observations(
+        self,
+        *,
+        product_id: str,
+        candles: List[Candle],
+        weekly_candles: Optional[List[Candle]],
+        timeframe: str,
+        min_prefix: int,
+        forward_bars: int,
+        spread_bps: float,
+    ) -> List[CalibrationObservation]:
+        """Replay historical candles while keeping future bars out of each signal."""
+        observations: List[CalibrationObservation] = []
+        if not candles or len(candles) < min_prefix + forward_bars + 1:
+            return observations
+
+        for i in range(min_prefix, len(candles) - forward_bars):
+            prefix = candles[:i]
+            future = candles[i:i + forward_bars]
+            if not prefix or not future:
+                continue
+            entry_price = float(prefix[-1].close)
+            if entry_price <= 0:
+                continue
+
+            replay_ts = int(prefix[-1].ts)
+            available_weekly = None
+            if weekly_candles:
+                available_weekly = [c for c in weekly_candles if int(c.ts) <= replay_ts]
+            try:
+                signal = self._build_historical_signal_from_candles(
+                    product_id=product_id,
+                    candles=prefix,
+                    weekly_candles=available_weekly,
+                    spread_bps=spread_bps,
+                )
+            except Exception:
+                continue
+            (
+                max_favorable_bps, max_adverse_bps, reached_min_profit,
+                reached_target, win_bps, loss_bps, _,
+            ) = self._evaluate_forward_outcome(
+                entry_price=entry_price,
+                future_candles=future,
+                target_bps=signal.target_bps,
+                cost_bps=signal.cost_bps,
+                min_net_gain_bps=MIN_NET_GAIN_AFTER_FEES_BPS,
+            )
+            expected_value_bps = win_bps if reached_min_profit else -loss_bps
+            observations.append(CalibrationObservation(
+                product_id=product_id,
+                timeframe=timeframe,
+                ts=replay_ts,
+                score=float(signal.score),
+                probability=float(signal.estimated_prob_up),
+                expected_net_edge_bps=float(signal.expected_net_edge_bps),
+                target_bps=float(signal.target_bps),
+                cost_bps=float(signal.cost_bps),
+                spread_bps=float(spread_bps),
+                max_favorable_bps=float(max_favorable_bps),
+                max_adverse_bps=float(max_adverse_bps),
+                reached_min_profit=bool(reached_min_profit),
+                reached_target=bool(reached_target),
+                expected_value_bps=float(expected_value_bps),
+                win_bps=float(win_bps),
+                loss_bps=float(loss_bps),
+            ))
+        return observations
+
+    def _win_rate(self, observations: List[CalibrationObservation]) -> float:
+        if not observations:
+            return 0.0
+        wins = sum(1 for observation in observations if observation.reached_min_profit)
+        return float(wins / len(observations))
+
+    def _build_calibration_profile(
+        self,
+        *,
+        product_id: str,
+        day_obs: List[CalibrationObservation],
+        week_obs: List[CalibrationObservation],
+    ) -> ProductCalibrationProfile:
+        """Select per-product buy thresholds from replayed outcomes."""
+        all_obs = list(day_obs) + list(week_obs)
+        if len(all_obs) < CALIB_MIN_PRODUCT_SAMPLES:
+            return ProductCalibrationProfile(
+                product_id=product_id,
+                day_sample_count=len(day_obs),
+                week_sample_count=len(week_obs),
+                day_win_rate=self._win_rate(day_obs),
+                week_win_rate=self._win_rate(week_obs),
+                reason=f"insufficient_samples total={len(all_obs)}",
+            )
+
+        buckets: Dict[Tuple[float, float], List[CalibrationObservation]] = {}
+        for observation in all_obs:
+            key = (
+                self._score_bucket(observation.score),
+                self._prob_bucket(observation.probability),
+            )
+            buckets.setdefault(key, []).append(observation)
+
+        candidates: List[Tuple[float, float, float, float, float, int, float]] = []
+        for (score_bucket, prob_bucket), observations in buckets.items():
+            if len(observations) < CALIB_MIN_BUCKET_SAMPLES:
+                continue
+            wins = [o for o in observations if o.reached_min_profit]
+            losses = [o for o in observations if not o.reached_min_profit]
+            win_rate = len(wins) / len(observations)
+            avg_win = float(np.mean([o.win_bps for o in wins])) if wins else 0.0
+            avg_loss = float(np.mean([o.loss_bps for o in losses])) if losses else 0.0
+            expected_value = win_rate * avg_win - (1.0 - win_rate) * avg_loss
+            if win_rate < CALIB_MIN_WIN_RATE or expected_value < CALIB_MIN_EXPECTED_VALUE_BPS:
+                continue
+            candidates.append((
+                expected_value, win_rate, avg_win, avg_loss,
+                score_bucket, len(observations), prob_bucket,
+            ))
+
+        if not candidates:
+            wins = [o for o in all_obs if o.reached_min_profit]
+            losses = [o for o in all_obs if not o.reached_min_profit]
+            win_rate = len(wins) / len(all_obs)
+            avg_win = float(np.mean([o.win_bps for o in wins])) if wins else 0.0
+            avg_loss = float(np.mean([o.loss_bps for o in losses])) if losses else 0.0
+            expected_value = win_rate * avg_win - (1.0 - win_rate) * avg_loss
+            return ProductCalibrationProfile(
+                product_id=product_id,
+                min_expected_value_bps=max(
+                    DEFAULT_CALIB_MIN_EV_BPS, CALIB_MIN_EXPECTED_VALUE_BPS
+                ),
+                day_sample_count=len(day_obs),
+                week_sample_count=len(week_obs),
+                day_win_rate=self._win_rate(day_obs),
+                week_win_rate=self._win_rate(week_obs),
+                blended_win_rate=win_rate,
+                avg_win_bps=avg_win,
+                avg_loss_bps=avg_loss,
+                expected_value_bps=expected_value,
+                reason=f"no_positive_bucket fallback total={len(all_obs)} ev={expected_value:.2f}",
+            )
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[5]), reverse=True)
+        best_ev, best_wr, best_avg_win, best_avg_loss, best_score, best_n, best_prob = candidates[0]
+        return ProductCalibrationProfile(
+            product_id=product_id,
+            min_score=max(float(best_score), DEFAULT_CALIB_MIN_SCORE),
+            min_probability=max(float(best_prob), DEFAULT_CALIB_MIN_PROB),
+            min_expected_value_bps=max(float(best_ev) * 0.35, CALIB_MIN_EXPECTED_VALUE_BPS),
+            day_sample_count=len(day_obs),
+            week_sample_count=len(week_obs),
+            day_win_rate=self._win_rate(day_obs),
+            week_win_rate=self._win_rate(week_obs),
+            blended_win_rate=float(best_wr),
+            avg_win_bps=float(best_avg_win),
+            avg_loss_bps=float(best_avg_loss),
+            expected_value_bps=float(best_ev),
+            reason=f"best_bucket score>={best_score:.1f} prob>={best_prob:.3f} samples={best_n}",
+        )
+
+    def _simulate_armed_exit_net_bps(
+        self,
+        *,
+        entry_price: float,
+        future_candles: List[Candle],
+        target_bps: float,
+        cost_bps: float,
+        pullback_pct: float,
+    ) -> Optional[float]:
+        """Simulate a target-arm and pullback exit over historical candles."""
+        if entry_price <= 0 or not future_candles:
+            return None
+        target_price = entry_price * bps_to_mult(float(target_bps))
+        armed = False
+        peak = 0.0
+        for candle in future_candles:
+            high = float(candle.high)
+            low = float(candle.low)
+            close = float(candle.close)
+            if not armed:
+                if high >= target_price:
+                    armed = True
+                    peak = max(high, target_price)
+                continue
+            peak = max(peak, high)
+            trigger_price = peak * (1.0 - float(pullback_pct))
+            if low <= trigger_price:
+                gross_bps = ((trigger_price / entry_price) - 1.0) * 10000.0
+                return float(gross_bps - float(cost_bps))
+            peak = max(peak, close)
+        if armed and peak > 0:
+            gross_bps = ((float(future_candles[-1].close) / entry_price) - 1.0) * 10000.0
+            return float(gross_bps - float(cost_bps))
+        return None
+
+    def _calibrate_sell_pullbacks(
+        self,
+        *,
+        product_id: str,
+        candles: List[Candle],
+        weekly_candles: Optional[List[Candle]],
+        profile: ProductCalibrationProfile,
+        spread_bps: float,
+    ) -> ProductCalibrationProfile:
+        """Choose scalp/core pullbacks from recent target-arm simulations."""
+        required = CALIB_MIN_PREFIX_CANDLES_1M + CALIB_FORWARD_MINUTES_1M + 1
+        if not candles or len(candles) < required:
+            return profile
+        scalp_results: Dict[float, List[float]] = {
+            pullback: [] for pullback in CALIB_SCALP_PULLBACK_CANDIDATES
+        }
+        core_results: Dict[float, List[float]] = {
+            pullback: [] for pullback in CALIB_CORE_PULLBACK_CANDIDATES
+        }
+        end_i = len(candles) - CALIB_FORWARD_MINUTES_1M
+        for i in range(CALIB_MIN_PREFIX_CANDLES_1M, end_i):
+            prefix = candles[:i]
+            future = candles[i:i + CALIB_FORWARD_MINUTES_1M]
+            entry_price = float(prefix[-1].close)
+            if entry_price <= 0:
+                continue
+            replay_ts = int(prefix[-1].ts)
+            available_weekly = None
+            if weekly_candles:
+                available_weekly = [c for c in weekly_candles if int(c.ts) <= replay_ts]
+            try:
+                signal = self._build_historical_signal_from_candles(
+                    product_id=product_id,
+                    candles=prefix,
+                    weekly_candles=available_weekly,
+                    spread_bps=spread_bps,
+                )
+            except Exception:
+                continue
+            if (
+                signal.score < profile.min_score
+                or signal.estimated_prob_up < profile.min_probability
+            ):
+                continue
+            scalp_target_bps = max(
+                signal.cost_bps + MIN_NET_GAIN_AFTER_FEES_BPS,
+                signal.target_bps * 0.55,
+            )
+            core_target_bps = max(
+                signal.cost_bps + MIN_NET_GAIN_AFTER_FEES_BPS,
+                signal.target_bps,
+            )
+            for pullback in CALIB_SCALP_PULLBACK_CANDIDATES:
+                result = self._simulate_armed_exit_net_bps(
+                    entry_price=entry_price,
+                    future_candles=future,
+                    target_bps=scalp_target_bps,
+                    cost_bps=signal.cost_bps,
+                    pullback_pct=pullback,
+                )
+                if result is not None:
+                    scalp_results[pullback].append(result)
+            for pullback in CALIB_CORE_PULLBACK_CANDIDATES:
+                result = self._simulate_armed_exit_net_bps(
+                    entry_price=entry_price,
+                    future_candles=future,
+                    target_bps=core_target_bps,
+                    cost_bps=signal.cost_bps,
+                    pullback_pct=pullback,
+                )
+                if result is not None:
+                    core_results[pullback].append(result)
+
+        def choose_best(results: Dict[float, List[float]], default: float) -> float:
+            best_pullback = default
+            best_score = -1e9
+            for pullback, values in results.items():
+                if len(values) < 5:
+                    continue
+                win_rate = sum(
+                    1 for value in values if value >= MIN_NET_GAIN_AFTER_FEES_BPS
+                ) / len(values)
+                candidate_score = float(np.mean(values)) + win_rate * 10.0
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_pullback = pullback
+            return float(best_pullback)
+
+        profile.scalp_pullback_pct = clamp_float(
+            choose_best(scalp_results, profile.scalp_pullback_pct),
+            CALIB_MIN_SCALP_PULLBACK,
+            CALIB_MAX_SCALP_PULLBACK,
+        )
+        profile.core_pullback_pct = clamp_float(
+            choose_best(core_results, profile.core_pullback_pct),
+            CALIB_MIN_CORE_PULLBACK,
+            CALIB_MAX_CORE_PULLBACK,
+        )
+        profile.reason += (
+            f"; sell_calibrated scalp={profile.scalp_pullback_pct:.4%} "
+            f"core={profile.core_pullback_pct:.4%}"
+        )
+        return profile
+
+    async def calibrate_products_on_startup(self) -> None:
+        """Fetch recent history and build per-product calibration profiles."""
+        if not ENABLE_WALK_FORWARD_CALIBRATION:
+            log("[calibration] disabled")
+            return
+        log("[calibration] startup walk-forward calibration started")
+        end_ts = int(now_ts_i())
+        start_day = end_ts - CALIB_DAY_LOOKBACK_MINUTES * 60
+        start_week = end_ts - CALIB_WEEK_LOOKBACK_MINUTES * 60
+        for product in PRODUCTS:
+            try:
+                log(f"[calibration] fetching history for {product}")
+                day_candles = await self.fetcher.fetch_chunked(
+                    product, start_day, end_ts, CALIB_DAY_GRANULARITY
+                )
+                week_candles = await self.fetcher.fetch_chunked(
+                    product, start_week, end_ts, CALIB_WEEK_GRANULARITY
+                )
+                if not day_candles:
+                    log(f"[calibration] no day candles for {product}; using default profile")
+                    profile = ProductCalibrationProfile(
+                        product_id=product,
+                        reason="no_day_candles_default",
+                    )
+                    self.calibration_profiles[product] = profile
+                    self.clog.log_profile(profile)
+                    continue
+                tob = self.tob.get(product)
+                spread_bps = (
+                    float(tob.spread_bps)
+                    if tob and tob.spread_bps > 0
+                    else float(MAX_SPREAD_BPS)
+                )
+                day_obs = self._walk_forward_observations(
+                    product_id=product,
+                    candles=day_candles,
+                    weekly_candles=week_candles,
+                    timeframe="day_1m",
+                    min_prefix=CALIB_MIN_PREFIX_CANDLES_1M,
+                    forward_bars=CALIB_FORWARD_MINUTES_1M,
+                    spread_bps=spread_bps,
+                )
+                week_obs = self._walk_forward_observations(
+                    product_id=product,
+                    candles=week_candles,
+                    weekly_candles=week_candles,
+                    timeframe="week_15m",
+                    min_prefix=CALIB_MIN_PREFIX_CANDLES_15M,
+                    forward_bars=CALIB_FORWARD_BARS_15M,
+                    spread_bps=spread_bps,
+                ) if week_candles else []
+                profile = self._build_calibration_profile(
+                    product_id=product,
+                    day_obs=day_obs,
+                    week_obs=week_obs,
+                )
+                profile = self._calibrate_sell_pullbacks(
+                    product_id=product,
+                    candles=day_candles,
+                    weekly_candles=week_candles,
+                    profile=profile,
+                    spread_bps=spread_bps,
+                )
+                self.calibration_profiles[product] = profile
+                self.clog.log_profile(profile)
+                log(
+                    f"[calibration] {product} profile "
+                    f"min_score={profile.min_score:.1f} "
+                    f"min_prob={profile.min_probability:.3f} "
+                    f"min_ev={profile.min_expected_value_bps:.2f} "
+                    f"scalp_pb={profile.scalp_pullback_pct:.4%} "
+                    f"core_pb={profile.core_pullback_pct:.4%} "
+                    f"reason={profile.reason}"
+                )
+            except Exception as exc:
+                log(f"[calibration] failed for {product}: {exc}")
+                profile = ProductCalibrationProfile(
+                    product_id=product,
+                    reason=f"calibration_error={exc}",
+                )
+                self.calibration_profiles[product] = profile
+                self.clog.log_profile(profile)
+        log("[calibration] startup walk-forward calibration finished")
+
+    def _run_live_recalibration(self) -> None:
+        """Smooth buy thresholds using completed rolling one-minute candles."""
+        for product in PRODUCTS:
+            live_rows = self.live_1m[product].export_rows(product)
+            minimum_rows = CALIB_MIN_PREFIX_CANDLES_1M + CALIB_FORWARD_MINUTES_1M
+            if len(live_rows) < minimum_rows:
+                continue
+            live_candles = [
+                Candle(
+                    ts=int(row["ts"]),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row.get("volume", 0.0)),
+                )
+                for row in live_rows
+            ]
+            old_profile = self.calibration_profiles.get(
+                product, ProductCalibrationProfile(product_id=product)
+            )
+            tob = self.tob.get(product)
+            spread_bps = (
+                float(tob.spread_bps)
+                if tob and tob.spread_bps > 0
+                else float(MAX_SPREAD_BPS)
+            )
+            forward_bars = min(
+                CALIB_FORWARD_MINUTES_1M,
+                max(5, len(live_candles) // 4),
+            )
+            day_obs = self._walk_forward_observations(
+                product_id=product,
+                candles=live_candles,
+                weekly_candles=live_candles,
+                timeframe="live_rolling_1m",
+                min_prefix=CALIB_MIN_PREFIX_CANDLES_1M,
+                forward_bars=forward_bars,
+                spread_bps=spread_bps,
+            )
+            if len(day_obs) < CALIB_MIN_PRODUCT_SAMPLES:
+                continue
+            new_profile = self._build_calibration_profile(
+                product_id=product,
+                day_obs=day_obs,
+                week_obs=[],
+            )
+            old_profile.min_score = old_profile.min_score * 0.80 + new_profile.min_score * 0.20
+            old_profile.min_probability = (
+                old_profile.min_probability * 0.80
+                + new_profile.min_probability * 0.20
+            )
+            old_profile.min_expected_value_bps = (
+                old_profile.min_expected_value_bps * 0.80
+                + new_profile.min_expected_value_bps * 0.20
+            )
+            old_profile.day_sample_count = new_profile.day_sample_count
+            old_profile.day_win_rate = new_profile.day_win_rate
+            old_profile.blended_win_rate = new_profile.blended_win_rate
+            old_profile.avg_win_bps = new_profile.avg_win_bps
+            old_profile.avg_loss_bps = new_profile.avg_loss_bps
+            old_profile.expected_value_bps = new_profile.expected_value_bps
+            old_profile.reason = "smoothed_live_recalibration"
+            self.calibration_profiles[product] = old_profile
+            self.clog.log_profile(old_profile)
+
+
     def _build_live_signal(
         self,
         *,
@@ -4014,12 +4837,21 @@ class TradingBot:
                 0.0,
             )
 
+        profile = self.calibration_profiles.get(
+            product_id,
+            ProductCalibrationProfile(product_id=product_id),
+        )
+        calib_min_score = float(profile.min_score)
+        calib_min_probability = float(profile.min_probability)
+        calib_min_ev = float(profile.min_expected_value_bps)
+
         ok_to_trade = (
             fee_available
             and round_trip_cost_bps is not None
             and strict_entry.ok
-            and estimated_prob_up >= float(PROB_FOR_MIN_SIZE)
-            and expected_net_edge_bps >= float(MIN_REQUIRED_NET_EDGE_BPS)
+            and score >= calib_min_score
+            and estimated_prob_up >= calib_min_probability
+            and expected_net_edge_bps >= max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev)
             and target_bps >= cost_bps * float(MIN_TARGET_TO_COST_MULT)
             and spread_bps <= float(MAX_SPREAD_BPS)
         )
@@ -4031,6 +4863,9 @@ class TradingBot:
 
         reason = (
             f"live_score={score:.1f}; display_prob={estimated_prob_up:.3f}; "
+            f"calib_min_score={calib_min_score:.1f}; "
+            f"calib_min_prob={calib_min_probability:.3f}; "
+            f"calib_ev={calib_min_ev:.2f}; "
             f"{fee_state}; strict={strict_entry.reason}; edge={expected_net_edge_bps:.1f}; "
             f"target={target_bps:.1f}; cost={cost_bps:.1f}; "
             f"mom5={momentum_5_bps:.1f}; mom15={momentum_15_bps:.1f}; "
@@ -4697,6 +5532,9 @@ class TradingBot:
 
         await self._refresh_coinbase_fee_tier_if_needed(force=True)
 
+        log("[run] calibrating products before live trading")
+        await self.calibrate_products_on_startup()
+
         log("[run] reconciling live Coinbase portfolio before trading")
         await self._startup_portfolio_reconcile()
 
@@ -5190,6 +6028,17 @@ class TradingBot:
                 log(f"[fee-tier] trading paused because real Coinbase fees are unavailable: {e}")
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
+
+            if (
+                ENABLE_WALK_FORWARD_CALIBRATION
+                and ts_now - self.last_live_calibration_ts >= 60.0
+            ):
+                self.last_live_calibration_ts = ts_now
+                try:
+                    self._run_live_recalibration()
+                except Exception as e:
+                    log(f"[calibration] live recalibration failed: {e}")
+
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:
                     cash_usd = float(self.portfolio.cash_usd)
@@ -5307,7 +6156,13 @@ class TradingBot:
 
                         scalp_drawdown = max(0.0, (scalp_peak - bid) / scalp_peak) if scalp_peak > 0 else 0.0
 
-                        if scalp_drawdown >= SCALP_TARGET_ARM_DRAWDOWN_PCT:
+                        profile = self.calibration_profiles.get(
+                            product_id,
+                            ProductCalibrationProfile(product_id=product_id),
+                        )
+                        scalp_pullback_pct = float(profile.scalp_pullback_pct)
+
+                        if scalp_drawdown >= scalp_pullback_pct:
                             if can_exit_net_positive(
                                 entry_price=avg_entry_price,
                                 exit_price=bid,
@@ -5338,7 +6193,13 @@ class TradingBot:
 
                         core_drawdown = max(0.0, (core_peak - bid) / core_peak) if core_peak > 0 else 0.0
 
-                        if core_drawdown >= CORE_TARGET_ARM_DRAWDOWN_PCT:
+                        profile = self.calibration_profiles.get(
+                            product_id,
+                            ProductCalibrationProfile(product_id=product_id),
+                        )
+                        core_pullback_pct = float(profile.core_pullback_pct)
+
+                        if core_drawdown >= core_pullback_pct:
                             if can_exit_net_positive(
                                 entry_price=avg_entry_price,
                                 exit_price=bid,

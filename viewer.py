@@ -893,7 +893,9 @@ def render_live_dashboard() -> None:
     if not configured_products:
         # Display fallback until bot.py publishes products_active.csv.
         configured_products = [
-            "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD"
+            "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD",
+            "DOGE-USD", "ADA-USD", "LINK-USD", "AVAX-USD", "XLM-USD",
+            "LTC-USD", "BCH-USD", "SHIB-USD", "DOT-USD", "SUI-USD",
         ]
 
     if not o.empty:
@@ -1102,7 +1104,7 @@ def render_live_dashboard() -> None:
         overview_sorted["ScoreRaw"] = pd.to_numeric(overview_sorted["Score"], errors="coerce")
         overview_sorted = overview_sorted.sort_values(["ProbRaw", "ScoreRaw"], ascending=False)
 
-        cols_per_row = 2
+        cols_per_row = 3
         rows = [overview_sorted.iloc[i:i + cols_per_row] for i in range(0, len(overview_sorted), cols_per_row)]
 
         for chunk in rows:
@@ -1306,7 +1308,7 @@ def render_live_dashboard() -> None:
     # Product selection
     # =============================================================================
 
-    products = overview["Product"].tolist() if not overview.empty else sorted(m["product_id"].dropna().unique().tolist())
+    products = all_products_for_overview
     if not products:
         st.warning("No products found.")
         st.stop()

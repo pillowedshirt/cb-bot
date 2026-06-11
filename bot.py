@@ -16,7 +16,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Dict, Deque, List, Optional, Tuple, Any
+from typing import Dict, Deque, List, Optional, Set, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -55,6 +55,16 @@ PRODUCTS_DEFAULT: List[str] = [
     "SOL-USD",
     "XRP-USD",
     "BNB-USD",
+    "DOGE-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "AVAX-USD",
+    "XLM-USD",
+    "LTC-USD",
+    "BCH-USD",
+    "SHIB-USD",
+    "DOT-USD",
+    "SUI-USD",
 ]
 
 # Auto-selection (diversify volatility + liquidity):
@@ -62,7 +72,7 @@ PRODUCTS_DEFAULT: List[str] = [
 # (b) tend to have higher realized volatility when BTC is quiet, while keeping
 # correlations in the basket lower.
 AUTO_SELECT_PRODUCTS: bool = False
-TARGET_PRODUCT_COUNT: int = 8          # total products to trade (includes BTC if available)
+TARGET_PRODUCT_COUNT: int = 15         # total products to trade (includes BTC if available)
 CANDIDATE_TOP_BY_USD_VOL: int = 60      # only consider the top-N USD-volume products (liquidity filter)
 SELECTION_LOOKBACK_DAYS: int = 140      # daily bars to pull for correlation/volatility scoring
 SELECTION_BTC_QUIET_ROLL_DAYS: int = 14 # define "BTC quiet" by rolling vol over this many days
@@ -132,8 +142,12 @@ REENTRY_REARM_BPS: float = 15.0
 FIRST_BUY_DELAY_SEC: float = 0.0
 BUY_COOLDOWN_SEC: float = 20.0
 POST_EXIT_COOLDOWN_SEC: float = 120.0
-MAX_NEW_ENTRIES_PER_EVAL: int = 1
+MAX_NEW_ENTRIES_PER_EVAL: int = 3
 EVAL_TICK_SEC: float = 2.0
+
+# Bound aggregate deployment when several candidates pass in the same cycle.
+MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY: float = 0.40
+ENABLE_MULTI_CANDIDATE_BUYS: bool = True
 
 # Allocation / exposure
 MAX_OPEN_POSITIONS: int = 20
@@ -515,7 +529,7 @@ RISK_OFF_MIN_NOTIONAL_USD: float = 1.0
 
 # Universe / selection
 AUTO_SELECT_PRODUCTS: bool = False
-TARGET_PRODUCT_COUNT: int = 8
+TARGET_PRODUCT_COUNT: int = 15
 CANDIDATE_TOP_BY_USD_VOL: int = 60
 MIN_DAILY_RANGE_PCT: float = 0.06
 
@@ -610,6 +624,23 @@ def clamp_float(x: float, lo: float, hi: float) -> float:
 
 def lerp_float(a: float, b: float, t: float) -> float:
     return float(float(a) + (float(b) - float(a)) * float(t))
+
+
+def candidate_rank_score(candidate: Dict[str, Any]) -> float:
+    """Rank passing candidates with net edge as the primary opportunity signal."""
+    probability = float(candidate.get("estimated_prob_up", 0.0))
+    expected_edge_bps = float(candidate.get("expected_net_edge_bps", 0.0))
+    score = float(candidate.get("score", 0.0))
+    spread_bps = float(candidate.get("spread_bps", 0.0))
+    cost_bps = float(candidate.get("cost_bps", 0.0))
+
+    return (
+        expected_edge_bps
+        + probability * 75.0
+        + score * 0.35
+        - spread_bps * 0.25
+        - max(0.0, cost_bps - 260.0) * 0.05
+    )
 
 
 def fee_usd(notional_usd: float, fee_bps: float) -> float:
@@ -6535,21 +6566,23 @@ class TradingBot:
         )
 
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
-        """
-        Map estimated probability to a single-buy percentage of total equity.
-
-        Below PROB_FOR_MIN_SIZE: 0%.
-        At PROB_FOR_MIN_SIZE: minimum size.
-        At PROB_FOR_MAX_SIZE or higher: maximum single-buy size.
-        """
+        """Convert a positive, buy-ready probability into an equity allocation."""
         p = clamp_float(float(estimated_prob_up), 0.0, 1.0)
 
-        if p < float(PROB_FOR_MIN_SIZE):
+        if p <= 0.0:
             return 0.0
 
-        denom = max(1e-9, float(PROB_FOR_MAX_SIZE) - float(PROB_FOR_MIN_SIZE))
-        t = clamp_float((p - float(PROB_FOR_MIN_SIZE)) / denom, 0.0, 1.0)
-        return lerp_float(MIN_POSITION_PCT_OF_EQUITY, MAX_SINGLE_BUY_PCT_OF_EQUITY, t)
+        # The entry gate decides whether a signal is tradable. A passing signal
+        # below the preferred sizing range still receives the minimum allocation.
+        if p <= float(PROB_FOR_MIN_SIZE):
+            return float(MIN_POSITION_PCT_OF_EQUITY)
+
+        span = max(1e-9, float(PROB_FOR_MAX_SIZE) - float(PROB_FOR_MIN_SIZE))
+        t = clamp_float((p - float(PROB_FOR_MIN_SIZE)) / span, 0.0, 1.0)
+        return float(MIN_POSITION_PCT_OF_EQUITY) + t * (
+            float(MAX_SINGLE_BUY_PCT_OF_EQUITY)
+            - float(MIN_POSITION_PCT_OF_EQUITY)
+        )
 
     def _micro_trending_down(self, product_id: str) -> Tuple[bool, str]:
         series = self.live_1m.get(product_id)
@@ -7621,13 +7654,22 @@ class TradingBot:
 
             single_buy_pct = self._position_pct_from_probability(float(prob))
             proposed = current_equity_usd * float(single_buy_pct)
+            min_viable = max(
+                float(MIN_ENTRY_USD),
+                float(MIN_LIVE_ORDER_USD),
+                current_equity_usd * float(MIN_POSITION_PCT_OF_EQUITY),
+            )
+            if proposed > 0.0:
+                proposed = max(float(proposed), float(min_viable))
 
             max_product_exposure = current_equity_usd * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
             remaining_product_room = max(0.0, max_product_exposure - current_product_exposure_usd)
 
+            # Cash and exposure caps remain authoritative. If either cap makes the
+            # minimum viable order impossible, skip rather than overspend.
             proposed = min(proposed, remaining_product_room, spendable_cash)
 
-            if proposed < max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD)):
+            if proposed < float(min_viable):
                 return 0.0
 
             return float(proposed)
@@ -8201,30 +8243,34 @@ class TradingBot:
                     buy_gate_blocker=live_signal.buy_gate_blocker,
                 )
 
-            candidates.sort(
-                key=lambda x: (
-                    float(x.get("estimated_prob_up", 0.0)),
-                    float(x.get("expected_net_edge_bps", 0.0)),
-                    float(x.get("score", 0.0)),
-                ),
-                reverse=True,
-            )
+            candidates.sort(key=candidate_rank_score, reverse=True)
             if candidates:
-                top = candidates[0]
-                log(
-                    f"[buy-candidates] count={len(candidates)} "
-                    f"top={top.get('product_id')} "
-                    f"score={float(top.get('score', 0.0)):.3f} "
-                    f"prob={float(top.get('estimated_prob_up', 0.0)):.6f} "
-                    f"ev={float(top.get('expected_net_edge_bps', 0.0)):.3f} "
-                    f"position_pct={float(top.get('position_pct', 0.0)):.6f}"
+                top_preview = ", ".join(
+                    f"{candidate.get('product_id')}("
+                    f"rank={candidate_rank_score(candidate):.2f},"
+                    f"score={float(candidate.get('score', 0.0)):.1f},"
+                    f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f},"
+                    f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.1f},"
+                    f"pct={float(candidate.get('position_pct', 0.0)):.3f})"
+                    for candidate in candidates[:5]
                 )
+                log(f"[buy-candidates] count={len(candidates)} top={top_preview}")
             else:
                 log("[buy-candidates] count=0")
 
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
+            max_deploy_this_eval = (
+                float(equity_usd)
+                * float(MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY)
+            )
+            deployed_this_eval = 0.0
+            candidate_slice = (
+                candidates[:MAX_NEW_ENTRIES_PER_EVAL]
+                if ENABLE_MULTI_CANDIDATE_BUYS
+                else candidates[:1]
+            )
 
-            for candidate in candidates[:MAX_NEW_ENTRIES_PER_EVAL]:
+            for candidate in candidate_slice:
                 product_id = candidate["product_id"]
                 existing_qty = sum(l.qty for l in self.positions.get(product_id, []))
                 if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
@@ -8287,6 +8333,12 @@ class TradingBot:
                         max_product_exposure - float(product_exposure),
                     )
                     entry_notional = min(entry_notional, remaining_product_room)
+
+                remaining_eval_budget = max(
+                    0.0,
+                    float(max_deploy_this_eval) - float(deployed_this_eval),
+                )
+                entry_notional = min(float(entry_notional), remaining_eval_budget)
 
                 min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
 
@@ -8382,6 +8434,9 @@ class TradingBot:
                     continue
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                actual_deployment = float(filled_notional or entry_notional)
+                deployed_this_eval += actual_deployment
+                cash_usd = max(0.0, float(cash_usd) - actual_deployment - float(fee_val))
                 log(
                     f"[buy-success] {product_id} "
                     f"qty={float(filled_qty):.12f} avg_px={float(avg_px):.8f} "
@@ -8852,6 +8907,95 @@ def load_coinbase_client() -> RESTClient:
     return RESTClient(api_key=api_key, api_secret=pem)
 
 
+def _coinbase_response_dict(response: Any) -> Dict[str, Any]:
+    """Convert a Coinbase SDK response into a plain dictionary."""
+    if isinstance(response, dict):
+        return response
+    if hasattr(response, "to_dict"):
+        data = response.to_dict()
+        return data if isinstance(data, dict) else {}
+    data = getattr(response, "__dict__", None)
+    return data if isinstance(data, dict) else {}
+
+
+def _coinbase_flag(value: Any) -> bool:
+    """Interpret Coinbase boolean fields without treating the string 'false' as true."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def get_available_product_ids(
+    client: RESTClient,
+    configured_products: Optional[List[str]] = None,
+) -> Set[str]:
+    """Return product ids that Coinbase currently reports as tradable."""
+    requested = list(configured_products or [])
+    try:
+        response = (
+            client.get_products(
+                product_ids=requested,
+                get_tradability_status=True,
+            )
+            if requested
+            else client.get_products(get_tradability_status=True)
+        )
+    except TypeError:
+        # Support older coinbase-advanced-py releases without these filters.
+        response = client.get_products(limit=1000)
+
+    data = _coinbase_response_dict(response)
+    products: Any = data.get("products", [])
+    if not isinstance(products, list):
+        products = getattr(response, "products", [])
+    if not isinstance(products, list):
+        products = []
+
+    available: Set[str] = set()
+    allowed_statuses = {"online", "active", "tradable"}
+    for product in products:
+        item = _coinbase_response_dict(product)
+        product_id = str(item.get("product_id", "")).strip()
+        status = str(item.get("status", "")).strip().lower()
+        disabled = any(
+            _coinbase_flag(item.get(field, False))
+            for field in ("trading_disabled", "is_disabled", "view_only", "cancel_only")
+        )
+
+        if not product_id or disabled:
+            continue
+        if status and status not in allowed_statuses:
+            continue
+        available.add(product_id)
+
+    return available
+
+
+def validate_configured_products_with_coinbase(
+    products: List[str],
+    client: RESTClient,
+) -> List[str]:
+    """Keep only configured products Coinbase currently reports as tradable."""
+    try:
+        available = get_available_product_ids(client, configured_products=products)
+    except Exception as exc:
+        log(
+            "[products] could not validate product list with Coinbase; "
+            f"using configured list: {exc}"
+        )
+        return list(products)
+
+    valid = [product for product in products if product in available]
+    removed = [product for product in products if product not in available]
+
+    if removed:
+        log(f"[products] removed unavailable Coinbase products: {removed}")
+    if not valid:
+        raise RuntimeError("No configured products are currently available on Coinbase.")
+
+    return valid
+
+
 # ------------------------------------------------------------
 # Main entry point
 # ------------------------------------------------------------
@@ -8883,10 +9027,21 @@ async def main() -> None:
     else:
         PRODUCTS = list(PRODUCTS_DEFAULT)
 
-    # Currency safety: enforce USD quote pairs.
+    # Currency safety: enforce USD quote pairs, then confirm Coinbase currently
+    # permits them before creating subscriptions or evaluating orders.
     PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
+    PRODUCTS = await asyncio.to_thread(
+        validate_configured_products_with_coinbase,
+        PRODUCTS,
+        rest,
+    )
 
-    log(f"[config] Trading products: {PRODUCTS}")
+    log(f"[config] product_count={len(PRODUCTS)} products={PRODUCTS}")
+    if len(PRODUCTS) < 15:
+        log(
+            "[config] warning: fewer than 15 products active after Coinbase "
+            f"validation; active_count={len(PRODUCTS)}"
+        )
     log("[startup] creating TradingBot instance")
     bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
     log("[startup] LIVE-ONLY MODE: this bot can place real Coinbase orders.")

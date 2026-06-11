@@ -313,34 +313,35 @@ CALIB_MIN_PREFIX_CANDLES_15M: int = 32
 CALIB_FORWARD_MINUTES_1M: int = 60
 CALIB_FORWARD_BARS_15M: int = 16
 
-# Historical bucket requirements.
-CALIB_MIN_BUCKET_SAMPLES: int = 8
+# Minimum product history required before calibration.
 CALIB_MIN_PRODUCT_SAMPLES: int = 25
 
-# Calibration buckets.
-CALIB_SCORE_BUCKET_SIZE: float = 5.0
-CALIB_PROB_BUCKET_SIZE: float = 0.025
+# Exact calibration search.
+# Do not round score/probability targets into buckets.
+# The chosen target should come from actual observed walk-forward values.
+CALIB_USE_EXACT_THRESHOLDS: bool = True
 
-# Minimum acceptable calibrated behavior.
+# To avoid overfitting, each candidate threshold must have enough historical samples.
+CALIB_EXACT_MIN_SAMPLES: int = 12
+
+# Candidate pool limits keep startup fast without rounding the final chosen value.
+CALIB_MAX_EXACT_SCORE_CANDIDATES: int = 80
+CALIB_MAX_EXACT_PROB_CANDIDATES: int = 80
+
+# Minimum acceptable historical performance for a buy threshold.
 CALIB_MIN_WIN_RATE: float = 0.54
 CALIB_MIN_EXPECTED_VALUE_BPS: float = 2.0
 
-# Defaults if calibration has insufficient data.
+# Fallback behavior if no threshold passes.
+# These are only fallbacks, not floors.
 DEFAULT_CALIB_MIN_SCORE: float = 60.0
 DEFAULT_CALIB_MIN_PROB: float = 0.58
 DEFAULT_CALIB_MIN_EV_BPS: float = 2.0
 
-# Calibration threshold behavior.
-# These are safety bounds, not forced default targets.
-CALIB_MIN_ALLOWED_SCORE: float = 45.0
-CALIB_MAX_ALLOWED_SCORE: float = 82.0
-CALIB_MIN_ALLOWED_PROB: float = 0.50
-CALIB_MAX_ALLOWED_PROB: float = 0.78
-
-# If no positive bucket exists, derive a product-specific fallback from recent
-# observations instead of giving every product the same default.
-CALIB_FALLBACK_SCORE_QUANTILE: float = 0.65
-CALIB_FALLBACK_PROB_QUANTILE: float = 0.65
+# If no positive threshold is found, pick a product-specific fallback from the
+# product's own winning observations instead of assigning all products the same value.
+CALIB_FALLBACK_SCORE_QUANTILE: float = 0.55
+CALIB_FALLBACK_PROB_QUANTILE: float = 0.55
 
 # Live recalibration can be CPU-heavy. Do it less often and off the event loop.
 LIVE_RECALIBRATION_EVERY_SEC: float = 5 * 60
@@ -4408,12 +4409,6 @@ class TradingBot:
             float(win_bps), float(loss_bps), 0.0,
         )
 
-    def _score_bucket(self, score: float) -> float:
-        return math.floor(float(score) / CALIB_SCORE_BUCKET_SIZE) * CALIB_SCORE_BUCKET_SIZE
-
-    def _prob_bucket(self, probability: float) -> float:
-        return math.floor(float(probability) / CALIB_PROB_BUCKET_SIZE) * CALIB_PROB_BUCKET_SIZE
-
     def _walk_forward_observations(
         self,
         *,
@@ -4495,6 +4490,63 @@ class TradingBot:
             return float(default)
         return float(np.quantile(clean, clamp_float(float(q), 0.0, 1.0)))
 
+    def _exact_candidate_values(
+        self,
+        values: List[float],
+        *,
+        max_candidates: int,
+    ) -> List[float]:
+        """
+        Return exact observed values to use as threshold candidates.
+
+        This does not round the chosen target. If there are too many values,
+        it samples exact observed values across the distribution.
+        """
+        clean = sorted(set(
+            float(v) for v in values
+            if v is not None and np.isfinite(float(v))
+        ))
+
+        if not clean:
+            return []
+
+        if len(clean) <= int(max_candidates):
+            return clean
+
+        idxs = np.linspace(0, len(clean) - 1, int(max_candidates))
+        out = []
+        for idx in idxs:
+            out.append(clean[int(round(float(idx)))])
+        return sorted(set(out))
+
+    def _observation_ev_stats(
+        self,
+        observations: List[CalibrationObservation],
+    ) -> Tuple[float, float, float, float, int]:
+        """
+        Return:
+            win_rate
+            avg_win_bps
+            avg_loss_bps
+            expected_value_bps
+            sample_count
+
+        A win means the setup reached the minimum required net gain after fees.
+        """
+        n = len(observations)
+        if n <= 0:
+            return 0.0, 0.0, 0.0, -9999.0, 0
+
+        wins = [o for o in observations if o.reached_min_profit]
+        losses = [o for o in observations if not o.reached_min_profit]
+
+        win_rate = len(wins) / max(1, n)
+        avg_win = float(np.mean([o.win_bps for o in wins])) if wins else 0.0
+        avg_loss = float(np.mean([o.loss_bps for o in losses])) if losses else 0.0
+        ev = win_rate * avg_win - (1.0 - win_rate) * avg_loss
+
+        return float(win_rate), float(avg_win), float(avg_loss), float(ev), int(n)
+
     def _build_calibration_profile(
         self,
         *,
@@ -4503,12 +4555,13 @@ class TradingBot:
         week_obs: List[CalibrationObservation],
     ) -> ProductCalibrationProfile:
         """
-        Build per-product thresholds from walk-forward observations.
+        Build exact per-product buy thresholds from walk-forward observations.
 
-        Important:
-        - Do not force every product back to the same default score/probability.
-        - Defaults are only used when data is missing.
-        - When positive buckets are unavailable, use product-specific quantiles.
+        This version does NOT round into buckets and does NOT force every product
+        to the same 45 / 50% floor.
+
+        It chooses the score/probability pair that historically had the best
+        likelihood of reaching the minimum required gain after fees.
         """
         all_obs = list(day_obs) + list(week_obs)
 
@@ -4525,80 +4578,111 @@ class TradingBot:
                 reason=f"insufficient_samples total={len(all_obs)} using_defaults",
             )
 
-        buckets: Dict[Tuple[float, float], List[CalibrationObservation]] = {}
+        # Overall product stats.
+        blended_wr, blended_avg_win, blended_avg_loss, blended_ev, _ = self._observation_ev_stats(all_obs)
 
-        for observation in all_obs:
-            key = (
-                self._score_bucket(observation.score),
-                self._prob_bucket(observation.probability),
+        # Candidate thresholds come from exact observed values.
+        score_candidates = self._exact_candidate_values(
+            [o.score for o in all_obs],
+            max_candidates=CALIB_MAX_EXACT_SCORE_CANDIDATES,
+        )
+        prob_candidates = self._exact_candidate_values(
+            [o.probability for o in all_obs],
+            max_candidates=CALIB_MAX_EXACT_PROB_CANDIDATES,
+        )
+
+        best: Optional[Dict[str, Any]] = None
+
+        for score_threshold in score_candidates:
+            for prob_threshold in prob_candidates:
+                selected = [
+                    o for o in all_obs
+                    if float(o.score) >= float(score_threshold)
+                    and float(o.probability) >= float(prob_threshold)
+                ]
+
+                if len(selected) < CALIB_EXACT_MIN_SAMPLES:
+                    continue
+
+                win_rate, avg_win, avg_loss, ev, n = self._observation_ev_stats(selected)
+
+                if win_rate < CALIB_MIN_WIN_RATE:
+                    continue
+
+                if ev < CALIB_MIN_EXPECTED_VALUE_BPS:
+                    continue
+
+                # Tradeoff:
+                # - prioritize expected value
+                # - then win rate
+                # - then sample count
+                # - slightly prefer lower thresholds only after quality is proven
+                opportunity_bonus = min(10.0, n / 25.0)
+                quality_score = (
+                    ev * 1.00
+                    + win_rate * 10.0
+                    + opportunity_bonus
+                    - float(score_threshold) * 0.015
+                    - float(prob_threshold) * 1.50
+                )
+
+                candidate = {
+                    "score_threshold": float(score_threshold),
+                    "prob_threshold": float(prob_threshold),
+                    "win_rate": float(win_rate),
+                    "avg_win": float(avg_win),
+                    "avg_loss": float(avg_loss),
+                    "ev": float(ev),
+                    "n": int(n),
+                    "quality_score": float(quality_score),
+                }
+
+                if best is None or candidate["quality_score"] > best["quality_score"]:
+                    best = candidate
+
+        if best is not None:
+            return ProductCalibrationProfile(
+                product_id=product_id,
+                min_score=float(best["score_threshold"]),
+                min_probability=float(best["prob_threshold"]),
+                min_expected_value_bps=max(float(best["ev"]) * 0.35, CALIB_MIN_EXPECTED_VALUE_BPS),
+                day_sample_count=len(day_obs),
+                week_sample_count=len(week_obs),
+                day_win_rate=self._win_rate(day_obs),
+                week_win_rate=self._win_rate(week_obs),
+                blended_win_rate=float(best["win_rate"]),
+                avg_win_bps=float(best["avg_win"]),
+                avg_loss_bps=float(best["avg_loss"]),
+                expected_value_bps=float(best["ev"]),
+                reason=(
+                    f"exact_threshold product={product_id} "
+                    f"score>={best['score_threshold']:.6f} "
+                    f"prob>={best['prob_threshold']:.6f} "
+                    f"samples={best['n']} "
+                    f"win_rate={best['win_rate']:.6f} "
+                    f"ev={best['ev']:.6f} "
+                    f"avg_win={best['avg_win']:.6f} "
+                    f"avg_loss={best['avg_loss']:.6f}"
+                ),
             )
-            buckets.setdefault(key, []).append(observation)
 
-        candidates: List[Tuple[float, float, float, float, float, int, float]] = []
+        # Product-specific fallback:
+        # If no exact threshold passes win-rate/EV requirements, choose from this
+        # product's winning observations, not global static floors.
+        winning_obs = [o for o in all_obs if o.reached_min_profit]
 
-        for (score_bucket, prob_bucket), observations in buckets.items():
-            if len(observations) < CALIB_MIN_BUCKET_SAMPLES:
-                continue
-
-            wins = [o for o in observations if o.reached_min_profit]
-            losses = [o for o in observations if not o.reached_min_profit]
-
-            win_rate = len(wins) / max(1, len(observations))
-            avg_win = float(np.mean([o.win_bps for o in wins])) if wins else 0.0
-            avg_loss = float(np.mean([o.loss_bps for o in losses])) if losses else 0.0
-            expected_value = win_rate * avg_win - (1.0 - win_rate) * avg_loss
-
-            if win_rate < CALIB_MIN_WIN_RATE:
-                continue
-
-            if expected_value < CALIB_MIN_EXPECTED_VALUE_BPS:
-                continue
-
-            candidates.append((
-                expected_value,
-                win_rate,
-                avg_win,
-                avg_loss,
-                float(score_bucket),
-                len(observations),
-                float(prob_bucket),
-            ))
-
-        wins_all = [o for o in all_obs if o.reached_min_profit]
-        losses_all = [o for o in all_obs if not o.reached_min_profit]
-        blended_win_rate = len(wins_all) / max(1, len(all_obs))
-        avg_win_all = float(np.mean([o.win_bps for o in wins_all])) if wins_all else 0.0
-        avg_loss_all = float(np.mean([o.loss_bps for o in losses_all])) if losses_all else 0.0
-        blended_ev = blended_win_rate * avg_win_all - (1.0 - blended_win_rate) * avg_loss_all
-
-        if not candidates:
-            # Adaptive fallback:
-            # Use this product's own recent score/probability distribution instead of
-            # assigning every product the same default target.
-            product_scores = [o.score for o in all_obs]
-            product_probs = [o.probability for o in all_obs]
-
+        if winning_obs:
             fallback_score = self._safe_quantile(
-                product_scores,
+                [o.score for o in winning_obs],
                 CALIB_FALLBACK_SCORE_QUANTILE,
                 DEFAULT_CALIB_MIN_SCORE,
             )
             fallback_prob = self._safe_quantile(
-                product_probs,
+                [o.probability for o in winning_obs],
                 CALIB_FALLBACK_PROB_QUANTILE,
                 DEFAULT_CALIB_MIN_PROB,
             )
-
-            fallback_score = clamp_float(
-                fallback_score,
-                CALIB_MIN_ALLOWED_SCORE,
-                CALIB_MAX_ALLOWED_SCORE,
-            )
-            fallback_prob = clamp_float(
-                fallback_prob,
-                CALIB_MIN_ALLOWED_PROB,
-                CALIB_MAX_ALLOWED_PROB,
-            )
+            _, fallback_avg_win, fallback_avg_loss, _, _ = self._observation_ev_stats(winning_obs)
 
             return ProductCalibrationProfile(
                 product_id=product_id,
@@ -4609,50 +4693,37 @@ class TradingBot:
                 week_sample_count=len(week_obs),
                 day_win_rate=self._win_rate(day_obs),
                 week_win_rate=self._win_rate(week_obs),
-                blended_win_rate=blended_win_rate,
-                avg_win_bps=avg_win_all,
-                avg_loss_bps=avg_loss_all,
+                blended_win_rate=blended_wr,
+                avg_win_bps=fallback_avg_win,
+                avg_loss_bps=fallback_avg_loss,
                 expected_value_bps=blended_ev,
                 reason=(
-                    f"adaptive_fallback no_positive_bucket total={len(all_obs)} "
-                    f"q_score={fallback_score:.1f} q_prob={fallback_prob:.3f} "
-                    f"ev={blended_ev:.2f}"
+                    f"winning_observation_fallback product={product_id} "
+                    f"winning_samples={len(winning_obs)} "
+                    f"score_q={fallback_score:.6f} "
+                    f"prob_q={fallback_prob:.6f} "
+                    f"overall_ev={blended_ev:.6f}"
                 ),
             )
 
-        # Choose best bucket by expected value first, then win rate, then sample count.
-        candidates.sort(key=lambda item: (item[0], item[1], item[5]), reverse=True)
-        best_ev, best_wr, best_avg_win, best_avg_loss, best_score, best_n, best_prob = candidates[0]
-
-        # Do not force thresholds to the same default. Bound them within safe rails.
-        calibrated_score = clamp_float(
-            float(best_score),
-            CALIB_MIN_ALLOWED_SCORE,
-            CALIB_MAX_ALLOWED_SCORE,
-        )
-        calibrated_prob = clamp_float(
-            float(best_prob),
-            CALIB_MIN_ALLOWED_PROB,
-            CALIB_MAX_ALLOWED_PROB,
-        )
-
+        # Last resort only: no historical winning examples at all.
         return ProductCalibrationProfile(
             product_id=product_id,
-            min_score=float(calibrated_score),
-            min_probability=float(calibrated_prob),
-            min_expected_value_bps=max(float(best_ev) * 0.35, CALIB_MIN_EXPECTED_VALUE_BPS),
+            min_score=DEFAULT_CALIB_MIN_SCORE,
+            min_probability=DEFAULT_CALIB_MIN_PROB,
+            min_expected_value_bps=max(DEFAULT_CALIB_MIN_EV_BPS, CALIB_MIN_EXPECTED_VALUE_BPS),
             day_sample_count=len(day_obs),
             week_sample_count=len(week_obs),
             day_win_rate=self._win_rate(day_obs),
             week_win_rate=self._win_rate(week_obs),
-            blended_win_rate=float(best_wr),
-            avg_win_bps=float(best_avg_win),
-            avg_loss_bps=float(best_avg_loss),
-            expected_value_bps=float(best_ev),
+            blended_win_rate=blended_wr,
+            avg_win_bps=blended_avg_win,
+            avg_loss_bps=blended_avg_loss,
+            expected_value_bps=blended_ev,
             reason=(
-                f"best_bucket score>={calibrated_score:.1f} "
-                f"prob>={calibrated_prob:.3f} samples={best_n} "
-                f"ev={best_ev:.2f} wr={best_wr:.3f}"
+                f"no_winning_observations product={product_id} "
+                f"using_defaults total={len(all_obs)} "
+                f"overall_ev={blended_ev:.6f}"
             ),
         )
 
@@ -4934,14 +5005,19 @@ class TradingBot:
                 day_obs=day_obs,
                 week_obs=[],
             )
-            old_profile.min_score = old_profile.min_score * 0.80 + new_profile.min_score * 0.20
+            # Smooth each product against its own previous target only.
+            # Do not clamp or bucket; preserve exact product-specific values.
+            old_profile.min_score = (
+                float(old_profile.min_score) * 0.80
+                + float(new_profile.min_score) * 0.20
+            )
             old_profile.min_probability = (
-                old_profile.min_probability * 0.80
-                + new_profile.min_probability * 0.20
+                float(old_profile.min_probability) * 0.80
+                + float(new_profile.min_probability) * 0.20
             )
             old_profile.min_expected_value_bps = (
-                old_profile.min_expected_value_bps * 0.80
-                + new_profile.min_expected_value_bps * 0.20
+                float(old_profile.min_expected_value_bps) * 0.80
+                + float(new_profile.min_expected_value_bps) * 0.20
             )
             old_profile.day_sample_count = new_profile.day_sample_count
             old_profile.day_win_rate = new_profile.day_win_rate

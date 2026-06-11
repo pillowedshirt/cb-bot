@@ -429,13 +429,22 @@ with st.sidebar:
     show_macro = st.checkbox("Show compact macro panel", value=True)
     show_debug_tables = st.checkbox("Show detailed tables", value=False)
 
+refresh_count = 0
+refresh_status = "paused"
+
 if live_update:
     if st_autorefresh is None:
-        st.warning("Install streamlit-autorefresh for live updates without browser page reload: pip install streamlit-autorefresh")
+        st.warning(
+            "Install streamlit-autorefresh for live updates without browser page reload: "
+            "pip install streamlit-autorefresh"
+        )
+        refresh_status = "package missing"
     else:
-        refresh_count = st_autorefresh(interval=int(refresh_sec * 1000), key="live_data_update")
-else:
-    refresh_count = 0
+        refresh_count = st_autorefresh(
+            interval=int(refresh_sec * 1000),
+            key="live_data_update",
+        )
+        refresh_status = "active"
 
 
 # =============================================================================
@@ -533,7 +542,7 @@ last_seen = to_dt_mst(pd.Series([m["ts"].dropna().iloc[-1]])).iloc[0] if not m["
 with top_b:
     st.caption(
         f"Last telemetry: {last_seen.strftime('%H:%M:%S %Z') if last_seen is not None else '—'} · "
-        f"interval: {refresh_sec}s · cycle: {refresh_count}"
+        f"live update: {refresh_status} · interval: {refresh_sec}s · cycle: {refresh_count}"
     )
 
 t_prod = pd.DataFrame()

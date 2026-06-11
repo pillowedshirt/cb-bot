@@ -217,8 +217,17 @@ STARTUP_LIQUIDATION_USE_MARKET: bool = True
 # Your current $1–$2 holdings may be near exchange minimums, so some sells may fail or be skipped.
 MIN_STARTUP_LIQUIDATION_USD: float = 0.01
 
-# How long to wait for websocket top-of-book prices before startup reconciliation.
-STARTUP_TOB_TIMEOUT_SEC: float = 30.0
+# Top-of-book readiness.
+# Websocket can be slow or sparse for some products. Use REST fallback quotes
+# so the bot can monitor all configured coins.
+ENABLE_REST_TOP_OF_BOOK_FALLBACK: bool = True
+TOP_OF_BOOK_READY_MIN_PRODUCTS_PCT: float = 0.80
+TOP_OF_BOOK_WAIT_SEC: float = 45.0
+TOP_OF_BOOK_REST_FALLBACK_EVERY_SEC: float = 3.0
+TOP_OF_BOOK_MAX_STALE_SEC: float = 15.0
+
+# If a product has no fresh quote, do not buy it.
+REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY: bool = True
 
 TARGET_UTIL_MIN: float = 0.35
 TARGET_UTIL_MID: float = 0.65
@@ -432,9 +441,9 @@ BLOCK_BUY_WHILE_MICROTREND_DOWN: bool = True
 REQUIRE_MICRO_UPTURN_FOR_BUY: bool = True
 
 # Momentum thresholds in basis points.
-MIN_ENTRY_MOMENTUM_1_BPS: float = 1.5
-MIN_ENTRY_MOMENTUM_3_BPS: float = 2.5
-MIN_ENTRY_MOMENTUM_5_BPS: float = 3.5
+MIN_ENTRY_MOMENTUM_1_BPS: float = 0.0
+MIN_ENTRY_MOMENTUM_3_BPS: float = 2.0
+MIN_ENTRY_MOMENTUM_5_BPS: float = 3.0
 
 # If a signal stops qualifying, retain its armed state for this long so a brief
 # evaluation gap does not immediately reset it.
@@ -2541,7 +2550,18 @@ class PositionTargetsLogger:
                     "" if r.get("calibrated_post_profit_breathing_minutes") is None else f"{float(r.get('calibrated_post_profit_breathing_minutes')):.6f}",
                     r.get("exit_plan_note", ""),
                 ])
-        os.replace(tmp, self.path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, self.path)
+                break
+            except PermissionError:
+                if attempt >= 4:
+                    log(
+                        f"[position-targets] replace failed after retries; "
+                        f"path={self.path}"
+                    )
+                    break
+                time.sleep(0.15)
 
 
 def _clip_score(x: float) -> float:
@@ -2928,6 +2948,67 @@ class LivePortfolio:
             return d if isinstance(d, dict) else {}
         except Exception:
             return {}
+
+    def get_best_bid_ask(self, product_id: str) -> Tuple[Optional[float], Optional[float]]:
+        """Return a best-effort REST quote when websocket data is unavailable."""
+        product_id = str(product_id).strip().upper()
+
+        try:
+            fn = getattr(self.rest, "get_best_bid_ask", None)
+            if callable(fn):
+                try:
+                    resp = fn(product_ids=[product_id])
+                except TypeError:
+                    resp = fn(product_id=product_id)
+
+                data = self._to_dict(resp)
+                pricebooks = (
+                    data.get("pricebooks")
+                    or data.get("price_books")
+                    or data.get("data")
+                    or []
+                )
+                if isinstance(pricebooks, dict):
+                    pricebooks = (
+                        pricebooks.get("pricebooks")
+                        or pricebooks.get("price_books")
+                        or [pricebooks]
+                    )
+
+                if isinstance(pricebooks, list):
+                    for pricebook in pricebooks:
+                        pricebook_data = self._to_dict(pricebook)
+                        if str(pricebook_data.get("product_id", "")).upper() not in ("", product_id):
+                            continue
+                        bids = pricebook_data.get("bids") or []
+                        asks = pricebook_data.get("asks") or []
+                        bid = safe_float(self._to_dict(bids[0]).get("price") or self._to_dict(bids[0]).get("bid_price")) if bids else None
+                        ask = safe_float(self._to_dict(asks[0]).get("price") or self._to_dict(asks[0]).get("ask_price")) if asks else None
+                        if bid is not None and ask is not None and bid > 0 and ask > 0:
+                            return float(bid), float(ask)
+        except Exception:
+            pass
+
+        try:
+            fn = getattr(self.rest, "get_product_book", None)
+            if callable(fn):
+                try:
+                    resp = fn(product_id=product_id, limit=1)
+                except TypeError:
+                    resp = fn(product_id)
+
+                data = self._to_dict(resp)
+                pricebook = self._to_dict(data.get("pricebook"))
+                bids = data.get("bids") or pricebook.get("bids") or []
+                asks = data.get("asks") or pricebook.get("asks") or []
+                bid = safe_float(self._to_dict(bids[0]).get("price")) if bids else None
+                ask = safe_float(self._to_dict(asks[0]).get("price")) if asks else None
+                if bid is not None and ask is not None and bid > 0 and ask > 0:
+                    return float(bid), float(ask)
+        except Exception:
+            pass
+
+        return None, None
 
     def get_product_meta(self, product_id: str) -> Dict[str, Any]:
         """Return Coinbase product metadata used to format order sizes."""
@@ -3545,6 +3626,24 @@ class LivePortfolio:
 
         client_order_id = str(uuid.uuid4())
 
+        before_snapshot: Dict[str, Dict[str, float]] = {}
+        before_cash = 0.0
+        before_base_total = 0.0
+        before_snapshot_ok = False
+        base_asset = product_base_asset(product_id)
+
+        try:
+            before_snapshot = self.refresh_snapshot(force=True, ttl_sec=0.0)
+            before_snapshot_ok = bool(before_snapshot)
+            before_cash = self.get_tradable_usd(snapshot=before_snapshot)
+            before_base_total = (
+                self.get_total_asset(base_asset, snapshot=before_snapshot)
+                if base_asset
+                else 0.0
+            )
+        except Exception as exc:
+            log(f"[fill-reconcile] pre-trade balance snapshot failed for {product_id}: {exc}")
+
         # Place order
         try:
             if side_u == "BUY":
@@ -3694,11 +3793,88 @@ class LivePortfolio:
             if not status:
                 status = "FILLED"
 
-        # Sync balances
+        after_snapshot: Dict[str, Dict[str, float]] = {}
+        after_cash = 0.0
+        after_base_total = 0.0
+        after_snapshot_ok = False
+
         try:
-            self.sync_after_trade(attempts=6, sleep_sec=0.5)
-        except Exception:
-            pass
+            self.sync_after_trade(attempts=8, sleep_sec=0.5)
+            after_snapshot = self.refresh_snapshot(force=True, ttl_sec=0.0)
+            after_snapshot_ok = bool(after_snapshot)
+            after_cash = self.get_tradable_usd(snapshot=after_snapshot)
+            after_base_total = (
+                self.get_total_asset(base_asset, snapshot=after_snapshot)
+                if base_asset
+                else 0.0
+            )
+        except Exception as exc:
+            log(f"[fill-reconcile] post-trade balance snapshot failed for {product_id}: {exc}")
+
+        # Coinbase balance deltas are authoritative for BUY quantity. This avoids
+        # treating quote-denominated SDK fields as base-asset fills.
+        if side_u == "BUY":
+            requested_quote = float(quote_usd or 0.0)
+            if not before_snapshot_ok or not after_snapshot_ok:
+                ok_final = False
+                err = err or "buy_balance_snapshot_unavailable"
+            else:
+                try:
+                    base_delta = float(after_base_total) - float(before_base_total)
+                    cash_delta = float(before_cash) - float(after_cash)
+
+                    if base_delta > 1e-12:
+                        qty_f = float(base_delta)
+                        if cash_delta > 0 and cash_delta <= requested_quote * 1.25:
+                            notional_f = float(cash_delta)
+                        else:
+                            notional_f = float(requested_quote)
+
+                        if notional_f > 0:
+                            avg_px_f = float(notional_f) / float(qty_f)
+                        ok_final = True
+                        status = status or "FILLED_BALANCE_DELTA"
+                        err = None
+                    else:
+                        ok_final = False
+                        err = err or "buy_no_base_balance_delta"
+                except Exception as exc:
+                    ok_final = False
+                    err = err or "buy_balance_delta_reconcile_failed"
+                    log(f"[fill-reconcile] BUY balance-delta failed for {product_id}: {exc}")
+
+        # A small quote order must never create an implausibly large local position.
+        if side_u == "BUY" and ok_final:
+            requested_quote = float(quote_usd or 0.0)
+            try:
+                if (
+                    requested_quote > 0
+                    and notional_f is not None
+                    and float(notional_f) > requested_quote * 1.25
+                ):
+                    log(
+                        f"[fill-reconcile] {product_id} impossible BUY notional; "
+                        f"requested_quote={requested_quote:.6f} "
+                        f"notional={float(notional_f):.6f}; forcing failure"
+                    )
+                    ok_final = False
+                    err = "impossible_buy_notional_vs_requested_quote"
+
+                if requested_quote > 0 and avg_px_f is not None and qty_f > 0:
+                    max_possible_base = (requested_quote * 1.25) / float(avg_px_f)
+                    if float(qty_f) > max_possible_base:
+                        log(
+                            f"[fill-reconcile] {product_id} impossible BUY qty; "
+                            f"requested_quote={requested_quote:.6f} "
+                            f"qty={float(qty_f):.12f} "
+                            f"avg_px={float(avg_px_f):.8f}; forcing failure"
+                        )
+                        ok_final = False
+                        err = "impossible_buy_qty_vs_requested_quote"
+            except Exception as exc:
+                ok_final = False
+                err = err or "buy_sanity_check_failed"
+                log(f"[fill-reconcile] BUY sanity check failed for {product_id}: {exc}")
 
         return ExecutionResult(
             ok=ok_final,
@@ -4134,6 +4310,14 @@ class TradingBot:
         fee_val = safe_float(r.get("fee_usd")) or 0.0
         filled_notional = safe_float(r.get("filled_notional_usd"))
         avg_px = safe_float(r.get("avg_price"))
+
+        if side_u == "BUY":
+            log(
+                f"[buy-fill-check] {product_id} "
+                f"filled_qty={filled_qty:.12f} "
+                f"avg_px={0.0 if avg_px is None else float(avg_px):.8f} "
+                f"filled_notional={0.0 if filled_notional is None else float(filled_notional):.6f}"
+            )
 
         # If avg_price missing, derive it from notional/qty (still fill-truth, not a quote fallback).
         if (avg_px is None or avg_px <= 0) and filled_notional is not None and filled_notional > 0:
@@ -6982,19 +7166,24 @@ class TradingBot:
                 f"mom3={mom3:.2f};mom5={mom5:.2f}",
             )
 
-        upturn_ok = bool(
+        momentum_confirmed = bool(
             mom1 >= float(MIN_ENTRY_MOMENTUM_1_BPS)
-            or mom3 >= float(MIN_ENTRY_MOMENTUM_3_BPS)
-            or mom5 >= float(MIN_ENTRY_MOMENTUM_5_BPS)
-            or vwap_ok
-            or higher_low_ok
+            and (
+                mom3 >= float(MIN_ENTRY_MOMENTUM_3_BPS)
+                or mom5 >= float(MIN_ENTRY_MOMENTUM_5_BPS)
+            )
         )
+        structure_confirmed = bool(vwap_ok or higher_low_ok)
+        upturn_ok = bool(momentum_confirmed and structure_confirmed)
 
         if REQUIRE_MICRO_UPTURN_FOR_BUY and not upturn_ok:
             return (
                 False,
-                f"no_micro_upturn;mom1={mom1:.2f};mom3={mom3:.2f};"
-                f"mom5={mom5:.2f};vwap={vwap_ok};hl={higher_low_ok}",
+                f"no_confirmed_upturn;"
+                f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};"
+                f"momentum_confirmed={momentum_confirmed};"
+                f"structure_confirmed={structure_confirmed};"
+                f"vwap={vwap_ok};hl={higher_low_ok}",
             )
 
         return (
@@ -7326,41 +7515,98 @@ class TradingBot:
             return None
         return await asyncio.to_thread(self.portfolio.refresh_snapshot, force=bool(force), ttl_sec=float(ttl_sec))
 
-    async def _wait_for_tob_ready(self, timeout_sec: float = STARTUP_TOB_TIMEOUT_SEC) -> None:
-        """
-        Wait for top-of-book prices for all configured products before startup reconciliation.
-        This prevents startup liquidation from skipping products simply because the websocket
-        has not received their first bid/ask yet.
-        """
-        t0 = now_ts()
+    def _rest_backfill_top_of_book(self, product_ids: Optional[List[str]] = None) -> None:
+        """Fill missing or stale top-of-book data using Coinbase REST quotes."""
+        if not ENABLE_REST_TOP_OF_BOOK_FALLBACK:
+            return
+        if not isinstance(self.portfolio, LivePortfolio):
+            return
+
+        requested_products = product_ids or list(PRODUCTS)
+        now_value = now_ts()
+        for product_id in requested_products:
+            tob = self.tob.get(product_id)
+            is_missing = tob is None or tob.bid <= 0 or tob.ask <= 0
+            try:
+                is_stale = tob is not None and (now_value - float(tob.ts)) > float(TOP_OF_BOOK_MAX_STALE_SEC)
+            except Exception:
+                is_stale = True
+
+            if not is_missing and not is_stale:
+                continue
+
+            bid, ask = self.portfolio.get_best_bid_ask(product_id)
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                continue
+
+            quote = TopOfBook(bid=float(bid), ask=float(ask), ts=now_value)
+            self.tob[product_id] = quote
+            log(
+                f"[tob-rest] {product_id} bid={bid:.8f} ask={ask:.8f} "
+                f"spread_bps={quote.spread_bps:.3f}"
+            )
+
+    async def _wait_for_tob_ready(self, timeout_sec: float = TOP_OF_BOOK_WAIT_SEC) -> None:
+        """Wait until the configured percentage of products have valid quotes."""
+        started_at = now_ts()
         last_log = 0.0
+        last_rest_tob_backfill = 0.0
+        required_ready = max(
+            1,
+            int(math.ceil(len(PRODUCTS) * float(TOP_OF_BOOK_READY_MIN_PRODUCTS_PCT))),
+        )
 
-        while now_ts() - t0 < float(timeout_sec):
+        while now_ts() - started_at < float(timeout_sec):
+            if (
+                ENABLE_REST_TOP_OF_BOOK_FALLBACK
+                and now_ts() - last_rest_tob_backfill >= TOP_OF_BOOK_REST_FALLBACK_EVERY_SEC
+            ):
+                missing_or_stale = []
+                current_time = now_ts()
+                for product_id in PRODUCTS:
+                    quote = self.tob.get(product_id)
+                    if (
+                        quote is None
+                        or quote.bid <= 0
+                        or quote.ask <= 0
+                        or current_time - float(quote.ts) > float(TOP_OF_BOOK_MAX_STALE_SEC)
+                    ):
+                        missing_or_stale.append(product_id)
+                self._rest_backfill_top_of_book(missing_or_stale)
+                last_rest_tob_backfill = now_ts()
+
             ready = [
-                p for p in PRODUCTS
-                if self.tob.get(p) is not None
-                and self.tob[p].bid > 0
-                and self.tob[p].ask > 0
+                product_id for product_id in PRODUCTS
+                if self.tob.get(product_id) is not None
+                and self.tob[product_id].bid > 0
+                and self.tob[product_id].ask > 0
             ]
-
-            if len(ready) >= len(PRODUCTS):
-                log(f"[startup] top-of-book ready for all {len(ready)}/{len(PRODUCTS)} products")
+            if len(ready) >= required_ready:
+                log(f"[startup] top-of-book ready for {len(ready)}/{len(PRODUCTS)} products")
                 return
 
             if now_ts() - last_log >= 5.0:
-                missing = [p for p in PRODUCTS if p not in ready]
-                log(f"[startup] waiting for top-of-book | ready={len(ready)}/{len(PRODUCTS)} missing={missing}")
+                missing = [product_id for product_id in PRODUCTS if product_id not in ready]
+                log(
+                    f"[startup] waiting for top-of-book | "
+                    f"ready={len(ready)}/{len(PRODUCTS)} required={required_ready} missing={missing}"
+                )
                 last_log = now_ts()
 
             await asyncio.sleep(0.25)
 
         missing = [
-            p for p in PRODUCTS
-            if self.tob.get(p) is None
-            or self.tob[p].bid <= 0
-            or self.tob[p].ask <= 0
+            product_id for product_id in PRODUCTS
+            if self.tob.get(product_id) is None
+            or self.tob[product_id].bid <= 0
+            or self.tob[product_id].ask <= 0
         ]
-        log(f"[startup] top-of-book wait timed out; missing={missing}; liquidation will skip products without valid bid/ask")
+        log(
+            f"[startup] top-of-book wait timed out; "
+            f"ready={len(PRODUCTS) - len(missing)}/{len(PRODUCTS)} "
+            f"required={required_ready} missing={missing}; "
+            f"trading will skip products without fresh bid/ask"
+        )
 
     def _live_mid_by_product(self) -> Dict[str, float]:
         mids: Dict[str, float] = {}
@@ -7582,7 +7828,7 @@ class TradingBot:
         if not isinstance(self.portfolio, LivePortfolio):
             return
 
-        await self._wait_for_tob_ready(timeout_sec=STARTUP_TOB_TIMEOUT_SEC)
+        await self._wait_for_tob_ready(timeout_sec=TOP_OF_BOOK_WAIT_SEC)
 
         snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
         if not snap:
@@ -7623,10 +7869,11 @@ class TradingBot:
         ws_task = asyncio.create_task(self.ws_loop())
 
         log("[run] waiting for initial top-of-book data")
-        await self._wait_for_tob_ready(timeout_sec=20.0)
+        await self._wait_for_tob_ready(timeout_sec=TOP_OF_BOOK_WAIT_SEC)
 
         await self._refresh_coinbase_fee_tier_if_needed(force=True)
 
+        self._rest_backfill_top_of_book(PRODUCTS)
         log("[run] calibrating products before live trading")
         await self.calibrate_products_on_startup()
         self.last_hourly_calibration_update_ts = now_ts()
@@ -8232,6 +8479,26 @@ class TradingBot:
             candidates = []
             for product_id in PRODUCTS:
                 tob = self.tob.get(product_id)
+                if REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY:
+                    if tob is None or tob.bid <= 0 or tob.ask <= 0:
+                        self._rest_backfill_top_of_book([product_id])
+                        tob = self.tob.get(product_id)
+
+                    if tob is None or tob.bid <= 0 or tob.ask <= 0:
+                        log(f"[buy-skip] {product_id} no fresh top-of-book")
+                        continue
+
+                    if now_ts() - float(tob.ts) > float(TOP_OF_BOOK_MAX_STALE_SEC):
+                        self._rest_backfill_top_of_book([product_id])
+                        tob = self.tob.get(product_id)
+
+                    if (
+                        tob is None
+                        or now_ts() - float(tob.ts) > float(TOP_OF_BOOK_MAX_STALE_SEC)
+                    ):
+                        log(f"[buy-skip] {product_id} stale top-of-book")
+                        continue
+
                 if not tob:
                     continue
                 bid, ask, mid, spread_bps = tob.bid, tob.ask, tob.mid, tob.spread_bps

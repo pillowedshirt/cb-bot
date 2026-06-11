@@ -443,6 +443,27 @@ BEST_AVAILABLE_TOP_MOTION_FRACTION: float = 0.25
 # Avoid zero targets while still not using static score/probability defaults.
 MIN_LEARNED_TARGET_EPSILON: float = 1e-9
 
+# Outcome-calibrated probability behavior.
+# The old probability model was frequently pinned at 20%, which made winners look weak.
+USE_OUTCOME_CALIBRATED_PROBABILITY: bool = True
+
+# Do not clamp live probability to 20%. Let weak setups be low and strong setups rise.
+DISPLAY_PROB_MIN: float = 0.01
+DISPLAY_PROB_MAX: float = 0.92
+
+# Probability should care about projected forward gain versus real modeled cost.
+PROB_PROJECTED_FORWARD_RATIO_WEIGHT: float = 0.10
+PROB_EXPECTED_EDGE_WEIGHT: float = 0.12
+PROB_PRICE_ACTION_WEIGHT: float = 0.55
+PROB_STRUCTURE_WEIGHT: float = 0.20
+
+# Learned EV targets are minimum acceptable thresholds, not full winner EV.
+BEST_AVAILABLE_EV_TARGET_FRACTION: float = 0.65
+EXACT_THRESHOLD_EV_TARGET_FRACTION: float = 0.65
+
+# Avoid probability targets sitting at the old artificial 20% floor.
+MIN_LEARNED_PROB_TARGET: float = 0.05
+
 # Event loop lag diagnostics.
 EVENT_LOOP_LAG_WARN_SEC: float = 3.0
 
@@ -2195,6 +2216,9 @@ class ProductCalibrationProfile:
     calibrated_post_profit_extra_gain_bps: float = 0.0
     calibrated_max_adverse_before_profit_bps: float = 0.0
     calibrated_expected_bps_per_minute: float = 0.0
+    calibrated_raw_probability_median: float = 0.0
+    calibrated_empirical_win_rate: float = 0.0
+    calibrated_probability_model_note: str = ""
 
     reason: str = "not_calibrated"
 
@@ -2275,6 +2299,9 @@ class CalibrationLogger:
             "calibrated_post_profit_extra_gain_bps",
             "calibrated_max_adverse_before_profit_bps",
             "calibrated_expected_bps_per_minute",
+            "calibrated_raw_probability_median",
+            "calibrated_empirical_win_rate",
+            "calibrated_probability_model_note",
             "reason",
         ]
         if os.path.exists(self.path):
@@ -2317,6 +2344,9 @@ class CalibrationLogger:
                 f"{profile.calibrated_post_profit_extra_gain_bps:.6f}",
                 f"{profile.calibrated_max_adverse_before_profit_bps:.6f}",
                 f"{profile.calibrated_expected_bps_per_minute:.6f}",
+                f"{profile.calibrated_raw_probability_median:.6f}",
+                f"{profile.calibrated_empirical_win_rate:.6f}",
+                profile.calibrated_probability_model_note,
                 profile.reason,
             ])
 
@@ -3668,6 +3698,7 @@ class TradingBot:
             product: [] for product in PRODUCTS
         }
         self.last_hourly_calibration_update_ts: float = 0.0
+        self.last_buy_gate_log_ts_by_product: Dict[str, float] = {}
         self.live_recalibration_running: bool = False
         self.last_loop_lag_check_ts: float = now_ts()
         self.cached_account_snapshot: Optional[Dict[str, Dict[str, float]]] = None
@@ -4378,60 +4409,89 @@ class TradingBot:
         higher_low_ok: bool,
         trending_down: bool,
         target_bps: Optional[float] = None,
+        projected_forward_gain_bps: Optional[float] = None,
+        expected_net_edge_bps: Optional[float] = None,
         cost_bps: Optional[float] = None,
         fee_available: bool = False,
     ) -> float:
         """
-        Display probability for live monitoring.
+        Outcome-calibrated live probability.
 
-        This should move continuously for every product.
-        It is not a guarantee and not a standalone permission to buy.
-
-        If real Coinbase fees are available, target/cost improves the probability.
-        If real fees are unavailable, this still displays a live price-action probability,
-        but the trade gate remains closed.
+        The older version was often pinned at 20%, which caused the bot to
+        under-score probable winners. This version uses:
+        - live score / price action
+        - projected forward gain versus real cost
+        - projected net edge
+        - structure and confirmation
         """
         s = clamp_float(float(score), 0.0, 100.0)
 
-        # Base probability from live score.
-        # score 0 -> 32%, score 50 -> 50%, score 100 -> 68%
-        prob = 0.32 + (s / 100.0) * 0.36
+        # Price-action base.
+        # score 0 -> 18%, score 50 -> 48%, score 100 -> 78% before modifiers.
+        price_action_prob = 0.18 + (s / 100.0) * 0.60
 
         # Momentum contribution.
-        prob += clamp_float(float(momentum_5_bps) / 80.0, -0.08, 0.08)
-        prob += clamp_float(float(momentum_15_bps) / 140.0, -0.06, 0.06)
+        momentum_adj = 0.0
+        momentum_adj += clamp_float(float(momentum_5_bps) / 90.0, -0.08, 0.08)
+        momentum_adj += clamp_float(float(momentum_15_bps) / 160.0, -0.06, 0.06)
 
         # Structure contribution.
-        prob += ((float(support_score) - 50.0) / 100.0) * 0.045
-        prob += ((float(room_score) - 50.0) / 100.0) * 0.040
-        prob += ((float(regime_score) - 50.0) / 100.0) * 0.035
+        structure_adj = 0.0
+        structure_adj += ((float(support_score) - 50.0) / 100.0) * 0.055
+        structure_adj += ((float(room_score) - 50.0) / 100.0) * 0.050
+        structure_adj += ((float(regime_score) - 50.0) / 100.0) * 0.040
 
         # Confirmation contribution.
-        prob += 0.030 if vwap_ok else -0.030
-        prob += 0.030 if higher_low_ok else -0.030
+        confirmation_adj = 0.0
+        confirmation_adj += 0.035 if vwap_ok else -0.025
+        confirmation_adj += 0.035 if higher_low_ok else -0.025
 
         # Trend and spread penalties.
+        risk_adj = 0.0
         if trending_down:
-            prob -= 0.070
+            risk_adj -= 0.065
 
         if spread_bps > SCALP_MAX_SPREAD_BPS:
-            prob -= 0.025
+            risk_adj -= 0.020
         if spread_bps > MAX_SPREAD_BPS:
-            prob -= 0.080
+            risk_adj -= 0.070
 
-        # Fee-aware contribution only when real Coinbase fee data is available.
-        if fee_available and target_bps is not None and cost_bps is not None and float(cost_bps) > 0:
-            ratio = float(target_bps) / float(cost_bps)
-            if ratio >= 4.0:
-                prob += 0.050
-            elif ratio >= 3.0:
-                prob += 0.032
-            elif ratio >= MIN_TARGET_TO_COST_MULT:
-                prob += 0.018
-            else:
-                prob -= clamp_float((MIN_TARGET_TO_COST_MULT - ratio) * 0.040, 0.0, 0.09)
+        # Fee-aware projection contribution.
+        projection_adj = 0.0
 
-        return clamp_float(prob, 0.20, 0.88)
+        if (
+            fee_available
+            and cost_bps is not None
+            and float(cost_bps) > 0
+            and projected_forward_gain_bps is not None
+        ):
+            projected_ratio = float(projected_forward_gain_bps) / float(cost_bps)
+
+            # Ratio around 1.0 means projected gross only covers cost.
+            # Ratio above 1.0 means there is room for actual net profit.
+            projection_adj += clamp_float((projected_ratio - 1.0) * 0.16, -0.10, 0.16)
+
+        if expected_net_edge_bps is not None:
+            # Positive edge matters because it already includes projected forward
+            # gain minus real modeled cost.
+            edge_ratio = float(expected_net_edge_bps) / max(
+                1.0, float(MIN_REQUIRED_NET_EDGE_BPS)
+            )
+            projection_adj += clamp_float(edge_ratio * 0.045, -0.09, 0.14)
+
+        prob = (
+            price_action_prob * PROB_PRICE_ACTION_WEIGHT
+            + (0.50 + structure_adj + confirmation_adj) * PROB_STRUCTURE_WEIGHT
+            + (0.50 + projection_adj)
+            * (
+                PROB_PROJECTED_FORWARD_RATIO_WEIGHT
+                + PROB_EXPECTED_EDGE_WEIGHT
+            )
+            + momentum_adj
+            + risk_adj
+        )
+
+        return clamp_float(prob, DISPLAY_PROB_MIN, DISPLAY_PROB_MAX)
 
     def _estimate_prob_up_from_candidate(
         self,
@@ -4674,6 +4734,8 @@ class TradingBot:
             higher_low_ok=bool(higher_low_ok),
             trending_down=bool(trending_down),
             target_bps=target_bps,
+            projected_forward_gain_bps=target_bps,
+            expected_net_edge_bps=expected_net_edge_bps,
             cost_bps=cost_bps,
             fee_available=fee_available,
         )
@@ -5133,6 +5195,27 @@ class TradingBot:
             source = sorted_by_motion[:take_n]
             source_label = "top_motion_no_winners"
 
+        source_probabilities = [
+            float(observation.probability)
+            for observation in source
+            if observation.probability is not None
+            and np.isfinite(float(observation.probability))
+        ]
+        source_raw_prob_median = (
+            float(np.median(source_probabilities))
+            if source_probabilities
+            else 0.0
+        )
+        source_empirical_win_rate = (
+            sum(
+                1
+                for observation in source
+                if observation.reached_min_profit
+                and observation.survived_to_profit
+            )
+            / max(1, len(source))
+        )
+
         def q(
             values: List[float],
             quantile: float,
@@ -5156,9 +5239,12 @@ class TradingBot:
             [observation.score for observation in source],
             BEST_AVAILABLE_SCORE_QUANTILE,
         )
-        learned_prob = q(
-            [observation.probability for observation in source],
-            BEST_AVAILABLE_PROB_QUANTILE,
+        learned_prob = max(
+            q(
+                [observation.probability for observation in source],
+                BEST_AVAILABLE_PROB_QUANTILE,
+            ),
+            float(MIN_LEARNED_PROB_TARGET),
         )
         learned_ev = q(
             [
@@ -5169,12 +5255,11 @@ class TradingBot:
             BEST_AVAILABLE_EV_QUANTILE,
         )
 
-        # Do not authorize negative-EV buys, but keep the measured EV in the
-        # profile statistics and reason for inspection.
+        # The EV target is the minimum acceptable edge required for a new trade.
+        # It should not require the live setup to match the full winner EV.
         learned_ev_target = max(
-            float(learned_ev),
             float(CALIB_MIN_EXPECTED_VALUE_BPS),
-            float(MIN_LEARNED_TARGET_EPSILON),
+            float(learned_ev) * float(BEST_AVAILABLE_EV_TARGET_FRACTION),
         )
 
         win_rate, avg_win, avg_loss, ev, _ = self._observation_ev_stats(
@@ -5223,6 +5308,17 @@ class TradingBot:
             calibrated_expected_bps_per_minute=(
                 float(ev)
                 / max(1.0, float(median_time_to_min_profit or 1.0))
+            ),
+            calibrated_raw_probability_median=float(
+                source_raw_prob_median
+            ),
+            calibrated_empirical_win_rate=float(
+                source_empirical_win_rate
+            ),
+            calibrated_probability_model_note=(
+                f"source={source_label}; "
+                f"raw_prob_median={source_raw_prob_median:.6f}; "
+                f"source_empirical_win_rate={source_empirical_win_rate:.6f}"
             ),
             reason=(
                 f"learned_profile product={product_id} status={status} "
@@ -5421,6 +5517,33 @@ class TradingBot:
         if best is not None:
             for observation in best["selected_observations"]:
                 observation.accepted_by_calibration = True
+
+            selected_for_stats = best["selected_observations"]
+            selected_probabilities = [
+                float(observation.probability)
+                for observation in selected_for_stats
+                if observation.probability is not None
+                and np.isfinite(float(observation.probability))
+            ]
+            selected_raw_prob_median = (
+                float(np.median(selected_probabilities))
+                if selected_probabilities
+                else 0.0
+            )
+            selected_empirical_win_rate = (
+                sum(
+                    1
+                    for observation in selected_for_stats
+                    if observation.reached_min_profit
+                    and observation.survived_to_profit
+                )
+                / max(1, len(selected_for_stats))
+            )
+            calibrated_prob_threshold = max(
+                float(best["prob_threshold"]),
+                float(MIN_LEARNED_PROB_TARGET),
+            )
+
             return ProductCalibrationProfile(
                 product_id=product_id,
                 is_calibrated=True,
@@ -5429,11 +5552,12 @@ class TradingBot:
                     float(best["score_threshold"]),
                     float(MIN_LEARNED_TARGET_EPSILON),
                 ),
-                min_probability=max(
-                    float(best["prob_threshold"]),
-                    float(MIN_LEARNED_TARGET_EPSILON),
+                min_probability=float(calibrated_prob_threshold),
+                min_expected_value_bps=max(
+                    float(CALIB_MIN_EXPECTED_VALUE_BPS),
+                    float(best["ev"])
+                    * float(EXACT_THRESHOLD_EV_TARGET_FRACTION),
                 ),
-                min_expected_value_bps=max(float(best["ev"]) * 0.35, CALIB_MIN_EXPECTED_VALUE_BPS),
                 day_sample_count=len(day_obs),
                 week_sample_count=len(week_obs),
                 day_win_rate=self._win_rate(day_obs),
@@ -5451,7 +5575,23 @@ class TradingBot:
                 calibrated_post_profit_extra_gain_bps=float(best["median_post_profit_extra_gain"]),
                 calibrated_max_adverse_before_profit_bps=float(best["median_adverse_before_profit"]),
                 calibrated_expected_bps_per_minute=(
-                    float(best["ev"]) / max(1.0, float(best["median_time_to_min_profit"] or 1.0))
+                    float(best["ev"])
+                    / max(
+                        1.0,
+                        float(best["median_time_to_min_profit"] or 1.0),
+                    )
+                ),
+                calibrated_raw_probability_median=float(
+                    selected_raw_prob_median
+                ),
+                calibrated_empirical_win_rate=float(
+                    selected_empirical_win_rate
+                ),
+                calibrated_probability_model_note=(
+                    "source=exact_threshold; "
+                    f"raw_prob_median={selected_raw_prob_median:.6f}; "
+                    "selected_empirical_win_rate="
+                    f"{selected_empirical_win_rate:.6f}"
                 ),
                 reason=(
                     f"exact_threshold product={product_id} "
@@ -6049,6 +6189,8 @@ class TradingBot:
             higher_low_ok=bool(higher_low_ok),
             trending_down=bool(trending_down),
             target_bps=target_bps,
+            projected_forward_gain_bps=calibrated_forward_gain_bps,
+            expected_net_edge_bps=expected_net_edge_bps,
             cost_bps=cost_bps,
             fee_available=fee_available,
         )
@@ -6271,7 +6413,17 @@ class TradingBot:
 
         buy_gate_blocker = "BUY_READY" if ok_to_trade else ";".join(blockers)
 
-        if ok_to_trade:
+        last_logged = self.last_buy_gate_log_ts_by_product.get(
+            product_id, 0.0
+        )
+        log_ts = now_ts()
+        should_log_buy_gate = bool(
+            ok_to_trade or log_ts - float(last_logged) >= 15.0
+        )
+        if should_log_buy_gate:
+            self.last_buy_gate_log_ts_by_product[product_id] = log_ts
+
+        if should_log_buy_gate and ok_to_trade:
             log(
                 f"[buy-gate] {product_id} BUY_READY "
                 f"mode={buy_gate_mode} "
@@ -6282,6 +6434,8 @@ class TradingBot:
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
                 f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
+                f"raw_prob_median={profile.calibrated_raw_probability_median:.6f} "
+                f"empirical_wr={profile.calibrated_empirical_win_rate:.6f} "
                 f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_floor_ok={buy_gate_prob_floor_ok} "
                 f"prob_ok={buy_gate_prob_ok} prob_target_ok={buy_gate_prob_target_ok} "
                 f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
@@ -6294,7 +6448,7 @@ class TradingBot:
                 f"cost={cost_bps:.3f} "
                 f"spread={spread_bps:.3f}"
             )
-        else:
+        elif should_log_buy_gate:
             log(
                 f"[buy-gate] {product_id} BLOCKED "
                 f"mode={buy_gate_mode} "
@@ -6306,6 +6460,8 @@ class TradingBot:
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
                 f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
+                f"raw_prob_median={profile.calibrated_raw_probability_median:.6f} "
+                f"empirical_wr={profile.calibrated_empirical_win_rate:.6f} "
                 f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_floor_ok={buy_gate_prob_floor_ok} "
                 f"prob_ok={buy_gate_prob_ok} prob_target_ok={buy_gate_prob_target_ok} "
                 f"ev_primary={USE_EV_PRIMARY_BUY_GATE} "
@@ -7021,6 +7177,11 @@ class TradingBot:
 
         log("[run] calibrating products before live trading")
         await self.calibrate_products_on_startup()
+        self.last_hourly_calibration_update_ts = now_ts()
+        log(
+            f"[calibration-hourly] next hourly update scheduled in "
+            f"{CALIBRATION_UPDATE_EVERY_SEC:.0f}s"
+        )
 
         log("[run] reconciling live Coinbase portfolio before trading")
         await self._startup_portfolio_reconcile()

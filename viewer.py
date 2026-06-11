@@ -25,6 +25,7 @@ MACRO_LEVELS_CSV = os.path.join(BASE_DIR, "macro_levels.csv")
 CALIBRATION_CSV = os.path.join(BASE_DIR, "calibration.csv")
 MICRO_HISTORY_CSV = os.path.join(BASE_DIR, "micro_history.csv")
 POSITION_TARGETS_CSV = os.path.join(BASE_DIR, "position_targets.csv")
+CANDIDATE_REPLAY_CSV = os.path.join(BASE_DIR, "candidate_replay.csv")
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -761,6 +762,7 @@ def render_live_dashboard() -> None:
     cal = load_csv(CALIBRATION_CSV)
     hist = load_csv(MICRO_HISTORY_CSV)
     pt = load_csv(POSITION_TARGETS_CSV)
+    cr = load_csv(CANDIDATE_REPLAY_CSV)
 
     st.markdown(
         """
@@ -798,6 +800,10 @@ def render_live_dashboard() -> None:
         "room_score", "regime_score", "spread_penalty", "cost_penalty"
     ])
 
+    m_eval = m[m["source"].astype(str).str.lower() == "eval"].copy() if "source" in m.columns else m.copy()
+    m_telemetry = m[m["source"].astype(str).str.lower() == "telemetry"].copy() if "source" in m.columns else m.copy()
+    m_chart = m.copy()
+
     cal = numeric(cal, [
         "ts", "min_score", "min_probability", "min_expected_value_bps",
         "scalp_pullback_pct", "core_pullback_pct",
@@ -808,6 +814,11 @@ def render_live_dashboard() -> None:
         "calibrated_projected_net_bps",
         "calibrated_time_to_min_profit_minutes",
         "calibrated_forward_window_minutes",
+        "calibrated_selected_window_minutes",
+        "calibrated_post_profit_breathing_minutes",
+        "calibrated_post_profit_extra_gain_bps",
+        "calibrated_max_adverse_before_profit_bps",
+        "calibrated_expected_bps_per_minute",
     ])
     hist = numeric(hist, ["ts", "open", "high", "low", "close", "volume"])
     pt = numeric(pt, [
@@ -817,6 +828,16 @@ def render_live_dashboard() -> None:
         "scalp_pullback_pct", "core_pullback_pct",
         "scalp_pullback_trigger_price", "core_pullback_trigger_price",
         "distance_to_min_profit_bps", "distance_to_scalp_bps", "distance_to_core_bps",
+        "profit_lock_price", "min_profitable_exit_price_from_lot",
+        "calibrated_forward_window_minutes", "calibrated_post_profit_breathing_minutes",
+    ])
+    cr = numeric(cr, [
+        "ts", "score", "probability", "expected_net_edge_bps",
+        "target_bps", "cost_bps", "spread_bps",
+        "selected_forward_window_minutes", "max_favorable_bps", "max_adverse_bps",
+        "adverse_before_profit_bps", "time_to_min_profit_minutes",
+        "forward_window_minutes", "post_profit_max_favorable_bps",
+        "post_profit_extra_gain_bps",
     ])
 
     ml = numeric(ml, [
@@ -837,8 +858,8 @@ def render_live_dashboard() -> None:
     # Overview data
     # =============================================================================
 
-    latest_all = latest_by_product(m)
-    previous_map = previous_by_product(m, overview_lookback_rows)
+    latest_all = latest_by_product(m_eval)
+    previous_map = previous_by_product(m_chart, overview_lookback_rows)
 
     overview_rows = []
     for _, r in latest_all.iterrows():
@@ -1044,7 +1065,7 @@ def render_live_dashboard() -> None:
     else:
         cutoff = pd.Timestamp.utcnow().timestamp() - float(window_minutes) * 60.0
 
-    m_prod_live = m[(m["product_id"] == product) & (m["ts"] >= cutoff)].dropna(subset=["ts", "mid"]).copy()
+    m_prod_live = m_chart[(m_chart["product_id"] == product) & (m["ts"] >= cutoff)].dropna(subset=["ts", "mid"]).copy()
     hist_prod = pd.DataFrame()
     if not hist.empty and "product_id" in hist.columns:
         hist_prod = hist[(hist["product_id"] == product) & (hist["ts"] >= cutoff)].copy()
@@ -1064,8 +1085,13 @@ def render_live_dashboard() -> None:
         st.stop()
 
     m_prod["dt"] = to_dt_mst(m_prod["ts"])
-    scored_rows = m_prod.dropna(subset=["entry_score"]) if "entry_score" in m_prod.columns else pd.DataFrame()
-    latest_row = scored_rows.iloc[-1] if not scored_rows.empty else m_prod.iloc[-1]
+    latest_eval_rows = latest_by_product(m_eval)
+    selected_eval_rows = latest_eval_rows[latest_eval_rows["product_id"] == product] if not latest_eval_rows.empty else pd.DataFrame()
+    if not selected_eval_rows.empty:
+        latest_row = selected_eval_rows.iloc[-1]
+    else:
+        latest_row = m_prod.iloc[-1]
+        st.warning(f"No eval row is available for {product} yet; buy requirements are waiting for the evaluation loop.")
     with top_b:
         selected_age = age_seconds(latest_row.get("ts"))
         selected_status = status_for_age(selected_age)
@@ -1277,6 +1303,28 @@ def render_live_dashboard() -> None:
 
         st.caption(f"Calibration reason: {selected_cal.get('reason', '—')}")
 
+    st.markdown(f'<div class="cb-section">{product} calibration quality</div>', unsafe_allow_html=True)
+    if selected_cal is not None:
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            mini_card(
+                "Selected window",
+                fmt_num(selected_cal.get("calibrated_selected_window_minutes", np.nan), 1, " min"),
+                "historical forward window",
+            )
+        with q2:
+            mini_card(
+                "Time to min profit",
+                fmt_num(selected_cal.get("calibrated_time_to_min_profit_minutes", np.nan), 1, " min"),
+                "median survivable winner",
+            )
+        with q3:
+            mini_card(
+                "Extra after min profit",
+                fmt_num(selected_cal.get("calibrated_post_profit_extra_gain_bps", np.nan), 1, " bps"),
+                "breathing-room upside",
+            )
+
     selected_pt = latest_position_target_for_product(pt, product)
     st.markdown(f'<div class="cb-section">{product} sell plan</div>', unsafe_allow_html=True)
     if selected_pt is None:
@@ -1299,8 +1347,51 @@ def render_live_dashboard() -> None:
             mini_card("Scalp pullback trigger", fmt_money(selected_pt.get("scalp_pullback_trigger_price", np.nan), 6), f"peak {fmt_money(selected_pt.get('scalp_arm_peak', np.nan), 6)}")
         with s6:
             mini_card("Core pullback trigger", fmt_money(selected_pt.get("core_pullback_trigger_price", np.nan), 6), f"peak {fmt_money(selected_pt.get('core_arm_peak', np.nan), 6)}")
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            mini_card(
+                "Profit lock",
+                "ARMED" if truthy_cell(selected_pt.get("profit_lock_armed", False)) else "waiting",
+                fmt_money(selected_pt.get("profit_lock_price", np.nan), 6),
+            )
+        with p2:
+            mini_card(
+                "Forward window",
+                fmt_num(selected_pt.get("calibrated_forward_window_minutes", np.nan), 1, " min"),
+                "expected time horizon",
+            )
+        with p3:
+            mini_card(
+                "Breathing room",
+                fmt_num(selected_pt.get("calibrated_post_profit_breathing_minutes", np.nan), 1, " min"),
+                "after min profit",
+            )
         st.caption(str(selected_pt.get("exit_plan_note", "")))
 
+
+    with st.expander(f"{product} calibration replay candidates"):
+        if cr.empty or "product_id" not in cr.columns:
+            st.info("No candidate_replay.csv rows yet.")
+        else:
+            crp = cr[cr["product_id"] == product].copy()
+            if crp.empty:
+                st.info("No replay candidates for this product yet.")
+            else:
+                show_cols = [
+                    "dt_mst", "timeframe", "score", "probability",
+                    "expected_net_edge_bps", "cost_bps",
+                    "selected_forward_window_minutes", "max_favorable_bps",
+                    "max_adverse_bps", "adverse_before_profit_bps",
+                    "time_to_min_profit_minutes", "post_profit_extra_gain_bps",
+                    "reached_min_profit", "survived_to_profit",
+                    "accepted_by_calibration",
+                ]
+                show_cols = [column for column in show_cols if column in crp.columns]
+                st.dataframe(
+                    crp.sort_values("ts", ascending=False)[show_cols].head(250),
+                    width="stretch",
+                    hide_index=True,
+                )
 
     # =============================================================================
     # Selected coin signal detail

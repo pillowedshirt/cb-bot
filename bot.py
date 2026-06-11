@@ -86,6 +86,7 @@ CALIBRATION_CSV_PATH: str = os.path.join(BASE_DIR, "calibration.csv")
 MICRO_HISTORY_CSV_PATH: str = os.path.join(BASE_DIR, "micro_history.csv")
 POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
+CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 DEBUG_LOG_ENABLED: bool = True
 DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
@@ -363,6 +364,38 @@ CALIB_MIN_PREFIX_CANDLES_15M: int = 32
 # Future windows used to judge whether the signal worked.
 CALIB_FORWARD_MINUTES_1M: int = 60
 CALIB_FORWARD_BARS_15M: int = 16
+
+# Multi-window calibration and post-profit breathing-room analysis.
+CALIB_FORWARD_WINDOWS_1M: List[int] = [15, 30, 60, 120, 180, 240]
+CALIB_FORWARD_WINDOWS_15M: List[int] = [4, 8, 12, 16, 24]
+CALIB_POST_PROFIT_BREATHING_MINUTES: int = 60
+MAX_ADVERSE_BEFORE_PROFIT_BPS: float = 140.0
+PREFERRED_TIME_TO_MIN_PROFIT_MINUTES: float = 180.0
+
+# Similar historical setup matching.
+SIMILAR_SCORE_BAND: float = 8.0
+SIMILAR_PROB_BAND: float = 0.08
+SIMILAR_COST_BAND_BPS: float = 80.0
+SIMILAR_SPREAD_BAND_BPS: float = 8.0
+
+# Live recalibration protection.
+REQUIRE_VALID_LIVE_RECALIBRATION_PROFILE: bool = True
+LIVE_RECALIBRATION_PROJECTED_GROSS_MIN_BPS: float = 1.0
+
+# Edge-aware entry execution.
+USE_EDGE_AWARE_ENTRY_EXECUTION: bool = True
+MARKET_ENTRY_MIN_PROJECTED_NET_BPS: float = 120.0
+MAKER_OR_SKIP_MIN_PROJECTED_NET_BPS: float = 35.0
+MAKER_ENTRY_TIMEOUT_SEC: float = 8.0
+
+# Profit lock and stale-position review.
+ENABLE_PROFIT_LOCK: bool = True
+PROFIT_LOCK_BUFFER_BPS: float = 2.0
+PROFIT_LOCK_SELL_FRACTION: float = 1.0
+ENABLE_STALE_POSITION_REVIEW: bool = True
+STALE_POSITION_MIN_SCORE_TO_KEEP: float = 35.0
+STALE_POSITION_MIN_PROB_TO_KEEP: float = 0.45
+STALE_POSITION_MIN_EV_TO_KEEP_BPS: float = 0.0
 
 # Minimum product history required before calibration.
 CALIB_MIN_PRODUCT_SAMPLES: int = 25
@@ -1403,7 +1436,7 @@ class MarketLogger:
         with open(self.path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                "ts", "dt_mst", "product_id", "bid", "ask", "mid", "spread_bps",
+                "ts", "dt_mst", "product_id", "source", "bid", "ask", "mid", "spread_bps",
                 "exposures_usd", "position_qty", "avg_entry_price",
                 "anchored_vwap", "fair_value", "sigma_bps", "weekly_bias",
                 "state", "cash_usd", "equity_usd",
@@ -1425,6 +1458,7 @@ class MarketLogger:
         *,
         ts: float,
         product_id: str,
+        source: str = "unknown",
         bid: float,
         ask: float,
         mid: float,
@@ -1476,7 +1510,7 @@ class MarketLogger:
             w = csv.writer(f)
             dt_mst = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
             w.writerow([
-                f"{ts:.6f}", dt_mst, product_id, f"{bid:.10f}", f"{ask:.10f}", f"{mid:.10f}", f"{spread_bps:.6f}",
+                f"{ts:.6f}", dt_mst, product_id, source, f"{bid:.10f}", f"{ask:.10f}", f"{mid:.10f}", f"{spread_bps:.6f}",
                 f"{exposures_usd:.10f}", f"{position_qty:.10f}",
                 "" if avg_entry_price is None else f"{avg_entry_price:.10f}",
                 "" if anchored_vwap is None else f"{anchored_vwap:.10f}",
@@ -2102,6 +2136,12 @@ class CalibrationObservation:
     time_to_min_profit_minutes: Optional[float] = None
     forward_window_minutes: Optional[float] = None
     projected_forward_gain_bps: float = 0.0
+    selected_forward_window_minutes: float = 0.0
+    post_profit_max_favorable_bps: float = 0.0
+    post_profit_extra_gain_bps: float = 0.0
+    adverse_before_profit_bps: float = 0.0
+    survived_to_profit: bool = False
+    accepted_by_calibration: bool = False
 
 
 @dataclass
@@ -2128,8 +2168,66 @@ class ProductCalibrationProfile:
     calibrated_projected_net_bps: float = 0.0
     calibrated_time_to_min_profit_minutes: float = 0.0
     calibrated_forward_window_minutes: float = 0.0
+    calibrated_selected_window_minutes: float = 0.0
+    calibrated_post_profit_breathing_minutes: float = 0.0
+    calibrated_post_profit_extra_gain_bps: float = 0.0
+    calibrated_max_adverse_before_profit_bps: float = 0.0
+    calibrated_expected_bps_per_minute: float = 0.0
 
     reason: str = "not_calibrated"
+
+
+class CandidateReplayLogger:
+    """Persist walk-forward candidates so calibration decisions are inspectable."""
+
+    columns = [
+        "ts", "dt_mst", "product_id", "timeframe",
+        "score", "probability", "expected_net_edge_bps",
+        "target_bps", "cost_bps", "spread_bps",
+        "selected_forward_window_minutes",
+        "max_favorable_bps", "max_adverse_bps",
+        "adverse_before_profit_bps", "time_to_min_profit_minutes",
+        "forward_window_minutes", "post_profit_max_favorable_bps",
+        "post_profit_extra_gain_bps", "reached_min_profit",
+        "survived_to_profit", "accepted_by_calibration",
+    ]
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._ensure_header()
+
+    def _ensure_header(self) -> None:
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, newline="", encoding="utf-8") as f:
+                    if next(csv.reader(f), []) == self.columns:
+                        return
+            except (OSError, csv.Error):
+                pass
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(self.columns)
+
+    def log_observations(self, observations: List[CalibrationObservation]) -> None:
+        if not observations:
+            return
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for o in observations:
+                dt_mst = datetime.fromtimestamp(float(o.ts), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                w.writerow([
+                    int(o.ts), dt_mst, o.product_id, o.timeframe,
+                    f"{o.score:.6f}", f"{o.probability:.6f}",
+                    f"{o.expected_net_edge_bps:.6f}", f"{o.target_bps:.6f}",
+                    f"{o.cost_bps:.6f}", f"{o.spread_bps:.6f}",
+                    f"{o.selected_forward_window_minutes:.6f}",
+                    f"{o.max_favorable_bps:.6f}", f"{o.max_adverse_bps:.6f}",
+                    f"{o.adverse_before_profit_bps:.6f}",
+                    "" if o.time_to_min_profit_minutes is None else f"{o.time_to_min_profit_minutes:.6f}",
+                    "" if o.forward_window_minutes is None else f"{o.forward_window_minutes:.6f}",
+                    f"{o.post_profit_max_favorable_bps:.6f}",
+                    f"{o.post_profit_extra_gain_bps:.6f}", bool(o.reached_min_profit),
+                    bool(o.survived_to_profit), bool(o.accepted_by_calibration),
+                ])
 
 
 class CalibrationLogger:
@@ -2150,6 +2248,11 @@ class CalibrationLogger:
             "calibrated_projected_net_bps",
             "calibrated_time_to_min_profit_minutes",
             "calibrated_forward_window_minutes",
+            "calibrated_selected_window_minutes",
+            "calibrated_post_profit_breathing_minutes",
+            "calibrated_post_profit_extra_gain_bps",
+            "calibrated_max_adverse_before_profit_bps",
+            "calibrated_expected_bps_per_minute",
             "reason",
         ]
         if os.path.exists(self.path):
@@ -2187,6 +2290,11 @@ class CalibrationLogger:
                 f"{profile.calibrated_projected_net_bps:.6f}",
                 f"{profile.calibrated_time_to_min_profit_minutes:.6f}",
                 f"{profile.calibrated_forward_window_minutes:.6f}",
+                f"{profile.calibrated_selected_window_minutes:.6f}",
+                f"{profile.calibrated_post_profit_breathing_minutes:.6f}",
+                f"{profile.calibrated_post_profit_extra_gain_bps:.6f}",
+                f"{profile.calibrated_max_adverse_before_profit_bps:.6f}",
+                f"{profile.calibrated_expected_bps_per_minute:.6f}",
                 profile.reason,
             ])
 
@@ -2238,6 +2346,10 @@ class PositionTargetsLogger:
         "distance_to_min_profit_bps",
         "distance_to_scalp_bps",
         "distance_to_core_bps",
+        "profit_lock_armed", "profit_lock_price",
+        "min_profitable_exit_price_from_lot",
+        "calibrated_forward_window_minutes",
+        "calibrated_post_profit_breathing_minutes",
         "exit_plan_note",
     ]
 
@@ -2275,6 +2387,11 @@ class PositionTargetsLogger:
                     "" if r.get("distance_to_min_profit_bps") is None else f"{float(r.get('distance_to_min_profit_bps')):.6f}",
                     "" if r.get("distance_to_scalp_bps") is None else f"{float(r.get('distance_to_scalp_bps')):.6f}",
                     "" if r.get("distance_to_core_bps") is None else f"{float(r.get('distance_to_core_bps')):.6f}",
+                    bool(r.get("profit_lock_armed", False)),
+                    "" if r.get("profit_lock_price") is None else f"{float(r.get('profit_lock_price')):.10f}",
+                    "" if r.get("min_profitable_exit_price_from_lot") is None else f"{float(r.get('min_profitable_exit_price_from_lot')):.10f}",
+                    "" if r.get("calibrated_forward_window_minutes") is None else f"{float(r.get('calibrated_forward_window_minutes')):.6f}",
+                    "" if r.get("calibrated_post_profit_breathing_minutes") is None else f"{float(r.get('calibrated_post_profit_breathing_minutes')):.6f}",
                     r.get("exit_plan_note", ""),
                 ])
         os.replace(tmp, self.path)
@@ -3491,6 +3608,7 @@ class TradingBot:
         self.clog = CalibrationLogger(CALIBRATION_CSV_PATH)
         self.micro_history_log = MicroHistoryLogger(MICRO_HISTORY_CSV_PATH)
         self.position_targets_log = PositionTargetsLogger(POSITION_TARGETS_CSV_PATH)
+        self.candidate_replay_log = CandidateReplayLogger(CANDIDATE_REPLAY_CSV_PATH)
         self.mlog = MarketLogger(MARKET_CSV_PATH)
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
@@ -4094,7 +4212,7 @@ class TradingBot:
         if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
             raise RuntimeError("Coinbase fee tier has not been loaded; refusing to estimate entry fees.")
 
-        mode = str(ENTRY_EXECUTION_MODE).upper().strip()
+        mode = str(execution_mode or ENTRY_EXECUTION_MODE).upper().strip()
         if mode in ("MARKET", "LIMIT_THEN_MARKET"):
             return float(self.current_taker_fee_bps)
         return float(self.current_maker_fee_bps)
@@ -4558,56 +4676,63 @@ class TradingBot:
         cost_bps: float,
         min_net_gain_bps: float,
         bar_minutes: float,
-    ) -> Tuple[float, float, bool, bool, float, float, float, Optional[int], Optional[float], float]:
-        """
-        Look forward after a historical signal and determine what happened.
-
-        Also measure how many bars/minutes it took to reach minimum profit and
-        the total forward window represented by the replay.
-        """
+    ) -> Tuple[
+        float, float, bool, bool, float, float, float,
+        Optional[int], Optional[float], float,
+        float, float, float, bool,
+    ]:
+        """Measure profitability, timing, continuation, and pre-profit adversity."""
         if entry_price <= 0 or not future_candles:
-            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0, None, None, 0.0
+            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0, None, None, 0.0, 0.0, 0.0, 0.0, False
 
-        highs = [float(c.high) for c in future_candles if float(c.high) > 0]
-        lows = [float(c.low) for c in future_candles if float(c.low) > 0]
-
-        if not highs or not lows:
-            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0, None, None, 0.0
-
-        max_high = max(highs)
-        min_low = min(lows)
-        max_favorable_bps = ((max_high / entry_price) - 1.0) * 10000.0
-        max_adverse_bps = ((entry_price / min_low) - 1.0) * 10000.0
         required_profit_bps = float(cost_bps) + float(min_net_gain_bps)
-        reached_min_profit = max_favorable_bps >= required_profit_bps
+        max_high = 0.0
+        min_low = float("inf")
+        max_favorable_bps = 0.0
+        max_adverse_bps = 0.0
+        time_to_min_profit_bars: Optional[int] = None
+        time_to_min_profit_minutes: Optional[float] = None
+        adverse_before_profit_bps = 0.0
+        low_before_profit = entry_price
+        profit_hit_index: Optional[int] = None
+
+        for idx, candle in enumerate(future_candles, start=1):
+            high = float(candle.high)
+            low = float(candle.low)
+            if high <= 0 or low <= 0:
+                continue
+            max_high = max(max_high, high)
+            min_low = min(min_low, low)
+            max_favorable_bps = max(max_favorable_bps, ((max_high / entry_price) - 1.0) * 10000.0)
+            max_adverse_bps = max(max_adverse_bps, ((entry_price / min_low) - 1.0) * 10000.0)
+            if time_to_min_profit_bars is None:
+                low_before_profit = min(low_before_profit, low)
+                if ((high / entry_price) - 1.0) * 10000.0 >= required_profit_bps:
+                    time_to_min_profit_bars = idx
+                    time_to_min_profit_minutes = float(idx) * float(bar_minutes)
+                    profit_hit_index = idx - 1
+                    adverse_before_profit_bps = ((entry_price / low_before_profit) - 1.0) * 10000.0
+
+        reached_min_profit = time_to_min_profit_bars is not None
         reached_target = max_favorable_bps >= max(float(target_bps), required_profit_bps)
         win_bps = max(0.0, max_favorable_bps - float(cost_bps))
         loss_bps = max(0.0, max_adverse_bps)
-
-        time_to_min_profit_bars = None
-        time_to_min_profit_minutes = None
-        if reached_min_profit:
-            for idx, candle in enumerate(future_candles, start=1):
-                if float(candle.high) <= 0:
-                    continue
-                move_bps = ((float(candle.high) / entry_price) - 1.0) * 10000.0
-                if move_bps >= required_profit_bps:
-                    time_to_min_profit_bars = int(idx)
-                    time_to_min_profit_minutes = float(idx) * float(bar_minutes)
-                    break
-
         forward_window_minutes = float(len(future_candles)) * float(bar_minutes)
+        post_profit_max_favorable_bps = 0.0
+        post_profit_extra_gain_bps = 0.0
+        if reached_min_profit and profit_hit_index is not None:
+            post_profit_highs = [float(c.high) for c in future_candles[profit_hit_index:] if float(c.high) > 0]
+            if post_profit_highs:
+                post_profit_max_favorable_bps = ((max(post_profit_highs) / entry_price) - 1.0) * 10000.0
+                post_profit_extra_gain_bps = max(0.0, post_profit_max_favorable_bps - required_profit_bps)
+        survived_to_profit = bool(reached_min_profit and adverse_before_profit_bps <= MAX_ADVERSE_BEFORE_PROFIT_BPS)
         return (
-            float(max_favorable_bps),
-            float(max_adverse_bps),
-            bool(reached_min_profit),
-            bool(reached_target),
-            float(win_bps),
-            float(loss_bps),
-            0.0,
-            time_to_min_profit_bars,
-            time_to_min_profit_minutes,
-            forward_window_minutes,
+            float(max_favorable_bps), float(max_adverse_bps), bool(reached_min_profit),
+            bool(reached_target), float(win_bps), float(loss_bps), 0.0,
+            time_to_min_profit_bars, time_to_min_profit_minutes,
+            float(forward_window_minutes), float(post_profit_max_favorable_bps),
+            float(post_profit_extra_gain_bps), float(adverse_before_profit_bps),
+            bool(survived_to_profit),
         )
 
     def _walk_forward_observations(
@@ -4660,6 +4785,10 @@ class TradingBot:
                 time_to_min_profit_bars,
                 time_to_min_profit_minutes,
                 forward_window_minutes,
+                post_profit_max_favorable_bps,
+                post_profit_extra_gain_bps,
+                adverse_before_profit_bps,
+                survived_to_profit,
             ) = self._evaluate_forward_outcome(
                 entry_price=entry_price,
                 future_candles=future,
@@ -4690,7 +4819,101 @@ class TradingBot:
                 time_to_min_profit_minutes=time_to_min_profit_minutes,
                 forward_window_minutes=forward_window_minutes,
                 projected_forward_gain_bps=float(max_favorable_bps),
+                selected_forward_window_minutes=float(forward_window_minutes),
+                post_profit_max_favorable_bps=float(post_profit_max_favorable_bps),
+                post_profit_extra_gain_bps=float(post_profit_extra_gain_bps),
+                adverse_before_profit_bps=float(adverse_before_profit_bps),
+                survived_to_profit=bool(survived_to_profit),
             ))
+        return observations
+
+    def _walk_forward_observations_multi_window(
+        self,
+        *,
+        product_id: str,
+        candles: List[Candle],
+        weekly_candles: Optional[List[Candle]],
+        timeframe: str,
+        min_prefix: int,
+        forward_windows: List[int],
+        spread_bps: float,
+    ) -> List[CalibrationObservation]:
+        """Replay each signal across several horizons and retain its best survivable path."""
+        observations: List[CalibrationObservation] = []
+        if not candles or not forward_windows:
+            return observations
+        windows = sorted({int(x) for x in forward_windows if int(x) > 0})
+        if not windows:
+            return observations
+        max_forward = max(windows)
+        if len(candles) < min_prefix + max_forward + 1:
+            return observations
+
+        for i in range(min_prefix, len(candles) - max_forward):
+            prefix = candles[:i]
+            entry_price = float(prefix[-1].close) if prefix else 0.0
+            if entry_price <= 0:
+                continue
+            replay_ts = int(prefix[-1].ts)
+            available_weekly = [c for c in weekly_candles if int(c.ts) <= replay_ts] if weekly_candles else None
+            try:
+                signal = self._build_historical_signal_from_candles(
+                    product_id=product_id, candles=prefix,
+                    weekly_candles=available_weekly, spread_bps=spread_bps,
+                )
+            except Exception:
+                continue
+            bar_minutes = 1.0 if timeframe in ("day_1m", "live_rolling_1m") else 15.0
+            best_obs: Optional[CalibrationObservation] = None
+            best_quality = -float("inf")
+            for forward_bars in windows:
+                future = candles[i:i + forward_bars]
+                if len(future) < forward_bars:
+                    continue
+                (
+                    max_favorable_bps, max_adverse_bps, reached_min_profit,
+                    reached_target, win_bps, loss_bps, _, time_to_min_profit_bars,
+                    time_to_min_profit_minutes, forward_window_minutes,
+                    post_profit_max_favorable_bps, post_profit_extra_gain_bps,
+                    adverse_before_profit_bps, survived_to_profit,
+                ) = self._evaluate_forward_outcome(
+                    entry_price=entry_price, future_candles=future,
+                    target_bps=signal.target_bps, cost_bps=signal.cost_bps,
+                    min_net_gain_bps=MIN_NET_GAIN_AFTER_FEES_BPS,
+                    bar_minutes=bar_minutes,
+                )
+                expected_value_bps = win_bps if reached_min_profit else -loss_bps
+                time_penalty = 0.0 if time_to_min_profit_minutes is None else max(
+                    0.0, time_to_min_profit_minutes - PREFERRED_TIME_TO_MIN_PROFIT_MINUTES
+                ) * 0.05
+                quality = (
+                    expected_value_bps + post_profit_extra_gain_bps * 0.35
+                    - adverse_before_profit_bps * 0.45 - time_penalty
+                    - (0.0 if survived_to_profit else 1000.0)
+                )
+                obs = CalibrationObservation(
+                    product_id=product_id, timeframe=timeframe, ts=replay_ts,
+                    score=float(signal.score), probability=float(signal.estimated_prob_up),
+                    expected_net_edge_bps=float(signal.expected_net_edge_bps),
+                    target_bps=float(signal.target_bps), cost_bps=float(signal.cost_bps),
+                    spread_bps=float(spread_bps), max_favorable_bps=float(max_favorable_bps),
+                    max_adverse_bps=float(max_adverse_bps), reached_min_profit=bool(reached_min_profit),
+                    reached_target=bool(reached_target), expected_value_bps=float(expected_value_bps),
+                    win_bps=float(win_bps), loss_bps=float(loss_bps),
+                    time_to_min_profit_bars=time_to_min_profit_bars,
+                    time_to_min_profit_minutes=time_to_min_profit_minutes,
+                    forward_window_minutes=forward_window_minutes,
+                    projected_forward_gain_bps=float(max_favorable_bps),
+                    selected_forward_window_minutes=float(forward_window_minutes),
+                    post_profit_max_favorable_bps=float(post_profit_max_favorable_bps),
+                    post_profit_extra_gain_bps=float(post_profit_extra_gain_bps),
+                    adverse_before_profit_bps=float(adverse_before_profit_bps),
+                    survived_to_profit=bool(survived_to_profit),
+                )
+                if quality > best_quality:
+                    best_quality, best_obs = quality, obs
+            if best_obs is not None:
+                observations.append(best_obs)
         return observations
 
     def _win_rate(self, observations: List[CalibrationObservation]) -> float:
@@ -4759,44 +4982,23 @@ class TradingBot:
     def _projection_stats_from_observations(
         self,
         observations: List[CalibrationObservation],
-    ) -> Tuple[float, float, float]:
-        """Return median gross movement, time-to-profit, and forward window.
-
-        Winning observations are preferred because this projection describes
-        how far and how fast a similar setup usually moves when it works.
-        """
+    ) -> Tuple[float, float, float, float, float, float]:
+        """Return gross, timing, selected-window, continuation, and adversity medians."""
         if not observations:
-            return 0.0, 0.0, 0.0
-
-        winners = [o for o in observations if o.reached_min_profit]
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        winners = [o for o in observations if o.reached_min_profit and o.survived_to_profit]
         source = winners if winners else observations
-        favorable = [
-            float(o.max_favorable_bps)
-            for o in source
-            if o.max_favorable_bps is not None
-            and np.isfinite(float(o.max_favorable_bps))
-        ]
-        times = [
-            float(o.time_to_min_profit_minutes)
-            for o in winners
-            if o.time_to_min_profit_minutes is not None
-            and np.isfinite(float(o.time_to_min_profit_minutes))
-        ]
-        windows = [
-            float(o.forward_window_minutes)
-            for o in source
-            if o.forward_window_minutes is not None
-            and np.isfinite(float(o.forward_window_minutes))
-        ]
-
-        projected_gross_bps = float(np.median(favorable)) if favorable else 0.0
-        median_time_to_min_profit_minutes = float(np.median(times)) if times else 0.0
-        median_forward_window_minutes = float(np.median(windows)) if windows else 0.0
-        return (
-            projected_gross_bps,
-            median_time_to_min_profit_minutes,
-            median_forward_window_minutes,
-        )
+        def finite(values: List[float]) -> List[float]:
+            return [float(v) for v in values if v is not None and np.isfinite(float(v))]
+        favorable = finite([o.max_favorable_bps for o in source])
+        times = finite([o.time_to_min_profit_minutes for o in winners])
+        windows = finite([o.forward_window_minutes for o in source])
+        selected_windows = finite([o.selected_forward_window_minutes for o in source])
+        extra = finite([o.post_profit_extra_gain_bps for o in source])
+        adverse = finite([o.adverse_before_profit_bps for o in source])
+        return tuple(float(np.median(v)) if v else 0.0 for v in (
+            favorable, times, windows, selected_windows, extra, adverse,
+        ))
 
     def _uncalibrated_profile(
         self,
@@ -4893,15 +5095,35 @@ class TradingBot:
                     and float(o.probability) >= float(prob_threshold)
                 ]
 
-                if len(selected) < CALIB_EXACT_MIN_SAMPLES:
+                if selected:
+                    reference_cost = float(np.median([o.cost_bps for o in selected]))
+                    reference_spread = float(np.median([o.spread_bps for o in selected]))
+                    similar_selected = [
+                        o for o in selected
+                        if abs(float(o.score) - float(score_threshold)) <= SIMILAR_SCORE_BAND
+                        and abs(float(o.probability) - float(prob_threshold)) <= SIMILAR_PROB_BAND
+                        and abs(float(o.cost_bps) - reference_cost) <= SIMILAR_COST_BAND_BPS
+                        and abs(float(o.spread_bps) - reference_spread) <= SIMILAR_SPREAD_BAND_BPS
+                    ]
+                    if len(similar_selected) >= CALIB_EXACT_MIN_SAMPLES:
+                        selected = similar_selected
+
+                selected_for_stats = [
+                    o for o in selected
+                    if (not o.reached_min_profit) or o.survived_to_profit
+                ]
+                if len(selected_for_stats) < CALIB_EXACT_MIN_SAMPLES:
                     continue
 
-                win_rate, avg_win, avg_loss, ev, n = self._observation_ev_stats(selected)
+                win_rate, avg_win, avg_loss, ev, n = self._observation_ev_stats(selected_for_stats)
                 (
                     projected_gross_bps,
                     median_time_to_min_profit,
                     median_forward_window,
-                ) = self._projection_stats_from_observations(selected)
+                    median_selected_window,
+                    median_post_profit_extra_gain,
+                    median_adverse_before_profit,
+                ) = self._projection_stats_from_observations(selected_for_stats)
 
                 if win_rate < CALIB_MIN_WIN_RATE:
                     continue
@@ -4917,10 +5139,13 @@ class TradingBot:
                 opportunity_bonus = min(10.0, n / 25.0)
                 quality_score = (
                     ev * 1.00
-                    + win_rate * 10.0
+                    + win_rate * 12.0
                     + opportunity_bonus
-                    - float(score_threshold) * 0.015
-                    - float(prob_threshold) * 1.50
+                    + median_post_profit_extra_gain * 0.20
+                    - median_adverse_before_profit * 0.25
+                    - max(0.0, median_time_to_min_profit - PREFERRED_TIME_TO_MIN_PROFIT_MINUTES) * 0.05
+                    - float(score_threshold) * 0.010
+                    - float(prob_threshold) * 1.00
                 )
 
                 candidate = {
@@ -4933,6 +5158,10 @@ class TradingBot:
                     "projected_gross_bps": float(projected_gross_bps),
                     "median_time_to_min_profit": float(median_time_to_min_profit),
                     "median_forward_window": float(median_forward_window),
+                    "median_selected_window": float(median_selected_window),
+                    "median_post_profit_extra_gain": float(median_post_profit_extra_gain),
+                    "median_adverse_before_profit": float(median_adverse_before_profit),
+                    "selected_observations": selected_for_stats,
                     "n": int(n),
                     "quality_score": float(quality_score),
                 }
@@ -4941,6 +5170,8 @@ class TradingBot:
                     best = candidate
 
         if best is not None:
+            for observation in best["selected_observations"]:
+                observation.accepted_by_calibration = True
             return ProductCalibrationProfile(
                 product_id=product_id,
                 is_calibrated=True,
@@ -4960,6 +5191,13 @@ class TradingBot:
                 calibrated_projected_net_bps=float(best["ev"]),
                 calibrated_time_to_min_profit_minutes=float(best["median_time_to_min_profit"]),
                 calibrated_forward_window_minutes=float(best["median_forward_window"]),
+                calibrated_selected_window_minutes=float(best["median_selected_window"]),
+                calibrated_post_profit_breathing_minutes=float(CALIB_POST_PROFIT_BREATHING_MINUTES),
+                calibrated_post_profit_extra_gain_bps=float(best["median_post_profit_extra_gain"]),
+                calibrated_max_adverse_before_profit_bps=float(best["median_adverse_before_profit"]),
+                calibrated_expected_bps_per_minute=(
+                    float(best["ev"]) / max(1.0, float(best["median_time_to_min_profit"] or 1.0))
+                ),
                 reason=(
                     f"exact_threshold product={product_id} "
                     f"score>={best['score_threshold']:.6f} "
@@ -4968,7 +5206,10 @@ class TradingBot:
                     f"win_rate={best['win_rate']:.6f} "
                     f"ev={best['ev']:.6f} "
                     f"avg_win={best['avg_win']:.6f} "
-                    f"avg_loss={best['avg_loss']:.6f}"
+                    f"avg_loss={best['avg_loss']:.6f} "
+                    f"window={best['median_selected_window']:.1f}m "
+                    f"post_profit_extra={best['median_post_profit_extra_gain']:.2f} "
+                    f"adverse_before_profit={best['median_adverse_before_profit']:.2f}"
                 ),
             )
 
@@ -5052,7 +5293,7 @@ class TradingBot:
         """Choose scalp/core pullbacks from recent target-arm simulations."""
         if not profile.is_calibrated:
             return profile
-        required = CALIB_MIN_PREFIX_CANDLES_1M + CALIB_FORWARD_MINUTES_1M + 1
+        required = CALIB_MIN_PREFIX_CANDLES_1M + max(CALIB_FORWARD_WINDOWS_1M) + 1
         if not candles or len(candles) < required:
             return profile
         scalp_results: Dict[float, List[float]] = {
@@ -5061,10 +5302,10 @@ class TradingBot:
         core_results: Dict[float, List[float]] = {
             pullback: [] for pullback in CALIB_CORE_PULLBACK_CANDIDATES
         }
-        end_i = len(candles) - CALIB_FORWARD_MINUTES_1M
+        end_i = len(candles) - max(CALIB_FORWARD_WINDOWS_1M)
         for i in range(CALIB_MIN_PREFIX_CANDLES_1M, end_i):
             prefix = candles[:i]
-            future = candles[i:i + CALIB_FORWARD_MINUTES_1M]
+            future = candles[i:i + max(CALIB_FORWARD_WINDOWS_1M)]
             entry_price = float(prefix[-1].close)
             if entry_price <= 0:
                 continue
@@ -5081,10 +5322,23 @@ class TradingBot:
                 )
             except Exception:
                 continue
-            if (
-                signal.score < profile.min_score
-                or signal.estimated_prob_up < profile.min_probability
-            ):
+            if not profile.is_calibrated:
+                continue
+            if signal.score < profile.min_score:
+                continue
+            if signal.estimated_prob_up < profile.min_probability:
+                continue
+            if signal.expected_net_edge_bps < profile.min_expected_value_bps:
+                continue
+            outcome = self._evaluate_forward_outcome(
+                entry_price=entry_price,
+                future_candles=future,
+                target_bps=signal.target_bps,
+                cost_bps=signal.cost_bps,
+                min_net_gain_bps=MIN_NET_GAIN_AFTER_FEES_BPS,
+                bar_minutes=1.0,
+            )
+            if not outcome[2] or not outcome[-1]:
                 continue
             scalp_target_bps = max(
                 signal.cost_bps + MIN_NET_GAIN_AFTER_FEES_BPS,
@@ -5179,22 +5433,22 @@ class TradingBot:
                     if tob and tob.spread_bps > 0
                     else float(MAX_SPREAD_BPS)
                 )
-                day_obs = self._walk_forward_observations(
+                day_obs = self._walk_forward_observations_multi_window(
                     product_id=product,
                     candles=day_candles,
                     weekly_candles=week_candles,
                     timeframe="day_1m",
                     min_prefix=CALIB_MIN_PREFIX_CANDLES_1M,
-                    forward_bars=CALIB_FORWARD_MINUTES_1M,
+                    forward_windows=CALIB_FORWARD_WINDOWS_1M,
                     spread_bps=spread_bps,
                 )
-                week_obs = self._walk_forward_observations(
+                week_obs = self._walk_forward_observations_multi_window(
                     product_id=product,
                     candles=week_candles,
                     weekly_candles=week_candles,
                     timeframe="week_15m",
                     min_prefix=CALIB_MIN_PREFIX_CANDLES_15M,
-                    forward_bars=CALIB_FORWARD_BARS_15M,
+                    forward_windows=CALIB_FORWARD_WINDOWS_15M,
                     spread_bps=spread_bps,
                 ) if week_candles else []
                 log(
@@ -5207,6 +5461,10 @@ class TradingBot:
                     day_obs=day_obs,
                     week_obs=week_obs,
                 )
+                try:
+                    self.candidate_replay_log.log_observations(day_obs + week_obs)
+                except Exception as replay_error:
+                    log(f"[candidate-replay] failed to log startup replay for {product}: {replay_error}")
                 profile = self._calibrate_sell_pullbacks(
                     product_id=product,
                     candles=day_candles,
@@ -5244,7 +5502,7 @@ class TradingBot:
             live_rows = self.live_1m[product].export_rows(product)
             minimum_rows = max(
                 LIVE_RECALIBRATION_MIN_ROWS,
-                CALIB_MIN_PREFIX_CANDLES_1M + CALIB_FORWARD_MINUTES_1M,
+                CALIB_MIN_PREFIX_CANDLES_1M + max(CALIB_FORWARD_WINDOWS_1M),
             )
             if len(live_rows) < minimum_rows:
                 continue
@@ -5268,17 +5526,17 @@ class TradingBot:
                 if tob and tob.spread_bps > 0
                 else float(MAX_SPREAD_BPS)
             )
-            forward_bars = min(
-                CALIB_FORWARD_MINUTES_1M,
-                max(5, len(live_candles) // 4),
-            )
-            day_obs = self._walk_forward_observations(
+            forward_windows = [
+                window for window in CALIB_FORWARD_WINDOWS_1M
+                if window <= max(5, len(live_candles) // 3)
+            ]
+            day_obs = self._walk_forward_observations_multi_window(
                 product_id=product,
                 candles=live_candles,
                 weekly_candles=live_candles,
                 timeframe="live_rolling_1m",
                 min_prefix=CALIB_MIN_PREFIX_CANDLES_1M,
-                forward_bars=forward_bars,
+                forward_windows=forward_windows,
                 spread_bps=spread_bps,
             )
             if len(day_obs) < CALIB_MIN_PRODUCT_SAMPLES:
@@ -5288,9 +5546,22 @@ class TradingBot:
                 day_obs=day_obs,
                 week_obs=[],
             )
-            if not new_profile.is_calibrated:
-                self.calibration_profiles[product] = new_profile
-                self.clog.log_profile(new_profile)
+            try:
+                self.candidate_replay_log.log_observations(day_obs)
+            except Exception as replay_error:
+                log(f"[candidate-replay] failed to log live replay for {product}: {replay_error}")
+
+            if REQUIRE_VALID_LIVE_RECALIBRATION_PROFILE:
+                if not new_profile.is_calibrated:
+                    log(f"[calibration] skip live smoothing for {product}: new profile not calibrated status={new_profile.calibration_status}")
+                    continue
+                if new_profile.calibrated_projected_gross_bps < LIVE_RECALIBRATION_PROJECTED_GROSS_MIN_BPS:
+                    log(f"[calibration] skip live smoothing for {product}: projected gross too low {new_profile.calibrated_projected_gross_bps:.3f}")
+                    continue
+                if new_profile.min_score <= 0 or new_profile.min_probability <= 0:
+                    log(f"[calibration] skip live smoothing for {product}: invalid threshold")
+                    continue
+            elif not new_profile.is_calibrated:
                 continue
 
             if not old_profile.is_calibrated:
@@ -5298,48 +5569,61 @@ class TradingBot:
                 self.clog.log_profile(new_profile)
                 continue
 
-            # Smooth exact product-specific targets only after both the previous
-            # and current recalibrations have produced valid thresholds.
-            old_profile.min_score = (
-                float(old_profile.min_score) * 0.80
-                + float(new_profile.min_score) * 0.20
-            )
-            old_profile.min_probability = (
-                float(old_profile.min_probability) * 0.80
-                + float(new_profile.min_probability) * 0.20
-            )
-            old_profile.min_expected_value_bps = (
-                float(old_profile.min_expected_value_bps) * 0.80
-                + float(new_profile.min_expected_value_bps) * 0.20
-            )
+            # Preserve startup calibration and blend only a validated live profile.
+            old_profile.min_score = old_profile.min_score * 0.85 + new_profile.min_score * 0.15
+            old_profile.min_probability = old_profile.min_probability * 0.85 + new_profile.min_probability * 0.15
+            old_profile.min_expected_value_bps = old_profile.min_expected_value_bps * 0.85 + new_profile.min_expected_value_bps * 0.15
             old_profile.day_sample_count = new_profile.day_sample_count
             old_profile.day_win_rate = new_profile.day_win_rate
             old_profile.blended_win_rate = new_profile.blended_win_rate
             old_profile.avg_win_bps = new_profile.avg_win_bps
             old_profile.avg_loss_bps = new_profile.avg_loss_bps
             old_profile.expected_value_bps = new_profile.expected_value_bps
-            old_profile.calibrated_projected_gross_bps = (
-                float(old_profile.calibrated_projected_gross_bps) * 0.80
-                + float(new_profile.calibrated_projected_gross_bps) * 0.20
-            )
-            old_profile.calibrated_projected_net_bps = (
-                float(old_profile.calibrated_projected_net_bps) * 0.80
-                + float(new_profile.calibrated_projected_net_bps) * 0.20
-            )
-            old_profile.calibrated_time_to_min_profit_minutes = (
-                float(old_profile.calibrated_time_to_min_profit_minutes) * 0.80
-                + float(new_profile.calibrated_time_to_min_profit_minutes) * 0.20
-            )
-            old_profile.calibrated_forward_window_minutes = (
-                float(old_profile.calibrated_forward_window_minutes) * 0.80
-                + float(new_profile.calibrated_forward_window_minutes) * 0.20
-            )
+            for field_name in (
+                "calibrated_projected_gross_bps",
+                "calibrated_projected_net_bps",
+                "calibrated_time_to_min_profit_minutes",
+                "calibrated_forward_window_minutes",
+                "calibrated_selected_window_minutes",
+                "calibrated_post_profit_extra_gain_bps",
+                "calibrated_max_adverse_before_profit_bps",
+                "calibrated_expected_bps_per_minute",
+            ):
+                old_value = float(getattr(old_profile, field_name, 0.0))
+                new_value = float(getattr(new_profile, field_name, 0.0))
+                setattr(old_profile, field_name, old_value * 0.90 + new_value * 0.10)
+            old_profile.calibrated_post_profit_breathing_minutes = float(CALIB_POST_PROFIT_BREATHING_MINUTES)
+            old_profile.calibration_status = "smoothed_valid_live_recalibration"
             old_profile.is_calibrated = True
-            old_profile.calibration_status = "exact_threshold"
-            old_profile.reason = "smoothed_live_exact_threshold_recalibration"
+            old_profile.reason = (
+                f"smoothed_valid_live_recalibration from={new_profile.calibration_status} "
+                f"new_reason={new_profile.reason}"
+            )
             self.calibration_profiles[product] = old_profile
             self.clog.log_profile(old_profile)
 
+
+    def _latest_live_signal_for_product(self, product_id: str) -> Optional[LiveSignal]:
+        tob = self.tob.get(product_id)
+        series = self.live_1m.get(product_id)
+        if not tob or tob.mid <= 0 or series is None:
+            return None
+        minute_candles = list(series.candles)
+        if not minute_candles:
+            return None
+        levels_day = self.macro.get_levels(product_id, "day")
+        levels_week = self.macro.get_levels(product_id, "week")
+        weekly_bias = self.macro.compute_weekly_bias(product_id, tob.mid) if levels_week else None
+        return self._build_live_signal(
+            product_id=product_id,
+            mid=float(tob.mid),
+            spread_bps=float(tob.spread_bps),
+            levels_day=levels_day,
+            levels_week=levels_week,
+            minute_candles=minute_candles,
+            weekly_bias=weekly_bias,
+            sigma_bps=self._compute_sigma_bps_from_1m(product_id),
+        )
 
     def _build_live_signal(
         self,
@@ -5966,7 +6250,7 @@ class TradingBot:
             product_id=product_id,
             quote_usd=float(quote_usd),
             start_price=float(bid),
-            max_wait_sec=6.0,
+            max_wait_sec=MAKER_ENTRY_TIMEOUT_SEC,
             reprice_every_sec=2.0,
         )
 
@@ -6002,6 +6286,7 @@ class TradingBot:
         bid: float,
         ask: float,
         reason: str,
+        execution_mode: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
         """Execute a live buy and return only a Coinbase-confirmed fill."""
         mode = str(ENTRY_EXECUTION_MODE).upper().strip()
@@ -6024,7 +6309,7 @@ class TradingBot:
                     return fill
                 result = await self._live_buy_market(product_id=product_id, quote_usd=quote_usd)
             else:
-                raise RuntimeError(f"Invalid ENTRY_EXECUTION_MODE={ENTRY_EXECUTION_MODE}")
+                raise RuntimeError(f"Invalid live buy execution mode={mode}")
 
             fill = self._require_live_fill(result, product_id=product_id, side="BUY")
             if LOG_ORDER_ATTEMPTS:
@@ -7145,6 +7430,91 @@ class TradingBot:
                                 lot_meta["core_done"] = True
                                 lot_meta["core_armed"] = False
 
+                    if ENABLE_PROFIT_LOCK:
+                        min_exit_px = lot_meta.get("min_profitable_exit_price")
+                        if min_exit_px is None:
+                            try:
+                                min_exit_px = required_exit_price_for_net_gain(
+                                    effective_entry_price=avg_entry_price,
+                                    exit_fee_bps=self._exit_fee_bps_for_mode(),
+                                    est_slippage_bps=EST_SLIPPAGE_BPS,
+                                    est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                                    min_net_gain_bps=max(
+                                        MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                                        MIN_NET_GAIN_AFTER_FEES_BPS,
+                                    ),
+                                )
+                                lot_meta["min_profitable_exit_price"] = float(min_exit_px)
+                            except Exception:
+                                min_exit_px = None
+                        if min_exit_px is not None and bid >= float(min_exit_px):
+                            if not lot_meta.get("profit_lock_armed", False):
+                                lot_meta["profit_lock_armed"] = True
+                                lot_meta["profit_lock_price"] = float(min_exit_px)
+                                log(f"[profit-lock] {product_id} armed at {float(min_exit_px):.8f}")
+                        if lot_meta.get("profit_lock_armed", False):
+                            lock_price = float(lot_meta.get("profit_lock_price") or 0.0)
+                            trigger_px = lock_price * bps_to_mult(-PROFIT_LOCK_BUFFER_BPS)
+                            if lock_price > 0 and bid <= trigger_px and can_exit_net_positive(
+                                entry_price=avg_entry_price,
+                                exit_price=bid,
+                                taker_fee_bps=self._exit_fee_bps_for_mode(),
+                                est_slippage_bps=EST_SLIPPAGE_BPS,
+                                est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                                min_net_profit_bps=max(
+                                    MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                                    MIN_NET_GAIN_AFTER_FEES_BPS,
+                                ),
+                            ):
+                                sell_qty = max(sell_qty, position_qty * PROFIT_LOCK_SELL_FRACTION)
+                                exit_reason = f"profit_lock_trigger lock={lock_price:.8f} trigger={trigger_px:.8f}"
+                                exit_role = "profit_lock"
+
+                    pos_start = self.position_start_ts.get(product_id)
+                    age_sec = ts_now - float(pos_start) if pos_start is not None else 0.0
+                    if ENABLE_STALE_POSITION_REVIEW and age_sec > 0:
+                        calibrated_window = float(
+                            lot_meta.get("calibrated_forward_window_minutes")
+                            or lot_meta.get("calibrated_time_to_min_profit_minutes")
+                            or 0.0
+                        )
+                        breathing_minutes = float(
+                            lot_meta.get("calibrated_post_profit_breathing_minutes")
+                            or CALIB_POST_PROFIT_BREATHING_MINUTES
+                        )
+                        review_after_minutes = calibrated_window + breathing_minutes
+                        if review_after_minutes > 0 and age_sec / 60.0 >= review_after_minutes:
+                            try:
+                                current_signal = self._latest_live_signal_for_product(product_id)
+                            except Exception:
+                                current_signal = None
+                            keep_position = bool(
+                                current_signal is not None
+                                and current_signal.score >= STALE_POSITION_MIN_SCORE_TO_KEEP
+                                and current_signal.estimated_prob_up >= STALE_POSITION_MIN_PROB_TO_KEEP
+                                and current_signal.expected_net_edge_bps >= STALE_POSITION_MIN_EV_TO_KEEP_BPS
+                            )
+                            if not keep_position:
+                                if can_exit_net_positive(
+                                    entry_price=avg_entry_price,
+                                    exit_price=bid,
+                                    taker_fee_bps=self._exit_fee_bps_for_mode(),
+                                    est_slippage_bps=EST_SLIPPAGE_BPS,
+                                    est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                                    min_net_profit_bps=0.0,
+                                ):
+                                    sell_qty = max(sell_qty, position_qty)
+                                    exit_reason = (
+                                        f"stale_position_profitable_exit age_min={age_sec / 60.0:.1f} "
+                                        f"review_after={review_after_minutes:.1f}"
+                                    )
+                                    exit_role = "stale_position_review"
+                                else:
+                                    log(
+                                        f"[stale-review] {product_id} stale but not net-positive; holding "
+                                        f"age_min={age_sec / 60.0:.1f} review_after={review_after_minutes:.1f}"
+                                    )
+
                     remaining_qty = sum(l.qty for l in self.positions.get(product_id, []))
                     peak_bid = float(self.peak_bid.get(product_id) or bid)
                     if peak_bid <= 0:
@@ -7304,11 +7674,18 @@ class TradingBot:
                         "position_pct": float(position_pct),
                         "target_bps": float(target_bps),
                         "cost_bps": float(cost_bps),
+                        "calibrated_time_to_min_profit_minutes": float(live_signal.calibrated_time_to_min_profit_minutes),
+                        "calibrated_forward_window_minutes": float(live_signal.calibrated_forward_window_minutes),
+                        "calibrated_post_profit_breathing_minutes": float(
+                            self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id)).calibrated_post_profit_breathing_minutes
+                            or CALIB_POST_PROFIT_BREATHING_MINUTES
+                        ),
                         "weekly_bias": weekly_bias,
                     })
 
                 self.mlog.log_snapshot(
                     ts=ts_now,
+                    source="eval",
                     product_id=product_id,
                     bid=bid,
                     ask=ask,
@@ -7495,6 +7872,20 @@ class TradingBot:
                     continue
 
                 bid, ask = candidate["bid"], candidate["ask"]
+                entry_mode_for_this_trade = ENTRY_EXECUTION_MODE
+                if USE_EDGE_AWARE_ENTRY_EXECUTION:
+                    projected_net = float(candidate.get("expected_net_edge_bps", 0.0))
+                    if projected_net >= MARKET_ENTRY_MIN_PROJECTED_NET_BPS:
+                        entry_mode_for_this_trade = "MARKET"
+                    elif projected_net >= MAKER_OR_SKIP_MIN_PROJECTED_NET_BPS:
+                        entry_mode_for_this_trade = "MAKER"
+                    else:
+                        log(
+                            f"[buy-skip] {product_id} projected_net_too_low_for_execution "
+                            f"projected_net={projected_net:.3f}"
+                        )
+                        continue
+
                 log(
                     f"[buy-attempt] {product_id} "
                     f"quote_usd={entry_notional:.2f} "
@@ -7509,6 +7900,7 @@ class TradingBot:
                     bid=bid,
                     ask=ask,
                     reason=candidate.get("entry_reason", "score_entry"),
+                    execution_mode=entry_mode_for_this_trade,
                 )
 
                 if fill is None:
@@ -7545,7 +7937,23 @@ class TradingBot:
                         "position_pct": float(candidate.get("position_pct", 0.0)),
                         "target_bps": float(candidate.get("target_bps", 0.0)),
                         "cost_bps": float(candidate.get("cost_bps", 0.0)),
+                        "profit_lock_armed": False,
+                        "profit_lock_price": None,
+                        "min_profitable_exit_price": None,
+                        "calibrated_time_to_min_profit_minutes": float(candidate.get("calibrated_time_to_min_profit_minutes", 0.0)),
+                        "calibrated_forward_window_minutes": float(candidate.get("calibrated_forward_window_minutes", 0.0)),
+                        "calibrated_post_profit_breathing_minutes": float(candidate.get("calibrated_post_profit_breathing_minutes", CALIB_POST_PROFIT_BREATHING_MINUTES)),
                     }
+                    lot_meta["min_profitable_exit_price"] = float(required_exit_price_for_net_gain(
+                        effective_entry_price=eff_price1,
+                        exit_fee_bps=self._exit_fee_bps_for_mode(),
+                        est_slippage_bps=EST_SLIPPAGE_BPS,
+                        est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                        min_net_gain_bps=max(
+                            MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                            MIN_NET_GAIN_AFTER_FEES_BPS,
+                        ),
+                    ))
                     existing_lots = self.positions.get(product_id, [])
                     if existing_lots:
                         existing_lots.append(
@@ -7630,6 +8038,11 @@ class TradingBot:
                 "distance_to_min_profit_bps": None,
                 "distance_to_scalp_bps": None,
                 "distance_to_core_bps": None,
+                "profit_lock_armed": False,
+                "profit_lock_price": None,
+                "min_profitable_exit_price_from_lot": None,
+                "calibrated_forward_window_minutes": None,
+                "calibrated_post_profit_breathing_minutes": None,
                 "exit_plan_note": "no open position",
             }
 
@@ -7704,6 +8117,11 @@ class TradingBot:
                     "distance_to_min_profit_bps": dist_bps(min_exit_px),
                     "distance_to_scalp_bps": dist_bps(scalp_target),
                     "distance_to_core_bps": dist_bps(core_target),
+                    "profit_lock_armed": bool(lot_meta.get("profit_lock_armed", False)),
+                    "profit_lock_price": lot_meta.get("profit_lock_price"),
+                    "min_profitable_exit_price_from_lot": lot_meta.get("min_profitable_exit_price"),
+                    "calibrated_forward_window_minutes": lot_meta.get("calibrated_forward_window_minutes"),
+                    "calibrated_post_profit_breathing_minutes": lot_meta.get("calibrated_post_profit_breathing_minutes"),
                     "exit_plan_note": (
                         "scalp/core armed trailing active"
                         if scalp_armed or core_armed
@@ -7843,6 +8261,7 @@ class TradingBot:
 
                 self.mlog.log_snapshot(
                     ts=ts_now,
+                    source="telemetry",
                     product_id=product,
                     bid=tob.bid,
                     ask=tob.ask,

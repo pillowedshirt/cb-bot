@@ -224,15 +224,27 @@ MIN_REQUIRED_NET_EDGE_BPS: float = 35.0
 MIN_TARGET_TO_COST_MULT: float = 2.75
 ROUND_TRIP_SAFETY_BPS: float = 8.0
 
-# Buy gate behavior.
-# If True, the old strict dip/reversal gate must pass before buying.
-# If False, a calibrated high-EV setup may buy as long as score/probability/EV,
-# fee, spread, and target-cost gates pass.
+# Minimum realized net gain required for discretionary profit exits and the
+# calibrated projected-forward-gain buy gate. 1 basis point = 0.01%.
+MIN_NET_GAIN_AFTER_FEES_BPS: float = 1.0
+
+# Calibrated buy gate behavior.
+# The old target-to-cost gate used target_bps, which is often only a few bps.
+# The new EV system should use calibrated projected forward gain instead.
+USE_CALIBRATED_FORWARD_GAIN_FOR_TARGET_COST_GATE: bool = True
+
+# Require projected forward gain to cover modeled cost plus minimum gain.
+# This is more appropriate than requiring 2.75x cost for a tiny scalping strategy.
+MIN_PROJECTED_GAIN_OVER_COST_BPS: float = MIN_NET_GAIN_AFTER_FEES_BPS
+
+# Allow calibrated high-EV setups to buy without the old strict dip setup.
 REQUIRE_STRICT_DIP_GATE_FOR_BUY: bool = False
 
-# If strict dip gate is not required, still require basic reversal quality.
-# This prevents buying purely because calibration numbers pass while price is falling.
-REQUIRE_BASIC_REVERSAL_CONFIRMATION_FOR_CALIBRATED_BUY: bool = True
+# Do not require the old dip to be fresh if calibrated EV/probability/score pass.
+REQUIRE_BASIC_REVERSAL_CONFIRMATION_FOR_CALIBRATED_BUY: bool = False
+
+# Still block clearly falling markets.
+BLOCK_BUY_WHEN_MICRO_TRENDING_DOWN: bool = True
 
 # Basic reversal fallback requirements when strict_entry.ok is false.
 BASIC_REVERSAL_MIN_SCORE: float = 45.0
@@ -380,10 +392,6 @@ CALIB_MIN_SCALP_PULLBACK: float = 0.0005
 CALIB_MAX_SCALP_PULLBACK: float = 0.0030
 CALIB_MIN_CORE_PULLBACK: float = 0.0010
 CALIB_MAX_CORE_PULLBACK: float = 0.0060
-
-# Minimum realized net gain required for discretionary profit exits.
-# 1 basis point = 0.01%.
-MIN_NET_GAIN_AFTER_FEES_BPS: float = 1.0
 
 # Time-based exits are disabled for this strategy style.
 ENABLE_NO_PROGRESS_STOP: bool = False
@@ -4933,6 +4941,12 @@ class TradingBot:
                 fallback_window,
             ) = self._projection_stats_from_observations(winning_obs)
 
+            # If the product's overall expectancy is negative, do not let fallback
+            # thresholds become extremely permissive. Use conservative defaults.
+            if blended_ev < 0:
+                fallback_score = max(float(fallback_score), DEFAULT_CALIB_MIN_SCORE)
+                fallback_prob = max(float(fallback_prob), DEFAULT_CALIB_MIN_PROB)
+
             return ProductCalibrationProfile(
                 product_id=product_id,
                 min_score=float(fallback_score),
@@ -5483,19 +5497,39 @@ class TradingBot:
         buy_gate_ev_ok = bool(
             expected_net_edge_bps >= max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev)
         )
-        buy_gate_target_cost_ok = bool(
-            cost_bps > 0
-            and target_bps >= cost_bps * float(MIN_TARGET_TO_COST_MULT)
-        )
+        # Target/cost gate:
+        # Use calibrated projected forward gain, not the small structural target_bps.
+        # The structural target is often only a few bps and was blocking every buy.
+        if USE_CALIBRATED_FORWARD_GAIN_FOR_TARGET_COST_GATE:
+            buy_gate_target_cost_ok = bool(
+                cost_bps > 0
+                and calibrated_forward_gain_bps >= (
+                    cost_bps + float(MIN_PROJECTED_GAIN_OVER_COST_BPS)
+                )
+            )
+        else:
+            buy_gate_target_cost_ok = bool(
+                cost_bps > 0
+                and target_bps >= cost_bps * float(MIN_TARGET_TO_COST_MULT)
+            )
         buy_gate_spread_ok = bool(spread_bps <= float(MAX_SPREAD_BPS))
         buy_gate_strict_ok = bool(strict_entry.ok)
 
-        basic_reversal_ok = (
-            score >= float(BASIC_REVERSAL_MIN_SCORE)
-            and room_score >= float(BASIC_REVERSAL_MIN_ROOM_SCORE)
-            and support_score >= float(BASIC_REVERSAL_MIN_SUPPORT_SCORE)
-            and not bool(trending_down)
-        )
+        # Basic market-safety check:
+        # Do not force the old exact dip/reversal pattern unless configured.
+        # For calibrated buys, the key safety check is avoiding obviously falling microtrends.
+        basic_reversal_ok = True
+
+        if BLOCK_BUY_WHEN_MICRO_TRENDING_DOWN and bool(trending_down):
+            basic_reversal_ok = False
+
+        if REQUIRE_BASIC_REVERSAL_CONFIRMATION_FOR_CALIBRATED_BUY:
+            basic_reversal_ok = bool(
+                basic_reversal_ok
+                and score >= float(BASIC_REVERSAL_MIN_SCORE)
+                and room_score >= float(BASIC_REVERSAL_MIN_ROOM_SCORE)
+                and support_score >= float(BASIC_REVERSAL_MIN_SUPPORT_SCORE)
+            )
 
         if REQUIRE_STRICT_DIP_GATE_FOR_BUY:
             buy_gate_setup_ok = buy_gate_strict_ok
@@ -5504,16 +5538,13 @@ class TradingBot:
             if buy_gate_strict_ok:
                 buy_gate_setup_ok = True
                 setup_blocker = "strict_entry_passed"
-            elif REQUIRE_BASIC_REVERSAL_CONFIRMATION_FOR_CALIBRATED_BUY:
+            else:
                 buy_gate_setup_ok = bool(basic_reversal_ok)
                 setup_blocker = (
-                    "basic_reversal_passed"
+                    "calibrated_setup_allowed"
                     if basic_reversal_ok
-                    else f"basic_reversal_blocked:{strict_entry.reason}"
+                    else f"micro_trend_blocked:{trend_reason}"
                 )
-            else:
-                buy_gate_setup_ok = True
-                setup_blocker = "strict_entry_not_required"
 
         buy_gate_calibrated_ok = bool(
             buy_gate_score_ok
@@ -5539,7 +5570,10 @@ class TradingBot:
         if not buy_gate_ev_ok:
             blockers.append("ev_below_target")
         if not buy_gate_target_cost_ok:
-            blockers.append("target_to_cost_failed")
+            if USE_CALIBRATED_FORWARD_GAIN_FOR_TARGET_COST_GATE:
+                blockers.append("projected_gain_does_not_cover_cost")
+            else:
+                blockers.append("target_to_cost_failed")
         if not buy_gate_spread_ok:
             blockers.append("spread_too_wide")
         if not buy_gate_setup_ok:
@@ -5554,7 +5588,9 @@ class TradingBot:
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
                 f"ev={expected_net_edge_bps:.3f} "
                 f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} "
-                f"target={target_bps:.3f} cost={cost_bps:.3f} "
+                f"target={target_bps:.3f} "
+                f"projected_forward={calibrated_forward_gain_bps:.3f} "
+                f"cost={cost_bps:.3f} "
                 f"spread={spread_bps:.3f}"
             )
         else:
@@ -5565,7 +5601,10 @@ class TradingBot:
                 f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} prob_ok={buy_gate_prob_ok} "
                 f"ev={expected_net_edge_bps:.3f} "
                 f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} ev_ok={buy_gate_ev_ok} "
-                f"target={target_bps:.3f} cost={cost_bps:.3f} target_cost_ok={buy_gate_target_cost_ok} "
+                f"target={target_bps:.3f} "
+                f"projected_forward={calibrated_forward_gain_bps:.3f} "
+                f"cost={cost_bps:.3f} "
+                f"target_cost_ok={buy_gate_target_cost_ok} "
                 f"spread={spread_bps:.3f} spread_ok={buy_gate_spread_ok} "
                 f"fee_ok={buy_gate_fee_ok} setup_ok={buy_gate_setup_ok} strict_ok={buy_gate_strict_ok}"
             )

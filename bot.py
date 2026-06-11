@@ -228,6 +228,18 @@ ROUND_TRIP_SAFETY_BPS: float = 8.0
 # calibrated projected-forward-gain buy gate. 1 basis point = 0.01%.
 MIN_NET_GAIN_AFTER_FEES_BPS: float = 1.0
 
+# Simplified buy gate.
+# The strategy buy decision should be based on only the three intended requirements.
+SIMPLIFY_BUY_GATE_TO_THREE_REQUIREMENTS: bool = True
+
+# Keep spread, setup/reversal, and target-cost as diagnostics only.
+SPREAD_GATE_BLOCKS_BUY: bool = False
+SETUP_REVERSAL_GATE_BLOCKS_BUY: bool = False
+TARGET_COST_GATE_BLOCKS_BUY: bool = False
+
+# Fee data is operationally required because the bot must calculate real costs.
+FEE_DATA_REQUIRED_FOR_LIVE_BUY: bool = True
+
 # Calibrated buy gate behavior.
 # The old target-to-cost gate used target_bps, which is often only a few bps.
 # The new EV system should use calibrated projected forward gain instead.
@@ -5604,45 +5616,91 @@ class TradingBot:
             and buy_gate_ev_ok
         )
 
-        ok_to_trade = bool(
-            buy_gate_fee_ok
-            and buy_gate_setup_ok
-            and buy_gate_calibrated_ok
-            and buy_gate_target_cost_ok
-            and buy_gate_spread_ok
-        )
+        if SIMPLIFY_BUY_GATE_TO_THREE_REQUIREMENTS:
+            # The actual strategy decision:
+            # Buy when the three core calibrated requirements pass.
+            three_requirement_signal_ok = bool(
+                buy_gate_score_ok
+                and buy_gate_prob_ok
+                and buy_gate_ev_ok
+            )
+
+            # Operational readiness:
+            # Fee data is required so EV/cost math is grounded in real Coinbase fees.
+            operational_ok = bool(
+                buy_gate_fee_ok if FEE_DATA_REQUIRED_FOR_LIVE_BUY else True
+            )
+
+            ok_to_trade = bool(
+                three_requirement_signal_ok
+                and operational_ok
+            )
+        else:
+            # Old multi-gate behavior, kept only as fallback.
+            ok_to_trade = bool(
+                buy_gate_fee_ok
+                and buy_gate_setup_ok
+                and buy_gate_calibrated_ok
+                and buy_gate_target_cost_ok
+                and buy_gate_spread_ok
+            )
 
         blockers = []
-        if not buy_gate_fee_ok:
-            blockers.append("fee_not_ready")
-        if not buy_gate_score_ok:
-            if USE_EV_PRIMARY_BUY_GATE and buy_gate_ev_ok:
-                blockers.append("score_below_ev_primary_floor")
-            else:
-                blockers.append("score_below_target")
 
-        if not buy_gate_prob_ok:
-            if USE_EV_PRIMARY_BUY_GATE and buy_gate_ev_ok:
-                blockers.append("probability_below_ev_primary_floor")
-            else:
+        if SIMPLIFY_BUY_GATE_TO_THREE_REQUIREMENTS:
+            if FEE_DATA_REQUIRED_FOR_LIVE_BUY and not buy_gate_fee_ok:
+                blockers.append("fee_data_not_ready")
+
+            if not buy_gate_score_ok:
+                blockers.append("score_below_calibrated_target")
+
+            if not buy_gate_prob_ok:
+                blockers.append("probability_below_calibrated_target")
+
+            if not buy_gate_ev_ok:
+                blockers.append("ev_below_calibrated_target")
+
+            # Diagnostic-only notes. These should not block buys in simplified mode.
+            diagnostics = []
+            if not buy_gate_spread_ok:
+                diagnostics.append("spread_would_have_blocked_old_gate")
+            if not buy_gate_target_cost_ok:
+                diagnostics.append("target_cost_would_have_blocked_old_gate")
+            if not buy_gate_setup_ok:
+                diagnostics.append(
+                    f"setup_would_have_blocked_old_gate:{setup_blocker}"
+                )
+
+            diagnostic_note = (
+                ",".join(diagnostics) if diagnostics else "diagnostics_clear"
+            )
+            buy_gate_mode = "simplified_three_requirements"
+        else:
+            if not buy_gate_fee_ok:
+                blockers.append("fee_not_ready")
+            if not buy_gate_score_ok:
+                blockers.append("score_below_target")
+            if not buy_gate_prob_ok:
                 blockers.append("probability_below_target")
-        if not buy_gate_ev_ok:
-            blockers.append("ev_below_target")
-        if not buy_gate_target_cost_ok:
-            if USE_CALIBRATED_FORWARD_GAIN_FOR_TARGET_COST_GATE:
-                blockers.append("projected_gain_does_not_cover_cost")
-            else:
+            if not buy_gate_ev_ok:
+                blockers.append("ev_below_target")
+            if not buy_gate_target_cost_ok:
                 blockers.append("target_to_cost_failed")
-        if not buy_gate_spread_ok:
-            blockers.append("spread_too_wide")
-        if not buy_gate_setup_ok:
-            blockers.append(setup_blocker)
+            if not buy_gate_spread_ok:
+                blockers.append("spread_too_wide")
+            if not buy_gate_setup_ok:
+                blockers.append(setup_blocker)
+
+            diagnostic_note = "old_gate_mode"
+            buy_gate_mode = "legacy_multi_gate"
 
         buy_gate_blocker = "BUY_READY" if ok_to_trade else ";".join(blockers)
 
         if ok_to_trade:
             log(
                 f"[buy-gate] {product_id} BUY_READY "
+                f"mode={buy_gate_mode} "
+                f"diagnostics={diagnostic_note} "
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_ok={buy_gate_score_ok} "
                 f"score_target_ok={buy_gate_score_target_ok} "
@@ -5660,7 +5718,9 @@ class TradingBot:
         else:
             log(
                 f"[buy-gate] {product_id} BLOCKED "
+                f"mode={buy_gate_mode} "
                 f"blocker={buy_gate_blocker} "
+                f"diagnostics={diagnostic_note} "
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_ok={buy_gate_score_ok} "
                 f"score_target_ok={buy_gate_score_target_ok} "

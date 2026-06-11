@@ -856,6 +856,8 @@ def render_live_dashboard() -> None:
         "calibrated_post_profit_extra_gain_bps",
         "calibrated_max_adverse_before_profit_bps",
         "calibrated_expected_bps_per_minute",
+        "calibrated_raw_probability_median",
+        "calibrated_empirical_win_rate",
     ])
     hist = numeric(hist, ["ts", "open", "high", "low", "close", "volume"])
     pt = numeric(pt, [
@@ -1265,6 +1267,24 @@ def render_live_dashboard() -> None:
                 fmt_num(min_ev, 1, " bps")
                 if valid_targets else "Awaiting calibration"
             ),
+            "Raw Prob Median": (
+                fmt_pct(
+                    calibration.get(
+                        "calibrated_raw_probability_median", np.nan
+                    ),
+                    3,
+                )
+                if calibration is not None else "—"
+            ),
+            "Empirical Win Rate": (
+                fmt_pct(
+                    calibration.get(
+                        "calibrated_empirical_win_rate", np.nan
+                    ),
+                    3,
+                )
+                if calibration is not None else "—"
+            ),
             "Projected Forward": fmt_num(
                 latest_eval.get("projected_forward_gain_bps", np.nan),
                 1,
@@ -1566,6 +1586,30 @@ def render_live_dashboard() -> None:
                 "Extra after min profit",
                 fmt_num(selected_cal.get("calibrated_post_profit_extra_gain_bps", np.nan), 1, " bps"),
                 "breathing-room upside",
+            )
+
+        q4, q5 = st.columns(2)
+        with q4:
+            mini_card(
+                "Raw prob median",
+                fmt_pct(
+                    selected_cal.get(
+                        "calibrated_raw_probability_median", np.nan
+                    ),
+                    3,
+                ),
+                "calibration source",
+            )
+        with q5:
+            mini_card(
+                "Empirical win rate",
+                fmt_pct(
+                    selected_cal.get(
+                        "calibrated_empirical_win_rate", np.nan
+                    ),
+                    3,
+                ),
+                "source outcome rate",
             )
 
     selected_pt = latest_position_target_for_product(pt, product)

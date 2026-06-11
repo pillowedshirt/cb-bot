@@ -22,6 +22,9 @@ MARKET_CSV = os.path.join(BASE_DIR, "market.csv")
 TRADES_CSV = os.path.join(BASE_DIR, "trades.csv")
 ORDERS_CSV = os.path.join(BASE_DIR, "orders.csv")
 MACRO_LEVELS_CSV = os.path.join(BASE_DIR, "macro_levels.csv")
+CALIBRATION_CSV = os.path.join(BASE_DIR, "calibration.csv")
+MICRO_HISTORY_CSV = os.path.join(BASE_DIR, "micro_history.csv")
+POSITION_TARGETS_CSV = os.path.join(BASE_DIR, "position_targets.csv")
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -350,6 +353,24 @@ def previous_by_product(m: pd.DataFrame, lookback_rows: int = 20) -> Dict[str, p
     return out
 
 
+def latest_calibration_for_product(cal: pd.DataFrame, product: str) -> pd.Series | None:
+    if cal.empty or "product_id" not in cal.columns or "ts" not in cal.columns:
+        return None
+    rows = cal[cal["product_id"] == product].copy()
+    if rows.empty:
+        return None
+    return rows.sort_values("ts").iloc[-1]
+
+
+def latest_position_target_for_product(pt: pd.DataFrame, product: str) -> pd.Series | None:
+    if pt.empty or "product_id" not in pt.columns or "ts" not in pt.columns:
+        return None
+    rows = pt[pt["product_id"] == product].copy()
+    if rows.empty:
+        return None
+    return rows.sort_values("ts").iloc[-1]
+
+
 def age_seconds(ts_value: Any) -> float:
     try:
         return max(0.0, pd.Timestamp.utcnow().timestamp() - float(ts_value))
@@ -474,7 +495,14 @@ def plot_price(ax, d: pd.DataFrame, *, title: str, show_bid_ask: bool, trades: p
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=5, fontsize=7, frameon=False, labelcolor="#CBD5E1")
 
 
-def plot_price_plotly(d: pd.DataFrame, *, title: str, show_bid_ask: bool, trades: pd.DataFrame):
+def plot_price_plotly(
+    d: pd.DataFrame,
+    *,
+    title: str,
+    show_bid_ask: bool,
+    trades: pd.DataFrame,
+    sell_target_row: pd.Series | None = None,
+):
     """
     Live chart rendered with Plotly instead of st.pyplot.
 
@@ -563,6 +591,29 @@ def plot_price_plotly(d: pd.DataFrame, *, title: str, show_bid_ask: bool, trades
                 marker=dict(symbol="triangle-down", size=12, line=dict(width=1)),
                 hovertemplate="SELL<br>price=%{y}<br>%{x}<extra></extra>",
             ))
+
+    if sell_target_row is not None and str(sell_target_row.get("has_position", "False")).lower() in ("true", "1", "yes"):
+        line_specs = [
+            ("Min profitable exit", sell_target_row.get("min_profitable_exit_price"), "dot"),
+            ("Scalp target", sell_target_row.get("scalp_target_price"), "dash"),
+            ("Core target", sell_target_row.get("core_target_price"), "dash"),
+            ("Scalp trigger", sell_target_row.get("scalp_pullback_trigger_price"), "dot"),
+            ("Core trigger", sell_target_row.get("core_pullback_trigger_price"), "dot"),
+        ]
+        for label, value, dash in line_specs:
+            try:
+                y = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(y) or y <= 0:
+                continue
+            fig.add_hline(
+                y=y,
+                line_dash=dash,
+                annotation_text=label,
+                annotation_position="top left",
+                opacity=0.72,
+            )
 
     fig.update_layout(
         title=title,
@@ -699,6 +750,9 @@ def render_live_dashboard() -> None:
     t = clean_trades(load_csv(TRADES_CSV))
     o = load_csv(ORDERS_CSV)
     ml = load_csv(MACRO_LEVELS_CSV)
+    cal = load_csv(CALIBRATION_CSV)
+    hist = load_csv(MICRO_HISTORY_CSV)
+    pt = load_csv(POSITION_TARGETS_CSV)
 
     st.markdown(
         """
@@ -732,6 +786,23 @@ def render_live_dashboard() -> None:
         "current_maker_fee_bps", "current_taker_fee_bps",
         "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
         "room_score", "regime_score", "spread_penalty", "cost_penalty"
+    ])
+
+    cal = numeric(cal, [
+        "ts", "min_score", "min_probability", "min_expected_value_bps",
+        "scalp_pullback_pct", "core_pullback_pct",
+        "day_sample_count", "week_sample_count",
+        "day_win_rate", "week_win_rate", "blended_win_rate",
+        "avg_win_bps", "avg_loss_bps", "expected_value_bps",
+    ])
+    hist = numeric(hist, ["ts", "open", "high", "low", "close", "volume"])
+    pt = numeric(pt, [
+        "ts", "position_qty", "avg_entry_price", "current_bid", "current_ask",
+        "min_profitable_exit_price", "scalp_target_price", "core_target_price",
+        "scalp_arm_peak", "core_arm_peak",
+        "scalp_pullback_pct", "core_pullback_pct",
+        "scalp_pullback_trigger_price", "core_pullback_trigger_price",
+        "distance_to_min_profit_bps", "distance_to_scalp_bps", "distance_to_core_bps",
     ])
 
     ml = numeric(ml, [
@@ -772,6 +843,10 @@ def render_live_dashboard() -> None:
         status = status_for_age(age)
 
         product_rows = m[m["product_id"] == product_id] if "product_id" in m.columns else pd.DataFrame()
+        calibration = latest_calibration_for_product(cal, product_id)
+        buy_score_target = calibration.get("min_score", np.nan) if calibration is not None else np.nan
+        buy_prob_target = calibration.get("min_probability", np.nan) if calibration is not None else np.nan
+        buy_ev_target = calibration.get("min_expected_value_bps", np.nan) if calibration is not None else np.nan
 
         overview_rows.append({
             "Product": product_id,
@@ -779,6 +854,9 @@ def render_live_dashboard() -> None:
             "Age": f"{age:.0f}s" if pd.notna(age) else "—",
             "Prob": prob,
             "Score": safe_float(r.get("entry_score")),
+            "Buy Score Target": buy_score_target,
+            "Buy Prob Target": buy_prob_target,
+            "Buy EV Target": buy_ev_target,
             "Mid": mid,
             "Δ bps": mid_change_bps,
             "Spread": safe_float(r.get("spread_bps")),
@@ -895,6 +973,9 @@ def render_live_dashboard() -> None:
       <div class="cb-kv" style="margin-top:0.35rem;">
         <div class="k">Probability</div><div class="v">{fmt_pct(prob_val)}</div>
         <div class="k">Score</div><div class="v">{fmt_num(score_val, 1)}</div>
+        <div class="k">Buy score target</div><div class="v">{fmt_num(row.get("Buy Score Target", np.nan), 1)}</div>
+        <div class="k">Buy prob target</div><div class="v">{fmt_pct(row.get("Buy Prob Target", np.nan))}</div>
+        <div class="k">Buy EV target</div><div class="v">{fmt_num(row.get("Buy EV Target", np.nan), 1, " bps")}</div>
         <div class="k">Mid</div><div class="v">{fmt_num(mid_val, 6)}</div>
         <div class="k">Change</div><div class="v">{fmt_num(change_val, 1, ' bps')}</div>
         <div class="k">Spread</div><div class="v">{fmt_num(spread_val, 1, ' bps')}</div>
@@ -910,6 +991,9 @@ def render_live_dashboard() -> None:
             display_overview = overview.copy()
             display_overview["Prob"] = display_overview["Prob"].map(lambda x: fmt_pct(x))
             display_overview["Score"] = display_overview["Score"].map(lambda x: fmt_num(x, 1))
+            display_overview["Buy Score Target"] = display_overview["Buy Score Target"].map(lambda x: fmt_num(x, 1))
+            display_overview["Buy Prob Target"] = display_overview["Buy Prob Target"].map(lambda x: fmt_pct(x))
+            display_overview["Buy EV Target"] = display_overview["Buy EV Target"].map(lambda x: fmt_num(x, 1, " bps"))
             display_overview["Mid"] = display_overview["Mid"].map(lambda x: fmt_num(x, 6))
             display_overview["Δ bps"] = display_overview["Δ bps"].map(lambda x: fmt_num(x, 1))
             display_overview["Spread"] = display_overview["Spread"].map(lambda x: fmt_num(x, 1))
@@ -919,7 +1003,7 @@ def render_live_dashboard() -> None:
 
             st.dataframe(
                 display_overview[
-                    ["Product", "Status", "Age", "Prob", "Score", "Mid", "Δ bps", "Spread", "Pos %", "Projected", "Exposure", "Rows"]
+                    ["Product", "Status", "Age", "Prob", "Score", "Buy Score Target", "Buy Prob Target", "Buy EV Target", "Mid", "Δ bps", "Spread", "Pos %", "Projected", "Exposure", "Rows"]
                 ],
                 width="stretch",
                 hide_index=True,
@@ -942,13 +1026,25 @@ def render_live_dashboard() -> None:
         product = st.selectbox("Selected coin", products, index=default_idx, label_visibility="collapsed")
 
     if pd.notna(latest_market_ts):
-        cutoff = max(
-            float(earliest_market_ts) if pd.notna(earliest_market_ts) else 0.0,
-            float(latest_market_ts) - float(window_minutes) * 60.0,
-        )
+        cutoff = float(latest_market_ts) - float(window_minutes) * 60.0
     else:
         cutoff = pd.Timestamp.utcnow().timestamp() - float(window_minutes) * 60.0
-    m_prod = m[(m["product_id"] == product) & (m["ts"] >= cutoff)].dropna(subset=["ts", "mid"]).copy()
+
+    m_prod_live = m[(m["product_id"] == product) & (m["ts"] >= cutoff)].dropna(subset=["ts", "mid"]).copy()
+    hist_prod = pd.DataFrame()
+    if not hist.empty and "product_id" in hist.columns:
+        hist_prod = hist[(hist["product_id"] == product) & (hist["ts"] >= cutoff)].copy()
+        if not hist_prod.empty:
+            hist_prod["mid"] = hist_prod["close"]
+            hist_prod["bid"] = np.nan
+            hist_prod["ask"] = np.nan
+            hist_prod["spread_bps"] = np.nan
+
+    m_prod = pd.concat([
+        hist_prod[[c for c in ["ts", "mid", "bid", "ask", "spread_bps"] if c in hist_prod.columns]],
+        m_prod_live[[c for c in ["ts", "mid", "bid", "ask", "spread_bps", "anchored_vwap", "fair_value", "entry_score", "estimated_prob_up", "expected_net_edge_bps", "cash_usd", "equity_usd", "exposures_usd", "position_qty", "target_bps", "cost_bps", "position_pct", "current_maker_fee_bps", "current_taker_fee_bps", "fee_tier_reason", "entry_tier", "entry_reason"] if c in m_prod_live.columns]],
+    ], ignore_index=True)
+    m_prod = m_prod.dropna(subset=["ts", "mid"]).drop_duplicates(subset=["ts"], keep="last").sort_values("ts").copy()
     if m_prod.empty:
         st.warning(f"No recent telemetry rows for {product} in the selected window.")
         st.stop()
@@ -1004,6 +1100,53 @@ def render_live_dashboard() -> None:
     with p4:
         mini_card("Position qty", fmt_num(position_qty, 8), product)
 
+    selected_cal = latest_calibration_for_product(cal, product)
+    st.markdown(f'<div class="cb-section">{product} buy requirements</div>', unsafe_allow_html=True)
+    if selected_cal is None:
+        st.warning("No calibration profile available yet. Waiting for calibration.csv.")
+    else:
+        current_score = latest_row.get("entry_score", np.nan)
+        current_prob = latest_row.get("estimated_prob_up", np.nan)
+        current_ev = latest_row.get("expected_net_edge_bps", np.nan)
+        min_score = selected_cal.get("min_score", np.nan)
+        min_prob = selected_cal.get("min_probability", np.nan)
+        min_ev = selected_cal.get("min_expected_value_bps", np.nan)
+        score_ok = pd.notna(current_score) and pd.notna(min_score) and float(current_score) >= float(min_score)
+        prob_ok = pd.notna(current_prob) and pd.notna(min_prob) and float(current_prob) >= float(min_prob)
+        ev_ok = pd.notna(current_ev) and pd.notna(min_ev) and float(current_ev) >= float(min_ev)
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            mini_card("Buy score requirement", f"{fmt_num(current_score, 1)} / {fmt_num(min_score, 1)}", "PASS" if score_ok else "waiting")
+        with b2:
+            mini_card("Buy probability requirement", f"{fmt_pct(current_prob)} / {fmt_pct(min_prob)}", "PASS" if prob_ok else "waiting")
+        with b3:
+            mini_card("Buy EV requirement", f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}", "PASS" if ev_ok else "waiting")
+
+    selected_pt = latest_position_target_for_product(pt, product)
+    st.markdown(f'<div class="cb-section">{product} sell plan</div>', unsafe_allow_html=True)
+    if selected_pt is None:
+        st.info("No sell target snapshot available yet.")
+    elif str(selected_pt.get("has_position", "False")).lower() not in ("true", "1", "yes"):
+        st.info("No open position. Sell targets will appear after a confirmed buy.")
+    else:
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            mini_card("Current bid", fmt_money(selected_pt.get("current_bid", np.nan), 6), f"ask {fmt_money(selected_pt.get('current_ask', np.nan), 6)}")
+        with s2:
+            mini_card("Minimum profitable exit", fmt_money(selected_pt.get("min_profitable_exit_price", np.nan), 6), f"distance {fmt_num(selected_pt.get('distance_to_min_profit_bps', np.nan), 1, ' bps')}")
+        with s3:
+            mini_card("Scalp target", fmt_money(selected_pt.get("scalp_target_price", np.nan), 6), f"distance {fmt_num(selected_pt.get('distance_to_scalp_bps', np.nan), 1, ' bps')} · armed: {selected_pt.get('scalp_armed', False)} · pullback {fmt_pct(selected_pt.get('scalp_pullback_pct', np.nan), 2)}")
+        with s4:
+            mini_card("Core target", fmt_money(selected_pt.get("core_target_price", np.nan), 6), f"distance {fmt_num(selected_pt.get('distance_to_core_bps', np.nan), 1, ' bps')} · armed: {selected_pt.get('core_armed', False)} · pullback {fmt_pct(selected_pt.get('core_pullback_pct', np.nan), 2)}")
+
+        s5, s6 = st.columns(2)
+        with s5:
+            mini_card("Scalp pullback trigger", fmt_money(selected_pt.get("scalp_pullback_trigger_price", np.nan), 6), f"peak {fmt_money(selected_pt.get('scalp_arm_peak', np.nan), 6)}")
+        with s6:
+            mini_card("Core pullback trigger", fmt_money(selected_pt.get("core_pullback_trigger_price", np.nan), 6), f"peak {fmt_money(selected_pt.get('core_arm_peak', np.nan), 6)}")
+        st.caption(str(selected_pt.get("exit_plan_note", "")))
+
 
     # =============================================================================
     # Selected coin signal detail
@@ -1043,6 +1186,7 @@ def render_live_dashboard() -> None:
         title=f"{product} · last {window_minutes} min",
         show_bid_ask=show_bid_ask,
         trades=t_prod,
+        sell_target_row=selected_pt,
     )
     st.plotly_chart(fig, width="stretch", key=f"live_price_chart_{product}")
 

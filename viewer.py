@@ -1115,7 +1115,35 @@ def render_live_dashboard() -> None:
         mini_card("Position qty", fmt_num(position_qty, 8), product)
 
     selected_cal = latest_calibration_for_product(cal, product)
+    is_calibrated = False
+    calibration_status = "unknown"
+    if selected_cal is not None:
+        is_calibrated = truthy_cell(
+            selected_cal.get("is_calibrated", False)
+        )
+        calibration_status = str(
+            selected_cal.get("calibration_status", "unknown")
+        )
+
     st.markdown(f'<div class="cb-section">{product} buy requirements</div>', unsafe_allow_html=True)
+    c0, c1 = st.columns(2)
+    with c0:
+        mini_card(
+            "Calibration",
+            "READY" if is_calibrated else "NOT READY",
+            calibration_status,
+        )
+    with c1:
+        mini_card(
+            "Calibration reason",
+            (
+                str(selected_cal.get("reason", "—"))
+                if selected_cal is not None
+                else "No calibration row yet"
+            ),
+            "",
+        )
+
     if selected_cal is None:
         st.warning("No calibration profile available yet. Waiting for calibration.csv.")
     else:
@@ -1137,24 +1165,40 @@ def render_live_dashboard() -> None:
             latest_row.get("buy_gate_ev_ok", False)
         )
 
+        if is_calibrated:
+            score_display = (
+                f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}"
+            )
+            prob_display = (
+                f"{fmt_pct(current_prob, 3)} / {fmt_pct(min_prob, 3)}"
+            )
+            ev_display = (
+                f"{fmt_num(current_ev, 1, ' bps')} / "
+                f"{fmt_num(min_ev, 1, ' bps')}"
+            )
+        else:
+            score_display = "Not calibrated"
+            prob_display = "Not calibrated"
+            ev_display = "Not calibrated"
+
         b1, b2, b3 = st.columns(3)
         with b1:
             mini_card(
                 "Calibrated buy score target",
-                f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}",
-                "PASS" if score_target_ok else "waiting",
+                score_display,
+                "PASS" if score_target_ok and is_calibrated else "waiting",
             )
         with b2:
             mini_card(
                 "Calibrated buy probability target",
-                f"{fmt_pct(current_prob, 3)} / {fmt_pct(min_prob, 3)}",
-                "PASS" if prob_target_ok else "waiting",
+                prob_display,
+                "PASS" if prob_target_ok and is_calibrated else "waiting",
             )
         with b3:
             mini_card(
                 "Projected net edge",
-                f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}",
-                "PASS" if ev_target_ok else "waiting",
+                ev_display,
+                "PASS" if ev_target_ok and is_calibrated else "waiting",
             )
 
         st.markdown(

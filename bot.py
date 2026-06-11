@@ -383,29 +383,9 @@ CALIB_MAX_EXACT_PROB_CANDIDATES: int = 80
 CALIB_MIN_WIN_RATE: float = 0.54
 CALIB_MIN_EXPECTED_VALUE_BPS: float = 2.0
 
-# Fallback behavior if no threshold passes.
-# These are only fallbacks, not floors.
-DEFAULT_CALIB_MIN_SCORE: float = 60.0
-DEFAULT_CALIB_MIN_PROB: float = 0.58
-DEFAULT_CALIB_MIN_EV_BPS: float = 2.0
-
-# Calibration repair:
-# These are only emergency safety floors, not default targets.
-# They prevent absurd values while preserving product-specific calibration.
-CALIB_ABSOLUTE_MIN_SCORE: float = 20.0
-CALIB_ABSOLUTE_MIN_PROB: float = 0.20
-
-# If fallback uses winning observations, use these quantiles from actual winners.
-# This keeps targets based on setups that reached the minimum gain after fees.
-CALIB_WINNER_SCORE_QUANTILE: float = 0.55
-CALIB_WINNER_PROB_QUANTILE: float = 0.55
-
-# If no exact positive-EV threshold is found, still choose product-specific
-# thresholds from historical winners instead of defaulting every product.
-ALLOW_WINNER_BASED_FALLBACK_THRESHOLDS: bool = True
-
 # Live recalibration can be CPU-heavy. Do it less often and off the event loop.
 LIVE_RECALIBRATION_EVERY_SEC: float = 5 * 60
+UNCALIBRATED_RETRY_EVERY_SEC: float = 60.0
 LIVE_RECALIBRATION_MIN_ROWS: int = 240
 
 # Event loop lag diagnostics.
@@ -2127,9 +2107,11 @@ class CalibrationObservation:
 @dataclass
 class ProductCalibrationProfile:
     product_id: str
-    min_score: float = DEFAULT_CALIB_MIN_SCORE
-    min_probability: float = DEFAULT_CALIB_MIN_PROB
-    min_expected_value_bps: float = DEFAULT_CALIB_MIN_EV_BPS
+    is_calibrated: bool = False
+    calibration_status: str = "not_calibrated"
+    min_score: float = 0.0
+    min_probability: float = 0.0
+    min_expected_value_bps: float = 0.0
     scalp_pullback_pct: float = SCALP_TARGET_ARM_DRAWDOWN_PCT
     core_pullback_pct: float = CORE_TARGET_ARM_DRAWDOWN_PCT
     day_sample_count: int = 0
@@ -2147,7 +2129,7 @@ class ProductCalibrationProfile:
     calibrated_time_to_min_profit_minutes: float = 0.0
     calibrated_forward_window_minutes: float = 0.0
 
-    reason: str = "default_profile"
+    reason: str = "not_calibrated"
 
 
 class CalibrationLogger:
@@ -2156,23 +2138,30 @@ class CalibrationLogger:
         self._ensure_header()
 
     def _ensure_header(self) -> None:
+        header = [
+            "ts", "dt_mst", "product_id",
+            "is_calibrated", "calibration_status",
+            "min_score", "min_probability", "min_expected_value_bps",
+            "scalp_pullback_pct", "core_pullback_pct",
+            "day_sample_count", "week_sample_count",
+            "day_win_rate", "week_win_rate", "blended_win_rate",
+            "avg_win_bps", "avg_loss_bps", "expected_value_bps",
+            "calibrated_projected_gross_bps",
+            "calibrated_projected_net_bps",
+            "calibrated_time_to_min_profit_minutes",
+            "calibrated_forward_window_minutes",
+            "reason",
+        ]
         if os.path.exists(self.path):
-            return
+            try:
+                with open(self.path, newline="", encoding="utf-8") as f:
+                    existing_header = next(csv.reader(f), [])
+                if existing_header == header:
+                    return
+            except (OSError, csv.Error):
+                pass
         with open(self.path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "ts", "dt_mst", "product_id",
-                "min_score", "min_probability", "min_expected_value_bps",
-                "scalp_pullback_pct", "core_pullback_pct",
-                "day_sample_count", "week_sample_count",
-                "day_win_rate", "week_win_rate", "blended_win_rate",
-                "avg_win_bps", "avg_loss_bps", "expected_value_bps",
-                "calibrated_projected_gross_bps",
-                "calibrated_projected_net_bps",
-                "calibrated_time_to_min_profit_minutes",
-                "calibrated_forward_window_minutes",
-                "reason",
-            ])
+            csv.writer(f).writerow(header)
 
     def log_profile(self, profile: ProductCalibrationProfile) -> None:
         tsv = now_ts()
@@ -2181,6 +2170,7 @@ class CalibrationLogger:
             w = csv.writer(f)
             w.writerow([
                 f"{tsv:.6f}", dt_mst, profile.product_id,
+                profile.is_calibrated, profile.calibration_status,
                 f"{profile.min_score:.6f}",
                 f"{profile.min_probability:.6f}",
                 f"{profile.min_expected_value_bps:.6f}",
@@ -4709,12 +4699,6 @@ class TradingBot:
         wins = sum(1 for observation in observations if observation.reached_min_profit)
         return float(wins / len(observations))
 
-    def _safe_quantile(self, values: List[float], q: float, default: float) -> float:
-        clean = [float(v) for v in values if v is not None and np.isfinite(float(v))]
-        if not clean:
-            return float(default)
-        return float(np.quantile(clean, clamp_float(float(q), 0.0, 1.0)))
-
     def _exact_candidate_values(
         self,
         values: List[float],
@@ -4814,6 +4798,49 @@ class TradingBot:
             median_forward_window_minutes,
         )
 
+    def _uncalibrated_profile(
+        self,
+        *,
+        product_id: str,
+        status: str,
+        day_obs: Optional[List[CalibrationObservation]] = None,
+        week_obs: Optional[List[CalibrationObservation]] = None,
+        blended_ev: float = 0.0,
+        avg_win_bps: float = 0.0,
+        avg_loss_bps: float = 0.0,
+    ) -> ProductCalibrationProfile:
+        """
+        Return a non-tradeable calibration profile.
+
+        This replaces all previous default/fallback calibration behavior.
+        If the bot cannot produce real calibrated targets, the product should
+        not trade until recalibration succeeds.
+        """
+        day_obs = day_obs or []
+        week_obs = week_obs or []
+
+        return ProductCalibrationProfile(
+            product_id=product_id,
+            is_calibrated=False,
+            calibration_status=status,
+            min_score=0.0,
+            min_probability=0.0,
+            min_expected_value_bps=0.0,
+            day_sample_count=len(day_obs),
+            week_sample_count=len(week_obs),
+            day_win_rate=self._win_rate(day_obs),
+            week_win_rate=self._win_rate(week_obs),
+            blended_win_rate=0.0,
+            avg_win_bps=float(avg_win_bps),
+            avg_loss_bps=float(avg_loss_bps),
+            expected_value_bps=float(blended_ev),
+            calibrated_projected_gross_bps=0.0,
+            calibrated_projected_net_bps=float(blended_ev),
+            calibrated_time_to_min_profit_minutes=0.0,
+            calibrated_forward_window_minutes=0.0,
+            reason=f"UNCALIBRATED: {status}",
+        )
+
     def _build_calibration_profile(
         self,
         *,
@@ -4833,20 +4860,14 @@ class TradingBot:
         all_obs = list(day_obs) + list(week_obs)
 
         if len(all_obs) < CALIB_MIN_PRODUCT_SAMPLES:
-            return ProductCalibrationProfile(
+            return self._uncalibrated_profile(
                 product_id=product_id,
-                min_score=DEFAULT_CALIB_MIN_SCORE,
-                min_probability=DEFAULT_CALIB_MIN_PROB,
-                min_expected_value_bps=DEFAULT_CALIB_MIN_EV_BPS,
-                day_sample_count=len(day_obs),
-                week_sample_count=len(week_obs),
-                day_win_rate=self._win_rate(day_obs),
-                week_win_rate=self._win_rate(week_obs),
-                calibrated_projected_gross_bps=0.0,
-                calibrated_projected_net_bps=0.0,
-                calibrated_time_to_min_profit_minutes=0.0,
-                calibrated_forward_window_minutes=0.0,
-                reason=f"insufficient_samples total={len(all_obs)} using_defaults",
+                status=(
+                    f"insufficient_samples total={len(all_obs)} "
+                    f"required={CALIB_MIN_PRODUCT_SAMPLES}"
+                ),
+                day_obs=day_obs,
+                week_obs=week_obs,
             )
 
         # Overall product stats.
@@ -4922,6 +4943,8 @@ class TradingBot:
         if best is not None:
             return ProductCalibrationProfile(
                 product_id=product_id,
+                is_calibrated=True,
+                calibration_status="exact_threshold",
                 min_score=float(best["score_threshold"]),
                 min_probability=float(best["prob_threshold"]),
                 min_expected_value_bps=max(float(best["ev"]) * 0.35, CALIB_MIN_EXPECTED_VALUE_BPS),
@@ -4951,88 +4974,35 @@ class TradingBot:
 
         winning_obs = [o for o in all_obs if o.reached_min_profit]
 
-        if winning_obs and ALLOW_WINNER_BASED_FALLBACK_THRESHOLDS:
-            # Product-specific fallback:
-            # Use this product's actual historical winners.
-            # A "winner" means the future candles reached the minimum required
-            # net gain after fees/costs.
-            fallback_score = self._safe_quantile(
-                [o.score for o in winning_obs],
-                CALIB_WINNER_SCORE_QUANTILE,
-                DEFAULT_CALIB_MIN_SCORE,
-            )
-            fallback_prob = self._safe_quantile(
-                [o.probability for o in winning_obs],
-                CALIB_WINNER_PROB_QUANTILE,
-                DEFAULT_CALIB_MIN_PROB,
+        if winning_obs:
+            blended_wr, blended_avg_win, blended_avg_loss, blended_ev, _ = (
+                self._observation_ev_stats(all_obs)
             )
 
-            # Safety only. Do not force back to 60 / 58%.
-            fallback_score = max(float(fallback_score), float(CALIB_ABSOLUTE_MIN_SCORE))
-            fallback_prob = max(float(fallback_prob), float(CALIB_ABSOLUTE_MIN_PROB))
-
-            fallback_wr, fallback_avg_win, fallback_avg_loss, fallback_ev, fallback_n = (
-                self._observation_ev_stats(winning_obs)
-            )
-
-            (
-                fallback_projected_gross,
-                fallback_time_to_profit,
-                fallback_window,
-            ) = self._projection_stats_from_observations(winning_obs)
-
-            return ProductCalibrationProfile(
+            return self._uncalibrated_profile(
                 product_id=product_id,
-                min_score=float(fallback_score),
-                min_probability=float(fallback_prob),
-                min_expected_value_bps=max(
-                    DEFAULT_CALIB_MIN_EV_BPS,
-                    CALIB_MIN_EXPECTED_VALUE_BPS,
+                status=(
+                    f"exact_threshold_not_found winners_exist={len(winning_obs)} "
+                    f"but_no_threshold_met_winrate_ev_rules"
                 ),
-                day_sample_count=len(day_obs),
-                week_sample_count=len(week_obs),
-                day_win_rate=self._win_rate(day_obs),
-                week_win_rate=self._win_rate(week_obs),
-                blended_win_rate=blended_wr,
-                avg_win_bps=fallback_avg_win,
-                avg_loss_bps=fallback_avg_loss,
-                expected_value_bps=blended_ev,
-                calibrated_projected_gross_bps=float(fallback_projected_gross),
-                calibrated_projected_net_bps=float(blended_ev),
-                calibrated_time_to_min_profit_minutes=float(fallback_time_to_profit),
-                calibrated_forward_window_minutes=float(fallback_window),
-                reason=(
-                    f"winner_based_product_fallback product={product_id} "
-                    f"winning_samples={len(winning_obs)} "
-                    f"score_q={fallback_score:.6f} "
-                    f"prob_q={fallback_prob:.6f} "
-                    f"overall_ev={blended_ev:.6f} "
-                    f"note=targets_from_actual_min_gain_winners"
-                ),
+                day_obs=day_obs,
+                week_obs=week_obs,
+                blended_ev=blended_ev,
+                avg_win_bps=blended_avg_win,
+                avg_loss_bps=blended_avg_loss,
             )
 
-        return ProductCalibrationProfile(
+        return self._uncalibrated_profile(
             product_id=product_id,
-            min_score=DEFAULT_CALIB_MIN_SCORE,
-            min_probability=DEFAULT_CALIB_MIN_PROB,
-            min_expected_value_bps=max(DEFAULT_CALIB_MIN_EV_BPS, CALIB_MIN_EXPECTED_VALUE_BPS),
-            day_sample_count=len(day_obs),
-            week_sample_count=len(week_obs),
-            day_win_rate=self._win_rate(day_obs),
-            week_win_rate=self._win_rate(week_obs),
-            blended_win_rate=blended_wr,
-            avg_win_bps=blended_avg_win,
-            avg_loss_bps=blended_avg_loss,
-            expected_value_bps=blended_ev,
-            calibrated_projected_gross_bps=0.0,
-            calibrated_projected_net_bps=float(blended_ev),
-            calibrated_time_to_min_profit_minutes=0.0,
-            calibrated_forward_window_minutes=0.0,
-            reason=(
-                f"no_winning_observations product={product_id} "
-                f"using_defaults total={len(all_obs)} "
+            status=(
+                f"no_winning_observations total={len(all_obs)} "
                 f"overall_ev={blended_ev:.6f}"
             ),
+            day_obs=day_obs,
+            week_obs=week_obs,
+            blended_ev=blended_ev,
+            avg_win_bps=blended_avg_win,
+            avg_loss_bps=blended_avg_loss,
         )
 
     def _simulate_armed_exit_net_bps(
@@ -5080,6 +5050,8 @@ class TradingBot:
         spread_bps: float,
     ) -> ProductCalibrationProfile:
         """Choose scalp/core pullbacks from recent target-arm simulations."""
+        if not profile.is_calibrated:
+            return profile
         required = CALIB_MIN_PREFIX_CANDLES_1M + CALIB_FORWARD_MINUTES_1M + 1
         if not candles or len(candles) < required:
             return profile
@@ -5193,10 +5165,10 @@ class TradingBot:
                     product, start_week, end_ts, CALIB_WEEK_GRANULARITY
                 )
                 if not day_candles:
-                    log(f"[calibration] no day candles for {product}; using default profile")
-                    profile = ProductCalibrationProfile(
+                    log(f"[calibration] no day candles for {product}; product uncalibrated")
+                    profile = self._uncalibrated_profile(
                         product_id=product,
-                        reason="no_day_candles_default",
+                        status="no_day_candles",
                     )
                     self.calibration_profiles[product] = profile
                     self.clog.log_profile(profile)
@@ -5258,9 +5230,9 @@ class TradingBot:
                 )
             except Exception as exc:
                 log_exception(f"[calibration] failed for {product}", exc)
-                profile = ProductCalibrationProfile(
+                profile = self._uncalibrated_profile(
                     product_id=product,
-                    reason=f"calibration_error={exc}",
+                    status=f"calibration_error={exc}",
                 )
                 self.calibration_profiles[product] = profile
                 self.clog.log_profile(profile)
@@ -5316,8 +5288,18 @@ class TradingBot:
                 day_obs=day_obs,
                 week_obs=[],
             )
-            # Smooth each product against its own previous target only.
-            # Do not clamp or bucket; preserve exact product-specific values.
+            if not new_profile.is_calibrated:
+                self.calibration_profiles[product] = new_profile
+                self.clog.log_profile(new_profile)
+                continue
+
+            if not old_profile.is_calibrated:
+                self.calibration_profiles[product] = new_profile
+                self.clog.log_profile(new_profile)
+                continue
+
+            # Smooth exact product-specific targets only after both the previous
+            # and current recalibrations have produced valid thresholds.
             old_profile.min_score = (
                 float(old_profile.min_score) * 0.80
                 + float(new_profile.min_score) * 0.20
@@ -5352,7 +5334,9 @@ class TradingBot:
                 float(old_profile.calibrated_forward_window_minutes) * 0.80
                 + float(new_profile.calibrated_forward_window_minutes) * 0.20
             )
-            old_profile.reason = "smoothed_live_recalibration"
+            old_profile.is_calibrated = True
+            old_profile.calibration_status = "exact_threshold"
+            old_profile.reason = "smoothed_live_exact_threshold_recalibration"
             self.calibration_profiles[product] = old_profile
             self.clog.log_profile(old_profile)
 
@@ -5402,6 +5386,9 @@ class TradingBot:
         profile = self.calibration_profiles.get(
             product_id,
             ProductCalibrationProfile(product_id=product_id),
+        )
+        buy_gate_calibration_ready = bool(
+            getattr(profile, "is_calibrated", False)
         )
         calibrated_forward_gain_bps = float(profile.calibrated_projected_gross_bps or 0.0)
         # Before calibration is available, fall back to the structure target.
@@ -5529,8 +5516,13 @@ class TradingBot:
 
         # Individual buy-gate checks.
         buy_gate_fee_ok = bool(fee_available and round_trip_cost_bps is not None)
-        buy_gate_score_target_ok = bool(score >= calib_min_score)
-        buy_gate_prob_target_ok = bool(estimated_prob_up >= calib_min_probability)
+        buy_gate_score_target_ok = bool(
+            buy_gate_calibration_ready and score >= calib_min_score
+        )
+        buy_gate_prob_target_ok = bool(
+            buy_gate_calibration_ready
+            and estimated_prob_up >= calib_min_probability
+        )
 
         # Floors are diagnostic only. They do not authorize buys.
         buy_gate_score_floor_ok = bool(score >= float(EV_PRIMARY_MIN_SCORE_FLOOR))
@@ -5539,7 +5531,8 @@ class TradingBot:
         )
 
         buy_gate_ev_ok = bool(
-            expected_net_edge_bps >= max(
+            buy_gate_calibration_ready
+            and expected_net_edge_bps >= max(
                 float(MIN_REQUIRED_NET_EDGE_BPS),
                 calib_min_ev,
             )
@@ -5615,7 +5608,8 @@ class TradingBot:
             # Operational readiness:
             # Fee data is required so EV/cost math is grounded in real Coinbase fees.
             operational_ok = bool(
-                buy_gate_fee_ok if FEE_DATA_REQUIRED_FOR_LIVE_BUY else True
+                buy_gate_calibration_ready
+                and (buy_gate_fee_ok if FEE_DATA_REQUIRED_FOR_LIVE_BUY else True)
             )
 
             ok_to_trade = bool(
@@ -5625,7 +5619,8 @@ class TradingBot:
         else:
             # Old multi-gate behavior, kept only as fallback.
             ok_to_trade = bool(
-                buy_gate_fee_ok
+                buy_gate_calibration_ready
+                and buy_gate_fee_ok
                 and buy_gate_setup_ok
                 and buy_gate_calibrated_ok
                 and buy_gate_target_cost_ok
@@ -5635,6 +5630,10 @@ class TradingBot:
         blockers = []
 
         if SIMPLIFY_BUY_GATE_TO_THREE_REQUIREMENTS:
+            if not buy_gate_calibration_ready:
+                blockers.append(
+                    f"calibration_not_ready:{profile.calibration_status}"
+                )
             if FEE_DATA_REQUIRED_FOR_LIVE_BUY and not buy_gate_fee_ok:
                 blockers.append("fee_data_not_ready")
 
@@ -5663,6 +5662,10 @@ class TradingBot:
             )
             buy_gate_mode = "simplified_three_requirements"
         else:
+            if not buy_gate_calibration_ready:
+                blockers.append(
+                    f"calibration_not_ready:{profile.calibration_status}"
+                )
             if not buy_gate_fee_ok:
                 blockers.append("fee_not_ready")
             if not buy_gate_score_ok:
@@ -5688,6 +5691,8 @@ class TradingBot:
                 f"[buy-gate] {product_id} BUY_READY "
                 f"mode={buy_gate_mode} "
                 f"diagnostics={diagnostic_note} "
+                f"calibrated={buy_gate_calibration_ready} "
+                f"calibration_status={profile.calibration_status} "
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
                 f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
@@ -5710,6 +5715,8 @@ class TradingBot:
                 f"mode={buy_gate_mode} "
                 f"blocker={buy_gate_blocker} "
                 f"diagnostics={diagnostic_note} "
+                f"calibrated={buy_gate_calibration_ready} "
+                f"calibration_status={profile.calibration_status} "
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
                 f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
@@ -6931,10 +6938,18 @@ class TradingBot:
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
 
+            retry_sec = (
+                UNCALIBRATED_RETRY_EVERY_SEC
+                if any(
+                    not profile.is_calibrated
+                    for profile in self.calibration_profiles.values()
+                )
+                else LIVE_RECALIBRATION_EVERY_SEC
+            )
             if (
                 ENABLE_WALK_FORWARD_CALIBRATION
                 and not self.live_recalibration_running
-                and ts_now - self.last_live_calibration_ts >= LIVE_RECALIBRATION_EVERY_SEC
+                and ts_now - self.last_live_calibration_ts >= retry_sec
             ):
                 self.last_live_calibration_ts = ts_now
                 self.live_recalibration_running = True

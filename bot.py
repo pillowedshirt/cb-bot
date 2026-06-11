@@ -3661,6 +3661,75 @@ class TradingBot:
         net_bps = float(target_bps - cost_bps)
         return net_bps, target_bps, cost_bps
 
+    def _estimate_display_prob_up(
+        self,
+        *,
+        score: float,
+        spread_bps: float,
+        momentum_5_bps: float,
+        momentum_15_bps: float,
+        support_score: float,
+        room_score: float,
+        regime_score: float,
+        vwap_ok: bool,
+        higher_low_ok: bool,
+        trending_down: bool,
+        target_bps: Optional[float] = None,
+        cost_bps: Optional[float] = None,
+        fee_available: bool = False,
+    ) -> float:
+        """
+        Display probability for live monitoring.
+
+        This should move continuously for every product.
+        It is not a guarantee and not a standalone permission to buy.
+
+        If real Coinbase fees are available, target/cost improves the probability.
+        If real fees are unavailable, this still displays a live price-action probability,
+        but the trade gate remains closed.
+        """
+        s = clamp_float(float(score), 0.0, 100.0)
+
+        # Base probability from live score.
+        # score 0 -> 32%, score 50 -> 50%, score 100 -> 68%
+        prob = 0.32 + (s / 100.0) * 0.36
+
+        # Momentum contribution.
+        prob += clamp_float(float(momentum_5_bps) / 80.0, -0.08, 0.08)
+        prob += clamp_float(float(momentum_15_bps) / 140.0, -0.06, 0.06)
+
+        # Structure contribution.
+        prob += ((float(support_score) - 50.0) / 100.0) * 0.045
+        prob += ((float(room_score) - 50.0) / 100.0) * 0.040
+        prob += ((float(regime_score) - 50.0) / 100.0) * 0.035
+
+        # Confirmation contribution.
+        prob += 0.030 if vwap_ok else -0.030
+        prob += 0.030 if higher_low_ok else -0.030
+
+        # Trend and spread penalties.
+        if trending_down:
+            prob -= 0.070
+
+        if spread_bps > SCALP_MAX_SPREAD_BPS:
+            prob -= 0.025
+        if spread_bps > MAX_SPREAD_BPS:
+            prob -= 0.080
+
+        # Fee-aware contribution only when real Coinbase fee data is available.
+        if fee_available and target_bps is not None and cost_bps is not None and float(cost_bps) > 0:
+            ratio = float(target_bps) / float(cost_bps)
+            if ratio >= 4.0:
+                prob += 0.050
+            elif ratio >= 3.0:
+                prob += 0.032
+            elif ratio >= MIN_TARGET_TO_COST_MULT:
+                prob += 0.018
+            else:
+                prob -= clamp_float((MIN_TARGET_TO_COST_MULT - ratio) * 0.040, 0.0, 0.09)
+
+        return clamp_float(prob, 0.20, 0.88)
+
     def _estimate_prob_up_from_candidate(
         self,
         *,
@@ -3752,10 +3821,10 @@ class TradingBot:
         score_entry_candidate() answers: "Is the strict dip setup tradeable?"
         _build_live_signal() answers: "How attractive is this product right now?"
         """
-        try:
-            round_trip_cost_bps = self._round_trip_cost_bps(spread_bps=spread_bps)
-        except Exception:
-            round_trip_cost_bps = 999.0
+        fee_available = (
+            self.current_maker_fee_bps is not None
+            and self.current_taker_fee_bps is not None
+        )
 
         target_bps = self._target_move_bps_from_room_and_sigma(
             mid=mid,
@@ -3764,8 +3833,18 @@ class TradingBot:
             levels_week=levels_week,
             sigma_bps=sigma_bps,
         )
-        cost_bps = float(round_trip_cost_bps)
-        expected_net_edge_bps = float(target_bps - cost_bps)
+
+        if fee_available:
+            try:
+                round_trip_cost_bps = self._round_trip_cost_bps(spread_bps=spread_bps)
+            except Exception as cost_err:
+                log(f"[signal] fee cost unavailable for {product_id}: {cost_err}")
+                round_trip_cost_bps = None
+        else:
+            round_trip_cost_bps = None
+
+        cost_bps = float(round_trip_cost_bps) if round_trip_cost_bps is not None else 0.0
+        expected_net_edge_bps = float(target_bps - cost_bps) if fee_available else 0.0
 
         support_score = _support_proximity_score(mid, levels_day, levels_week)
         room_score, room_reason = _room_score(mid, levels_day, levels_week, RESIST_BUFFER_BPS)
@@ -3832,32 +3911,57 @@ class TradingBot:
 
         score = _clip_score(raw_score)
         tier = _score_to_tier(score)
-        estimated_prob_up = self._estimate_prob_up_from_candidate(
+        estimated_prob_up = self._estimate_display_prob_up(
             score=score,
-            expected_net_edge_bps=expected_net_edge_bps,
             spread_bps=spread_bps,
-            target_bps=target_bps,
-            cost_bps=cost_bps,
-            trending_down=bool(trending_down),
+            momentum_5_bps=momentum_5_bps,
+            momentum_15_bps=momentum_15_bps,
+            support_score=support_score,
+            room_score=room_score,
+            regime_score=regime_score,
             vwap_ok=bool(vwap_ok),
             higher_low_ok=bool(higher_low_ok),
+            trending_down=bool(trending_down),
+            target_bps=target_bps,
+            cost_bps=cost_bps,
+            fee_available=fee_available,
         )
+
         position_pct = self._position_pct_from_probability(estimated_prob_up)
 
-        strict_entry = score_entry_candidate(
-            mid=mid,
-            spread_bps=spread_bps,
-            levels_day=levels_day,
-            levels_week=levels_week,
-            minute_candles=minute_candles,
-            weekly_bias=weekly_bias,
-            trending_down=trending_down,
-            resist_buffer_bps=RESIST_BUFFER_BPS,
-            round_trip_cost_bps=round_trip_cost_bps,
-        )
+        if fee_available and round_trip_cost_bps is not None:
+            strict_entry = score_entry_candidate(
+                mid=mid,
+                spread_bps=spread_bps,
+                levels_day=levels_day,
+                levels_week=levels_week,
+                minute_candles=minute_candles,
+                weekly_bias=weekly_bias,
+                trending_down=trending_down,
+                resist_buffer_bps=RESIST_BUFFER_BPS,
+                round_trip_cost_bps=float(round_trip_cost_bps),
+            )
+        else:
+            strict_entry = EntryScore(
+                False,
+                score,
+                tier,
+                "fee_tier_unavailable_trade_gate_closed",
+                dip_depth_score,
+                dip_speed_score,
+                reversal_score,
+                support_score,
+                room_score,
+                regime_score,
+                spread_penalty,
+                cost_penalty,
+                0.0,
+            )
 
         ok_to_trade = (
-            strict_entry.ok
+            fee_available
+            and round_trip_cost_bps is not None
+            and strict_entry.ok
             and estimated_prob_up >= float(PROB_FOR_MIN_SIZE)
             and expected_net_edge_bps >= float(MIN_REQUIRED_NET_EDGE_BPS)
             and target_bps >= cost_bps * float(MIN_TARGET_TO_COST_MULT)
@@ -3867,9 +3971,11 @@ class TradingBot:
         if not ok_to_trade:
             position_pct = 0.0
 
+        fee_state = "fee_ok" if fee_available else "fee_missing_trade_closed"
+
         reason = (
-            f"live_score={score:.1f}; prob={estimated_prob_up:.3f}; "
-            f"strict={strict_entry.reason}; edge={expected_net_edge_bps:.1f}; "
+            f"live_score={score:.1f}; display_prob={estimated_prob_up:.3f}; "
+            f"{fee_state}; strict={strict_entry.reason}; edge={expected_net_edge_bps:.1f}; "
             f"target={target_bps:.1f}; cost={cost_bps:.1f}; "
             f"mom5={momentum_5_bps:.1f}; mom15={momentum_15_bps:.1f}; "
             f"room={room_reason}; {vwap_reason}; {higher_low_reason}; {trend_reason}"

@@ -501,11 +501,17 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    window_minutes = st.slider("Micro chart window", 5, 240, 45)
-    overview_lookback_rows = st.slider("Overview change lookback rows", 2, 60, 20)
+    # Default to max so the first opened view shows the broadest available run context.
+    window_minutes = st.slider("Micro chart window", 5, 1440, 1440)
+    overview_lookback_rows = st.slider("Overview change lookback rows", 2, 120, 120)
     show_bid_ask = st.checkbox("Show bid/ask lines", value=True)
     show_macro = st.checkbox("Show macro tabs", value=True)
     show_debug_tables = st.checkbox("Show debug telemetry table", value=False)
+
+# Keep a viewer session start time so the display does not feel like it resets
+# every rerun. Streamlit reruns the script, but session_state persists.
+if "viewer_started_at_ts" not in st.session_state:
+    st.session_state["viewer_started_at_ts"] = pd.Timestamp.utcnow().timestamp()
 
 refresh_count = 0
 refresh_status = "paused"
@@ -515,7 +521,10 @@ if live_update:
         refresh_status = "missing package"
         st.error("Live update requires streamlit-autorefresh. Run: pip install streamlit-autorefresh")
     else:
-        refresh_count = st_autorefresh(interval=int(refresh_sec * 1000), key="live_data_update")
+        refresh_count = st_autorefresh(
+            interval=int(refresh_sec * 1000),
+            key="live_data_update",
+        )
         refresh_status = "active"
 
 
@@ -615,9 +624,23 @@ for _, r in latest_all.iterrows():
 overview = pd.DataFrame(overview_rows)
 
 latest_ts = pd.to_numeric(m["ts"], errors="coerce").dropna()
-last_seen = to_dt_mst(pd.Series([latest_ts.iloc[-1]])).iloc[0] if not latest_ts.empty else None
-global_age = age_seconds(latest_ts.iloc[-1]) if not latest_ts.empty else np.nan
+latest_market_ts = latest_ts.max() if not latest_ts.empty else np.nan
+earliest_market_ts = latest_ts.min() if not latest_ts.empty else np.nan
+last_seen = to_dt_mst(pd.Series([latest_market_ts])).iloc[0] if pd.notna(latest_market_ts) else None
+global_age = age_seconds(latest_market_ts) if pd.notna(latest_market_ts) else np.nan
 global_status = status_for_age(global_age)
+
+viewer_runtime_sec = pd.Timestamp.utcnow().timestamp() - float(
+    st.session_state.get("viewer_started_at_ts", pd.Timestamp.utcnow().timestamp())
+)
+
+bot_runtime_sec = np.nan
+try:
+    if pd.notna(earliest_market_ts) and pd.notna(latest_market_ts):
+        bot_runtime_sec = float(latest_market_ts) - float(earliest_market_ts)
+except Exception:
+    bot_runtime_sec = np.nan
+
 status_cls = status_class(global_status)
 
 st.markdown(
@@ -626,7 +649,9 @@ st.markdown(
   <div class="cb-small">
     Last telemetry:
     <span class="{status_cls}">{last_seen.strftime('%H:%M:%S %Z') if last_seen is not None else '—'}</span>
-    · age {fmt_num(global_age, 0, 's')}
+    · data age {fmt_num(global_age, 0, 's')}
+    · bot runtime {fmt_num(bot_runtime_sec / 60.0 if pd.notna(bot_runtime_sec) else np.nan, 1, ' min')}
+    · viewer runtime {fmt_num(viewer_runtime_sec / 60.0, 1, ' min')}
     · update {refresh_status}
     · interval {refresh_sec}s
     · cycle {refresh_count}
@@ -665,24 +690,74 @@ with act2:
 # =============================================================================
 
 st.markdown('<div class="cb-section">All monitored coins overview</div>', unsafe_allow_html=True)
+
 if overview.empty:
     st.warning("No product overview rows available yet.")
 else:
-    display_overview = overview.copy()
-    display_overview["Prob"] = display_overview["Prob"].map(lambda x: fmt_pct(x))
-    display_overview["Score"] = display_overview["Score"].map(lambda x: fmt_num(x, 1))
-    display_overview["Mid"] = display_overview["Mid"].map(lambda x: fmt_num(x, 6))
-    display_overview["Δ bps"] = display_overview["Δ bps"].map(lambda x: fmt_num(x, 1))
-    display_overview["Spread"] = display_overview["Spread"].map(lambda x: fmt_num(x, 1))
-    display_overview["Pos %"] = display_overview["Pos %"].map(lambda x: fmt_pct(x))
-    display_overview["Projected"] = display_overview["Projected"].map(lambda x: fmt_money(x))
-    display_overview["Exposure"] = display_overview["Exposure"].map(lambda x: fmt_money(x))
-    st.dataframe(
-        display_overview[["Product", "Status", "Age", "Prob", "Score", "Mid", "Δ bps", "Spread", "Pos %", "Projected", "Exposure", "Rows"]],
-        use_container_width=True,
-        hide_index=True,
-        height=210,
-    )
+    # Sort by estimated probability, then score, so the strongest setup is visually first.
+    overview_sorted = overview.copy()
+    overview_sorted["ProbRaw"] = pd.to_numeric(overview_sorted["Prob"], errors="coerce")
+    overview_sorted["ScoreRaw"] = pd.to_numeric(overview_sorted["Score"], errors="coerce")
+    overview_sorted = overview_sorted.sort_values(["ProbRaw", "ScoreRaw"], ascending=False)
+
+    cols_per_row = 2
+    rows = [overview_sorted.iloc[i:i + cols_per_row] for i in range(0, len(overview_sorted), cols_per_row)]
+
+    for chunk in rows:
+        cols = st.columns(cols_per_row)
+        for col, (_, row) in zip(cols, chunk.iterrows()):
+            status = str(row.get("Status", "unknown"))
+            cls = status_class(status)
+            product_label = str(row.get("Product", "—"))
+
+            prob_val = row.get("Prob", np.nan)
+            score_val = row.get("Score", np.nan)
+            mid_val = row.get("Mid", np.nan)
+            change_val = row.get("Δ bps", np.nan)
+            spread_val = row.get("Spread", np.nan)
+            projected_val = row.get("Projected", np.nan)
+            exposure_val = row.get("Exposure", np.nan)
+            rows_val = row.get("Rows", "—")
+
+            body = f"""
+<div class="cb-card">
+  <div class="cb-row">
+    <div class="cb-value">{product_label}</div>
+    <div class="{cls}">{status.upper()}</div>
+  </div>
+  <div class="cb-kv" style="margin-top:0.35rem;">
+    <div class="k">Probability</div><div class="v">{fmt_pct(prob_val)}</div>
+    <div class="k">Score</div><div class="v">{fmt_num(score_val, 1)}</div>
+    <div class="k">Mid</div><div class="v">{fmt_num(mid_val, 6)}</div>
+    <div class="k">Change</div><div class="v">{fmt_num(change_val, 1, ' bps')}</div>
+    <div class="k">Spread</div><div class="v">{fmt_num(spread_val, 1, ' bps')}</div>
+    <div class="k">Projected buy</div><div class="v">{fmt_money(projected_val)}</div>
+    <div class="k">Exposure</div><div class="v">{fmt_money(exposure_val)}</div>
+    <div class="k">Rows</div><div class="v">{rows_val}</div>
+  </div>
+</div>
+"""
+            col.markdown(body, unsafe_allow_html=True)
+
+    with st.expander("Overview table"):
+        display_overview = overview.copy()
+        display_overview["Prob"] = display_overview["Prob"].map(lambda x: fmt_pct(x))
+        display_overview["Score"] = display_overview["Score"].map(lambda x: fmt_num(x, 1))
+        display_overview["Mid"] = display_overview["Mid"].map(lambda x: fmt_num(x, 6))
+        display_overview["Δ bps"] = display_overview["Δ bps"].map(lambda x: fmt_num(x, 1))
+        display_overview["Spread"] = display_overview["Spread"].map(lambda x: fmt_num(x, 1))
+        display_overview["Pos %"] = display_overview["Pos %"].map(lambda x: fmt_pct(x))
+        display_overview["Projected"] = display_overview["Projected"].map(lambda x: fmt_money(x))
+        display_overview["Exposure"] = display_overview["Exposure"].map(lambda x: fmt_money(x))
+
+        st.dataframe(
+            display_overview[
+                ["Product", "Status", "Age", "Prob", "Score", "Mid", "Δ bps", "Spread", "Pos %", "Projected", "Exposure", "Rows"]
+            ],
+            width="stretch",
+            hide_index=True,
+            height=210,
+        )
 
 
 # =============================================================================
@@ -699,7 +774,13 @@ with top_a:
     default_idx = products.index("BTC-USD") if "BTC-USD" in products else 0
     product = st.selectbox("Selected coin", products, index=default_idx, label_visibility="collapsed")
 
-cutoff = pd.Timestamp.utcnow().timestamp() - float(window_minutes) * 60.0
+if pd.notna(latest_market_ts):
+    cutoff = max(
+        float(earliest_market_ts) if pd.notna(earliest_market_ts) else 0.0,
+        float(latest_market_ts) - float(window_minutes) * 60.0,
+    )
+else:
+    cutoff = pd.Timestamp.utcnow().timestamp() - float(window_minutes) * 60.0
 m_prod = m[(m["product_id"] == product) & (m["ts"] >= cutoff)].dropna(subset=["ts", "mid"]).copy()
 if m_prod.empty:
     st.warning(f"No recent telemetry rows for {product} in the selected window.")
@@ -793,7 +874,7 @@ st.markdown(f'<div class="cb-section">{product} live chart with buy/sell overlay
 fig = plt.figure(figsize=(7.5, 2.75), facecolor="#050814")
 ax = plt.gca()
 plot_price(ax, m_prod, title=f"{product} · last {window_minutes} min", show_bid_ask=show_bid_ask, trades=t_prod)
-st.pyplot(fig, clear_figure=True, use_container_width=True)
+st.pyplot(fig, clear_figure=True, width="stretch")
 
 
 # =============================================================================
@@ -808,14 +889,14 @@ with r1:
         st.write("No order attempts.")
     else:
         compact_cols = [c for c in ["dt_mst", "event", "product_id", "side", "mode", "requested_quote_usd", "ok", "status", "filled_qty", "avg_price", "raw_error"] if c in o_sorted.columns]
-        st.dataframe(o_sorted[compact_cols].head(5), use_container_width=True, height=175, hide_index=True)
+        st.dataframe(o_sorted[compact_cols].head(5), width="stretch", height=175, hide_index=True)
 with r2:
     st.caption("Recent confirmed trades")
     if t_sorted.empty:
         st.write("No confirmed trades.")
     else:
         compact_cols = [c for c in ["dt_mst", "event", "product_id", "side", "qty", "price", "fee_usd", "net_pnl_usd", "note"] if c in t_sorted.columns]
-        st.dataframe(t_sorted[compact_cols].head(5), use_container_width=True, height=175, hide_index=True)
+        st.dataframe(t_sorted[compact_cols].head(5), width="stretch", height=175, hide_index=True)
 
 
 # =============================================================================
@@ -841,7 +922,7 @@ if show_macro:
                     figm = plt.figure(figsize=(7.5, 2.05), facecolor="#050814")
                     axm = plt.gca()
                     plot_macro(axm, df_macro, levels, f"{product} · {label}")
-                    st.pyplot(figm, clear_figure=True, use_container_width=True)
+                    st.pyplot(figm, clear_figure=True, width="stretch")
 
 
 # =============================================================================
@@ -853,14 +934,14 @@ with st.expander("Older order attempts"):
         st.write("No order attempts logged yet.")
     else:
         show_cols = [c for c in ["dt_mst", "event", "product_id", "side", "mode", "requested_quote_usd", "requested_base_qty", "ok", "status", "filled_qty", "avg_price", "filled_notional_usd", "fee_usd", "reason", "raw_error"] if c in o_sorted.columns]
-        st.dataframe(o_sorted[show_cols].head(150), use_container_width=True, height=420, hide_index=True)
+        st.dataframe(o_sorted[show_cols].head(150), width="stretch", height=420, hide_index=True)
 with st.expander("Older confirmed trades"):
     if t_sorted.empty:
         st.write("No confirmed trades logged yet.")
     else:
         show_cols = [c for c in ["dt_mst", "event", "product_id", "side", "qty", "price", "fee_usd", "gross_pnl_usd", "net_pnl_usd", "cum_pnl_usd", "entry_price", "exit_price", "exit_role", "note"] if c in t_sorted.columns]
-        st.dataframe(t_sorted[show_cols].head(150), use_container_width=True, height=420, hide_index=True)
+        st.dataframe(t_sorted[show_cols].head(150), width="stretch", height=420, hide_index=True)
 if show_debug_tables:
     with st.expander("Market telemetry debug"):
         debug_cols = [c for c in ["ts", "product_id", "bid", "ask", "mid", "spread_bps", "cash_usd", "equity_usd", "entry_score", "entry_tier", "estimated_prob_up", "position_pct", "target_bps", "cost_bps", "entry_reason"] if c in m.columns]
-        st.dataframe(m.sort_values("ts", ascending=False)[debug_cols].head(300), use_container_width=True, height=420, hide_index=True)
+        st.dataframe(m.sort_values("ts", ascending=False)[debug_cols].head(300), width="stretch", height=420, hide_index=True)

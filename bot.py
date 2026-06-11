@@ -120,7 +120,7 @@ REENTRY_REARM_BPS: float = 15.0
 FIRST_BUY_DELAY_SEC: float = 0.0
 BUY_COOLDOWN_SEC: float = 20.0
 POST_EXIT_COOLDOWN_SEC: float = 120.0
-MAX_NEW_ENTRIES_PER_EVAL: int = 4
+MAX_NEW_ENTRIES_PER_EVAL: int = 1
 EVAL_TICK_SEC: float = 2.0
 
 # Allocation / exposure
@@ -147,10 +147,10 @@ MAX_SINGLE_BUY_PCT_OF_EQUITY: float = 0.20
 MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.50
 
 # Probability mapping:
-# estimated probability <= 55% gets minimum size.
-# estimated probability >= 80% gets maximum single-buy size.
-PROB_FOR_MIN_SIZE: float = 0.55
-PROB_FOR_MAX_SIZE: float = 0.80
+# estimated probability below 52% gets no size.
+# estimated probability at 52% gets minimum size; 78% gets maximum size.
+PROB_FOR_MIN_SIZE: float = 0.52
+PROB_FOR_MAX_SIZE: float = 0.78
 
 # Cash reserve.
 # The bot will not intentionally spend this final amount.
@@ -295,8 +295,8 @@ INVALIDATION_BUFFER_BPS: float = 10.0
 MAX_DAILY_LOSS_USD: float = 3.00
 MAX_CONSECUTIVE_LOSSES: int = 3
 COOLDOWN_AFTER_LOSS_SEC: float = 15 * 60
-MAX_TRADES_PER_HOUR: int = 6
-MAX_TRADES_PER_PRODUCT_PER_HOUR: int = 2
+MAX_TRADES_PER_HOUR: int = 4
+MAX_TRADES_PER_PRODUCT_PER_HOUR: int = 1
 PAUSE_AFTER_DAILY_LOSS_SEC: float = 6 * 60 * 60
 
 # Scaling
@@ -3589,59 +3589,76 @@ class TradingBot:
         """
         Estimate probability that price reaches the intended profitable move from the buy point.
 
-        This is not a true statistical probability yet.
-        It is a calibrated probability proxy based on signal quality.
-        Later, it can be calibrated from actual trades.csv outcomes.
+        This is a dynamic signal-confidence model, not a guarantee.
+        It intentionally does not clamp weak setups to 50%, because that made the
+        viewer look stagnant and hid meaningful differences between products.
         """
         s = clamp_float(float(score), 0.0, 100.0)
+        edge = float(expected_net_edge_bps)
+        spr = float(spread_bps)
 
-        # Base probability from score:
-        # score 50 => about 55%
-        # score 80 => about 70%
-        # score 100 => about 80%
-        prob = 0.50 + ((s - 40.0) / 150.0)
+        # Base from score. Allows weak setups below 50 and strong setups above 50.
+        # score 0   => 0.35
+        # score 50  => 0.50
+        # score 80  => 0.59 before boosts
+        # score 100 => 0.65 before boosts
+        prob = 0.35 + (s / 100.0) * 0.30
 
-        # Fee-adjusted edge matters.
-        if expected_net_edge_bps >= MIN_REQUIRED_NET_EDGE_BPS:
-            prob += 0.03
-        if expected_net_edge_bps >= MIN_REQUIRED_NET_EDGE_BPS * 1.75:
-            prob += 0.04
-        if expected_net_edge_bps < MIN_REQUIRED_NET_EDGE_BPS:
-            prob -= 0.08
+        # Fee-adjusted edge contribution.
+        # Strong edge should visibly raise probability; negative edge should lower it.
+        if MIN_REQUIRED_NET_EDGE_BPS > 0:
+            edge_ratio = edge / float(MIN_REQUIRED_NET_EDGE_BPS)
+            prob += clamp_float(edge_ratio, -2.0, 2.5) * 0.045
 
         # Target-to-cost quality.
-        if target_bps is not None and cost_bps is not None and cost_bps > 0:
+        if target_bps is not None and cost_bps is not None and float(cost_bps) > 0:
             ratio = float(target_bps) / float(cost_bps)
             if ratio >= 4.0:
-                prob += 0.04
+                prob += 0.055
             elif ratio >= 3.0:
-                prob += 0.02
-            elif ratio < MIN_TARGET_TO_COST_MULT:
-                prob -= 0.08
+                prob += 0.035
+            elif ratio >= MIN_TARGET_TO_COST_MULT:
+                prob += 0.018
+            else:
+                prob -= clamp_float((float(MIN_TARGET_TO_COST_MULT) - ratio) * 0.06, 0.0, 0.12)
 
         # Confirmation boosts.
         if vwap_ok:
-            prob += 0.025
+            prob += 0.030
+        else:
+            prob -= 0.030
+
         if higher_low_ok:
-            prob += 0.025
+            prob += 0.030
+        else:
+            prob -= 0.030
 
-        # Trend/spread penalties.
+        # Trend penalty.
         if trending_down:
-            prob -= 0.07
-        if spread_bps > SCALP_MAX_SPREAD_BPS:
-            prob -= 0.03
-        if spread_bps > MAX_SPREAD_BPS:
-            prob -= 0.10
+            prob -= 0.080
 
-        return clamp_float(prob, 0.50, 0.85)
+        # Spread penalty. Wide spreads are hostile to small trades.
+        if spr > SCALP_MAX_SPREAD_BPS:
+            prob -= 0.030
+        if spr > MAX_SPREAD_BPS:
+            prob -= 0.100
+
+        # Keep the output bounded but visibly dynamic.
+        return clamp_float(prob, 0.25, 0.88)
 
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
         """
         Map estimated probability to a single-buy percentage of total equity.
-        55% or lower => 5%.
-        80% or higher => 20%.
+
+        Below PROB_FOR_MIN_SIZE: 0%.
+        At PROB_FOR_MIN_SIZE: minimum size.
+        At PROB_FOR_MAX_SIZE or higher: maximum single-buy size.
         """
         p = clamp_float(float(estimated_prob_up), 0.0, 1.0)
+
+        if p < float(PROB_FOR_MIN_SIZE):
+            return 0.0
+
         denom = max(1e-9, float(PROB_FOR_MAX_SIZE) - float(PROB_FOR_MIN_SIZE))
         t = clamp_float((p - float(PROB_FOR_MIN_SIZE)) / denom, 0.0, 1.0)
         return lerp_float(MIN_POSITION_PCT_OF_EQUITY, MAX_SINGLE_BUY_PCT_OF_EQUITY, t)
@@ -5014,10 +5031,19 @@ class TradingBot:
                     vwap_ok=bool(vwap_ok),
                     higher_low_ok=bool(hl_ok),
                 )
-                position_pct = self._position_pct_from_probability(estimated_prob_up)
+                # Probability is always shown for monitoring, but position sizing should
+                # only become meaningful when the candidate is actually tradeable.
+                if not scored.ok:
+                    display_position_pct = 0.0
+                else:
+                    display_position_pct = self._position_pct_from_probability(estimated_prob_up)
+
+                position_pct = display_position_pct
+                tradeable_probability = float(estimated_prob_up) >= float(PROB_FOR_MIN_SIZE)
 
                 if (
                     scored.ok
+                    and tradeable_probability
                     and warmup_done
                     and not self._risk_pause_active()
                     and self._trade_rate_ok(product_id)
@@ -5318,6 +5344,66 @@ class TradingBot:
                 sigma_bps = self._compute_sigma_bps_from_1m(product)
                 weekly_bias = self.macro.compute_weekly_bias(product, mid)
                 state = "long" if position_qty > 0 else "flat"
+                # Compute display-only signal fields for every telemetry row so the
+                # viewer always has fresh probability values, not stale/blank values.
+                try:
+                    minute_candles = list(self.live_1m.get(product).candles) if self.live_1m.get(product) else []
+                    trending_down, trend_reason = self._micro_trending_down(product)
+                    vwap_ok, vwap_reason = self._micro_vwap_reclaimed(product, mid)
+                    hl_ok, hl_reason = self._higher_low_confirmed(product)
+                    round_trip_cost_bps_for_score = self._round_trip_cost_bps(spread_bps=spread_bps)
+
+                    scored = score_entry_candidate(
+                        mid=mid,
+                        spread_bps=spread_bps,
+                        levels_day=levels_day,
+                        levels_week=levels_week,
+                        minute_candles=minute_candles,
+                        weekly_bias=weekly_bias,
+                        trending_down=trending_down,
+                        resist_buffer_bps=RESIST_BUFFER_BPS,
+                        round_trip_cost_bps=round_trip_cost_bps_for_score,
+                    )
+
+                    fee_edge_bps, target_bps, cost_bps = self._fee_aware_expected_edge_bps(
+                        product_id=product,
+                        mid=mid,
+                        spread_bps=spread_bps,
+                        levels_day=levels_day,
+                        levels_week=levels_week,
+                        sigma_bps=sigma_bps,
+                    )
+
+                    estimated_prob_up = self._estimate_prob_up_from_candidate(
+                        score=float(scored.score),
+                        expected_net_edge_bps=float(fee_edge_bps),
+                        spread_bps=float(spread_bps),
+                        target_bps=float(target_bps),
+                        cost_bps=float(cost_bps),
+                        trending_down=bool(trending_down),
+                        vwap_ok=bool(vwap_ok),
+                        higher_low_ok=bool(hl_ok),
+                    )
+
+                    position_pct = self._position_pct_from_probability(estimated_prob_up) if scored.ok else 0.0
+                    scored.expected_net_edge_bps = fee_edge_bps
+                    scored.reason = (
+                        f"{scored.reason}; display_prob={estimated_prob_up:.3f}; "
+                        f"target={target_bps:.1f}; cost={cost_bps:.1f}; "
+                        f"{vwap_reason}; {hl_reason}; {trend_reason}"
+                    )
+
+                except Exception as sig_err:
+                    log(f"[telemetry] signal snapshot failed for {product}: {sig_err}")
+                    scored = EntryScore(
+                        False, 0.0, 0, f"signal_snapshot_error={sig_err}",
+                        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    )
+                    estimated_prob_up = None
+                    position_pct = None
+                    target_bps = None
+                    cost_bps = None
+
                 self.mlog.log_snapshot(
                     ts=ts_now,
                     product_id=product,
@@ -5335,6 +5421,25 @@ class TradingBot:
                     state=state,
                     cash_usd=cash_usd,
                     equity_usd=equity_usd,
+                    entry_score=scored.score,
+                    entry_tier=scored.tier,
+                    entry_reason=scored.reason,
+                    expected_net_edge_bps=scored.expected_net_edge_bps,
+                    estimated_prob_up=estimated_prob_up,
+                    position_pct=position_pct,
+                    target_bps=target_bps,
+                    cost_bps=cost_bps,
+                    current_maker_fee_bps=self.current_maker_fee_bps,
+                    current_taker_fee_bps=self.current_taker_fee_bps,
+                    fee_tier_reason=self.last_fee_tier_reason,
+                    dip_depth_score=scored.dip_depth_score,
+                    dip_speed_score=scored.dip_speed_score,
+                    reversal_score=scored.reversal_score,
+                    support_score=scored.support_score,
+                    room_score=scored.room_score,
+                    regime_score=scored.regime_score,
+                    spread_penalty=scored.spread_penalty,
+                    cost_penalty=scored.cost_penalty,
                 )
             await asyncio.sleep(EVAL_TICK_SEC)
 

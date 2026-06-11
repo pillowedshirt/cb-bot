@@ -782,7 +782,9 @@ def render_live_dashboard() -> None:
         "anchored_vwap", "fair_value", "sigma_bps", "weekly_bias",
         "cash_usd", "equity_usd",
         "entry_score", "entry_tier", "expected_net_edge_bps",
-        "estimated_prob_up", "position_pct", "target_bps", "cost_bps",
+        "estimated_prob_up", "position_pct",
+        "target_bps", "projected_forward_gain_bps", "cost_bps",
+        "calibrated_time_to_min_profit_minutes", "calibrated_forward_window_minutes",
         "current_maker_fee_bps", "current_taker_fee_bps",
         "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
         "room_score", "regime_score", "spread_penalty", "cost_penalty"
@@ -794,6 +796,10 @@ def render_live_dashboard() -> None:
         "day_sample_count", "week_sample_count",
         "day_win_rate", "week_win_rate", "blended_win_rate",
         "avg_win_bps", "avg_loss_bps", "expected_value_bps",
+        "calibrated_projected_gross_bps",
+        "calibrated_projected_net_bps",
+        "calibrated_time_to_min_profit_minutes",
+        "calibrated_forward_window_minutes",
     ])
     hist = numeric(hist, ["ts", "open", "high", "low", "close", "volume"])
     pt = numeric(pt, [
@@ -1042,7 +1048,7 @@ def render_live_dashboard() -> None:
 
     m_prod = pd.concat([
         hist_prod[[c for c in ["ts", "mid", "bid", "ask", "spread_bps"] if c in hist_prod.columns]],
-        m_prod_live[[c for c in ["ts", "mid", "bid", "ask", "spread_bps", "anchored_vwap", "fair_value", "entry_score", "estimated_prob_up", "expected_net_edge_bps", "cash_usd", "equity_usd", "exposures_usd", "position_qty", "target_bps", "cost_bps", "position_pct", "current_maker_fee_bps", "current_taker_fee_bps", "fee_tier_reason", "entry_tier", "entry_reason"] if c in m_prod_live.columns]],
+        m_prod_live[[c for c in ["ts", "mid", "bid", "ask", "spread_bps", "anchored_vwap", "fair_value", "entry_score", "estimated_prob_up", "expected_net_edge_bps", "cash_usd", "equity_usd", "exposures_usd", "position_qty", "target_bps", "projected_forward_gain_bps", "cost_bps", "calibrated_time_to_min_profit_minutes", "calibrated_forward_window_minutes", "position_pct", "current_maker_fee_bps", "current_taker_fee_bps", "fee_tier_reason", "entry_tier", "entry_reason"] if c in m_prod_live.columns]],
     ], ignore_index=True)
     m_prod = m_prod.dropna(subset=["ts", "mid"]).drop_duplicates(subset=["ts"], keep="last").sort_values("ts").copy()
     if m_prod.empty:
@@ -1117,11 +1123,48 @@ def render_live_dashboard() -> None:
 
         b1, b2, b3 = st.columns(3)
         with b1:
-            mini_card("Buy score requirement", f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}", "PASS" if score_ok else "waiting")
+            mini_card(
+                "Buy score requirement",
+                f"{fmt_num(current_score, 3)} / {fmt_num(min_score, 3)}",
+                "PASS" if score_ok else "waiting",
+            )
         with b2:
-            mini_card("Buy probability requirement", f"{fmt_pct(current_prob, 3)} / {fmt_pct(min_prob, 3)}", "PASS" if prob_ok else "waiting")
+            mini_card(
+                "Buy probability requirement",
+                f"{fmt_pct(current_prob, 3)} / {fmt_pct(min_prob, 3)}",
+                "PASS" if prob_ok else "waiting",
+            )
         with b3:
-            mini_card("Buy EV requirement", f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}", "PASS" if ev_ok else "waiting")
+            mini_card(
+                "Projected net edge",
+                f"{fmt_num(current_ev, 1, ' bps')} / {fmt_num(min_ev, 1, ' bps')}",
+                "PASS" if ev_ok else "waiting",
+            )
+
+        current_projected_forward = latest_row.get("projected_forward_gain_bps", np.nan)
+        current_cost = latest_row.get("cost_bps", np.nan)
+        time_to_profit = latest_row.get("calibrated_time_to_min_profit_minutes", np.nan)
+        forward_window = latest_row.get("calibrated_forward_window_minutes", np.nan)
+
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            mini_card(
+                "Projected forward gain",
+                fmt_num(current_projected_forward, 1, " bps"),
+                "historical similar-setup projection",
+            )
+        with e2:
+            mini_card(
+                "Modeled cost",
+                fmt_num(current_cost, 1, " bps"),
+                "fees + spread + buffers",
+            )
+        with e3:
+            mini_card(
+                "Calibrated time window",
+                fmt_num(time_to_profit, 1, " min"),
+                f"window {fmt_num(forward_window, 1, ' min')}",
+            )
 
         st.caption(f"Calibration reason: {selected_cal.get('reason', '—')}")
 
@@ -1259,7 +1302,7 @@ def render_live_dashboard() -> None:
             st.dataframe(t_sorted[show_cols].head(150), width="stretch", height=420, hide_index=True)
     if show_debug_tables:
         with st.expander("Market telemetry debug"):
-            debug_cols = [c for c in ["ts", "product_id", "bid", "ask", "mid", "spread_bps", "cash_usd", "equity_usd", "entry_score", "entry_tier", "estimated_prob_up", "position_pct", "target_bps", "cost_bps", "entry_reason"] if c in m.columns]
+            debug_cols = [c for c in ["ts", "product_id", "bid", "ask", "mid", "spread_bps", "cash_usd", "equity_usd", "entry_score", "entry_tier", "estimated_prob_up", "position_pct", "target_bps", "projected_forward_gain_bps", "cost_bps", "calibrated_time_to_min_profit_minutes", "calibrated_forward_window_minutes", "entry_reason"] if c in m.columns]
             st.dataframe(m.sort_values("ts", ascending=False)[debug_cols].head(300), width="stretch", height=420, hide_index=True)
 
 if live_update and HAS_NATIVE_FRAGMENT_REFRESH:

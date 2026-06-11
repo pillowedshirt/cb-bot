@@ -1326,7 +1326,9 @@ class MarketLogger:
                 "anchored_vwap", "fair_value", "sigma_bps", "weekly_bias",
                 "state", "cash_usd", "equity_usd",
                 "entry_score", "entry_tier", "entry_reason", "expected_net_edge_bps",
-                "estimated_prob_up", "position_pct", "target_bps", "cost_bps",
+                "estimated_prob_up", "position_pct",
+                "target_bps", "projected_forward_gain_bps", "cost_bps",
+                "calibrated_time_to_min_profit_minutes", "calibrated_forward_window_minutes",
                 "current_maker_fee_bps", "current_taker_fee_bps", "fee_tier_reason",
                 "dip_depth_score", "dip_speed_score", "reversal_score", "support_score",
                 "room_score", "regime_score", "spread_penalty", "cost_penalty"
@@ -1358,7 +1360,10 @@ class MarketLogger:
         estimated_prob_up: Optional[float] = None,
         position_pct: Optional[float] = None,
         target_bps: Optional[float] = None,
+        projected_forward_gain_bps: Optional[float] = None,
         cost_bps: Optional[float] = None,
+        calibrated_time_to_min_profit_minutes: Optional[float] = None,
+        calibrated_forward_window_minutes: Optional[float] = None,
         current_maker_fee_bps: Optional[float] = None,
         current_taker_fee_bps: Optional[float] = None,
         fee_tier_reason: str = "",
@@ -1391,7 +1396,10 @@ class MarketLogger:
                 "" if estimated_prob_up is None else f"{estimated_prob_up:.6f}",
                 "" if position_pct is None else f"{position_pct:.6f}",
                 "" if target_bps is None else f"{target_bps:.6f}",
+                "" if projected_forward_gain_bps is None else f"{projected_forward_gain_bps:.6f}",
                 "" if cost_bps is None else f"{cost_bps:.6f}",
+                "" if calibrated_time_to_min_profit_minutes is None else f"{calibrated_time_to_min_profit_minutes:.6f}",
+                "" if calibrated_forward_window_minutes is None else f"{calibrated_forward_window_minutes:.6f}",
                 "" if current_maker_fee_bps is None else f"{current_maker_fee_bps:.6f}",
                 "" if current_taker_fee_bps is None else f"{current_taker_fee_bps:.6f}",
                 fee_tier_reason,
@@ -1938,14 +1946,17 @@ class LiveSignal:
     expected_net_edge_bps: float
     target_bps: float
     cost_bps: float
-    dip_depth_score: float
-    dip_speed_score: float
-    reversal_score: float
-    support_score: float
-    room_score: float
-    regime_score: float
-    spread_penalty: float
-    cost_penalty: float
+    projected_forward_gain_bps: float = 0.0
+    calibrated_time_to_min_profit_minutes: float = 0.0
+    calibrated_forward_window_minutes: float = 0.0
+    dip_depth_score: float = 0.0
+    dip_speed_score: float = 0.0
+    reversal_score: float = 0.0
+    support_score: float = 0.0
+    room_score: float = 0.0
+    regime_score: float = 0.0
+    spread_penalty: float = 0.0
+    cost_penalty: float = 0.0
     trend_reason: str = ""
     vwap_reason: str = ""
     higher_low_reason: str = ""
@@ -1970,6 +1981,12 @@ class CalibrationObservation:
     win_bps: float
     loss_bps: float
 
+    # Forward-projection measurements.
+    time_to_min_profit_bars: Optional[int] = None
+    time_to_min_profit_minutes: Optional[float] = None
+    forward_window_minutes: Optional[float] = None
+    projected_forward_gain_bps: float = 0.0
+
 
 @dataclass
 class ProductCalibrationProfile:
@@ -1987,6 +2004,13 @@ class ProductCalibrationProfile:
     avg_win_bps: float = 0.0
     avg_loss_bps: float = 0.0
     expected_value_bps: float = 0.0
+
+    # Calibrated forward-projection values.
+    calibrated_projected_gross_bps: float = 0.0
+    calibrated_projected_net_bps: float = 0.0
+    calibrated_time_to_min_profit_minutes: float = 0.0
+    calibrated_forward_window_minutes: float = 0.0
+
     reason: str = "default_profile"
 
 
@@ -2007,6 +2031,10 @@ class CalibrationLogger:
                 "day_sample_count", "week_sample_count",
                 "day_win_rate", "week_win_rate", "blended_win_rate",
                 "avg_win_bps", "avg_loss_bps", "expected_value_bps",
+                "calibrated_projected_gross_bps",
+                "calibrated_projected_net_bps",
+                "calibrated_time_to_min_profit_minutes",
+                "calibrated_forward_window_minutes",
                 "reason",
             ])
 
@@ -2029,6 +2057,10 @@ class CalibrationLogger:
                 f"{profile.avg_win_bps:.6f}",
                 f"{profile.avg_loss_bps:.6f}",
                 f"{profile.expected_value_bps:.6f}",
+                f"{profile.calibrated_projected_gross_bps:.6f}",
+                f"{profile.calibrated_projected_net_bps:.6f}",
+                f"{profile.calibrated_time_to_min_profit_minutes:.6f}",
+                f"{profile.calibrated_forward_window_minutes:.6f}",
                 profile.reason,
             ])
 
@@ -4367,6 +4399,9 @@ class TradingBot:
             expected_net_edge_bps=float(expected_net_edge_bps),
             target_bps=float(target_bps),
             cost_bps=float(cost_bps),
+            projected_forward_gain_bps=0.0,
+            calibrated_time_to_min_profit_minutes=0.0,
+            calibrated_forward_window_minutes=0.0,
             dip_depth_score=float(dip_depth_score),
             dip_speed_score=float(dip_speed_score),
             reversal_score=float(reversal_score),
@@ -4388,25 +4423,57 @@ class TradingBot:
         target_bps: float,
         cost_bps: float,
         min_net_gain_bps: float,
-    ) -> Tuple[float, float, bool, bool, float, float, float]:
-        """Evaluate favorable and adverse movement after a replayed signal."""
+        bar_minutes: float,
+    ) -> Tuple[float, float, bool, bool, float, float, float, Optional[int], Optional[float], float]:
+        """
+        Look forward after a historical signal and determine what happened.
+
+        Also measure how many bars/minutes it took to reach minimum profit and
+        the total forward window represented by the replay.
+        """
         if entry_price <= 0 or not future_candles:
-            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0
+            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0, None, None, 0.0
+
         highs = [float(c.high) for c in future_candles if float(c.high) > 0]
         lows = [float(c.low) for c in future_candles if float(c.low) > 0]
+
         if not highs or not lows:
-            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0
-        max_favorable_bps = ((max(highs) / entry_price) - 1.0) * 10000.0
-        max_adverse_bps = ((entry_price / min(lows)) - 1.0) * 10000.0
+            return 0.0, 0.0, False, False, 0.0, 0.0, 0.0, None, None, 0.0
+
+        max_high = max(highs)
+        min_low = min(lows)
+        max_favorable_bps = ((max_high / entry_price) - 1.0) * 10000.0
+        max_adverse_bps = ((entry_price / min_low) - 1.0) * 10000.0
         required_profit_bps = float(cost_bps) + float(min_net_gain_bps)
         reached_min_profit = max_favorable_bps >= required_profit_bps
         reached_target = max_favorable_bps >= max(float(target_bps), required_profit_bps)
         win_bps = max(0.0, max_favorable_bps - float(cost_bps))
         loss_bps = max(0.0, max_adverse_bps)
+
+        time_to_min_profit_bars = None
+        time_to_min_profit_minutes = None
+        if reached_min_profit:
+            for idx, candle in enumerate(future_candles, start=1):
+                if float(candle.high) <= 0:
+                    continue
+                move_bps = ((float(candle.high) / entry_price) - 1.0) * 10000.0
+                if move_bps >= required_profit_bps:
+                    time_to_min_profit_bars = int(idx)
+                    time_to_min_profit_minutes = float(idx) * float(bar_minutes)
+                    break
+
+        forward_window_minutes = float(len(future_candles)) * float(bar_minutes)
         return (
-            float(max_favorable_bps), float(max_adverse_bps),
-            bool(reached_min_profit), bool(reached_target),
-            float(win_bps), float(loss_bps), 0.0,
+            float(max_favorable_bps),
+            float(max_adverse_bps),
+            bool(reached_min_profit),
+            bool(reached_target),
+            float(win_bps),
+            float(loss_bps),
+            0.0,
+            time_to_min_profit_bars,
+            time_to_min_profit_minutes,
+            forward_window_minutes,
         )
 
     def _walk_forward_observations(
@@ -4447,15 +4514,25 @@ class TradingBot:
                 )
             except Exception:
                 continue
+            bar_minutes = 1.0 if timeframe in ("day_1m", "live_rolling_1m") else 15.0
             (
-                max_favorable_bps, max_adverse_bps, reached_min_profit,
-                reached_target, win_bps, loss_bps, _,
+                max_favorable_bps,
+                max_adverse_bps,
+                reached_min_profit,
+                reached_target,
+                win_bps,
+                loss_bps,
+                _,
+                time_to_min_profit_bars,
+                time_to_min_profit_minutes,
+                forward_window_minutes,
             ) = self._evaluate_forward_outcome(
                 entry_price=entry_price,
                 future_candles=future,
                 target_bps=signal.target_bps,
                 cost_bps=signal.cost_bps,
                 min_net_gain_bps=MIN_NET_GAIN_AFTER_FEES_BPS,
+                bar_minutes=bar_minutes,
             )
             expected_value_bps = win_bps if reached_min_profit else -loss_bps
             observations.append(CalibrationObservation(
@@ -4475,6 +4552,10 @@ class TradingBot:
                 expected_value_bps=float(expected_value_bps),
                 win_bps=float(win_bps),
                 loss_bps=float(loss_bps),
+                time_to_min_profit_bars=time_to_min_profit_bars,
+                time_to_min_profit_minutes=time_to_min_profit_minutes,
+                forward_window_minutes=forward_window_minutes,
+                projected_forward_gain_bps=float(max_favorable_bps),
             ))
         return observations
 
@@ -4547,6 +4628,48 @@ class TradingBot:
 
         return float(win_rate), float(avg_win), float(avg_loss), float(ev), int(n)
 
+    def _projection_stats_from_observations(
+        self,
+        observations: List[CalibrationObservation],
+    ) -> Tuple[float, float, float]:
+        """Return median gross movement, time-to-profit, and forward window.
+
+        Winning observations are preferred because this projection describes
+        how far and how fast a similar setup usually moves when it works.
+        """
+        if not observations:
+            return 0.0, 0.0, 0.0
+
+        winners = [o for o in observations if o.reached_min_profit]
+        source = winners if winners else observations
+        favorable = [
+            float(o.max_favorable_bps)
+            for o in source
+            if o.max_favorable_bps is not None
+            and np.isfinite(float(o.max_favorable_bps))
+        ]
+        times = [
+            float(o.time_to_min_profit_minutes)
+            for o in winners
+            if o.time_to_min_profit_minutes is not None
+            and np.isfinite(float(o.time_to_min_profit_minutes))
+        ]
+        windows = [
+            float(o.forward_window_minutes)
+            for o in source
+            if o.forward_window_minutes is not None
+            and np.isfinite(float(o.forward_window_minutes))
+        ]
+
+        projected_gross_bps = float(np.median(favorable)) if favorable else 0.0
+        median_time_to_min_profit_minutes = float(np.median(times)) if times else 0.0
+        median_forward_window_minutes = float(np.median(windows)) if windows else 0.0
+        return (
+            projected_gross_bps,
+            median_time_to_min_profit_minutes,
+            median_forward_window_minutes,
+        )
+
     def _build_calibration_profile(
         self,
         *,
@@ -4575,6 +4698,10 @@ class TradingBot:
                 week_sample_count=len(week_obs),
                 day_win_rate=self._win_rate(day_obs),
                 week_win_rate=self._win_rate(week_obs),
+                calibrated_projected_gross_bps=0.0,
+                calibrated_projected_net_bps=0.0,
+                calibrated_time_to_min_profit_minutes=0.0,
+                calibrated_forward_window_minutes=0.0,
                 reason=f"insufficient_samples total={len(all_obs)} using_defaults",
             )
 
@@ -4605,6 +4732,11 @@ class TradingBot:
                     continue
 
                 win_rate, avg_win, avg_loss, ev, n = self._observation_ev_stats(selected)
+                (
+                    projected_gross_bps,
+                    median_time_to_min_profit,
+                    median_forward_window,
+                ) = self._projection_stats_from_observations(selected)
 
                 if win_rate < CALIB_MIN_WIN_RATE:
                     continue
@@ -4633,6 +4765,9 @@ class TradingBot:
                     "avg_win": float(avg_win),
                     "avg_loss": float(avg_loss),
                     "ev": float(ev),
+                    "projected_gross_bps": float(projected_gross_bps),
+                    "median_time_to_min_profit": float(median_time_to_min_profit),
+                    "median_forward_window": float(median_forward_window),
                     "n": int(n),
                     "quality_score": float(quality_score),
                 }
@@ -4654,6 +4789,10 @@ class TradingBot:
                 avg_win_bps=float(best["avg_win"]),
                 avg_loss_bps=float(best["avg_loss"]),
                 expected_value_bps=float(best["ev"]),
+                calibrated_projected_gross_bps=float(best["projected_gross_bps"]),
+                calibrated_projected_net_bps=float(best["ev"]),
+                calibrated_time_to_min_profit_minutes=float(best["median_time_to_min_profit"]),
+                calibrated_forward_window_minutes=float(best["median_forward_window"]),
                 reason=(
                     f"exact_threshold product={product_id} "
                     f"score>={best['score_threshold']:.6f} "
@@ -4683,6 +4822,11 @@ class TradingBot:
                 DEFAULT_CALIB_MIN_PROB,
             )
             _, fallback_avg_win, fallback_avg_loss, _, _ = self._observation_ev_stats(winning_obs)
+            (
+                fallback_projected_gross,
+                fallback_time_to_profit,
+                fallback_window,
+            ) = self._projection_stats_from_observations(winning_obs)
 
             return ProductCalibrationProfile(
                 product_id=product_id,
@@ -4697,6 +4841,10 @@ class TradingBot:
                 avg_win_bps=fallback_avg_win,
                 avg_loss_bps=fallback_avg_loss,
                 expected_value_bps=blended_ev,
+                calibrated_projected_gross_bps=float(fallback_projected_gross),
+                calibrated_projected_net_bps=float(blended_ev),
+                calibrated_time_to_min_profit_minutes=float(fallback_time_to_profit),
+                calibrated_forward_window_minutes=float(fallback_window),
                 reason=(
                     f"winning_observation_fallback product={product_id} "
                     f"winning_samples={len(winning_obs)} "
@@ -4720,6 +4868,10 @@ class TradingBot:
             avg_win_bps=blended_avg_win,
             avg_loss_bps=blended_avg_loss,
             expected_value_bps=blended_ev,
+            calibrated_projected_gross_bps=0.0,
+            calibrated_projected_net_bps=float(blended_ev),
+            calibrated_time_to_min_profit_minutes=0.0,
+            calibrated_forward_window_minutes=0.0,
             reason=(
                 f"no_winning_observations product={product_id} "
                 f"using_defaults total={len(all_obs)} "
@@ -5025,6 +5177,22 @@ class TradingBot:
             old_profile.avg_win_bps = new_profile.avg_win_bps
             old_profile.avg_loss_bps = new_profile.avg_loss_bps
             old_profile.expected_value_bps = new_profile.expected_value_bps
+            old_profile.calibrated_projected_gross_bps = (
+                float(old_profile.calibrated_projected_gross_bps) * 0.80
+                + float(new_profile.calibrated_projected_gross_bps) * 0.20
+            )
+            old_profile.calibrated_projected_net_bps = (
+                float(old_profile.calibrated_projected_net_bps) * 0.80
+                + float(new_profile.calibrated_projected_net_bps) * 0.20
+            )
+            old_profile.calibrated_time_to_min_profit_minutes = (
+                float(old_profile.calibrated_time_to_min_profit_minutes) * 0.80
+                + float(new_profile.calibrated_time_to_min_profit_minutes) * 0.20
+            )
+            old_profile.calibrated_forward_window_minutes = (
+                float(old_profile.calibrated_forward_window_minutes) * 0.80
+                + float(new_profile.calibrated_forward_window_minutes) * 0.20
+            )
             old_profile.reason = "smoothed_live_recalibration"
             self.calibration_profiles[product] = old_profile
             self.clog.log_profile(old_profile)
@@ -5072,7 +5240,17 @@ class TradingBot:
             round_trip_cost_bps = None
 
         cost_bps = float(round_trip_cost_bps) if round_trip_cost_bps is not None else 0.0
-        expected_net_edge_bps = float(target_bps - cost_bps) if fee_available else 0.0
+        profile = self.calibration_profiles.get(
+            product_id,
+            ProductCalibrationProfile(product_id=product_id),
+        )
+        calibrated_forward_gain_bps = float(profile.calibrated_projected_gross_bps or 0.0)
+        # Before calibration is available, fall back to the structure target.
+        if calibrated_forward_gain_bps <= 0:
+            calibrated_forward_gain_bps = float(target_bps)
+        expected_net_edge_bps = (
+            float(calibrated_forward_gain_bps - cost_bps) if fee_available else 0.0
+        )
 
         support_score = _support_proximity_score(mid, levels_day, levels_week)
         room_score, room_reason = _room_score(mid, levels_day, levels_week, RESIST_BUFFER_BPS)
@@ -5186,10 +5364,6 @@ class TradingBot:
                 0.0,
             )
 
-        profile = self.calibration_profiles.get(
-            product_id,
-            ProductCalibrationProfile(product_id=product_id),
-        )
         calib_min_score = float(profile.min_score)
         calib_min_probability = float(profile.min_probability)
         calib_min_ev = float(profile.min_expected_value_bps)
@@ -5216,7 +5390,9 @@ class TradingBot:
             f"calib_min_prob={calib_min_probability:.3f}; "
             f"calib_ev={calib_min_ev:.2f}; "
             f"{fee_state}; strict={strict_entry.reason}; edge={expected_net_edge_bps:.1f}; "
-            f"target={target_bps:.1f}; cost={cost_bps:.1f}; "
+            f"target={target_bps:.1f}; projected_forward={calibrated_forward_gain_bps:.1f}; "
+            f"cost={cost_bps:.1f}; projected_net={expected_net_edge_bps:.1f}; "
+            f"time_to_min_profit={profile.calibrated_time_to_min_profit_minutes:.1f}m; "
             f"mom5={momentum_5_bps:.1f}; mom15={momentum_15_bps:.1f}; "
             f"room={room_reason}; {vwap_reason}; {higher_low_reason}; {trend_reason}"
         )
@@ -5231,6 +5407,9 @@ class TradingBot:
             expected_net_edge_bps=float(expected_net_edge_bps),
             target_bps=float(target_bps),
             cost_bps=float(cost_bps),
+            projected_forward_gain_bps=float(calibrated_forward_gain_bps),
+            calibrated_time_to_min_profit_minutes=float(profile.calibrated_time_to_min_profit_minutes),
+            calibrated_forward_window_minutes=float(profile.calibrated_forward_window_minutes),
             dip_depth_score=float(dip_depth_score),
             dip_speed_score=float(dip_speed_score),
             reversal_score=float(reversal_score),
@@ -6763,7 +6942,10 @@ class TradingBot:
                     estimated_prob_up=float(estimated_prob_up),
                     position_pct=float(position_pct),
                     target_bps=float(target_bps),
+                    projected_forward_gain_bps=live_signal.projected_forward_gain_bps,
                     cost_bps=float(cost_bps),
+                    calibrated_time_to_min_profit_minutes=live_signal.calibrated_time_to_min_profit_minutes,
+                    calibrated_forward_window_minutes=live_signal.calibrated_forward_window_minutes,
                     current_maker_fee_bps=self.current_maker_fee_bps,
                     current_taker_fee_bps=self.current_taker_fee_bps,
                     fee_tier_reason=self.last_fee_tier_reason,
@@ -7188,6 +7370,9 @@ class TradingBot:
                         expected_net_edge_bps=0.0,
                         target_bps=0.0,
                         cost_bps=0.0,
+                        projected_forward_gain_bps=0.0,
+                        calibrated_time_to_min_profit_minutes=0.0,
+                        calibrated_forward_window_minutes=0.0,
                         dip_depth_score=0.0,
                         dip_speed_score=0.0,
                         reversal_score=0.0,
@@ -7222,7 +7407,10 @@ class TradingBot:
                     estimated_prob_up=live_signal.estimated_prob_up,
                     position_pct=live_signal.position_pct,
                     target_bps=live_signal.target_bps,
+                    projected_forward_gain_bps=live_signal.projected_forward_gain_bps,
                     cost_bps=live_signal.cost_bps,
+                    calibrated_time_to_min_profit_minutes=live_signal.calibrated_time_to_min_profit_minutes,
+                    calibrated_forward_window_minutes=live_signal.calibrated_forward_window_minutes,
                     current_maker_fee_bps=self.current_maker_fee_bps,
                     current_taker_fee_bps=self.current_taker_fee_bps,
                     fee_tier_reason=self.last_fee_tier_reason,

@@ -4283,13 +4283,15 @@ class TradingBot:
             f"taker_bps={self.current_taker_fee_bps}"
         )
 
-    def _entry_fee_bps_for_mode(self) -> float:
+    def _entry_fee_bps_for_mode(self, execution_mode: Optional[str] = None) -> float:
         if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
             raise RuntimeError("Coinbase fee tier has not been loaded; refusing to estimate entry fees.")
 
         mode = str(execution_mode or ENTRY_EXECUTION_MODE).upper().strip()
+
         if mode in ("MARKET", "LIMIT_THEN_MARKET"):
             return float(self.current_taker_fee_bps)
+
         return float(self.current_maker_fee_bps)
 
     def _exit_fee_bps_for_mode(self) -> float:
@@ -6746,7 +6748,7 @@ class TradingBot:
         execution_mode: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
         """Execute a live buy and return only a Coinbase-confirmed fill."""
-        mode = str(ENTRY_EXECUTION_MODE).upper().strip()
+        mode = str(execution_mode or ENTRY_EXECUTION_MODE).upper().strip()
         result = None
 
         try:
@@ -8296,7 +8298,28 @@ class TradingBot:
                     )
                     continue
 
-                entry_fee_bps = self._entry_fee_bps_for_mode()
+                bid, ask = candidate["bid"], candidate["ask"]
+
+                entry_mode_for_this_trade = ENTRY_EXECUTION_MODE
+
+                if USE_EDGE_AWARE_ENTRY_EXECUTION:
+                    projected_net = float(candidate.get("expected_net_edge_bps", 0.0))
+
+                    if projected_net >= float(MARKET_ENTRY_MIN_PROJECTED_NET_BPS):
+                        entry_mode_for_this_trade = "MARKET"
+                    elif projected_net >= float(MAKER_OR_SKIP_MIN_PROJECTED_NET_BPS):
+                        entry_mode_for_this_trade = "MAKER"
+                    else:
+                        log(
+                            f"[buy-skip] {product_id} projected_net_too_low_for_execution "
+                            f"projected_net={projected_net:.3f}"
+                        )
+                        continue
+
+                entry_fee_bps = self._entry_fee_bps_for_mode(
+                    execution_mode=entry_mode_for_this_trade
+                )
+
                 can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
 
                 if not can_afford and ENABLE_PROFITABLE_ROTATION:
@@ -8335,24 +8358,11 @@ class TradingBot:
                     )
                     continue
 
-                bid, ask = candidate["bid"], candidate["ask"]
-                entry_mode_for_this_trade = ENTRY_EXECUTION_MODE
-                if USE_EDGE_AWARE_ENTRY_EXECUTION:
-                    projected_net = float(candidate.get("expected_net_edge_bps", 0.0))
-                    if projected_net >= MARKET_ENTRY_MIN_PROJECTED_NET_BPS:
-                        entry_mode_for_this_trade = "MARKET"
-                    elif projected_net >= MAKER_OR_SKIP_MIN_PROJECTED_NET_BPS:
-                        entry_mode_for_this_trade = "MAKER"
-                    else:
-                        log(
-                            f"[buy-skip] {product_id} projected_net_too_low_for_execution "
-                            f"projected_net={projected_net:.3f}"
-                        )
-                        continue
-
                 log(
                     f"[buy-attempt] {product_id} "
+                    f"mode={entry_mode_for_this_trade} "
                     f"quote_usd={entry_notional:.2f} "
+                    f"entry_fee_bps={entry_fee_bps:.3f} "
                     f"score={float(candidate.get('score', 0.0)):.3f} "
                     f"prob={float(candidate.get('estimated_prob_up', 0.0)):.6f} "
                     f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.3f} "

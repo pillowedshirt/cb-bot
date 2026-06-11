@@ -83,6 +83,8 @@ MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute cand
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
 MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
 CALIBRATION_CSV_PATH: str = os.path.join(BASE_DIR, "calibration.csv")
+MICRO_HISTORY_CSV_PATH: str = os.path.join(BASE_DIR, "micro_history.csv")
+POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
 
 # Cadence for macro refresh
 MACRO_REFRESH_EVERY_SEC: int = 3 * 60  # every 3 minutes
@@ -1023,19 +1025,60 @@ class LiveMinuteCandleSeries:
             self._c = mid
             self._v += 1.0
             return
-        # Finalise previous synthetic activity candle
-        self.candles.append(MinuteCandle(
+        # Finalise previous synthetic activity candle. Replace a seeded candle
+        # for the same minute so startup history transitions cleanly into live data.
+        closed_candle = MinuteCandle(
             minute_start_ts=self._cur_minute,
             open=float(self._o),
             high=float(self._h),
             low=float(self._l),
             close=float(self._c),
             volume=float(self._v),
-        ))
+        )
+        if self.candles and self.candles[-1].minute_start_ts == self._cur_minute:
+            self.candles[-1] = closed_candle
+        else:
+            self.candles.append(closed_candle)
         # Start new synthetic activity candle
         self._cur_minute = m
         self._o = self._h = self._l = self._c = mid
         self._v = 1.0
+
+    def append_closed_candle(
+        self,
+        *,
+        minute_start_ts: int,
+        open_price: float,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+        volume: float = 0.0,
+    ) -> None:
+        """Seed a fully formed historical 1-minute candle with true OHLCV."""
+        if close_price <= 0:
+            return
+
+        candle = MinuteCandle(
+            minute_start_ts=int(minute_start_ts),
+            open=float(open_price),
+            high=float(high_price),
+            low=float(low_price),
+            close=float(close_price),
+            volume=float(volume or 0.0),
+        )
+
+        if self.candles and int(self.candles[-1].minute_start_ts) == int(minute_start_ts):
+            self.candles[-1] = candle
+        else:
+            self.candles.append(candle)
+
+        # Keep the current-minute builder aligned after the seeded history.
+        self._cur_minute = int(minute_start_ts)
+        self._o = float(open_price)
+        self._h = float(high_price)
+        self._l = float(low_price)
+        self._c = float(close_price)
+        self._v = float(volume or 1.0)
 
     def export_rows(self, product_id: str) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -1965,6 +2008,95 @@ class CalibrationLogger:
                 f"{profile.expected_value_bps:.6f}",
                 profile.reason,
             ])
+
+
+class MicroHistoryLogger:
+    """Atomically writes startup 1-minute historical candles for the viewer."""
+
+    columns = [
+        "ts", "dt_mst", "product_id", "open", "high", "low", "close", "volume",
+    ]
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(self.columns)
+            for r in rows:
+                ts_val = float(r.get("ts", 0.0) or 0.0)
+                dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                w.writerow([
+                    int(ts_val),
+                    dt_mst,
+                    r.get("product_id", ""),
+                    f"{float(r.get('open', 0.0)):.10f}",
+                    f"{float(r.get('high', 0.0)):.10f}",
+                    f"{float(r.get('low', 0.0)):.10f}",
+                    f"{float(r.get('close', 0.0)):.10f}",
+                    f"{float(r.get('volume', 0.0)):.10f}",
+                ])
+        os.replace(tmp, self.path)
+
+
+class PositionTargetsLogger:
+    """Atomically writes the current open-position sell plan for the viewer."""
+
+    columns = [
+        "ts", "dt_mst", "product_id",
+        "has_position", "position_qty", "avg_entry_price",
+        "current_bid", "current_ask",
+        "min_profitable_exit_price",
+        "scalp_target_price", "core_target_price",
+        "scalp_armed", "core_armed",
+        "scalp_arm_peak", "core_arm_peak",
+        "scalp_pullback_pct", "core_pullback_pct",
+        "scalp_pullback_trigger_price", "core_pullback_trigger_price",
+        "distance_to_min_profit_bps",
+        "distance_to_scalp_bps",
+        "distance_to_core_bps",
+        "exit_plan_note",
+    ]
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(self.columns)
+            for r in rows:
+                ts_val = float(r.get("ts", now_ts()) or now_ts())
+                dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                w.writerow([
+                    f"{ts_val:.6f}",
+                    dt_mst,
+                    r.get("product_id", ""),
+                    bool(r.get("has_position", False)),
+                    f"{float(r.get('position_qty', 0.0)):.12f}",
+                    "" if r.get("avg_entry_price") is None else f"{float(r.get('avg_entry_price')):.10f}",
+                    "" if r.get("current_bid") is None else f"{float(r.get('current_bid')):.10f}",
+                    "" if r.get("current_ask") is None else f"{float(r.get('current_ask')):.10f}",
+                    "" if r.get("min_profitable_exit_price") is None else f"{float(r.get('min_profitable_exit_price')):.10f}",
+                    "" if r.get("scalp_target_price") is None else f"{float(r.get('scalp_target_price')):.10f}",
+                    "" if r.get("core_target_price") is None else f"{float(r.get('core_target_price')):.10f}",
+                    bool(r.get("scalp_armed", False)),
+                    bool(r.get("core_armed", False)),
+                    "" if r.get("scalp_arm_peak") is None else f"{float(r.get('scalp_arm_peak')):.10f}",
+                    "" if r.get("core_arm_peak") is None else f"{float(r.get('core_arm_peak')):.10f}",
+                    f"{float(r.get('scalp_pullback_pct', 0.0)):.8f}",
+                    f"{float(r.get('core_pullback_pct', 0.0)):.8f}",
+                    "" if r.get("scalp_pullback_trigger_price") is None else f"{float(r.get('scalp_pullback_trigger_price')):.10f}",
+                    "" if r.get("core_pullback_trigger_price") is None else f"{float(r.get('core_pullback_trigger_price')):.10f}",
+                    "" if r.get("distance_to_min_profit_bps") is None else f"{float(r.get('distance_to_min_profit_bps')):.6f}",
+                    "" if r.get("distance_to_scalp_bps") is None else f"{float(r.get('distance_to_scalp_bps')):.6f}",
+                    "" if r.get("distance_to_core_bps") is None else f"{float(r.get('distance_to_core_bps')):.6f}",
+                    r.get("exit_plan_note", ""),
+                ])
+        os.replace(tmp, self.path)
 
 
 def _clip_score(x: float) -> float:
@@ -3176,6 +3308,8 @@ class TradingBot:
         self.tlog = TradeLogger(TRADES_CSV_PATH)
         self.olog = OrderLogger(ORDERS_CSV_PATH)
         self.clog = CalibrationLogger(CALIBRATION_CSV_PATH)
+        self.micro_history_log = MicroHistoryLogger(MICRO_HISTORY_CSV_PATH)
+        self.position_targets_log = PositionTargetsLogger(POSITION_TARGETS_CSV_PATH)
         self.mlog = MarketLogger(MARKET_CSV_PATH)
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
@@ -3264,28 +3398,51 @@ class TradingBot:
         self.last_fee_tier_reason: str = "not_refreshed_yet"
 
     async def preload_micro_history(self) -> None:
-        """Preload the last MICRO_PRELOAD_MINUTES of 1m candles into micro buffers at startup.
+        """Preload true 1-minute OHLCV into bot buffers and viewer history."""
+        history_rows: List[Dict[str, Any]] = []
 
-        This ensures the micro price charts (RollingMidSeries) and signal charts (LiveMinuteCandleSeries)
-        have immediate context when the bot starts.
-        """
         try:
             end_ts = int(now_ts())
             start_ts = end_ts - int(MICRO_PRELOAD_MINUTES) * 60
-            # Pull 1m candles for each product and seed both mid_series and live_1m.
+
             for product in PRODUCTS:
                 candles = await self.fetcher.fetch_chunked(product, start_ts, end_ts, "ONE_MINUTE")
                 if not candles:
+                    log(f"[startup] no micro preload candles for {product}")
                     continue
+
                 for c in candles:
-                    # Candle timestamps are minute-starts; place a synthetic mid tick mid-minute.
-                    ts = float(int(c.ts) + 30)
-                    mid = float(c.close)
-                    if mid <= 0:
+                    minute_ts = int(c.ts)
+                    open_price = float(c.open)
+                    high_price = float(c.high)
+                    low_price = float(c.low)
+                    close_price = float(c.close)
+                    volume = float(c.volume or 0.0)
+
+                    if close_price <= 0:
                         continue
-                    self.mid_series[product].push(ts, mid)
-                    self.live_1m[product].push_mid(ts, mid)
-            log(f"[startup] preloaded {MICRO_PRELOAD_MINUTES}m micro context for {len(PRODUCTS)} products")
+
+                    self.live_1m[product].append_closed_candle(
+                        minute_start_ts=minute_ts,
+                        open_price=open_price,
+                        high_price=high_price,
+                        low_price=low_price,
+                        close_price=close_price,
+                        volume=volume,
+                    )
+                    self.mid_series[product].push(float(minute_ts) + 30.0, close_price)
+                    history_rows.append({
+                        "ts": minute_ts,
+                        "product_id": product,
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "close": close_price,
+                        "volume": volume,
+                    })
+
+            self.micro_history_log.write_rows(history_rows)
+            log(f"[startup] preloaded {MICRO_PRELOAD_MINUTES}m true micro candles; rows={len(history_rows)}")
         except Exception as e:
             log(f"[startup] micro preload failed: {e}")
 
@@ -6606,6 +6763,128 @@ class TradingBot:
             await asyncio.sleep(EVAL_TICK_SEC)
 
 
+    def _write_position_targets_snapshot(self) -> None:
+        """Write current open-position sell targets for viewer monitoring."""
+        rows: List[Dict[str, Any]] = []
+        ts_now = now_ts()
+
+        for product_id in PRODUCTS:
+            tob = self.tob.get(product_id)
+            bid = float(tob.bid) if tob and tob.bid > 0 else None
+            ask = float(tob.ask) if tob and tob.ask > 0 else None
+
+            lots = self.positions.get(product_id, [])
+            position_qty = sum(float(lot.qty) for lot in lots)
+            has_position = position_qty > 1e-12
+
+            row: Dict[str, Any] = {
+                "ts": ts_now,
+                "product_id": product_id,
+                "has_position": has_position,
+                "position_qty": position_qty,
+                "avg_entry_price": None,
+                "current_bid": bid,
+                "current_ask": ask,
+                "min_profitable_exit_price": None,
+                "scalp_target_price": None,
+                "core_target_price": None,
+                "scalp_armed": False,
+                "core_armed": False,
+                "scalp_arm_peak": None,
+                "core_arm_peak": None,
+                "scalp_pullback_pct": 0.0,
+                "core_pullback_pct": 0.0,
+                "scalp_pullback_trigger_price": None,
+                "core_pullback_trigger_price": None,
+                "distance_to_min_profit_bps": None,
+                "distance_to_scalp_bps": None,
+                "distance_to_core_bps": None,
+                "exit_plan_note": "no open position",
+            }
+
+            if has_position:
+                avg_entry_price = sum(float(lot.qty) * float(lot.price) for lot in lots) / position_qty
+                lot = lots[0]
+                lot_tier = lot.tier if lot.tier in EXIT_PLAN else TIER_LOW
+                lot_meta = lot.meta
+                sigma_bps = self._compute_sigma_bps_from_1m(product_id) or 35.0
+                targets = get_exit_targets(
+                    entry_price=avg_entry_price,
+                    sigma_bps=sigma_bps,
+                    tier=lot_tier,
+                )
+
+                profile = self.calibration_profiles.get(
+                    product_id,
+                    ProductCalibrationProfile(product_id=product_id),
+                )
+                scalp_pullback_pct = float(profile.scalp_pullback_pct)
+                core_pullback_pct = float(profile.core_pullback_pct)
+
+                try:
+                    min_exit_px = required_exit_price_for_net_gain(
+                        effective_entry_price=avg_entry_price,
+                        exit_fee_bps=self._exit_fee_bps_for_mode(),
+                        est_slippage_bps=EST_SLIPPAGE_BPS,
+                        est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                        min_net_gain_bps=max(
+                            MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                            MIN_NET_GAIN_AFTER_FEES_BPS,
+                        ),
+                    )
+                except Exception:
+                    min_exit_px = None
+
+                scalp_target = max(float(targets["scalp_target"]), float(min_exit_px or 0.0))
+                core_target = max(float(targets["core_target"]), float(min_exit_px or 0.0))
+                scalp_peak = lot_meta.get("scalp_arm_peak")
+                core_peak = lot_meta.get("core_arm_peak")
+                scalp_trigger = (
+                    float(scalp_peak) * (1.0 - scalp_pullback_pct)
+                    if scalp_peak is not None and float(scalp_peak) > 0
+                    else None
+                )
+                core_trigger = (
+                    float(core_peak) * (1.0 - core_pullback_pct)
+                    if core_peak is not None and float(core_peak) > 0
+                    else None
+                )
+
+                def dist_bps(target_px: Optional[float]) -> Optional[float]:
+                    if bid is None or target_px is None or bid <= 0 or target_px <= 0:
+                        return None
+                    return ((float(target_px) / bid) - 1.0) * 10000.0
+
+                scalp_armed = bool(lot_meta.get("scalp_armed", False))
+                core_armed = bool(lot_meta.get("core_armed", False))
+                row.update({
+                    "avg_entry_price": avg_entry_price,
+                    "min_profitable_exit_price": min_exit_px,
+                    "scalp_target_price": scalp_target,
+                    "core_target_price": core_target,
+                    "scalp_armed": scalp_armed,
+                    "core_armed": core_armed,
+                    "scalp_arm_peak": scalp_peak,
+                    "core_arm_peak": core_peak,
+                    "scalp_pullback_pct": scalp_pullback_pct,
+                    "core_pullback_pct": core_pullback_pct,
+                    "scalp_pullback_trigger_price": scalp_trigger,
+                    "core_pullback_trigger_price": core_trigger,
+                    "distance_to_min_profit_bps": dist_bps(min_exit_px),
+                    "distance_to_scalp_bps": dist_bps(scalp_target),
+                    "distance_to_core_bps": dist_bps(core_target),
+                    "exit_plan_note": (
+                        "scalp/core armed trailing active"
+                        if scalp_armed or core_armed
+                        else "waiting for min-profit/scalp/core target"
+                    ),
+                })
+
+            rows.append(row)
+
+        self.position_targets_log.write_rows(rows)
+
+
     async def telemetry_loop(self) -> None:
         """
         Periodically log market snapshots for viewer.  Includes exposures,
@@ -6731,6 +7010,11 @@ class TradingBot:
                     spread_penalty=live_signal.spread_penalty,
                     cost_penalty=live_signal.cost_penalty,
                 )
+            try:
+                self._write_position_targets_snapshot()
+            except Exception as e:
+                log(f"[telemetry] position target snapshot failed: {e}")
+
             await asyncio.sleep(EVAL_TICK_SEC)
 
 

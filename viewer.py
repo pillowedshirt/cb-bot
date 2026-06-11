@@ -1150,7 +1150,7 @@ def render_live_dashboard() -> None:
             )
 
         st.markdown(
-            f'<div class="cb-section">{product} full buy gate</div>',
+            f'<div class="cb-section">{product} buy requirements</div>',
             unsafe_allow_html=True,
         )
 
@@ -1158,12 +1158,6 @@ def render_live_dashboard() -> None:
             ("Score target", latest_row.get("buy_gate_score_ok", False)),
             ("Probability target", latest_row.get("buy_gate_prob_ok", False)),
             ("EV target", latest_row.get("buy_gate_ev_ok", False)),
-            ("Fee tier ready", latest_row.get("buy_gate_fee_ok", False)),
-            ("Setup/reversal gate", latest_row.get("buy_gate_strict_ok", False)),
-            ("Target-to-cost gate", latest_row.get("buy_gate_target_cost_ok", False)),
-            ("Spread gate", latest_row.get("buy_gate_spread_ok", False)),
-            ("Calibrated gate", latest_row.get("buy_gate_calibrated_ok", False)),
-            ("Tradeable signal", latest_row.get("buy_gate_tradeable", False)),
         ]
 
         gcols = st.columns(3)
@@ -1171,9 +1165,38 @@ def render_live_dashboard() -> None:
             with gcols[idx % 3]:
                 mini_card(label, "PASS" if truthy_cell(val) else "BLOCKED", "")
 
+        st.markdown(
+            f'<div class="cb-section">{product} execution readiness</div>',
+            unsafe_allow_html=True,
+        )
+
+        execution_items = [
+            ("Fee data ready", latest_row.get("buy_gate_fee_ok", False)),
+        ]
+
+        ecols = st.columns(3)
+        for idx, (label, val) in enumerate(execution_items):
+            with ecols[idx % 3]:
+                mini_card(label, "READY" if truthy_cell(val) else "WAITING", "")
+
         blocker = latest_row.get("buy_gate_blocker", "")
         if pd.notna(blocker) and str(blocker).strip():
-            st.caption(f"Buy gate blocker: {blocker}")
+            st.caption(f"Buy status: {blocker}")
+
+        with st.expander("Old diagnostic gates"):
+            st.write({
+                "spread_gate": latest_row.get("buy_gate_spread_ok", False),
+                "setup_reversal_gate": latest_row.get("buy_gate_strict_ok", False),
+                "target_cost_gate": latest_row.get(
+                    "buy_gate_target_cost_ok", False
+                ),
+                "calibrated_gate": latest_row.get(
+                    "buy_gate_calibrated_ok", False
+                ),
+                "tradeable_signal": latest_row.get(
+                    "buy_gate_tradeable", False
+                ),
+            })
 
         current_projected_forward = latest_row.get("projected_forward_gain_bps", np.nan)
         current_cost = latest_row.get("cost_bps", np.nan)

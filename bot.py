@@ -85,6 +85,9 @@ MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
 CALIBRATION_CSV_PATH: str = os.path.join(BASE_DIR, "calibration.csv")
 MICRO_HISTORY_CSV_PATH: str = os.path.join(BASE_DIR, "micro_history.csv")
 POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
+DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
+DEBUG_LOG_ENABLED: bool = True
+DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
 # Cadence for macro refresh
 MACRO_REFRESH_EVERY_SEC: int = 3 * 60  # every 3 minutes
@@ -442,9 +445,54 @@ TRAIL_MAX_DRAWDOWN_PCT: float = 0.0
 # Helper functions
 # ------------------------------------------------------------
 
+def _rotate_debug_log_if_needed() -> None:
+    """Rotate an oversized debug log without ever interrupting trading."""
+    if not DEBUG_LOG_ENABLED:
+        return
+
+    try:
+        if not os.path.exists(DEBUG_LOG_PATH):
+            return
+        if os.path.getsize(DEBUG_LOG_PATH) <= int(DEBUG_LOG_MAX_BYTES):
+            return
+
+        old_path = DEBUG_LOG_PATH + ".old"
+        try:
+            if os.path.exists(old_path):
+                os.remove(old_path)
+        except Exception:
+            pass
+        os.replace(DEBUG_LOG_PATH, old_path)
+    except Exception:
+        # Never let logging break trading.
+        pass
+
+
 def log(msg: str) -> None:
-    """Console logger with immediate flush so output always appears in the terminal."""
-    print(msg, flush=True)
+    """Write a timestamped bot log line to both the terminal and debug.log."""
+    try:
+        ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    except Exception:
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    line = f"{ts} {msg}"
+    print(line, flush=True)
+
+    if not DEBUG_LOG_ENABLED:
+        return
+
+    try:
+        _rotate_debug_log_if_needed()
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Logging should never crash the bot.
+        pass
+
+
+def log_exception(context: str, exc: Exception) -> None:
+    """Write a compact exception line to debug.log and the terminal."""
+    log(f"[exception] {context}: {type(exc).__name__}: {exc}")
 
 def now_ts() -> float:
     """Return current UNIX timestamp as float."""
@@ -806,7 +854,7 @@ def select_diversified_products() -> List[str]:
     if vol_ok:
         candidates = vol_ok
     else:
-        print("[selection] strict daily-range filter returned no products; using fallback candidate list")
+        log("[selection] strict daily-range filter returned no products; using fallback candidate list")
 
     # Ensure BTC is considered (anchor).
     if "BTC-USD" not in candidates and "BTC-USD" in usd_pairs:
@@ -1525,7 +1573,7 @@ class MacroFetcher:
 
     async def fetch(self, product_id: str, start: int, end: int, granularity: str) -> List[Candle]:
         try:
-            print(f"[macro] get_candles {product_id} {granularity} start={int(start)} end={int(end)} span={(int(end)-int(start))}")
+            log(f"[macro] get_candles {product_id} {granularity} start={int(start)} end={int(end)} span={(int(end)-int(start))}")
             resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.rest.get_candles(
@@ -1558,7 +1606,7 @@ class MacroFetcher:
 
             return []
         except Exception as e:
-            print(f"[macro] fetch failed for {product_id} {granularity}: {e}")
+            log_exception(f"[macro] fetch failed for {product_id} {granularity}", e)
             return []
 
     async def fetch_chunked(
@@ -3609,22 +3657,22 @@ class TradingBot:
         """
         side_u = str(side).upper().strip()
         if not isinstance(r, dict):
-            print(f"[{side_u.lower()}] non-dict execution result for {product_id}: {type(r)}")
+            log(f"[{side_u.lower()}] non-dict execution result for {product_id}: {type(r)}")
             return None
         if r.get("ok") is not True:
             err = r.get("error") or "exec_not_ok"
-            print(f"[{side_u.lower()}] execution failed for {product_id}: {err}")
+            log(f"[{side_u.lower()}] execution failed for {product_id}: {err}")
             return None
 
         order_id = r.get("order_id")
         if not isinstance(order_id, str) or not order_id.strip():
             # LivePortfolio should already fail without an order_id, but we double-enforce here.
-            print(f"[{side_u.lower()}] missing order_id; refusing to mutate local state for {product_id}")
+            log(f"[{side_u.lower()}] missing order_id; refusing to mutate local state for {product_id}")
             return None
 
         filled_qty = safe_float(r.get("filled_qty")) or 0.0
         if filled_qty <= 1e-12:
-            print(f"[{side_u.lower()}] zero fill for {product_id} (order_id={order_id})")
+            log(f"[{side_u.lower()}] zero fill for {product_id} (order_id={order_id})")
             return None
 
         fee_val = safe_float(r.get("fee_usd")) or 0.0
@@ -3637,7 +3685,7 @@ class TradingBot:
 
         if avg_px is None or avg_px <= 0:
             # Do NOT fall back to bid/ask. Without a fill price we cannot log truthfully.
-            print(
+            log(
                 f"[{side_u.lower()}] missing avg_price and filled_notional_usd; refusing local state mutation for {product_id} (order_id={order_id})"
             )
             return None
@@ -3993,6 +4041,10 @@ class TradingBot:
         maker_bps, taker_bps, reason = await asyncio.to_thread(self.portfolio.get_fee_tier_bps)
 
         if maker_bps is None or taker_bps is None:
+            log(
+                f"[fee-tier] unavailable maker={maker_bps} taker={taker_bps} "
+                f"reason={reason}"
+            )
             self.current_maker_fee_bps = None
             self.current_taker_fee_bps = None
             self.last_fee_tier_reason = reason
@@ -4003,7 +4055,11 @@ class TradingBot:
         self.current_taker_fee_bps = float(taker_bps)
         self.last_fee_tier_reason = reason
         self.last_fee_tier_refresh_ts = t
-        log(f"[fee-tier] refreshed from Coinbase: {reason}")
+        log(
+            f"[fee-tier] refreshed from Coinbase: {reason} "
+            f"maker_bps={self.current_maker_fee_bps} "
+            f"taker_bps={self.current_taker_fee_bps}"
+        )
 
     def _entry_fee_bps_for_mode(self) -> float:
         if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
@@ -5119,9 +5175,9 @@ class TradingBot:
                     spread_bps=spread_bps,
                 ) if week_candles else []
                 log(
-                    f"[calibration] {product} observations "
-                    f"day={len(day_obs)} week={len(week_obs)} "
-                    f"spread_bps={spread_bps:.2f}"
+                    f"[calibration-debug] {product} "
+                    f"day_obs={len(day_obs)} week_obs={len(week_obs)} "
+                    f"spread_bps={spread_bps:.3f}"
                 )
                 profile = self._build_calibration_profile(
                     product_id=product,
@@ -5138,16 +5194,19 @@ class TradingBot:
                 self.calibration_profiles[product] = profile
                 self.clog.log_profile(profile)
                 log(
-                    f"[calibration] {product} profile "
-                    f"min_score={profile.min_score:.1f} "
-                    f"min_prob={profile.min_probability:.3f} "
-                    f"min_ev={profile.min_expected_value_bps:.2f} "
+                    f"[calibration-debug] {product} profile "
+                    f"min_score={profile.min_score:.6f} "
+                    f"min_prob={profile.min_probability:.6f} "
+                    f"min_ev={profile.min_expected_value_bps:.6f} "
+                    f"projected_gross={profile.calibrated_projected_gross_bps:.6f} "
+                    f"projected_net={profile.calibrated_projected_net_bps:.6f} "
+                    f"time_to_profit={profile.calibrated_time_to_min_profit_minutes:.3f} "
                     f"scalp_pb={profile.scalp_pullback_pct:.4%} "
                     f"core_pb={profile.core_pullback_pct:.4%} "
                     f"reason={profile.reason}"
                 )
             except Exception as exc:
-                log(f"[calibration] failed for {product}: {exc}")
+                log_exception(f"[calibration] failed for {product}", exc)
                 profile = ProductCalibrationProfile(
                     product_id=product,
                     reason=f"calibration_error={exc}",
@@ -5487,6 +5546,29 @@ class TradingBot:
             blockers.append(setup_blocker)
 
         buy_gate_blocker = "BUY_READY" if ok_to_trade else ";".join(blockers)
+
+        if ok_to_trade:
+            log(
+                f"[buy-gate] {product_id} BUY_READY "
+                f"score={score:.3f} min_score={calib_min_score:.3f} "
+                f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
+                f"ev={expected_net_edge_bps:.3f} "
+                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} "
+                f"target={target_bps:.3f} cost={cost_bps:.3f} "
+                f"spread={spread_bps:.3f}"
+            )
+        else:
+            log(
+                f"[buy-gate] {product_id} BLOCKED "
+                f"blocker={buy_gate_blocker} "
+                f"score={score:.3f} min_score={calib_min_score:.3f} score_ok={buy_gate_score_ok} "
+                f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} prob_ok={buy_gate_prob_ok} "
+                f"ev={expected_net_edge_bps:.3f} "
+                f"min_ev={max(float(MIN_REQUIRED_NET_EDGE_BPS), calib_min_ev):.3f} ev_ok={buy_gate_ev_ok} "
+                f"target={target_bps:.3f} cost={cost_bps:.3f} target_cost_ok={buy_gate_target_cost_ok} "
+                f"spread={spread_bps:.3f} spread_ok={buy_gate_spread_ok} "
+                f"fee_ok={buy_gate_fee_ok} setup_ok={buy_gate_setup_ok} strict_ok={buy_gate_strict_ok}"
+            )
 
         if not ok_to_trade:
             position_pct = 0.0
@@ -6212,6 +6294,7 @@ class TradingBot:
                     close_timeout=5,
                     max_queue=1024,
                 ) as ws:
+                    log(f"[ws] connected url={WS_MARKET_URL} products={PRODUCTS}")
                     # authenticate and subscribe to ticker and heartbeats
                     jwt_token = jwt_generator.build_ws_jwt(self.api_key, self.pem_secret)
                     await ws.send(json.dumps({
@@ -6226,7 +6309,7 @@ class TradingBot:
                         "channel": "heartbeats",
                         "jwt": jwt_token
                     }))
-                    print("Subscribed to Coinbase WS ticker for", PRODUCTS)
+                    log("[ws] subscribed successfully")
                     last_msg_ts = now_ts()
                     async for message in ws:
                         last_msg_ts = now_ts()
@@ -6260,7 +6343,8 @@ class TradingBot:
                                 self.mid_series[product_id].push(ts, mid)
                                 self.live_1m[product_id].push_mid(ts, mid)
             except Exception as e:
-                print(f"WS error: {e}, reconnecting in {WS_RECONNECT_DELAY_SEC}s")
+                log_exception("[ws] websocket loop error/reconnect", e)
+                log(f"[ws] reconnecting in {WS_RECONNECT_DELAY_SEC}s")
                 await asyncio.sleep(WS_RECONNECT_DELAY_SEC)
 
     # --------------------------------------------------------
@@ -6312,9 +6396,9 @@ class TradingBot:
                 else:
                     candles_day = await self.fetcher.fetch_chunked(product, start_day, end_ts, "ONE_MINUTE")
                 if not candles_week:
-                    print(f"[macro] week empty for {product}")
+                    log(f"[macro] week empty for {product}")
                 if not candles_day:
-                    print(f"[macro] day empty for {product} (live_rows={len(live_rows)})")
+                    log(f"[macro] day empty for {product} (live_rows={len(live_rows)})")
                 if candles_day:
                     levels_day = compute_macro_levels(candles_day)
                     if levels_day:
@@ -6336,7 +6420,7 @@ class TradingBot:
                 await self.day_writer.write(day_rows)
                 await self.levels_writer.write(levels_rows)
             except Exception as e:
-                print("[macro] write failed:", e)
+                log_exception("[macro] write failed", e)
             # update last macro time
             self.last_macro_update = now_ts_i()
             await asyncio.sleep(MACRO_REFRESH_EVERY_SEC)
@@ -6684,7 +6768,7 @@ class TradingBot:
             try:
                 await self._refresh_coinbase_fee_tier_if_needed(force=False)
             except Exception as e:
-                log(f"[fee-tier] trading paused because real Coinbase fees are unavailable: {e}")
+                log_exception("[fee-tier] trading paused because real Coinbase fees are unavailable", e)
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
 
@@ -6946,6 +7030,12 @@ class TradingBot:
 
                     sell_qty = min(position_qty, max(0.0, sell_qty))
                     if sell_qty > 0:
+                        log(
+                            f"[sell-attempt] {product_id} "
+                            f"qty={sell_qty:.12f} reason={exit_reason} role={exit_role} "
+                            f"bid={bid:.8f} ask={ask:.8f} "
+                            f"avg_entry={avg_entry_price:.8f}"
+                        )
                         notional_usd = sell_qty * bid
                         exec_price = bid
                         fee = 0.0
@@ -6959,6 +7049,11 @@ class TradingBot:
                         )
                         if fill is not None:
                             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                            log(
+                                f"[sell-success] {product_id} "
+                                f"qty={float(filled_qty):.12f} avg_px={float(avg_px):.8f} "
+                                f"fee={float(fee_val):.6f} role={exit_role} reason={exit_reason}"
+                            )
                             sell_qty = min(float(sell_qty), float(filled_qty))
                             exec_price = float(avg_px)
                             fee = float(fee_val)
@@ -7100,12 +7195,15 @@ class TradingBot:
             if candidates:
                 top = candidates[0]
                 log(
-                    f"[buy-candidates] count={len(candidates)} top={top['product_id']} "
-                    f"score={float(top.get('score', 0.0)):.2f} "
-                    f"prob={float(top.get('estimated_prob_up', 0.0)):.3f} "
-                    f"ev={float(top.get('expected_net_edge_bps', 0.0)):.2f} "
-                    f"pos_pct={float(top.get('position_pct', 0.0)):.3f}"
+                    f"[buy-candidates] count={len(candidates)} "
+                    f"top={top.get('product_id')} "
+                    f"score={float(top.get('score', 0.0)):.3f} "
+                    f"prob={float(top.get('estimated_prob_up', 0.0)):.6f} "
+                    f"ev={float(top.get('expected_net_edge_bps', 0.0)):.3f} "
+                    f"position_pct={float(top.get('position_pct', 0.0)):.6f}"
                 )
+            else:
+                log("[buy-candidates] count=0")
 
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
 
@@ -7177,10 +7275,9 @@ class TradingBot:
 
                 if entry_notional < min_order:
                     log(
-                        f"[buy-skip] {product_id} entry_notional={entry_notional:.2f} "
-                        f"below_min_order={min_order:.2f} "
-                        f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f} "
-                        f"score={float(candidate.get('score', 0.0)):.2f}"
+                        f"[buy-skip] {product_id} below_min_order "
+                        f"entry_notional={entry_notional:.2f} min_order={min_order:.2f} "
+                        f"cash={cash_usd:.2f} equity={equity_usd:.2f}"
                     )
                     continue
 
@@ -7218,12 +7315,20 @@ class TradingBot:
                     log(
                         f"[buy-skip] {product_id} cannot_afford "
                         f"entry_notional={entry_notional:.2f} "
-                        f"cash_usd={cash_usd:.2f} "
-                        f"entry_fee_bps={entry_fee_bps:.2f}"
+                        f"cash={cash_usd:.2f} "
+                        f"entry_fee_bps={entry_fee_bps:.3f}"
                     )
                     continue
 
                 bid, ask = candidate["bid"], candidate["ask"]
+                log(
+                    f"[buy-attempt] {product_id} "
+                    f"quote_usd={entry_notional:.2f} "
+                    f"score={float(candidate.get('score', 0.0)):.3f} "
+                    f"prob={float(candidate.get('estimated_prob_up', 0.0)):.6f} "
+                    f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.3f} "
+                    f"bid={bid:.8f} ask={ask:.8f}"
+                )
                 fill = await self._execute_live_buy(
                     product_id=product_id,
                     quote_usd=entry_notional,
@@ -7233,10 +7338,17 @@ class TradingBot:
                 )
 
                 if fill is None:
-                    log(f"[buy-failed] {product_id} Coinbase buy returned no fill")
+                    log(f"[buy-failed] {product_id} live buy returned no confirmed fill")
                     continue
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                log(
+                    f"[buy-success] {product_id} "
+                    f"qty={float(filled_qty):.12f} avg_px={float(avg_px):.8f} "
+                    f"fee={float(fee_val):.6f} "
+                    f"filled_notional={float(filled_notional or 0.0):.6f} "
+                    f"order_id={_order_id}"
+                )
                 qty1 = float(filled_qty)
                 buy_px1 = float(avg_px)
                 fee1 = float(fee_val)
@@ -7424,6 +7536,16 @@ class TradingBot:
                         else "waiting for min-profit/scalp/core target"
                     ),
                 })
+                log(
+                    f"[sell-plan] {product_id} "
+                    f"qty={position_qty:.12f} entry={avg_entry_price:.8f} bid={bid} "
+                    f"min_exit={min_exit_px} "
+                    f"scalp_target={row.get('scalp_target_price')} "
+                    f"core_target={row.get('core_target_price')} "
+                    f"scalp_armed={row.get('scalp_armed')} "
+                    f"core_armed={row.get('core_armed')} "
+                    f"note={row.get('exit_plan_note')}"
+                )
 
             rows.append(row)
 
@@ -7670,6 +7792,7 @@ def load_coinbase_client() -> RESTClient:
 async def main() -> None:
     global PRODUCTS
 
+    log(f"[debug] writing debug log to {DEBUG_LOG_PATH}")
     log("[startup] bot.py launching")
     log(f"[startup] file={os.path.abspath(__file__)}")
     log("[startup] loading Coinbase client")
@@ -7710,4 +7833,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Bot interrupted by user.")
+        log("[shutdown] Bot interrupted by user.")
+    except Exception as exc:
+        log_exception("unhandled bot error", exc)
+        raise

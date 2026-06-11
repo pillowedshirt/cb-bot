@@ -14,6 +14,7 @@ import csv
 import math
 import asyncio
 import uuid
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass, field
 from collections import deque
 from typing import Dict, Deque, List, Optional, Set, Tuple, Any
@@ -501,6 +502,16 @@ ENABLE_TIME_STOP: bool = False
 # Keep structure/risk exits enabled.
 ENABLE_INVALIDATION_STOP: bool = True
 ENABLE_HARD_PEAK_STOP: bool = True
+
+# Loss exit behavior.
+# Normal sells should be net-positive after fees/buffers.
+# Loss sells are allowed only if the position is down at least this much from entry.
+ALLOW_LOSS_SELL_ONLY_AT_POSITION_LOSS_PCT: bool = True
+MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT: float = 0.01
+
+# When true, no-progress/time/invalidation/hard-peak exits cannot sell at a loss
+# unless the position has crossed the 1% loss threshold.
+BLOCK_NON_PROFIT_LOSS_EXITS_UNTIL_MAX_LOSS: bool = True
 
 # Faster invalidation/time exits for day-trading/scalping behavior
 TIME_STOP_SEC: int = 45 * 60
@@ -2848,6 +2859,7 @@ class LivePortfolio:
 
     def __init__(self, rest: RESTClient) -> None:
         self.rest = rest
+        self.product_meta_cache: Dict[str, Dict[str, Any]] = {}
 
         # Cached snapshot from get_accounts() to avoid hammering the API.
         self._snapshot_ts: float = 0.0
@@ -2881,6 +2893,105 @@ class LivePortfolio:
             return d if isinstance(d, dict) else {}
         except Exception:
             return {}
+
+    def get_product_meta(self, product_id: str) -> Dict[str, Any]:
+        """Return Coinbase product metadata used to format order sizes."""
+        product_id = str(product_id).strip().upper()
+
+        if product_id in self.product_meta_cache:
+            return self.product_meta_cache[product_id]
+
+        product: Dict[str, Any] = {}
+
+        try:
+            response = self.rest.get_products(
+                product_ids=[product_id],
+                get_tradability_status=True,
+            )
+            data = self._to_dict(response)
+            products = data.get("products", [])
+
+            if isinstance(products, list) and products:
+                product = self._to_dict(products[0])
+
+        except TypeError:
+            try:
+                response = self.rest.get_products(limit=1000)
+                data = self._to_dict(response)
+                products = data.get("products", [])
+
+                if isinstance(products, list):
+                    for item in products:
+                        candidate = self._to_dict(item)
+                        if str(candidate.get("product_id", "")).strip().upper() == product_id:
+                            product = candidate
+                            break
+
+            except Exception:
+                product = {}
+
+        except Exception:
+            product = {}
+
+        self.product_meta_cache[product_id] = product
+        return product
+
+    def _decimal_places_from_increment(self, increment: str) -> int:
+        try:
+            d = Decimal(str(increment))
+            return max(0, -d.as_tuple().exponent)
+        except Exception:
+            return 8
+
+    def format_base_size_for_product(self, product_id: str, base_qty: float) -> str:
+        """Format a base quantity to its Coinbase increment, always rounding down."""
+        product = self.get_product_meta(product_id)
+
+        base_increment = (
+            product.get("base_increment")
+            or product.get("baseIncrement")
+            or product.get("base_increment_size")
+            or product.get("base_increment_amount")
+            or "0.00000001"
+        )
+
+        try:
+            increment = Decimal(str(base_increment))
+            qty = Decimal(str(float(base_qty)))
+
+            if qty <= 0:
+                return "0"
+            if increment <= 0:
+                raise InvalidOperation("base_increment must be positive")
+
+            floored = (qty / increment).to_integral_value(rounding=ROUND_DOWN) * increment
+
+            places = self._decimal_places_from_increment(str(base_increment))
+            formatted = f"{floored:.{places}f}".rstrip("0").rstrip(".")
+
+            return formatted if formatted else "0"
+
+        except (InvalidOperation, ValueError, TypeError):
+            qty = Decimal(str(float(base_qty)))
+            floored = qty.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+            return f"{floored:.8f}".rstrip("0").rstrip(".")
+
+    def product_base_min_size(self, product_id: str) -> float:
+        """Return Coinbase's minimum base order size for a product, if available."""
+        product = self.get_product_meta(product_id)
+
+        raw = (
+            product.get("base_min_size")
+            or product.get("baseMinSize")
+            or product.get("base_min_order_size")
+            or product.get("min_market_funds")
+            or 0
+        )
+
+        try:
+            return float(raw)
+        except Exception:
+            return 0.0
 
     def _as_list(self, x: Any) -> List[Any]:
         if x is None:
@@ -3420,10 +3531,51 @@ class LivePortfolio:
                         filled_qty=0.0, avg_price=None, fee_usd=0.0, filled_notional_usd=None,
                         status="INVALID", error="base_qty<=0"
                     ).to_dict()
+                base_size = self.format_base_size_for_product(product_id, float(base_qty))
+                base_min_size = self.product_base_min_size(product_id)
+
+                try:
+                    base_size_float = float(base_size)
+                except Exception:
+                    base_size_float = 0.0
+
+                if base_size_float <= 0:
+                    return ExecutionResult(
+                        ok=False,
+                        order_id=None,
+                        client_order_id=client_order_id,
+                        product_id=product_id,
+                        side=side_u,
+                        filled_qty=0.0,
+                        avg_price=None,
+                        fee_usd=0.0,
+                        filled_notional_usd=None,
+                        status="INVALID",
+                        error=f"formatted_base_size<=0 raw_qty={base_qty} formatted={base_size}",
+                    ).to_dict()
+
+                if base_min_size > 0 and base_size_float < base_min_size:
+                    return ExecutionResult(
+                        ok=False,
+                        order_id=None,
+                        client_order_id=client_order_id,
+                        product_id=product_id,
+                        side=side_u,
+                        filled_qty=0.0,
+                        avg_price=None,
+                        fee_usd=0.0,
+                        filled_notional_usd=None,
+                        status="INVALID",
+                        error=(
+                            f"base_size_below_min raw_qty={base_qty} "
+                            f"formatted={base_size} min={base_min_size}"
+                        ),
+                    ).to_dict()
+
                 resp = self.rest.market_order_sell(
                     client_order_id=client_order_id,
                     product_id=product_id,
-                    base_size=format(float(base_qty), ".10f").rstrip("0").rstrip("."),
+                    base_size=base_size,
                 )
         except Exception as e:
             return ExecutionResult(
@@ -3531,6 +3683,11 @@ class LivePortfolio:
         return self._market_order(side="BUY", product_id=product_id, quote_usd=float(quote_usd))
 
     def sell_market(self, product_id: str, base_qty: float) -> dict:
+        formatted = self.format_base_size_for_product(product_id, float(base_qty))
+        log(
+            f"[sell-format] {product_id} market raw_qty={float(base_qty):.12f} "
+            f"formatted_base_size={formatted}"
+        )
         return self._market_order(side="SELL", product_id=product_id, base_qty=float(base_qty))
 
     def buy_limit_post_only(self, product_id: str, quote_usd: float, limit_price: float) -> dict:
@@ -3552,13 +3709,21 @@ class LivePortfolio:
 
     def sell_limit_post_only(self, product_id: str, base_qty: float, limit_price: float) -> dict:
         client_order_id = str(uuid.uuid4())
+
+        formatted_base_size = self.format_base_size_for_product(product_id, float(base_qty))
+
+        log(
+            f"[sell-format] {product_id} limit raw_qty={float(base_qty):.12f} "
+            f"formatted_base_size={formatted_base_size} limit_price={float(limit_price):.8f}"
+        )
+
         payload = {
             "client_order_id": client_order_id,
             "product_id": product_id,
             "side": "SELL",
             "order_configuration": {
                 "limit_limit_gtc": {
-                    "base_size": format(float(base_qty), ".10f").rstrip("0").rstrip("."),
+                    "base_size": formatted_base_size,
                     "limit_price": format(float(limit_price), ".8f").rstrip("0").rstrip("."),
                     "post_only": True,
                 }
@@ -3730,6 +3895,7 @@ class TradingBot:
         }
         self.last_hourly_calibration_update_ts: float = 0.0
         self.last_buy_gate_log_ts_by_product: Dict[str, float] = {}
+        self.last_sell_failure_ts_by_product: Dict[str, float] = {}
         self.live_recalibration_running: bool = False
         self.last_loop_lag_check_ts: float = now_ts()
         self.cached_account_snapshot: Optional[Dict[str, Dict[str, float]]] = None
@@ -4333,6 +4499,94 @@ class TradingBot:
         if mode in ("MARKET", "LIMIT_THEN_MARKET"):
             return float(self.current_taker_fee_bps)
         return float(self.current_maker_fee_bps)
+
+    def _position_gross_loss_pct(self, *, entry_price: float, exit_price: float) -> float:
+        """Return the gross price loss from entry to the current exit price."""
+        try:
+            entry = float(entry_price)
+            exit_px = float(exit_price)
+            if entry <= 0 or exit_px <= 0:
+                return 0.0
+            return max(0.0, (entry - exit_px) / entry)
+        except Exception:
+            return 0.0
+
+    def _loss_stop_triggered(self, *, entry_price: float, exit_price: float) -> bool:
+        """Return true only after the configured maximum-loss threshold is reached."""
+        if not BLOCK_NON_PROFIT_LOSS_EXITS_UNTIL_MAX_LOSS:
+            return True
+        if not ALLOW_LOSS_SELL_ONLY_AT_POSITION_LOSS_PCT:
+            return True
+
+        loss_pct = self._position_gross_loss_pct(
+            entry_price=entry_price,
+            exit_price=exit_price,
+        )
+
+        return bool(loss_pct >= float(MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT))
+
+    def _exit_is_net_positive(
+        self,
+        *,
+        entry_price: float,
+        exit_price: float,
+        min_net_profit_bps: float = 0.0,
+    ) -> bool:
+        """Return whether an exit remains net-positive after fees and buffers."""
+        return can_exit_net_positive(
+            entry_price=float(entry_price),
+            exit_price=float(exit_price),
+            taker_fee_bps=self._exit_fee_bps_for_mode(),
+            est_slippage_bps=EST_SLIPPAGE_BPS,
+            est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+            min_net_profit_bps=float(min_net_profit_bps),
+        )
+
+    def _allow_exit_for_role(
+        self,
+        *,
+        product_id: str,
+        role: str,
+        entry_price: float,
+        exit_price: float,
+        min_net_profit_bps: float = 0.0,
+    ) -> bool:
+        """Allow fee-aware profitable exits or a forced exit at the 1% loss stop."""
+        net_positive = self._exit_is_net_positive(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            min_net_profit_bps=min_net_profit_bps,
+        )
+
+        if net_positive:
+            return True
+
+        loss_stop = self._loss_stop_triggered(
+            entry_price=entry_price,
+            exit_price=exit_price,
+        )
+
+        if loss_stop:
+            loss_pct = self._position_gross_loss_pct(
+                entry_price=entry_price,
+                exit_price=exit_price,
+            )
+            log(
+                f"[loss-stop] {product_id} allowing loss exit role={role} "
+                f"loss_pct={loss_pct * 100:.3f}% "
+                f"threshold={MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT * 100:.3f}% "
+                f"entry={entry_price:.8f} bid={exit_price:.8f}"
+            )
+            return True
+
+        log(
+            f"[sell-block] {product_id} blocked loss exit role={role} "
+            f"entry={entry_price:.8f} bid={exit_price:.8f} "
+            f"loss_pct={self._position_gross_loss_pct(entry_price=entry_price, exit_price=exit_price) * 100:.3f}% "
+            f"threshold={MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT * 100:.3f}%"
+        )
+
+        return False
 
     def _round_trip_cost_bps(
         self,
@@ -6842,13 +7096,33 @@ class TradingBot:
             elif mode == "LIMIT_THEN_MARKET":
                 result = await self._live_sell_maker(product_id=product_id, base_qty=base_qty, ask=ask)
                 fill = self._require_live_fill(result, product_id=product_id, side="SELL")
+
                 if LOG_ORDER_ATTEMPTS:
                     self.olog.log_order(
-                        event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode="MAKER_FIRST",
-                        requested_base_qty=base_qty, result=result, reason=reason,
+                        event="SELL_ATTEMPT",
+                        product_id=product_id,
+                        side="SELL",
+                        mode="MAKER_FIRST",
+                        requested_base_qty=base_qty,
+                        result=result,
+                        reason=reason,
                     )
+
                 if fill is not None:
                     return fill
+
+                maker_error = ""
+                try:
+                    if isinstance(result, dict):
+                        maker_error = str(result.get("error") or result.get("status") or "")
+                except Exception:
+                    maker_error = ""
+
+                log(
+                    f"[sell-fallback] {product_id} maker did not fill; "
+                    f"maker_error={maker_error}; falling back to market"
+                )
+
                 result = await self._live_sell_market(product_id=product_id, base_qty=base_qty)
             else:
                 raise RuntimeError(f"Invalid live sell execution mode={mode}")
@@ -8033,11 +8307,25 @@ class TradingBot:
                     drawdown_from_peak = max(0.0, (peak_bid - bid) / peak_bid) if peak_bid and peak_bid > 0 else 0.0
                     peak_profit = max(0.0, (peak_bid - avg_entry_price) / avg_entry_price) if peak_bid and avg_entry_price > 0 else 0.0
 
-                    # True stop-loss / protective exit: always allowed
+                    # Hard peak stop: profitable exits remain allowed, but loss exits wait
+                    # until the position reaches the configured 1% loss threshold.
                     if ENABLE_HARD_PEAK_STOP and drawdown_from_peak >= HARD_PEAK_STOP_PCT:
-                        sell_qty = remaining_qty
-                        exit_reason = "hard_peak_stop"
-                        exit_role = "hard_peak_stop"
+                        if self._allow_exit_for_role(
+                            product_id=product_id,
+                            role="hard_peak_stop",
+                            entry_price=avg_entry_price,
+                            exit_price=bid,
+                            min_net_profit_bps=0.0,
+                        ):
+                            sell_qty = remaining_qty
+                            exit_reason = "hard_peak_stop_or_1pct_loss_stop"
+                            exit_role = "hard_peak_stop"
+                        else:
+                            log(
+                                f"[sell-skip] {product_id} hard_peak_stop triggered but blocked by 1pct-loss rule "
+                                f"drawdown_from_peak={drawdown_from_peak * 100:.3f}% "
+                                f"entry={avg_entry_price:.8f} bid={bid:.8f}"
+                            )
 
                     # Discretionary trailing profit exit: only allowed if net positive after costs
                     elif peak_profit >= TRAIL_ARM_PCT and drawdown_from_peak >= TRAIL_DRAWDOWN_PCT:
@@ -8064,24 +8352,98 @@ class TradingBot:
                             and age_sec >= NO_PROGRESS_STOP_SEC
                             and unrealized_bps < MIN_PROGRESS_BPS_BEFORE_TIME_STOP
                         ):
-                            exit_reason = f"no_progress_stop age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
-                            exit_role = "no_progress_stop"
-                            sell_qty = position_qty
+                            if self._allow_exit_for_role(
+                                product_id=product_id,
+                                role="no_progress_stop",
+                                entry_price=avg_entry_price,
+                                exit_price=bid,
+                                min_net_profit_bps=0.0,
+                            ):
+                                exit_reason = (
+                                    f"no_progress_stop_or_1pct_loss_stop "
+                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
+                                )
+                                exit_role = "no_progress_stop"
+                                sell_qty = position_qty
+                            else:
+                                log(
+                                    f"[sell-skip] {product_id} no_progress_stop blocked by 1pct-loss rule "
+                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
+                                )
 
                         if ENABLE_TIME_STOP and age_sec >= TIME_STOP_SEC:
-                            exit_reason = f"time_stop age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
-                            exit_role = "time_stop"
-                            sell_qty = position_qty
+                            if self._allow_exit_for_role(
+                                product_id=product_id,
+                                role="time_stop",
+                                entry_price=avg_entry_price,
+                                exit_price=bid,
+                                min_net_profit_bps=0.0,
+                            ):
+                                exit_reason = (
+                                    f"time_stop_or_1pct_loss_stop "
+                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
+                                )
+                                exit_role = "time_stop"
+                                sell_qty = position_qty
+                            else:
+                                log(
+                                    f"[sell-skip] {product_id} time_stop blocked by 1pct-loss rule "
+                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
+                                )
 
                         if ENABLE_INVALIDATION_STOP and levels_day and getattr(levels_day, "support_zone_low", 0) > 0:
                             invalidation_px = float(levels_day.support_zone_low) * bps_to_mult(-INVALIDATION_BUFFER_BPS)
                             if bid < invalidation_px:
-                                exit_reason = f"invalidation_stop bid<{invalidation_px:.8f}"
-                                exit_role = "invalidation_stop"
-                                sell_qty = position_qty
+                                if self._allow_exit_for_role(
+                                    product_id=product_id,
+                                    role="invalidation_stop",
+                                    entry_price=avg_entry_price,
+                                    exit_price=bid,
+                                    min_net_profit_bps=0.0,
+                                ):
+                                    exit_reason = (
+                                        f"invalidation_stop_or_1pct_loss_stop "
+                                        f"bid<{invalidation_px:.8f}"
+                                    )
+                                    exit_role = "invalidation_stop"
+                                    sell_qty = position_qty
+                                else:
+                                    log(
+                                        f"[sell-skip] {product_id} invalidation_stop blocked by 1pct-loss rule "
+                                        f"entry={avg_entry_price:.8f} bid={bid:.8f} "
+                                        f"invalidation={invalidation_px:.8f}"
+                                    )
 
                     sell_qty = min(position_qty, max(0.0, sell_qty))
                     if sell_qty > 0:
+                        if not self._allow_exit_for_role(
+                            product_id=product_id,
+                            role=exit_role or "unknown_exit",
+                            entry_price=avg_entry_price,
+                            exit_price=bid,
+                            min_net_profit_bps=(
+                                MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT
+                                if exit_role not in (
+                                    "hard_peak_stop",
+                                    "no_progress_stop",
+                                    "time_stop",
+                                    "invalidation_stop",
+                                )
+                                else 0.0
+                            ),
+                        ):
+                            log(
+                                f"[sell-skip] {product_id} final sell permission blocked "
+                                f"role={exit_role} reason={exit_reason}"
+                            )
+                            sell_qty = 0.0
+
+                    if sell_qty > 0:
+                        last_sell_fail = self.last_sell_failure_ts_by_product.get(product_id, 0.0)
+                        if ts_now - float(last_sell_fail) < 5.0:
+                            log(f"[sell-skip] {product_id} recent sell failure cooldown")
+                            continue
+
                         log(
                             f"[sell-attempt] {product_id} "
                             f"qty={sell_qty:.12f} reason={exit_reason} role={exit_role} "
@@ -8111,6 +8473,7 @@ class TradingBot:
                             fee = float(fee_val)
                             notional_usd = float(filled_notional) if filled_notional is not None else float(sell_qty) * float(avg_px)
                         else:
+                            self.last_sell_failure_ts_by_product[product_id] = ts_now
                             sell_qty = 0.0
 
                         if sell_qty > 0:

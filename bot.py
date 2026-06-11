@@ -404,9 +404,44 @@ LIVE_RECALIBRATION_PROJECTED_GROSS_MIN_BPS: float = 1.0
 
 # Edge-aware entry execution.
 USE_EDGE_AWARE_ENTRY_EXECUTION: bool = True
-MARKET_ENTRY_MIN_PROJECTED_NET_BPS: float = 120.0
-MAKER_OR_SKIP_MIN_PROJECTED_NET_BPS: float = 35.0
-MAKER_ENTRY_TIMEOUT_SEC: float = 8.0
+
+# If the bot has decided to buy live, prioritize reliable execution.
+# MARKET removes maker-no-fill failures.
+# LIMIT_THEN_MARKET is also acceptable, but MARKET is the most reliable.
+ENTRY_LOW_EDGE_MODE: str = "MARKET"
+ENTRY_MEDIUM_EDGE_MODE: str = "MARKET"
+ENTRY_HIGH_EDGE_MODE: str = "MARKET"
+
+LOW_EDGE_MIN_PROJECTED_NET_BPS: float = 35.0
+MEDIUM_EDGE_MIN_PROJECTED_NET_BPS: float = 75.0
+HIGH_EDGE_MIN_PROJECTED_NET_BPS: float = 120.0
+
+# Maker orders may save fees but can fail/no-fill.
+# For launch reliability, do not use maker-only entries.
+MAKER_ENTRY_TIMEOUT_SEC: float = 4.0
+
+# Entry timing confirmation.
+# The three core requirements identify a coin worth watching.
+# This layer waits for the actual turn upward before entering.
+REQUIRE_ENTRY_TIMING_CONFIRMATION: bool = True
+
+# Do not buy into an active live slide.
+BLOCK_BUY_WHILE_MICROTREND_DOWN: bool = True
+
+# Require at least one short-term upturn signal.
+REQUIRE_MICRO_UPTURN_FOR_BUY: bool = True
+
+# Momentum thresholds in basis points.
+MIN_ENTRY_MOMENTUM_1_BPS: float = 1.5
+MIN_ENTRY_MOMENTUM_3_BPS: float = 2.5
+MIN_ENTRY_MOMENTUM_5_BPS: float = 3.5
+
+# If a signal stops qualifying, retain its armed state for this long so a brief
+# evaluation gap does not immediately reset it.
+BUY_ARMED_SIGNAL_TTL_SEC: float = 180.0
+
+# Do not buy if the signal has been armed too long without confirming.
+BUY_ARMED_SIGNAL_STALE_SEC: float = 300.0
 
 # Profit lock and stale-position review.
 ENABLE_PROFIT_LOCK: bool = True
@@ -3896,6 +3931,8 @@ class TradingBot:
         self.last_hourly_calibration_update_ts: float = 0.0
         self.last_buy_gate_log_ts_by_product: Dict[str, float] = {}
         self.last_sell_failure_ts_by_product: Dict[str, float] = {}
+        self.armed_buy_signals: Dict[str, Dict[str, Any]] = {}
+        self.post_buy_review_queue: List[Dict[str, Any]] = []
         self.live_recalibration_running: bool = False
         self.last_loop_lag_check_ts: float = now_ts()
         self.cached_account_snapshot: Optional[Dict[str, Dict[str, float]]] = None
@@ -6891,6 +6928,81 @@ class TradingBot:
 
         return False, "higher_low_not_confirmed"
 
+    def _recent_momentum_bps_for_product(self, product_id: str, lookback: int) -> float:
+        """Return recent close-to-close momentum in bps from live 1m candles."""
+        try:
+            candles = list(self.live_1m[product_id].candles)
+        except Exception:
+            candles = []
+
+        if not candles or len(candles) <= int(lookback):
+            return 0.0
+
+        try:
+            old_px = float(candles[-int(lookback) - 1].close)
+            new_px = float(candles[-1].close)
+            if old_px <= 0 or new_px <= 0:
+                return 0.0
+            return ((new_px / old_px) - 1.0) * 10000.0
+        except Exception:
+            return 0.0
+
+    def _entry_timing_confirmation(
+        self,
+        *,
+        product_id: str,
+        signal: Optional["LiveSignal"],
+    ) -> Tuple[bool, str]:
+        """Confirm that live price action is turning upward before buying."""
+        trending_down, trend_reason = self._micro_trending_down(product_id)
+
+        mom1 = self._recent_momentum_bps_for_product(product_id, 1)
+        mom3 = self._recent_momentum_bps_for_product(product_id, 3)
+        mom5 = self._recent_momentum_bps_for_product(product_id, 5)
+
+        vwap_ok = False
+        higher_low_ok = False
+
+        try:
+            tob = self.tob.get(product_id)
+            if tob and tob.mid > 0:
+                vwap_reclaimed, vwap_reason = self._micro_vwap_reclaimed(
+                    product_id, float(tob.mid)
+                )
+                # An unavailable VWAP is not affirmative upturn evidence.
+                vwap_ok = bool(vwap_reclaimed and vwap_reason != "vwap_unknown")
+                higher_low_ok, _ = self._higher_low_confirmed(product_id)
+        except Exception:
+            pass
+
+        if BLOCK_BUY_WHILE_MICROTREND_DOWN and trending_down:
+            return (
+                False,
+                f"microtrend_down:{trend_reason};mom1={mom1:.2f};"
+                f"mom3={mom3:.2f};mom5={mom5:.2f}",
+            )
+
+        upturn_ok = bool(
+            mom1 >= float(MIN_ENTRY_MOMENTUM_1_BPS)
+            or mom3 >= float(MIN_ENTRY_MOMENTUM_3_BPS)
+            or mom5 >= float(MIN_ENTRY_MOMENTUM_5_BPS)
+            or vwap_ok
+            or higher_low_ok
+        )
+
+        if REQUIRE_MICRO_UPTURN_FOR_BUY and not upturn_ok:
+            return (
+                False,
+                f"no_micro_upturn;mom1={mom1:.2f};mom3={mom3:.2f};"
+                f"mom5={mom5:.2f};vwap={vwap_ok};hl={higher_low_ok}",
+            )
+
+        return (
+            True,
+            f"entry_confirmed;mom1={mom1:.2f};mom3={mom3:.2f};"
+            f"mom5={mom5:.2f};vwap={vwap_ok};hl={higher_low_ok}",
+        )
+
     def _risk_pause_active(self) -> bool:
         return now_ts() < float(self.paused_until_ts or 0.0)
 
@@ -7044,16 +7156,47 @@ class TradingBot:
             elif mode == "MAKER":
                 result = await self._live_buy_maker(product_id=product_id, quote_usd=quote_usd, bid=bid)
             elif mode == "LIMIT_THEN_MARKET":
-                result = await self._live_buy_maker(product_id=product_id, quote_usd=quote_usd, bid=bid)
-                fill = self._require_live_fill(result, product_id=product_id, side="BUY")
+                result = await self._live_buy_maker(
+                    product_id=product_id,
+                    quote_usd=quote_usd,
+                    bid=bid,
+                )
+
+                fill = self._require_live_fill(
+                    result, product_id=product_id, side="BUY"
+                )
+
                 if LOG_ORDER_ATTEMPTS:
                     self.olog.log_order(
-                        event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode="MAKER_FIRST",
-                        requested_quote_usd=quote_usd, result=result, reason=reason,
+                        event="BUY_ATTEMPT",
+                        product_id=product_id,
+                        side="BUY",
+                        mode="MAKER_FIRST",
+                        requested_quote_usd=quote_usd,
+                        result=result,
+                        reason=reason,
                     )
+
                 if fill is not None:
                     return fill
-                result = await self._live_buy_market(product_id=product_id, quote_usd=quote_usd)
+
+                maker_error = ""
+                try:
+                    if isinstance(result, dict):
+                        maker_error = str(
+                            result.get("error") or result.get("status") or ""
+                        )
+                except Exception:
+                    maker_error = ""
+
+                log(
+                    f"[buy-fallback] {product_id} maker did not fill; "
+                    f"maker_error={maker_error}; falling back to market"
+                )
+
+                result = await self._live_buy_market(
+                    product_id=product_id, quote_usd=quote_usd
+                )
             else:
                 raise RuntimeError(f"Invalid live buy execution mode={mode}")
 
@@ -7998,6 +8141,35 @@ class TradingBot:
             if loop_gap > EVENT_LOOP_LAG_WARN_SEC:
                 log(f"[lag] eval_loop gap={loop_gap:.2f}s; possible blocking work or REST delay")
             self.last_loop_lag_check_ts = ts_now
+
+            if self.post_buy_review_queue:
+                remaining_reviews: List[Dict[str, Any]] = []
+                for review in self.post_buy_review_queue:
+                    if ts_now < float(review.get("review_ts", 0.0)):
+                        remaining_reviews.append(review)
+                        continue
+
+                    product_r = str(review.get("product_id", ""))
+                    entry_r = float(review.get("entry_price", 0.0))
+                    tob_r = self.tob.get(product_r)
+
+                    if tob_r and entry_r > 0:
+                        move_30m_bps = (
+                            (float(tob_r.mid) / entry_r) - 1.0
+                        ) * 10000.0
+                        log(
+                            f"[post-buy-review] {product_r} "
+                            f"30m_move_bps={move_30m_bps:.2f} "
+                            f"entry={entry_r:.8f} mid={float(tob_r.mid):.8f} "
+                            f"order_id={review.get('order_id')}"
+                        )
+                    else:
+                        # Retry when top-of-book data becomes available rather than
+                        # silently dropping a due review.
+                        remaining_reviews.append(review)
+
+                self.post_buy_review_queue = remaining_reviews
+
             try:
                 await self._refresh_coinbase_fee_tier_if_needed(force=False)
             except Exception as e:
@@ -8540,6 +8712,9 @@ class TradingBot:
                         "tier": scored.tier,
                         "entry_reason": scored.reason,
                         "entry_score_obj": scored,
+                        "signal": live_signal,
+                        "entry_timing_ok": False,
+                        "entry_timing_reason": "",
                         "expected_net_edge_bps": scored.expected_net_edge_bps,
                         "estimated_prob_up": float(estimated_prob_up),
                         "position_pct": float(position_pct),
@@ -8627,10 +8802,73 @@ class TradingBot:
                 * float(MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY)
             )
             deployed_this_eval = 0.0
+
+            for armed_product, armed in list(self.armed_buy_signals.items()):
+                last_seen_ts = float(armed.get("last_seen_ts", armed.get("ts", ts_now)))
+                if ts_now - last_seen_ts > float(BUY_ARMED_SIGNAL_TTL_SEC):
+                    self.armed_buy_signals.pop(armed_product, None)
+
+            for candidate in candidates:
+                product_id_for_arm = str(candidate.get("product_id", ""))
+                if not product_id_for_arm:
+                    continue
+
+                armed = self.armed_buy_signals.get(product_id_for_arm)
+                if armed is None:
+                    armed = {
+                        "ts": ts_now,
+                        "last_seen_ts": ts_now,
+                        "candidate": candidate,
+                        "expired": False,
+                    }
+                    self.armed_buy_signals[product_id_for_arm] = armed
+                else:
+                    armed["last_seen_ts"] = ts_now
+                    armed["candidate"] = candidate
+
+                armed_age = ts_now - float(armed.get("ts", ts_now))
+                if armed_age > float(BUY_ARMED_SIGNAL_STALE_SEC):
+                    if not bool(armed.get("expired", False)):
+                        log(
+                            f"[buy-armed-expired] {product_id_for_arm} "
+                            f"armed signal expired age={armed_age:.1f}s"
+                        )
+                    armed["expired"] = True
+
+            timed_candidates = []
+
+            for candidate in candidates:
+                product_id_t = str(candidate.get("product_id", ""))
+                armed = self.armed_buy_signals.get(product_id_t)
+                if armed and bool(armed.get("expired", False)):
+                    continue
+
+                if not REQUIRE_ENTRY_TIMING_CONFIRMATION:
+                    candidate["entry_timing_ok"] = True
+                    candidate["entry_timing_reason"] = "timing_confirmation_disabled"
+                    timed_candidates.append(candidate)
+                    continue
+
+                timing_ok, timing_reason = self._entry_timing_confirmation(
+                    product_id=product_id_t,
+                    signal=candidate.get("signal"),
+                )
+
+                candidate["entry_timing_ok"] = bool(timing_ok)
+                candidate["entry_timing_reason"] = str(timing_reason)
+
+                if timing_ok:
+                    timed_candidates.append(candidate)
+                else:
+                    log(
+                        f"[buy-armed] {product_id_t} signal armed but "
+                        f"waiting for upturn reason={timing_reason}"
+                    )
+
             candidate_slice = (
-                candidates[:MAX_NEW_ENTRIES_PER_EVAL]
+                timed_candidates[:MAX_NEW_ENTRIES_PER_EVAL]
                 if ENABLE_MULTI_CANDIDATE_BUYS
-                else candidates[:1]
+                else timed_candidates[:1]
             )
 
             for candidate in candidate_slice:
@@ -8720,10 +8958,12 @@ class TradingBot:
                 if USE_EDGE_AWARE_ENTRY_EXECUTION:
                     projected_net = float(candidate.get("expected_net_edge_bps", 0.0))
 
-                    if projected_net >= float(MARKET_ENTRY_MIN_PROJECTED_NET_BPS):
-                        entry_mode_for_this_trade = "MARKET"
-                    elif projected_net >= float(MAKER_OR_SKIP_MIN_PROJECTED_NET_BPS):
-                        entry_mode_for_this_trade = "MAKER"
+                    if projected_net >= float(HIGH_EDGE_MIN_PROJECTED_NET_BPS):
+                        entry_mode_for_this_trade = ENTRY_HIGH_EDGE_MODE
+                    elif projected_net >= float(MEDIUM_EDGE_MIN_PROJECTED_NET_BPS):
+                        entry_mode_for_this_trade = ENTRY_MEDIUM_EDGE_MODE
+                    elif projected_net >= float(LOW_EDGE_MIN_PROJECTED_NET_BPS):
+                        entry_mode_for_this_trade = ENTRY_LOW_EDGE_MODE
                     else:
                         log(
                             f"[buy-skip] {product_id} projected_net_too_low_for_execution "
@@ -8778,6 +9018,8 @@ class TradingBot:
                     f"mode={entry_mode_for_this_trade} "
                     f"quote_usd={entry_notional:.2f} "
                     f"entry_fee_bps={entry_fee_bps:.3f} "
+                    f"timing={candidate.get('entry_timing_ok')} "
+                    f"timing_reason={candidate.get('entry_timing_reason', '')} "
                     f"score={float(candidate.get('score', 0.0)):.3f} "
                     f"prob={float(candidate.get('estimated_prob_up', 0.0)):.6f} "
                     f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.3f} "
@@ -8807,6 +9049,13 @@ class TradingBot:
                     f"filled_notional={float(filled_notional or 0.0):.6f} "
                     f"order_id={_order_id}"
                 )
+                self.armed_buy_signals.pop(product_id, None)
+                self.post_buy_review_queue.append({
+                    "review_ts": now_ts() + 30 * 60,
+                    "product_id": product_id,
+                    "entry_price": float(avg_px),
+                    "order_id": _order_id,
+                })
                 qty1 = float(filled_qty)
                 buy_px1 = float(avg_px)
                 fee1 = float(fee_val)

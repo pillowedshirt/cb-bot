@@ -27,6 +27,9 @@ MICRO_HISTORY_CSV = os.path.join(BASE_DIR, "micro_history.csv")
 POSITION_TARGETS_CSV = os.path.join(BASE_DIR, "position_targets.csv")
 CANDIDATE_REPLAY_CSV = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV = os.path.join(BASE_DIR, "products_active.csv")
+SIGNAL_EVENTS_CSV = os.path.join(BASE_DIR, "signal_events.csv")
+TRADE_OUTCOMES_CSV = os.path.join(BASE_DIR, "trade_outcomes.csv")
+RECONCILIATION_CSV = os.path.join(BASE_DIR, "reconciliation.csv")
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -800,6 +803,27 @@ def render_live_dashboard() -> None:
     pt = load_csv(POSITION_TARGETS_CSV)
     cr = load_csv(CANDIDATE_REPLAY_CSV)
     active_products_df = load_csv(PRODUCTS_ACTIVE_CSV)
+    signal_events = load_csv(SIGNAL_EVENTS_CSV)
+    trade_outcomes = load_csv(TRADE_OUTCOMES_CSV)
+    reconciliation = load_csv(RECONCILIATION_CSV)
+
+    signal_events = numeric(signal_events, [
+        "ts", "rank", "rank_score", "buy_ready_count",
+        "score", "score_target", "probability", "probability_target",
+        "ev_bps", "ev_target_bps", "projected_forward_bps",
+        "cost_bps", "spread_bps", "momentum_1_bps", "momentum_3_bps",
+        "momentum_5_bps", "momentum_15_bps", "green_candles",
+    ])
+    trade_outcomes = numeric(trade_outcomes, [
+        "ts", "review_minutes", "entry_ts", "entry_price", "review_price",
+        "move_bps", "max_favorable_bps", "max_adverse_bps",
+        "score_at_entry", "prob_at_entry", "ev_at_entry", "spread_at_entry",
+        "closed_net_pnl_usd",
+    ])
+    reconciliation = numeric(reconciliation, [
+        "ts", "requested_quote_usd", "expected_base_delta", "actual_base_delta",
+        "before_base", "after_base", "before_cash", "after_cash",
+    ])
 
     st.markdown(
         """
@@ -1776,6 +1800,53 @@ def render_live_dashboard() -> None:
     # =============================================================================
     # Expandable older data
     # =============================================================================
+
+    with st.expander("Signal events"):
+        if signal_events.empty:
+            st.info("No signal_events.csv rows yet.")
+        else:
+            show_cols = [
+                "dt_mst", "event_type", "product_id", "rank", "rank_score",
+                "buy_ready_count", "score", "probability", "ev_bps",
+                "spread_bps", "entry_timing_ok", "entry_timing_reason",
+                "action", "reason",
+            ]
+            show_cols = [c for c in show_cols if c in signal_events.columns]
+            st.dataframe(
+                signal_events.sort_values("ts", ascending=False)[show_cols].head(300),
+                width="stretch",
+            )
+
+    with st.expander("Post-buy outcome research"):
+        if trade_outcomes.empty:
+            st.info("No trade_outcomes.csv rows yet.")
+        else:
+            show_cols = [
+                "dt_mst", "trade_id", "product_id", "review_minutes",
+                "move_bps", "max_favorable_bps", "max_adverse_bps",
+                "score_at_entry", "prob_at_entry", "ev_at_entry",
+                "spread_at_entry", "timing_reason_at_entry",
+            ]
+            show_cols = [c for c in show_cols if c in trade_outcomes.columns]
+            st.dataframe(
+                trade_outcomes.sort_values("ts", ascending=False)[show_cols].head(300),
+                width="stretch",
+            )
+
+    with st.expander("Reconciliation events"):
+        if reconciliation.empty:
+            st.info("No reconciliation.csv rows yet.")
+        else:
+            show_cols = [
+                "dt_mst", "event_type", "product_id", "side",
+                "requested_quote_usd", "actual_base_delta",
+                "status", "error", "action_taken",
+            ]
+            show_cols = [c for c in show_cols if c in reconciliation.columns]
+            st.dataframe(
+                reconciliation.sort_values("ts", ascending=False)[show_cols].head(300),
+                width="stretch",
+            )
 
     with st.expander("Older order attempts"):
         if o_sorted.empty:

@@ -103,6 +103,9 @@ POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
+SIGNAL_EVENTS_CSV_PATH: str = os.path.join(BASE_DIR, "signal_events.csv")
+TRADE_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "trade_outcomes.csv")
+RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 DEBUG_LOG_ENABLED: bool = True
 DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
@@ -440,10 +443,45 @@ BLOCK_BUY_WHILE_MICROTREND_DOWN: bool = True
 # Require at least one short-term upturn signal.
 REQUIRE_MICRO_UPTURN_FOR_BUY: bool = True
 
-# Momentum thresholds in basis points.
+# Stronger entry timing confirmation.
+# Score/probability/EV identify products worth watching; these requirements
+# decide whether the live turn is strong enough to enter now.
+REQUIRE_PRICE_ABOVE_MICRO_VWAP_FOR_BUY: bool = True
+REQUIRE_HIGHER_LOW_OR_GREEN_SEQUENCE_FOR_BUY: bool = True
+REQUIRE_NO_LOWER_LOW_SEQUENCE_FOR_BUY: bool = True
+
+# Minimum live momentum stack in basis points.
 MIN_ENTRY_MOMENTUM_1_BPS: float = 0.0
-MIN_ENTRY_MOMENTUM_3_BPS: float = 2.0
-MIN_ENTRY_MOMENTUM_5_BPS: float = 3.0
+MIN_ENTRY_MOMENTUM_3_BPS: float = 3.0
+MIN_ENTRY_MOMENTUM_5_BPS: float = 5.0
+MIN_ENTRY_MOMENTUM_15_BPS: float = -8.0
+ENTRY_GREEN_CANDLE_LOOKBACK: int = 5
+ENTRY_MIN_GREEN_CANDLES: int = 3
+ENTRY_TIMING_FAIL_COOLDOWN_SEC: float = 45.0
+
+# Candidate selectivity: core calibrated gates mean watch, not buy immediately.
+ENABLE_RELATIVE_CANDIDATE_SELECTIVITY: bool = True
+MAX_BUYABLE_RANKED_CANDIDATES: int = 3
+MIN_RANK_ADVANTAGE_OVER_MEDIAN: float = 15.0
+MIN_CANDIDATE_RANK_SCORE_TO_BUY: float = 95.0
+MIN_LIVE_EV_BPS_FOR_ACTUAL_BUY: float = 55.0
+LOW_CONFIDENCE_EV_BONUS_REQUIREMENT_BPS: float = 35.0
+MAX_SIMULTANEOUS_BUY_READY_WITHOUT_RANK_EDGE: int = 5
+
+# Spread/friction filters and rank penalties.
+ENABLE_HARD_SPREAD_FILTER_FOR_BUYS: bool = True
+HARD_MAX_BUY_SPREAD_BPS: float = 14.0
+PRODUCT_MAX_BUY_SPREAD_BPS: Dict[str, float] = {
+    "SHIB-USD": 10.0,
+    "ADA-USD": 12.0,
+    "AVAX-USD": 12.0,
+    "DOT-USD": 12.0,
+}
+SPREAD_RANK_PENALTY_MULT: float = 2.0
+
+# Post-buy outcome research windows.
+POST_BUY_REVIEW_WINDOWS_MINUTES: List[int] = [5, 15, 30, 60, 120]
+ENABLE_TRADE_OUTCOME_RESEARCH_LOG: bool = True
 
 # If a signal stops qualifying, retain its armed state for this long so a brief
 # evaluation gap does not immediately reset it.
@@ -682,19 +720,33 @@ def lerp_float(a: float, b: float, t: float) -> float:
 
 
 def candidate_rank_score(candidate: Dict[str, Any]) -> float:
-    """Rank passing candidates with net edge as the primary opportunity signal."""
+    """Rank passing candidates by net opportunity, timing, and friction."""
     probability = float(candidate.get("estimated_prob_up", 0.0))
     expected_edge_bps = float(candidate.get("expected_net_edge_bps", 0.0))
     score = float(candidate.get("score", 0.0))
     spread_bps = float(candidate.get("spread_bps", 0.0))
+    projected_bps = float(candidate.get("projected_forward_gain_bps", 0.0))
     cost_bps = float(candidate.get("cost_bps", 0.0))
+    timing_reason = str(candidate.get("entry_timing_reason", ""))
+
+    timing_bonus = 0.0
+    if "entry_confirmed" in timing_reason:
+        timing_bonus += 35.0
+    if "hl=True" in timing_reason:
+        timing_bonus += 10.0
+    if "vwap=True" in timing_reason:
+        timing_bonus += 8.0
+    if "lower_low_seq=False" in timing_reason:
+        timing_bonus += 8.0
 
     return (
         expected_edge_bps
-        + probability * 75.0
-        + score * 0.35
-        - spread_bps * 0.25
-        - max(0.0, cost_bps - 260.0) * 0.05
+        + probability * 80.0
+        + score * 0.45
+        + max(0.0, projected_bps - cost_bps) * 0.20
+        + timing_bonus
+        - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
+        - max(0.0, cost_bps - 260.0) * 0.08
     )
 
 
@@ -1370,6 +1422,89 @@ class MinuteCandle:
     low: float
     close: float
     volume: float = 0.0
+
+
+class _ResearchCSVLogger:
+    """Append-only CSV logger with a stable schema and local-time timestamp."""
+
+    columns: List[str] = []
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._ensure_header()
+
+    def _ensure_header(self) -> None:
+        if os.path.exists(self.path):
+            return
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(self.columns)
+
+    def _write(self, kwargs: Dict[str, Any]) -> None:
+        tsv = float(kwargs.get("ts", now_ts()))
+        dt_mst = datetime.fromtimestamp(tsv, tz=timezone.utc).astimezone(TZ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        row: List[Any] = []
+        for column in self.columns:
+            if column == "ts":
+                row.append(f"{tsv:.6f}")
+            elif column == "dt_mst":
+                row.append(dt_mst)
+            else:
+                row.append(kwargs.get(column, ""))
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+
+
+class SignalEventsLogger(_ResearchCSVLogger):
+    """Log signal qualification, timing, and execution decisions."""
+
+    columns = [
+        "ts", "dt_mst", "event_type", "trade_id", "product_id",
+        "rank", "rank_score", "buy_ready_count",
+        "score", "score_target", "score_ok",
+        "probability", "probability_target", "probability_ok",
+        "ev_bps", "ev_target_bps", "ev_ok",
+        "projected_forward_bps", "cost_bps", "spread_bps",
+        "entry_timing_ok", "entry_timing_reason",
+        "momentum_1_bps", "momentum_3_bps", "momentum_5_bps",
+        "momentum_15_bps", "vwap_ok", "higher_low_ok", "green_candles",
+        "candidate_rank_reason", "action", "reason",
+    ]
+
+    def log_event(self, **kwargs: Any) -> None:
+        self._write(kwargs)
+
+
+class TradeOutcomeLogger(_ResearchCSVLogger):
+    """Log fixed-window price outcomes after each confirmed or adopted buy."""
+
+    columns = [
+        "ts", "dt_mst", "trade_id", "product_id",
+        "review_minutes", "entry_ts", "entry_price", "review_price",
+        "move_bps", "max_favorable_bps", "max_adverse_bps",
+        "score_at_entry", "prob_at_entry", "ev_at_entry",
+        "spread_at_entry", "timing_reason_at_entry",
+        "position_open", "closed", "closed_reason", "closed_net_pnl_usd",
+    ]
+
+    def log_outcome(self, **kwargs: Any) -> None:
+        self._write(kwargs)
+
+
+class ReconciliationLogger(_ResearchCSVLogger):
+    """Log uncertain Coinbase fill states and their final resolution."""
+
+    columns = [
+        "ts", "dt_mst", "event_type", "product_id", "side",
+        "client_order_id", "order_id", "requested_quote_usd",
+        "expected_base_delta", "actual_base_delta",
+        "before_base", "after_base", "before_cash", "after_cash",
+        "status", "error", "action_taken",
+    ]
+
+    def log_reconciliation(self, **kwargs: Any) -> None:
+        self._write(kwargs)
 
 
 class TradeLogger:
@@ -4087,6 +4222,9 @@ class TradingBot:
         self.position_targets_log = PositionTargetsLogger(POSITION_TARGETS_CSV_PATH)
         self.candidate_replay_log = CandidateReplayLogger(CANDIDATE_REPLAY_CSV_PATH)
         self.active_products_log = ActiveProductsLogger(PRODUCTS_ACTIVE_CSV_PATH)
+        self.signal_events_log = SignalEventsLogger(SIGNAL_EVENTS_CSV_PATH)
+        self.trade_outcomes_log = TradeOutcomeLogger(TRADE_OUTCOMES_CSV_PATH)
+        self.reconciliation_log = ReconciliationLogger(RECONCILIATION_CSV_PATH)
         self.mlog = MarketLogger(MARKET_CSV_PATH)
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
@@ -4108,6 +4246,9 @@ class TradingBot:
         self.last_buy_gate_log_ts_by_product: Dict[str, float] = {}
         self.last_sell_failure_ts_by_product: Dict[str, float] = {}
         self.armed_buy_signals: Dict[str, Dict[str, Any]] = {}
+        self.last_entry_timing_fail_ts_by_product: Dict[str, float] = {}
+        self.pending_buy_reconciliations: Dict[str, Dict[str, Any]] = {}
+        self.last_buy_execution_result: Dict[str, Dict[str, Any]] = {}
         self.post_buy_review_queue: List[Dict[str, Any]] = []
         self.live_recalibration_running: bool = False
         self.last_loop_lag_check_ts: float = now_ts()
@@ -7131,65 +7272,170 @@ class TradingBot:
         except Exception:
             return 0.0
 
+    def _recent_green_candle_count(self, product_id: str, lookback: int) -> int:
+        try:
+            candles = list(self.live_1m[product_id].candles)
+        except Exception:
+            candles = []
+        count = 0
+        for candle in candles[-max(1, int(lookback)):]:
+            try:
+                if float(candle.close) > float(candle.open):
+                    count += 1
+            except Exception:
+                pass
+        return count
+
+    def _recent_lower_low_sequence(self, product_id: str, lookback: int = 4) -> bool:
+        try:
+            candles = list(self.live_1m[product_id].candles)
+        except Exception:
+            candles = []
+        if len(candles) < max(2, int(lookback)):
+            return False
+        try:
+            lows = [float(c.low) for c in candles[-int(lookback):]]
+            return all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
+        except Exception:
+            return False
+
+    def _entry_momentum_snapshot(self, product_id: str) -> Dict[str, float]:
+        return {
+            "mom1": self._recent_momentum_bps_for_product(product_id, 1),
+            "mom3": self._recent_momentum_bps_for_product(product_id, 3),
+            "mom5": self._recent_momentum_bps_for_product(product_id, 5),
+            "mom15": self._recent_momentum_bps_for_product(product_id, 15),
+        }
+
+    def _max_buy_spread_for_product(self, product_id: str) -> float:
+        normalized = str(product_id).upper().strip()
+        return float(PRODUCT_MAX_BUY_SPREAD_BPS.get(normalized, HARD_MAX_BUY_SPREAD_BPS))
+
+    def _spread_allows_buy(self, product_id: str, spread_bps: float) -> Tuple[bool, str]:
+        if not ENABLE_HARD_SPREAD_FILTER_FOR_BUYS:
+            return True, "spread_filter_disabled"
+        max_spread = self._max_buy_spread_for_product(product_id)
+        if float(spread_bps) > max_spread:
+            return False, f"spread_too_high spread={float(spread_bps):.3f} max={max_spread:.3f}"
+        return True, f"spread_ok spread={float(spread_bps):.3f} max={max_spread:.3f}"
+
     def _entry_timing_confirmation(
         self,
         *,
         product_id: str,
         signal: Optional["LiveSignal"],
     ) -> Tuple[bool, str]:
-        """Confirm that live price action is turning upward before buying."""
+        """Confirm that price is actually turning upward before buying."""
         trending_down, trend_reason = self._micro_trending_down(product_id)
-
-        mom1 = self._recent_momentum_bps_for_product(product_id, 1)
-        mom3 = self._recent_momentum_bps_for_product(product_id, 3)
-        mom5 = self._recent_momentum_bps_for_product(product_id, 5)
-
+        moms = self._entry_momentum_snapshot(product_id)
+        mom1, mom3 = moms["mom1"], moms["mom3"]
+        mom5, mom15 = moms["mom5"], moms["mom15"]
         vwap_ok = False
         higher_low_ok = False
-
         try:
             tob = self.tob.get(product_id)
             if tob and tob.mid > 0:
-                vwap_reclaimed, vwap_reason = self._micro_vwap_reclaimed(
-                    product_id, float(tob.mid)
-                )
-                # An unavailable VWAP is not affirmative upturn evidence.
-                vwap_ok = bool(vwap_reclaimed and vwap_reason != "vwap_unknown")
+                vwap_ok, _ = self._micro_vwap_reclaimed(product_id, float(tob.mid))
                 higher_low_ok, _ = self._higher_low_confirmed(product_id)
         except Exception:
             pass
+        green_count = self._recent_green_candle_count(product_id, ENTRY_GREEN_CANDLE_LOOKBACK)
+        lower_low_seq = self._recent_lower_low_sequence(product_id, lookback=4)
 
+        detail = (
+            f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};mom15={mom15:.2f};"
+            f"vwap={vwap_ok};hl={higher_low_ok};green={green_count};"
+            f"lower_low_seq={lower_low_seq}"
+        )
         if BLOCK_BUY_WHILE_MICROTREND_DOWN and trending_down:
-            return (
-                False,
-                f"microtrend_down:{trend_reason};mom1={mom1:.2f};"
-                f"mom3={mom3:.2f};mom5={mom5:.2f}",
-            )
+            return False, f"microtrend_down:{trend_reason};{detail}"
+        if REQUIRE_NO_LOWER_LOW_SEQUENCE_FOR_BUY and lower_low_seq:
+            return False, f"lower_low_sequence;{detail}"
 
         momentum_confirmed = bool(
             mom1 >= float(MIN_ENTRY_MOMENTUM_1_BPS)
+            and mom15 >= float(MIN_ENTRY_MOMENTUM_15_BPS)
             and (
                 mom3 >= float(MIN_ENTRY_MOMENTUM_3_BPS)
                 or mom5 >= float(MIN_ENTRY_MOMENTUM_5_BPS)
             )
         )
-        structure_confirmed = bool(vwap_ok or higher_low_ok)
-        upturn_ok = bool(momentum_confirmed and structure_confirmed)
-
+        vwap_confirmed = bool(vwap_ok) if REQUIRE_PRICE_ABOVE_MICRO_VWAP_FOR_BUY else True
+        structure_confirmed = (
+            bool(higher_low_ok or green_count >= int(ENTRY_MIN_GREEN_CANDLES))
+            if REQUIRE_HIGHER_LOW_OR_GREEN_SEQUENCE_FOR_BUY
+            else True
+        )
+        upturn_ok = bool(momentum_confirmed and vwap_confirmed and structure_confirmed)
         if REQUIRE_MICRO_UPTURN_FOR_BUY and not upturn_ok:
             return (
                 False,
-                f"no_confirmed_upturn;"
-                f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};"
-                f"momentum_confirmed={momentum_confirmed};"
-                f"structure_confirmed={structure_confirmed};"
-                f"vwap={vwap_ok};hl={higher_low_ok}",
+                f"no_confirmed_upturn;{detail};momentum_confirmed={momentum_confirmed};"
+                f"vwap_confirmed={vwap_confirmed};structure_confirmed={structure_confirmed}",
             )
+        return True, f"entry_confirmed;{detail}"
 
-        return (
-            True,
-            f"entry_confirmed;mom1={mom1:.2f};mom3={mom3:.2f};"
-            f"mom5={mom5:.2f};vwap={vwap_ok};hl={higher_low_ok}",
+    def _queue_post_buy_reviews(
+        self, *, trade_id: str, product_id: str, entry_ts: float, entry_price: float,
+        candidate: Dict[str, Any],
+    ) -> None:
+        for minutes in POST_BUY_REVIEW_WINDOWS_MINUTES:
+            self.post_buy_review_queue.append({
+                "review_ts": float(entry_ts) + float(minutes) * 60.0,
+                "review_minutes": int(minutes),
+                "trade_id": trade_id,
+                "product_id": product_id,
+                "entry_ts": float(entry_ts),
+                "entry_price": float(entry_price),
+                "score_at_entry": float(candidate.get("score", 0.0)),
+                "prob_at_entry": float(candidate.get("estimated_prob_up", 0.0)),
+                "ev_at_entry": float(candidate.get("expected_net_edge_bps", 0.0)),
+                "spread_at_entry": float(candidate.get("spread_bps", 0.0)),
+                "timing_reason_at_entry": str(candidate.get("entry_timing_reason", "")),
+            })
+
+    def _adopt_live_position_after_uncertain_buy(
+        self, *, product_id: str, qty: float, entry_price: float, pending: Dict[str, Any],
+    ) -> None:
+        """Adopt only the reconciled balance delta as a managed position lot."""
+        qty = float(qty)
+        entry_price = float(entry_price)
+        if qty <= 0 or entry_price <= 0:
+            return
+        adopted_ts = now_ts()
+        trade_id = f"adopted-{product_id}-{int(adopted_ts)}-{uuid.uuid4().hex[:8]}"
+        candidate = dict(pending.get("candidate") or {})
+        lot_meta = {
+            "trade_id": trade_id,
+            "entry_ts": adopted_ts,
+            "entry_reason": "adopted_after_uncertain_buy",
+            "source": "coinbase_balance_reconciliation",
+            "pending_reason": pending.get("reason", ""),
+            "estimated_prob_up": float(candidate.get("estimated_prob_up", 0.0)),
+            "position_pct": float(candidate.get("position_pct", 0.0)),
+            "target_bps": float(candidate.get("target_bps", 0.0)),
+            "cost_bps": float(candidate.get("cost_bps", 0.0)),
+            "scalp_done": False, "core_done": False,
+            "scalp_armed": False, "core_armed": False,
+            "profit_lock_armed": False,
+        }
+        self.positions.setdefault(product_id, []).append(PositionLot(
+            qty=qty, price=entry_price, tier=int(candidate.get("tier", TIER_LOW)),
+            score=float(candidate.get("score", 0.0)), meta=lot_meta,
+        ))
+        self.lot_tags.setdefault(product_id, []).append("RECONCILED")
+        self.position_start_ts[product_id] = self.position_start_ts.get(product_id) or adopted_ts
+        self.position_entry_price[product_id] = entry_price
+        self.last_buy_ts[product_id] = adopted_ts
+        self.last_buy_price[product_id] = entry_price
+        self.anchor_ts[product_id] = adopted_ts
+        self._queue_post_buy_reviews(
+            trade_id=trade_id, product_id=product_id, entry_ts=adopted_ts,
+            entry_price=entry_price, candidate=candidate,
+        )
+        log(
+            f"[reconcile] adopted uncertain buy {product_id} qty={qty:.12f} "
+            f"entry={entry_price:.8f} trade_id={trade_id}"
         )
 
     def _risk_pause_active(self) -> bool:
@@ -7367,6 +7613,9 @@ class TradingBot:
                     )
 
                 if fill is not None:
+                    self.last_buy_execution_result[product_id] = (
+                        dict(result) if isinstance(result, dict) else {}
+                    )
                     return fill
 
                 maker_error = ""
@@ -7389,6 +7638,7 @@ class TradingBot:
             else:
                 raise RuntimeError(f"Invalid live buy execution mode={mode}")
 
+            self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
             fill = self._require_live_fill(result, product_id=product_id, side="BUY")
             if LOG_ORDER_ATTEMPTS:
                 self.olog.log_order(
@@ -7398,6 +7648,7 @@ class TradingBot:
             return fill
 
         except Exception as e:
+            self.last_buy_execution_result[product_id] = {"error": str(e), "status": "EXCEPTION"}
             if LOG_ORDER_ATTEMPTS:
                 self.olog.log_order(
                     event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode,
@@ -8389,32 +8640,94 @@ class TradingBot:
                 log(f"[lag] eval_loop gap={loop_gap:.2f}s; possible blocking work or REST delay")
             self.last_loop_lag_check_ts = ts_now
 
-            if self.post_buy_review_queue:
+            if self.pending_buy_reconciliations and isinstance(self.portfolio, LivePortfolio):
+                for product_id_r, pending in list(self.pending_buy_reconciliations.items()):
+                    age = ts_now - float(pending.get("ts", ts_now))
+                    if age < 10.0:
+                        continue
+                    try:
+                        snapshot = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                        base_asset = product_base_asset(product_id_r)
+                        qty_now = self.portfolio.get_total_asset(base_asset, snapshot=snapshot or {})
+                        before_base = float(pending.get("before_base", 0.0))
+                        actual_delta = max(0.0, float(qty_now) - before_base)
+                        if actual_delta > 1e-12:
+                            tob = self.tob.get(product_id_r)
+                            fallback_ask = float(pending.get("ask", 0.0))
+                            mid = float(tob.mid) if tob and tob.mid > 0 else fallback_ask
+                            entry_price = max(fallback_ask, mid)
+                            self._adopt_live_position_after_uncertain_buy(
+                                product_id=product_id_r, qty=actual_delta,
+                                entry_price=entry_price, pending=pending,
+                            )
+                            self.reconciliation_log.log_reconciliation(
+                                event_type="delayed_buy_adopted", product_id=product_id_r, side="BUY",
+                                requested_quote_usd=f"{float(pending.get('requested_quote_usd', 0.0)):.6f}",
+                                actual_base_delta=f"{actual_delta:.12f}", before_base=f"{before_base:.12f}",
+                                after_base=f"{float(qty_now):.12f}", status="adopted",
+                                error=pending.get("reason", ""),
+                                action_taken="adopted_coinbase_balance_delta_as_position",
+                            )
+                            self.pending_buy_reconciliations.pop(product_id_r, None)
+                        elif age > 60.0:
+                            self.reconciliation_log.log_reconciliation(
+                                event_type="delayed_buy_rejected", product_id=product_id_r, side="BUY",
+                                requested_quote_usd=f"{float(pending.get('requested_quote_usd', 0.0)):.6f}",
+                                before_base=f"{before_base:.12f}", after_base=f"{float(qty_now):.12f}",
+                                status="rejected", error="no_base_balance_delta_after_60s",
+                                action_taken="dropped_pending_reconciliation",
+                            )
+                            self.pending_buy_reconciliations.pop(product_id_r, None)
+                    except Exception as exc:
+                        log(f"[reconcile] delayed buy reconcile failed for {product_id_r}: {exc}")
+
+            if self.post_buy_review_queue and ENABLE_TRADE_OUTCOME_RESEARCH_LOG:
                 remaining_reviews: List[Dict[str, Any]] = []
                 for review in self.post_buy_review_queue:
                     if ts_now < float(review.get("review_ts", 0.0)):
                         remaining_reviews.append(review)
                         continue
-
                     product_r = str(review.get("product_id", ""))
                     entry_r = float(review.get("entry_price", 0.0))
                     tob_r = self.tob.get(product_r)
-
-                    if tob_r and entry_r > 0:
-                        move_30m_bps = (
-                            (float(tob_r.mid) / entry_r) - 1.0
-                        ) * 10000.0
-                        log(
-                            f"[post-buy-review] {product_r} "
-                            f"30m_move_bps={move_30m_bps:.2f} "
-                            f"entry={entry_r:.8f} mid={float(tob_r.mid):.8f} "
-                            f"order_id={review.get('order_id')}"
-                        )
-                    else:
-                        # Retry when top-of-book data becomes available rather than
-                        # silently dropping a due review.
+                    if not tob_r or entry_r <= 0:
                         remaining_reviews.append(review)
-
+                        continue
+                    current_mid = float(tob_r.mid)
+                    move_bps = ((current_mid / entry_r) - 1.0) * 10000.0
+                    max_fav: Any = ""
+                    max_adv: Any = ""
+                    try:
+                        candles = list(self.live_1m[product_r].candles)
+                        entry_ts = float(review.get("entry_ts", 0.0))
+                        path = [c for c in candles if float(c.ts) >= entry_ts]
+                        if path:
+                            high = max(float(c.high) for c in path)
+                            low = min(float(c.low) for c in path)
+                            max_fav = f"{((high / entry_r) - 1.0) * 10000.0:.6f}"
+                            max_adv = f"{((entry_r / low) - 1.0) * 10000.0:.6f}"
+                    except Exception:
+                        pass
+                    position_open = sum(float(lot.qty) for lot in self.positions.get(product_r, [])) > 1e-12
+                    self.trade_outcomes_log.log_outcome(
+                        trade_id=review.get("trade_id", ""), product_id=product_r,
+                        review_minutes=review.get("review_minutes", ""),
+                        entry_ts=f"{float(review.get('entry_ts', 0.0)):.6f}",
+                        entry_price=f"{entry_r:.8f}", review_price=f"{current_mid:.8f}",
+                        move_bps=f"{move_bps:.6f}", max_favorable_bps=max_fav,
+                        max_adverse_bps=max_adv,
+                        score_at_entry=f"{float(review.get('score_at_entry', 0.0)):.6f}",
+                        prob_at_entry=f"{float(review.get('prob_at_entry', 0.0)):.6f}",
+                        ev_at_entry=f"{float(review.get('ev_at_entry', 0.0)):.6f}",
+                        spread_at_entry=f"{float(review.get('spread_at_entry', 0.0)):.6f}",
+                        timing_reason_at_entry=review.get("timing_reason_at_entry", ""),
+                        position_open=position_open, closed=not position_open,
+                    )
+                    log(
+                        f"[post-buy-review] {product_r} trade_id={review.get('trade_id')} "
+                        f"window={review.get('review_minutes')}m move_bps={move_bps:.2f} "
+                        f"entry={entry_r:.8f} mid={current_mid:.8f}"
+                    )
                 self.post_buy_review_queue = remaining_reviews
 
             try:
@@ -8883,6 +9196,16 @@ class TradingBot:
                             log(f"[sell-skip] {product_id} recent sell failure cooldown")
                             continue
 
+                        sell_trade_id = ""
+                        for sell_lot in lots:
+                            if isinstance(sell_lot.meta, dict) and sell_lot.meta.get("trade_id"):
+                                sell_trade_id = str(sell_lot.meta.get("trade_id"))
+                                break
+                        self.signal_events_log.log_event(
+                            event_type="sell_attempt", trade_id=sell_trade_id,
+                            product_id=product_id, action="attempt_sell",
+                            reason=str(exit_reason or "sell"),
+                        )
                         log(
                             f"[sell-attempt] {product_id} "
                             f"qty={sell_qty:.12f} reason={exit_reason} role={exit_role} "
@@ -8902,6 +9225,11 @@ class TradingBot:
                         )
                         if fill is not None:
                             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                            self.signal_events_log.log_event(
+                                event_type="sell_fill", trade_id=sell_trade_id,
+                                product_id=product_id, action="sell_filled",
+                                reason=f"exit_role={exit_role};exit_reason={exit_reason}",
+                            )
                             log(
                                 f"[sell-success] {product_id} "
                                 f"qty={float(filled_qty):.12f} avg_px={float(avg_px):.8f} "
@@ -8969,32 +9297,54 @@ class TradingBot:
                     and self._trade_rate_ok(product_id)
                     and self._open_position_count() < MAX_OPEN_POSITIONS
                 ):
-                    candidates.append({
-                        "product_id": product_id,
-                        "mid": mid,
-                        "bid": bid,
-                        "ask": ask,
-                        "spread_bps": spread_bps,
-                        "score": scored.score,
-                        "tier": scored.tier,
-                        "entry_reason": scored.reason,
-                        "entry_score_obj": scored,
-                        "signal": live_signal,
-                        "entry_timing_ok": False,
-                        "entry_timing_reason": "",
-                        "expected_net_edge_bps": scored.expected_net_edge_bps,
-                        "estimated_prob_up": float(estimated_prob_up),
-                        "position_pct": float(position_pct),
-                        "target_bps": float(target_bps),
-                        "cost_bps": float(cost_bps),
-                        "calibrated_time_to_min_profit_minutes": float(live_signal.calibrated_time_to_min_profit_minutes),
-                        "calibrated_forward_window_minutes": float(live_signal.calibrated_forward_window_minutes),
-                        "calibrated_post_profit_breathing_minutes": float(
-                            self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id)).calibrated_post_profit_breathing_minutes
-                            or CALIB_POST_PROFIT_BREATHING_MINUTES
-                        ),
-                        "weekly_bias": weekly_bias,
-                    })
+                    spread_ok_for_buy, spread_buy_reason = self._spread_allows_buy(
+                        product_id, float(spread_bps)
+                    )
+                    if not spread_ok_for_buy:
+                        self.signal_events_log.log_event(
+                            event_type="buy_ready_rejected_spread", product_id=product_id,
+                            score=f"{float(live_signal.score):.6f}",
+                            probability=f"{float(live_signal.estimated_prob_up):.6f}",
+                            ev_bps=f"{float(live_signal.expected_net_edge_bps):.6f}",
+                            projected_forward_bps=f"{float(live_signal.projected_forward_gain_bps):.6f}",
+                            cost_bps=f"{float(live_signal.cost_bps):.6f}",
+                            spread_bps=f"{float(spread_bps):.6f}", action="reject",
+                            reason=spread_buy_reason,
+                        )
+                    else:
+                        profile = self.calibration_profiles.get(
+                            product_id, ProductCalibrationProfile(product_id=product_id)
+                        )
+                        candidates.append({
+                            "product_id": product_id,
+                            "mid": mid,
+                            "bid": bid,
+                            "ask": ask,
+                            "spread_bps": spread_bps,
+                            "score": scored.score,
+                            "tier": scored.tier,
+                            "entry_reason": scored.reason,
+                            "entry_score_obj": scored,
+                            "signal": live_signal,
+                            "entry_timing_ok": False,
+                            "entry_timing_reason": "",
+                            "expected_net_edge_bps": scored.expected_net_edge_bps,
+                            "estimated_prob_up": float(estimated_prob_up),
+                            "position_pct": float(position_pct),
+                            "target_bps": float(target_bps),
+                            "cost_bps": float(cost_bps),
+                            "projected_forward_gain_bps": float(live_signal.projected_forward_gain_bps),
+                            "min_score": float(profile.min_score),
+                            "min_probability": float(profile.min_probability),
+                            "min_expected_value_bps": float(profile.min_expected_value_bps),
+                            "calibrated_time_to_min_profit_minutes": float(live_signal.calibrated_time_to_min_profit_minutes),
+                            "calibrated_forward_window_minutes": float(live_signal.calibrated_forward_window_minutes),
+                            "calibrated_post_profit_breathing_minutes": float(
+                                self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id)).calibrated_post_profit_breathing_minutes
+                                or CALIB_POST_PROFIT_BREATHING_MINUTES
+                            ),
+                            "weekly_bias": weekly_bias,
+                        })
 
                 self.mlog.log_snapshot(
                     ts=ts_now,
@@ -9048,20 +9398,94 @@ class TradingBot:
                     buy_gate_blocker=live_signal.buy_gate_blocker,
                 )
 
-            candidates.sort(key=candidate_rank_score, reverse=True)
+            for candidate in candidates:
+                candidate["rank_score"] = candidate_rank_score(candidate)
+            candidates.sort(key=lambda c: float(c.get("rank_score", 0.0)), reverse=True)
+            buy_ready_count = len(candidates)
+
+            if ENABLE_RELATIVE_CANDIDATE_SELECTIVITY and candidates:
+                rank_values = [float(c.get("rank_score", 0.0)) for c in candidates]
+                median_rank = float(np.median(rank_values)) if rank_values else 0.0
+                filtered_candidates: List[Dict[str, Any]] = []
+                for idx, candidate in enumerate(candidates, start=1):
+                    product_id_c = str(candidate.get("product_id", ""))
+                    rank_score = float(candidate.get("rank_score", 0.0))
+                    ev = float(candidate.get("expected_net_edge_bps", 0.0))
+                    score = float(candidate.get("score", 0.0))
+                    probability = float(candidate.get("estimated_prob_up", 0.0))
+                    spread = float(candidate.get("spread_bps", 0.0))
+                    spread_ok, spread_reason = self._spread_allows_buy(product_id_c, spread)
+                    median_edge_ok = (
+                        buy_ready_count == 1
+                        or rank_score >= median_rank + float(MIN_RANK_ADVANTAGE_OVER_MEDIAN)
+                    )
+                    rank_edge_ok = bool(
+                        rank_score >= float(MIN_CANDIDATE_RANK_SCORE_TO_BUY)
+                        and median_edge_ok
+                    )
+                    required_ev = float(MIN_LIVE_EV_BPS_FOR_ACTUAL_BUY)
+                    if score < 25.0 or probability < 0.25:
+                        required_ev += float(LOW_CONFIDENCE_EV_BONUS_REQUIREMENT_BPS)
+                    ev_ok = ev >= required_ev
+                    too_many_ready_without_edge = bool(
+                        buy_ready_count > int(MAX_SIMULTANEOUS_BUY_READY_WITHOUT_RANK_EDGE)
+                        and not rank_edge_ok
+                    )
+
+                    if not spread_ok:
+                        reason = spread_reason
+                        event_type = "candidate_rejected_spread"
+                        action = "reject"
+                    elif idx > int(MAX_BUYABLE_RANKED_CANDIDATES):
+                        reason = f"outside_top_ranked_candidates idx={idx}"
+                        event_type = "candidate_selectivity"
+                        action = "reject"
+                    elif not rank_edge_ok:
+                        reason = f"rank_edge_failed rank_score={rank_score:.3f} median={median_rank:.3f}"
+                        event_type = "candidate_selectivity"
+                        action = "reject"
+                    elif not ev_ok:
+                        reason = f"ev_not_strong_enough ev={ev:.3f} required={required_ev:.3f}"
+                        event_type = "candidate_selectivity"
+                        action = "reject"
+                    elif too_many_ready_without_edge:
+                        reason = f"too_many_buy_ready_without_edge count={buy_ready_count}"
+                        event_type = "candidate_selectivity"
+                        action = "reject"
+                    else:
+                        reason = "relative_selectivity_pass"
+                        event_type = "candidate_selectivity"
+                        action = "keep"
+                        filtered_candidates.append(candidate)
+
+                    self.signal_events_log.log_event(
+                        event_type=event_type, product_id=product_id_c, rank=idx,
+                        rank_score=f"{rank_score:.6f}", buy_ready_count=buy_ready_count,
+                        score=f"{score:.6f}", score_target=f"{float(candidate.get('min_score', 0.0)):.6f}",
+                        score_ok=True, probability=f"{probability:.6f}",
+                        probability_target=f"{float(candidate.get('min_probability', 0.0)):.6f}",
+                        probability_ok=True, ev_bps=f"{ev:.6f}",
+                        ev_target_bps=f"{float(candidate.get('min_expected_value_bps', 0.0)):.6f}",
+                        ev_ok=ev_ok,
+                        projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
+                        cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
+                        spread_bps=f"{spread:.6f}", candidate_rank_reason=reason,
+                        action=action, reason=reason,
+                    )
+                candidates = filtered_candidates
+
             if candidates:
                 top_preview = ", ".join(
-                    f"{candidate.get('product_id')}("
-                    f"rank={candidate_rank_score(candidate):.2f},"
+                    f"{candidate.get('product_id')}(rank={float(candidate.get('rank_score', 0.0)):.2f},"
                     f"score={float(candidate.get('score', 0.0)):.1f},"
                     f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f},"
                     f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.1f},"
                     f"pct={float(candidate.get('position_pct', 0.0)):.3f})"
                     for candidate in candidates[:5]
                 )
-                log(f"[buy-candidates] count={len(candidates)} top={top_preview}")
+                log(f"[buy-candidates] buy_ready={buy_ready_count} selectable={len(candidates)} top={top_preview}")
             else:
-                log("[buy-candidates] count=0")
+                log(f"[buy-candidates] buy_ready={buy_ready_count} selectable=0")
 
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
             max_deploy_this_eval = (
@@ -9116,15 +9540,48 @@ class TradingBot:
                     timed_candidates.append(candidate)
                     continue
 
-                timing_ok, timing_reason = self._entry_timing_confirmation(
-                    product_id=product_id_t,
-                    signal=candidate.get("signal"),
+                last_timing_fail = float(
+                    self.last_entry_timing_fail_ts_by_product.get(product_id_t, 0.0)
                 )
+                fail_cooldown_left = float(ENTRY_TIMING_FAIL_COOLDOWN_SEC) - (ts_now - last_timing_fail)
+                if last_timing_fail > 0 and fail_cooldown_left > 0:
+                    timing_ok = False
+                    timing_reason = f"entry_timing_fail_cooldown remaining={fail_cooldown_left:.1f}s"
+                else:
+                    timing_ok, timing_reason = self._entry_timing_confirmation(
+                        product_id=product_id_t, signal=candidate.get("signal"),
+                    )
+                    if not timing_ok:
+                        self.last_entry_timing_fail_ts_by_product[product_id_t] = ts_now
 
                 candidate["entry_timing_ok"] = bool(timing_ok)
                 candidate["entry_timing_reason"] = str(timing_reason)
+                moms = self._entry_momentum_snapshot(product_id_t)
+                green_count = self._recent_green_candle_count(
+                    product_id_t, ENTRY_GREEN_CANDLE_LOOKBACK
+                )
+                self.signal_events_log.log_event(
+                    event_type="entry_timing_check", product_id=product_id_t,
+                    rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
+                    buy_ready_count=buy_ready_count,
+                    score=f"{float(candidate.get('score', 0.0)):.6f}",
+                    score_target=f"{float(candidate.get('min_score', 0.0)):.6f}", score_ok=True,
+                    probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
+                    probability_target=f"{float(candidate.get('min_probability', 0.0)):.6f}", probability_ok=True,
+                    ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                    ev_target_bps=f"{float(candidate.get('min_expected_value_bps', 0.0)):.6f}", ev_ok=True,
+                    projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
+                    cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
+                    spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
+                    entry_timing_ok=bool(timing_ok), entry_timing_reason=str(timing_reason),
+                    momentum_1_bps=f"{moms['mom1']:.6f}", momentum_3_bps=f"{moms['mom3']:.6f}",
+                    momentum_5_bps=f"{moms['mom5']:.6f}", momentum_15_bps=f"{moms['mom15']:.6f}",
+                    green_candles=green_count, action="keep" if timing_ok else "wait",
+                    reason=str(timing_reason),
+                )
 
                 if timing_ok:
+                    self.last_entry_timing_fail_ts_by_product.pop(product_id_t, None)
                     timed_candidates.append(candidate)
                 else:
                     log(
@@ -9140,6 +9597,9 @@ class TradingBot:
 
             for candidate in candidate_slice:
                 product_id = candidate["product_id"]
+                if product_id in self.pending_buy_reconciliations:
+                    log(f"[buy-skip] {product_id} pending delayed buy reconciliation")
+                    continue
                 existing_qty = sum(l.qty for l in self.positions.get(product_id, []))
                 if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
                     try:
@@ -9280,6 +9740,35 @@ class TradingBot:
                     )
                     continue
 
+                trade_id = f"{product_id}-{int(now_ts())}-{uuid.uuid4().hex[:8]}"
+                before_buy_base = 0.0
+                before_buy_cash = float(cash_usd)
+                try:
+                    if isinstance(self.portfolio, LivePortfolio):
+                        before_buy_snapshot = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                        before_buy_base = self.portfolio.get_product_total_qty(
+                            product_id, snapshot=before_buy_snapshot or {}
+                        )
+                        before_buy_cash = self.portfolio.get_tradable_usd(
+                            snapshot=before_buy_snapshot or {}
+                        )
+                except Exception as exc:
+                    log(f"[reconcile] pre-buy snapshot failed for {product_id}: {exc}")
+
+                self.signal_events_log.log_event(
+                    event_type="buy_attempt", trade_id=trade_id, product_id=product_id,
+                    rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
+                    buy_ready_count=buy_ready_count, score=f"{float(candidate.get('score', 0.0)):.6f}",
+                    probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
+                    ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                    projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
+                    cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
+                    spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
+                    entry_timing_ok=candidate.get("entry_timing_ok", ""),
+                    entry_timing_reason=candidate.get("entry_timing_reason", ""),
+                    action="attempt_buy", reason="selected_after_rank_and_timing",
+                )
+
                 log(
                     f"[buy-attempt] {product_id} "
                     f"mode={entry_mode_for_this_trade} "
@@ -9302,7 +9791,35 @@ class TradingBot:
                 )
 
                 if fill is None:
-                    log(f"[buy-failed] {product_id} live buy returned no confirmed fill")
+                    result = dict(self.last_buy_execution_result.get(product_id) or {})
+                    error_text = str(result.get("error") or result.get("status") or "")
+                    uncertain = any(token in error_text.lower() for token in (
+                        "buy_no_base_balance_delta", "balance_snapshot",
+                        "ambiguous_fill", "balance_delta_reconcile",
+                    ))
+                    if uncertain:
+                        self.pending_buy_reconciliations[product_id] = {
+                            "ts": now_ts(), "product_id": product_id,
+                            "requested_quote_usd": float(entry_notional),
+                            "candidate": dict(candidate), "bid": bid, "ask": ask,
+                            "before_base": float(before_buy_base),
+                            "before_cash": float(before_buy_cash),
+                            "trade_id": trade_id, "reason": error_text,
+                        }
+                        self.reconciliation_log.log_reconciliation(
+                            event_type="pending_buy_reconciliation", product_id=product_id, side="BUY",
+                            client_order_id=result.get("client_order_id", ""),
+                            order_id=result.get("order_id", ""),
+                            requested_quote_usd=f"{float(entry_notional):.6f}",
+                            before_base=f"{float(before_buy_base):.12f}",
+                            before_cash=f"{float(before_buy_cash):.6f}",
+                            status="pending", error=error_text,
+                            action_taken="queued_for_delayed_reconcile",
+                        )
+                    log(
+                        f"[buy-failed] {product_id} live buy returned no confirmed fill "
+                        f"error={error_text}"
+                    )
                     continue
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
@@ -9317,12 +9834,19 @@ class TradingBot:
                     f"order_id={_order_id}"
                 )
                 self.armed_buy_signals.pop(product_id, None)
-                self.post_buy_review_queue.append({
-                    "review_ts": now_ts() + 30 * 60,
-                    "product_id": product_id,
-                    "entry_price": float(avg_px),
-                    "order_id": _order_id,
-                })
+                entry_ts = now_ts()
+                self._queue_post_buy_reviews(
+                    trade_id=trade_id, product_id=product_id, entry_ts=entry_ts,
+                    entry_price=float(avg_px), candidate=candidate,
+                )
+                self.signal_events_log.log_event(
+                    event_type="buy_fill", trade_id=trade_id, product_id=product_id,
+                    action="buy_filled",
+                    reason=(
+                        f"avg_px={float(avg_px):.8f};qty={float(filled_qty):.12f};"
+                        f"notional={float(filled_notional or entry_notional):.6f}"
+                    ),
+                )
                 qty1 = float(filled_qty)
                 buy_px1 = float(avg_px)
                 fee1 = float(fee_val)
@@ -9330,6 +9854,8 @@ class TradingBot:
 
                 if qty1 > 0:
                     lot_meta = {
+                        "trade_id": trade_id,
+                        "entry_ts": entry_ts,
                         "scalp_done": False,
                         "core_done": False,
 

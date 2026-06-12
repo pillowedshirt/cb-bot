@@ -633,6 +633,44 @@ INVERTED_POST_CYCLE_COOLDOWN_SEC: float = 60.0
 # Logging.
 INVERTED_LOG_PREFIX: str = "[inverted-cycle]"
 
+# ============================================================
+# INVERTED STRATEGY REPAIR / SAFETY CONFIG
+# ============================================================
+
+# Fill sanity:
+# Reject fills whose average price is too far away from the current bid/ask.
+# This prevents impossible local entries like SUI at ~0.38 while live market is ~0.75.
+ENABLE_FILL_PRICE_SANITY_CHECK: bool = True
+MAX_FILL_PRICE_DEVIATION_FROM_TOB_PCT: float = 0.02
+
+# Dust cleanup:
+# If a local position is too tiny to sell, clear it locally instead of repeatedly
+# submitting invalid Coinbase orders.
+ENABLE_LOCAL_DUST_POSITION_CLEANUP: bool = True
+LOCAL_DUST_USD_THRESHOLD: float = 0.25
+LOCAL_DUST_QTY_EPSILON: float = 1e-8
+
+# Inverted buy stabilization:
+# Old stop-loss touched = arm the buy.
+# Actual buy happens only after price stops falling / stabilizes.
+INVERTED_REQUIRE_TRIGGER_STABILIZATION: bool = True
+INVERTED_BUY_TRIGGER_MIN_AGE_SEC: float = 20.0
+INVERTED_BUY_STABILIZATION_LOOKBACK_CANDLES: int = 3
+INVERTED_BUY_STABILIZATION_MAX_ADVERSE_BPS: float = 12.0
+INVERTED_BUY_STABILIZATION_REQUIRE_NON_NEGATIVE_1M: bool = True
+
+# Inverted rebuy rotation delay:
+# Do not sell old + buy larger instantly. Require the deeper loss condition
+# to persist briefly.
+INVERTED_REBUY_ROTATION_MIN_HOLD_SEC: float = 180.0
+INVERTED_REBUY_TRIGGER_CONFIRM_SEC: float = 45.0
+
+# Unbuyable marker handling:
+# If a marker keeps hitting its buy trigger but cannot buy due to zero notional,
+# cash, exposure, or minimum size, expire or cool it down.
+INVERTED_MAX_ZERO_NOTIONAL_TRIGGER_HITS: int = 5
+INVERTED_UNBUYABLE_MARKER_COOLDOWN_SEC: float = 10 * 60
+
 # When true, no-progress/time/invalidation/hard-peak exits cannot sell at a loss
 # unless the position has crossed the 1% loss threshold.
 BLOCK_NON_PROFIT_LOSS_EXITS_UNTIL_MAX_LOSS: bool = True
@@ -4467,6 +4505,46 @@ class TradingBot:
         return None
 
 
+    def _fill_price_near_live_market(
+        self,
+        *,
+        product_id: str,
+        side: str,
+        avg_price: float,
+    ) -> Tuple[bool, str]:
+        """Reject impossible fill prices that are far from the live market."""
+        if not ENABLE_FILL_PRICE_SANITY_CHECK:
+            return True, "fill_price_sanity_disabled"
+
+        tob = self.tob.get(product_id)
+        if not tob or tob.bid <= 0 or tob.ask <= 0:
+            return True, "no_tob_for_sanity_check"
+
+        side_u = str(side).upper().strip()
+        px = float(avg_price)
+        if px <= 0:
+            return False, "avg_price<=0"
+
+        # BUY should be near ask. SELL should be near bid.
+        ref = float(tob.ask) if side_u == "BUY" else float(tob.bid)
+        if ref <= 0:
+            return True, "invalid_ref_price"
+
+        deviation = abs(px - ref) / ref
+        if deviation > float(MAX_FILL_PRICE_DEVIATION_FROM_TOB_PCT):
+            return (
+                False,
+                f"fill_price_too_far_from_tob side={side_u} "
+                f"avg_price={px:.8f} ref={ref:.8f} "
+                f"deviation_pct={deviation * 100:.3f}% "
+                f"max_pct={MAX_FILL_PRICE_DEVIATION_FROM_TOB_PCT * 100:.3f}%",
+            )
+
+        return True, (
+            f"fill_price_ok side={side_u} avg_price={px:.8f} "
+            f"ref={ref:.8f} deviation_pct={deviation * 100:.3f}%"
+        )
+
     def _require_live_fill(
         self,
         r: Any,
@@ -4531,6 +4609,34 @@ class TradingBot:
         if filled_notional is None or filled_notional <= 0:
             filled_notional = float(filled_qty) * float(avg_px)
 
+        sanity_ok, sanity_reason = self._fill_price_near_live_market(
+            product_id=product_id,
+            side=side_u,
+            avg_price=float(avg_px),
+        )
+        if not sanity_ok:
+            log(
+                f"[fill-sanity] {product_id} rejected {side_u} fill: "
+                f"{sanity_reason}"
+            )
+            try:
+                self.reconciliation_log.log_reconciliation(
+                    event_type="fill_price_sanity_rejected",
+                    product_id=product_id,
+                    side=side_u,
+                    order_id=order_id,
+                    status="rejected",
+                    error=sanity_reason,
+                    action_taken="rejected_impossible_fill_price",
+                )
+            except Exception:
+                pass
+            return None
+
+        log(
+            f"[fill-sanity] {product_id} accepted {side_u} fill: "
+            f"{sanity_reason}"
+        )
         return float(filled_qty), float(avg_px), float(fee_val), float(filled_notional), str(order_id)
 
     def _fifo_cost_basis(self, lots: List[PositionLot], qty: float) -> Tuple[float, Optional[float]]:
@@ -8686,6 +8792,204 @@ class TradingBot:
     def _inverted_current_position_qty(self, product_id: str) -> float:
         return sum(float(lot.qty) for lot in self.positions.get(product_id, []))
 
+    def _position_estimated_usd_value(self, product_id: str, qty: float) -> float:
+        tob = self.tob.get(product_id)
+        if not tob or tob.mid <= 0:
+            return 0.0
+        return max(0.0, float(qty) * float(tob.mid))
+
+    def _is_local_dust_position(self, product_id: str, qty: float) -> bool:
+        if not ENABLE_LOCAL_DUST_POSITION_CLEANUP:
+            return False
+
+        qty = float(qty)
+        if qty <= float(LOCAL_DUST_QTY_EPSILON):
+            return True
+
+        usd_value = self._position_estimated_usd_value(product_id, qty)
+        return bool(usd_value > 0 and usd_value < float(LOCAL_DUST_USD_THRESHOLD))
+
+    def _clear_local_dust_position(
+        self,
+        *,
+        product_id: str,
+        reason: str,
+    ) -> None:
+        qty = self._inverted_current_position_qty(product_id)
+        usd_value = self._position_estimated_usd_value(product_id, qty)
+        log(
+            f"[dust-cleanup] {product_id} clearing local dust "
+            f"qty={qty:.12f} usd_value={usd_value:.6f} reason={reason}"
+        )
+
+        try:
+            self.signal_events_log.log_event(
+                event_type="dust_position_cleared",
+                product_id=product_id,
+                action="clear_local_dust",
+                reason=f"qty={qty:.12f};usd_value={usd_value:.6f};{reason}",
+            )
+        except Exception:
+            pass
+
+        self.positions[product_id] = []
+        self.lot_tags[product_id] = []
+        self.position_start_ts[product_id] = None
+        self.position_entry_price[product_id] = None
+        self.peak_bid[product_id] = None
+        self.scale_add_count[product_id] = 0
+        self.trailing_active[product_id] = False
+
+    def _inverted_marker_trigger_key(self, product_id: str) -> str:
+        return f"{product_id}:trigger"
+
+    def _inverted_get_marker_state(self, marker: Dict[str, Any]) -> Dict[str, Any]:
+        state = marker.get("state")
+        if not isinstance(state, dict):
+            state = {}
+            marker["state"] = state
+        return state
+
+    def _inverted_buy_trigger_stabilized(
+        self,
+        *,
+        product_id: str,
+        marker: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Arm at the old stop-loss and buy only after price stabilizes."""
+        if not INVERTED_REQUIRE_TRIGGER_STABILIZATION:
+            return True, "stabilization_disabled"
+
+        tob = self.tob.get(product_id)
+        if not tob or tob.ask <= 0:
+            return False, "no_tob"
+
+        state = self._inverted_get_marker_state(marker)
+        nowv = now_ts()
+        buy_trigger = float(marker.get("buy_trigger_price") or 0.0)
+        if buy_trigger <= 0:
+            return False, "invalid_buy_trigger"
+
+        if float(tob.ask) > buy_trigger:
+            state.pop("trigger_first_seen_ts", None)
+            state.pop("trigger_low_ask", None)
+            return False, "not_in_trigger_zone"
+
+        first_seen = float(state.get("trigger_first_seen_ts") or 0.0)
+        if first_seen <= 0:
+            state["trigger_first_seen_ts"] = nowv
+            state["trigger_low_ask"] = float(tob.ask)
+            return (
+                False,
+                f"trigger_armed_waiting_age ask={float(tob.ask):.8f} "
+                f"trigger={buy_trigger:.8f}",
+            )
+
+        trigger_age = nowv - first_seen
+        state["trigger_low_ask"] = min(
+            float(state.get("trigger_low_ask") or float(tob.ask)),
+            float(tob.ask),
+        )
+        if trigger_age < float(INVERTED_BUY_TRIGGER_MIN_AGE_SEC):
+            return (
+                False,
+                f"trigger_too_new age={trigger_age:.1f}s "
+                f"required={INVERTED_BUY_TRIGGER_MIN_AGE_SEC:.1f}s",
+            )
+
+        try:
+            candles = list(self.live_1m[product_id].candles)
+        except Exception:
+            candles = []
+
+        lookback = int(INVERTED_BUY_STABILIZATION_LOOKBACK_CANDLES)
+        if lookback > 0 and len(candles) >= lookback:
+            recent = candles[-lookback:]
+            first_close = float(recent[0].close)
+            last_close = float(recent[-1].close)
+            low = min(float(c.low) for c in recent)
+            adverse_bps = (
+                ((first_close / low) - 1.0) * 10000.0
+                if first_close > 0 and low > 0
+                else 0.0
+            )
+            still_sliding = bool(
+                last_close < first_close
+                and adverse_bps > float(INVERTED_BUY_STABILIZATION_MAX_ADVERSE_BPS)
+            )
+            if still_sliding:
+                return (
+                    False,
+                    f"still_sliding adverse_bps={adverse_bps:.2f} "
+                    f"first_close={first_close:.8f} last_close={last_close:.8f}",
+                )
+
+        if INVERTED_BUY_STABILIZATION_REQUIRE_NON_NEGATIVE_1M:
+            mom1 = self._recent_momentum_bps_for_product(product_id, 1)
+            if mom1 < 0:
+                return False, f"mom1_negative {mom1:.2f}bps"
+
+        return (
+            True,
+            f"stabilized age={trigger_age:.1f}s ask={float(tob.ask):.8f} "
+            f"trigger={buy_trigger:.8f}",
+        )
+
+    def _inverted_loss_rotation_confirmed(
+        self,
+        *,
+        product_id: str,
+        marker: Dict[str, Any],
+        trigger_price: float,
+    ) -> Tuple[bool, str]:
+        """Require position age and persistent loss before a larger rebuy."""
+        tob = self.tob.get(product_id)
+        if not tob or tob.bid <= 0:
+            return False, "no_tob"
+
+        avg_entry = self._inverted_avg_entry(product_id)
+        if avg_entry is None:
+            return False, "no_avg_entry"
+
+        entry_ts = float(self.position_start_ts.get(product_id) or 0.0)
+        age = now_ts() - entry_ts if entry_ts > 0 else 0.0
+        if age < float(INVERTED_REBUY_ROTATION_MIN_HOLD_SEC):
+            return (
+                False,
+                f"position_too_new_for_rotation age={age:.1f}s "
+                f"required={INVERTED_REBUY_ROTATION_MIN_HOLD_SEC:.1f}s",
+            )
+
+        state = self._inverted_get_marker_state(marker)
+        nowv = now_ts()
+        if float(tob.bid) > float(trigger_price):
+            state.pop("loss_rotation_first_seen_ts", None)
+            return False, "not_below_loss_rotation_trigger"
+
+        first_seen = float(state.get("loss_rotation_first_seen_ts") or 0.0)
+        if first_seen <= 0:
+            state["loss_rotation_first_seen_ts"] = nowv
+            return (
+                False,
+                f"loss_rotation_armed_waiting_confirm bid={float(tob.bid):.8f} "
+                f"trigger={float(trigger_price):.8f}",
+            )
+
+        confirm_age = nowv - first_seen
+        if confirm_age < float(INVERTED_REBUY_TRIGGER_CONFIRM_SEC):
+            return (
+                False,
+                f"loss_rotation_confirming age={confirm_age:.1f}s "
+                f"required={INVERTED_REBUY_TRIGGER_CONFIRM_SEC:.1f}s",
+            )
+
+        return (
+            True,
+            f"loss_rotation_confirmed age={age:.1f}s "
+            f"confirm_age={confirm_age:.1f}s bid={float(tob.bid):.8f} "
+            f"trigger={float(trigger_price):.8f}",
+        )
+
     def _inverted_target_sell_price(self, product_id: str) -> Optional[float]:
         marker = self.inverted_markers.get(product_id)
         if not marker:
@@ -8757,7 +9061,22 @@ class TradingBot:
 
         min_viable = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
         if 0 < notional < min_viable:
+            log(
+                f"{INVERTED_LOG_PREFIX} {product_id} notional_below_min "
+                f"notional={notional:.6f} min_viable={min_viable:.6f} "
+                f"equity={float(equity_usd):.6f} product_room={product_room:.6f}"
+            )
             return 0.0
+
+        if notional <= 0:
+            log(
+                f"{INVERTED_LOG_PREFIX} {product_id} notional_zero "
+                f"equity={float(equity_usd):.6f} product_room={product_room:.6f} "
+                f"current_exposure={float(self._current_product_exposure_usd(product_id)):.6f} "
+                f"max_product={max_product:.6f}"
+            )
+            return 0.0
+
         return float(notional)
 
     async def _execute_inverted_buy(
@@ -8781,7 +9100,20 @@ class TradingBot:
             is_rebuy=is_rebuy,
         )
         if quote_usd <= 0:
-            log(f"{INVERTED_LOG_PREFIX} {product_id} buy_skip zero_notional")
+            state = self._inverted_get_marker_state(marker)
+            state["zero_notional_count"] = int(state.get("zero_notional_count", 0)) + 1
+            log(
+                f"{INVERTED_LOG_PREFIX} {product_id} buy_skip zero_notional "
+                f"count={state['zero_notional_count']}"
+            )
+            if state["zero_notional_count"] >= int(INVERTED_MAX_ZERO_NOTIONAL_TRIGGER_HITS):
+                marker["cooldown_until"] = (
+                    now_ts() + float(INVERTED_UNBUYABLE_MARKER_COOLDOWN_SEC)
+                )
+                log(
+                    f"{INVERTED_LOG_PREFIX} {product_id} marker_unbuyable_cooldown "
+                    f"cooldown_sec={INVERTED_UNBUYABLE_MARKER_COOLDOWN_SEC:.1f}"
+                )
             return False
 
         entry_fee_bps = self._entry_fee_bps_for_mode(
@@ -8946,6 +9278,51 @@ class TradingBot:
         if qty <= 1e-12:
             return False
 
+        if self._is_local_dust_position(product_id, qty):
+            self._clear_local_dust_position(
+                product_id=product_id,
+                reason=f"inverted_sell_requested_but_position_is_dust;{reason}",
+            )
+            return True
+
+        # Coinbase available balance is the source of truth for what can actually be sold.
+        try:
+            if isinstance(self.portfolio, LivePortfolio):
+                snap = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
+                base_asset = product_base_asset(product_id)
+                available_qty = self.portfolio.get_available_asset(
+                    base_asset,
+                    snapshot=snap,
+                )
+                if available_qty <= 0:
+                    self._clear_local_dust_position(
+                        product_id=product_id,
+                        reason=(
+                            "coinbase_available_base_is_zero_before_sell;"
+                            f"local_qty={qty:.12f}"
+                        ),
+                    )
+                    return True
+
+                if available_qty < qty:
+                    log(
+                        f"{INVERTED_LOG_PREFIX} {product_id} sell_qty_clamped_to_coinbase_available "
+                        f"local_qty={qty:.12f} available={available_qty:.12f}"
+                    )
+                    qty = float(available_qty)
+
+                if self._is_local_dust_position(product_id, qty):
+                    self._clear_local_dust_position(
+                        product_id=product_id,
+                        reason=(
+                            "available_qty_is_dust_before_sell;"
+                            f"available={available_qty:.12f}"
+                        ),
+                    )
+                    return True
+        except Exception as e:
+            log(f"{INVERTED_LOG_PREFIX} {product_id} sell preflight failed: {e}")
+
         log(
             f"{INVERTED_LOG_PREFIX} {product_id} sell_attempt "
             f"mode={EXIT_EXECUTION_MODE} qty={qty:.12f} "
@@ -8993,6 +9370,19 @@ class TradingBot:
         self._record_trade_timestamp(product_id)
         self._record_realized_trade_result(net_pnl)
         self._fifo_reduce_lots(product_id, filled_qty)
+
+        remaining_qty_after_fifo = self._inverted_current_position_qty(product_id)
+        if remaining_qty_after_fifo > 0 and self._is_local_dust_position(
+            product_id,
+            remaining_qty_after_fifo,
+        ):
+            self._clear_local_dust_position(
+                product_id=product_id,
+                reason=(
+                    "remaining_after_fifo_sell_is_dust;"
+                    f"remaining={remaining_qty_after_fifo:.12f}"
+                ),
+            )
 
         fully_closed = self._inverted_current_position_qty(product_id) <= 1e-12
         if fully_closed:
@@ -9045,22 +9435,60 @@ class TradingBot:
                 continue
 
             marker = self.inverted_markers.get(product_id)
+            if marker:
+                marker_cooldown_until = float(marker.get("cooldown_until") or 0.0)
+                if marker_cooldown_until > now_ts():
+                    continue
+
             if marker and not has_position:
                 buy_trigger = float(marker.get("buy_trigger_price") or 0.0)
                 if buy_trigger > 0 and float(tob.ask) <= buy_trigger:
-                    self.signal_events_log.log_event(
-                        event_type="inverted_buy_trigger_hit",
-                        product_id=product_id,
-                        action="buy_trigger",
-                        reason=f"ask={float(tob.ask):.8f};trigger={buy_trigger:.8f}",
-                    )
-                    await self._execute_inverted_buy(
+                    stable_ok, stable_reason = self._inverted_buy_trigger_stabilized(
                         product_id=product_id,
                         marker=marker,
-                        equity_usd=equity_usd,
-                        is_rebuy=False,
-                        reason=f"inverted_old_stoploss_buy ask<={buy_trigger:.8f}",
                     )
+                    self.signal_events_log.log_event(
+                        event_type=(
+                            "inverted_buy_trigger_confirmed"
+                            if stable_ok
+                            else "inverted_buy_trigger_waiting"
+                        ),
+                        product_id=product_id,
+                        action="buy_trigger",
+                        reason=(
+                            f"ask={float(tob.ask):.8f};"
+                            f"trigger={buy_trigger:.8f};"
+                            f"{stable_reason}"
+                        ),
+                    )
+                    if stable_ok:
+                        ok = await self._execute_inverted_buy(
+                            product_id=product_id,
+                            marker=marker,
+                            equity_usd=equity_usd,
+                            is_rebuy=False,
+                            reason=(
+                                "inverted_old_stoploss_buy_stabilized "
+                                f"ask<={buy_trigger:.8f};{stable_reason}"
+                            ),
+                        )
+                        if not ok:
+                            state = self._inverted_get_marker_state(marker)
+                            state["failed_buy_trigger_hits"] = (
+                                int(state.get("failed_buy_trigger_hits", 0)) + 1
+                            )
+                            if (
+                                int(state.get("failed_buy_trigger_hits", 0))
+                                >= int(INVERTED_MAX_ZERO_NOTIONAL_TRIGGER_HITS)
+                            ):
+                                marker["cooldown_until"] = (
+                                    now_ts()
+                                    + float(INVERTED_UNBUYABLE_MARKER_COOLDOWN_SEC)
+                                )
+                                log(
+                                    f"{INVERTED_LOG_PREFIX} {product_id} marker_cooldown "
+                                    f"failed_buy_trigger_hits={state.get('failed_buy_trigger_hits')}"
+                                )
                 continue
 
             if not has_position:
@@ -9128,24 +9556,33 @@ class TradingBot:
                 and next_loss_trigger is not None
                 and float(tob.bid) <= float(next_loss_trigger)
             ):
+                rotation_ok, rotation_reason = self._inverted_loss_rotation_confirmed(
+                    product_id=product_id,
+                    marker=marker,
+                    trigger_price=float(next_loss_trigger),
+                )
                 log(
-                    f"{INVERTED_LOG_PREFIX} {product_id} rebuy_rotation_trigger "
-                    f"bid={float(tob.bid):.8f} trigger={next_loss_trigger:.8f}"
+                    f"{INVERTED_LOG_PREFIX} {product_id} rebuy_rotation_check "
+                    f"ok={rotation_ok} reason={rotation_reason}"
                 )
                 self.signal_events_log.log_event(
-                    event_type="inverted_loss_rotation_trigger",
-                    product_id=product_id,
-                    action="sell_old_buy_larger",
-                    reason=(
-                        f"bid={float(tob.bid):.8f};"
-                        f"trigger={float(next_loss_trigger):.8f}"
+                    event_type=(
+                        "inverted_loss_rotation_confirmed"
+                        if rotation_ok
+                        else "inverted_loss_rotation_waiting"
                     ),
+                    product_id=product_id,
+                    action="sell_old_buy_larger" if rotation_ok else "wait",
+                    reason=rotation_reason,
                 )
+                if not rotation_ok:
+                    continue
+
                 sold = await self._execute_inverted_full_sell(
                     product_id=product_id,
                     reason=(
-                        "inverted_rebuy_rotation_sell_old "
-                        f"bid<={next_loss_trigger:.8f}"
+                        "inverted_rebuy_rotation_sell_old_confirmed "
+                        f"bid<={next_loss_trigger:.8f};{rotation_reason}"
                     ),
                 )
                 if sold:
@@ -9157,13 +9594,20 @@ class TradingBot:
                     marker["sell_marker_price"] = float(new_marker_price)
                     marker["marker_price"] = float(new_marker_price)
                     marker["buy_trigger_price"] = float(new_buy_trigger)
+
+                    state = self._inverted_get_marker_state(marker)
+                    state.pop("trigger_first_seen_ts", None)
+                    state.pop("trigger_low_ask", None)
+                    state.pop("loss_rotation_first_seen_ts", None)
+                    state["failed_buy_trigger_hits"] = 0
+
                     await self._execute_inverted_buy(
                         product_id=product_id,
                         marker=marker,
                         equity_usd=equity_usd,
                         is_rebuy=True,
                         reason=(
-                            "inverted_rebuy_larger_after_loss "
+                            "inverted_rebuy_larger_after_confirmed_loss "
                             f"new_marker={new_marker_price:.8f} "
                             f"new_trigger={new_buy_trigger:.8f}"
                         ),

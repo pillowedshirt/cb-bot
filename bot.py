@@ -244,7 +244,7 @@ MID_SCORE_UTIL_THRESHOLD: float = 60.0
 # MAKER = cheaper if filled, but can fail/no-fill often.
 # LIMIT_THEN_MARKET = try maker briefly, then fall back to market.
 ENTRY_EXECUTION_MODE: str = "MARKET"
-EXIT_EXECUTION_MODE: str = "LIMIT_THEN_MARKET"
+EXIT_EXECUTION_MODE: str = "MARKET"
 
 # Execution friction
 MAX_SPREAD_BPS: float = 18.0
@@ -590,6 +590,48 @@ ENABLE_HARD_PEAK_STOP: bool = True
 # Loss sells are allowed only if the position is down at least this much from entry.
 ALLOW_LOSS_SELL_ONLY_AT_POSITION_LOSS_PCT: bool = True
 MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT: float = 0.01
+
+# ============================================================
+# INVERTED STOP-LOSS CYCLE STRATEGY
+# ============================================================
+#
+# Normal behavior:
+#   BUY_READY -> buy
+#   loss stop -> sell
+#
+# Inverted behavior:
+#   BUY_READY -> set sell marker / virtual peak
+#   old loss-stop point -> buy
+#   next old loss-stop point while holding -> sell old position and buy larger
+#   return to sell marker -> sell
+ENABLE_INVERTED_STOPLOSS_CYCLE: bool = True
+
+# Use the existing 1% loss threshold as the inverted buy trigger.
+INVERTED_BUY_DROP_PCT: float = MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT
+
+# If another stop-loss point is reached while holding, rotate into a larger position.
+INVERTED_ENABLE_LOSS_ROTATION: bool = True
+INVERTED_REBUY_SIZE_MULTIPLIER: float = 1.35
+
+# Hard caps so the larger rebuy does not overrun the account.
+INVERTED_MAX_SINGLE_BUY_PCT_OF_EQUITY: float = 0.25
+INVERTED_MAX_PRODUCT_EXPOSURE_PCT_OF_EQUITY: float = 0.60
+
+# Sell when price revisits the old buy marker. If fee protection is enabled,
+# the actual trigger is max(old_buy_marker_price, min_profitable_exit_price).
+INVERTED_REQUIRE_FEE_POSITIVE_SELL: bool = True
+
+# If price continues falling after an inverted buy, this is the next rotation trigger.
+INVERTED_NEXT_STOP_FROM_ENTRY_PCT: float = MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT
+
+# Expire old markers if price never drops into the inverted buy zone.
+INVERTED_MARKER_TTL_SEC: float = 4 * 60 * 60
+
+# Cooldown after completing an inverted cycle.
+INVERTED_POST_CYCLE_COOLDOWN_SEC: float = 60.0
+
+# Logging.
+INVERTED_LOG_PREFIX: str = "[inverted-cycle]"
 
 # When true, no-progress/time/invalidation/hard-peak exits cannot sell at a loss
 # unless the position has crossed the 1% loss threshold.
@@ -2641,6 +2683,12 @@ class PositionTargetsLogger:
         "min_profitable_exit_price_from_lot",
         "calibrated_forward_window_minutes",
         "calibrated_post_profit_breathing_minutes",
+        "inverted_mode",
+        "inverted_marker_price",
+        "inverted_buy_trigger_price",
+        "inverted_target_sell_price",
+        "inverted_next_loss_trigger_price",
+        "inverted_rebuy_count",
         "exit_plan_note",
     ]
 
@@ -2683,6 +2731,12 @@ class PositionTargetsLogger:
                     "" if r.get("min_profitable_exit_price_from_lot") is None else f"{float(r.get('min_profitable_exit_price_from_lot')):.10f}",
                     "" if r.get("calibrated_forward_window_minutes") is None else f"{float(r.get('calibrated_forward_window_minutes')):.6f}",
                     "" if r.get("calibrated_post_profit_breathing_minutes") is None else f"{float(r.get('calibrated_post_profit_breathing_minutes')):.6f}",
+                    bool(r.get("inverted_mode", False)),
+                    "" if r.get("inverted_marker_price") is None else f"{float(r.get('inverted_marker_price')):.10f}",
+                    "" if r.get("inverted_buy_trigger_price") is None else f"{float(r.get('inverted_buy_trigger_price')):.10f}",
+                    "" if r.get("inverted_target_sell_price") is None else f"{float(r.get('inverted_target_sell_price')):.10f}",
+                    "" if r.get("inverted_next_loss_trigger_price") is None else f"{float(r.get('inverted_next_loss_trigger_price')):.10f}",
+                    int(r.get("inverted_rebuy_count", 0) or 0),
                     r.get("exit_plan_note", ""),
                 ])
         for attempt in range(5):
@@ -4256,6 +4310,9 @@ class TradingBot:
         self.cached_account_snapshot_ts: float = 0.0
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
+        self.inverted_markers: Dict[str, Dict[str, Any]] = {}
+        self.inverted_cycle_cooldown_until: Dict[str, float] = {}
+        self.inverted_cycle_index_by_product: Dict[str, int] = {p: 0 for p in PRODUCTS}
         # parallel metadata for lots (so we can do tranche-specific exits without changing CSV schema)
         self.lot_tags: Dict[str, List[str]] = {p: [] for p in PRODUCTS}  # e.g., ["L1","L2","L3"]
 
@@ -7670,6 +7727,10 @@ class TradingBot:
         """Execute a live sell and return only a Coinbase-confirmed fill."""
         mode = str(mode_override or EXIT_EXECUTION_MODE).upper().strip()
         result = None
+        log(
+            f"[sell-attempt] {product_id} mode={mode} "
+            f"qty={base_qty:.12f} reason={reason}"
+        )
 
         try:
             if mode == "MARKET":
@@ -8525,6 +8586,589 @@ class TradingBot:
 
         return float(freed)
 
+    def _inverted_marker_is_active(self, product_id: str) -> bool:
+        marker = self.inverted_markers.get(product_id)
+        if not marker:
+            return False
+
+        ts = float(marker.get("ts", 0.0))
+        if ts <= 0:
+            return False
+
+        age_sec = now_ts() - ts
+        if age_sec > float(INVERTED_MARKER_TTL_SEC):
+            log(
+                f"{INVERTED_LOG_PREFIX} {product_id} marker expired "
+                f"age_sec={age_sec:.1f}"
+            )
+            self.inverted_markers.pop(product_id, None)
+            return False
+
+        return True
+
+    def _set_inverted_marker_from_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+    ) -> None:
+        """Turn a qualified normal buy signal into a future sell marker."""
+        product_id = str(candidate.get("product_id", ""))
+        if not product_id:
+            return
+
+        bid = float(candidate.get("bid", 0.0) or 0.0)
+        ask = float(candidate.get("ask", 0.0) or 0.0)
+        marker_price = ask if ask > 0 else bid
+        if marker_price <= 0:
+            return
+
+        cycle_index = int(self.inverted_cycle_index_by_product.get(product_id, 0)) + 1
+        self.inverted_cycle_index_by_product[product_id] = cycle_index
+        buy_trigger_price = marker_price * (1.0 - float(INVERTED_BUY_DROP_PCT))
+
+        self.inverted_markers[product_id] = {
+            "ts": now_ts(),
+            "cycle_index": cycle_index,
+            "product_id": product_id,
+            "marker_price": float(marker_price),
+            "sell_marker_price": float(marker_price),
+            "buy_trigger_price": float(buy_trigger_price),
+            "source": "old_buy_signal",
+            "candidate": dict(candidate),
+            "score": float(candidate.get("score", 0.0)),
+            "probability": float(candidate.get("estimated_prob_up", 0.0)),
+            "ev_bps": float(candidate.get("expected_net_edge_bps", 0.0)),
+            "rank_score": float(candidate.get("rank_score", 0.0)),
+            "armed_buy": False,
+            "bought": False,
+            "rebuy_count": 0,
+            "last_buy_notional": 0.0,
+        }
+
+        log(
+            f"{INVERTED_LOG_PREFIX} {product_id} marker_set "
+            f"cycle={cycle_index} marker={marker_price:.8f} "
+            f"buy_trigger={buy_trigger_price:.8f} "
+            f"score={float(candidate.get('score', 0.0)):.3f} "
+            f"prob={float(candidate.get('estimated_prob_up', 0.0)):.6f} "
+            f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.3f}"
+        )
+        self.signal_events_log.log_event(
+            event_type="inverted_marker_set",
+            product_id=product_id,
+            rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
+            score=f"{float(candidate.get('score', 0.0)):.6f}",
+            probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
+            ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+            projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
+            cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
+            spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
+            action="set_marker",
+            reason=f"sell_marker={marker_price:.8f};buy_trigger={buy_trigger_price:.8f}",
+        )
+
+    def _inverted_has_open_position(self, product_id: str) -> bool:
+        return self._inverted_current_position_qty(product_id) > 1e-12
+
+    def _inverted_avg_entry(self, product_id: str) -> Optional[float]:
+        lots = self.positions.get(product_id, [])
+        qty = sum(float(lot.qty) for lot in lots)
+        if qty <= 1e-12:
+            return None
+        return sum(float(lot.qty) * float(lot.price) for lot in lots) / qty
+
+    def _inverted_next_loss_trigger_price(self, product_id: str) -> Optional[float]:
+        avg_entry = self._inverted_avg_entry(product_id)
+        if avg_entry is None or avg_entry <= 0:
+            return None
+        return float(avg_entry) * (1.0 - float(INVERTED_NEXT_STOP_FROM_ENTRY_PCT))
+
+    def _inverted_current_position_qty(self, product_id: str) -> float:
+        return sum(float(lot.qty) for lot in self.positions.get(product_id, []))
+
+    def _inverted_target_sell_price(self, product_id: str) -> Optional[float]:
+        marker = self.inverted_markers.get(product_id)
+        if not marker:
+            return None
+
+        marker_sell = float(marker.get("sell_marker_price") or 0.0)
+        if marker_sell <= 0:
+            return None
+        if not INVERTED_REQUIRE_FEE_POSITIVE_SELL:
+            return marker_sell
+
+        avg_entry = self._inverted_avg_entry(product_id)
+        if avg_entry is None or avg_entry <= 0:
+            return marker_sell
+
+        try:
+            min_exit = required_exit_price_for_net_gain(
+                effective_entry_price=float(avg_entry),
+                exit_fee_bps=self._exit_fee_bps_for_mode(),
+                est_slippage_bps=EST_SLIPPAGE_BPS,
+                est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                min_net_gain_bps=max(
+                    MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                    MIN_NET_GAIN_AFTER_FEES_BPS,
+                ),
+            )
+            return max(float(marker_sell), float(min_exit))
+        except Exception:
+            return marker_sell
+
+    def _inverted_compute_buy_notional(
+        self,
+        *,
+        product_id: str,
+        equity_usd: float,
+        marker: Dict[str, Any],
+        is_rebuy: bool,
+    ) -> float:
+        """Size an inverted entry, increasing but capping loss-rotation rebuys."""
+        candidate = dict(marker.get("candidate") or {})
+        base_pct = float(
+            candidate.get("position_pct", MIN_POSITION_PCT_OF_EQUITY)
+            or MIN_POSITION_PCT_OF_EQUITY
+        )
+        base_pct = max(float(MIN_POSITION_PCT_OF_EQUITY), base_pct)
+
+        if is_rebuy:
+            previous_notional = float(marker.get("last_buy_notional") or 0.0)
+            if previous_notional > 0:
+                notional = previous_notional * float(INVERTED_REBUY_SIZE_MULTIPLIER)
+            else:
+                notional = (
+                    float(equity_usd)
+                    * base_pct
+                    * float(INVERTED_REBUY_SIZE_MULTIPLIER)
+                )
+        else:
+            notional = float(equity_usd) * base_pct
+
+        max_single = float(equity_usd) * float(INVERTED_MAX_SINGLE_BUY_PCT_OF_EQUITY)
+        max_product = float(equity_usd) * float(
+            INVERTED_MAX_PRODUCT_EXPOSURE_PCT_OF_EQUITY
+        )
+        product_room = max(
+            0.0,
+            max_product - float(self._current_product_exposure_usd(product_id)),
+        )
+        notional = min(float(notional), float(max_single), float(product_room))
+
+        min_viable = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
+        if 0 < notional < min_viable:
+            return 0.0
+        return float(notional)
+
+    async def _execute_inverted_buy(
+        self,
+        *,
+        product_id: str,
+        marker: Dict[str, Any],
+        equity_usd: float,
+        is_rebuy: bool,
+        reason: str,
+    ) -> bool:
+        tob = self.tob.get(product_id)
+        if not tob or tob.ask <= 0 or tob.bid <= 0:
+            log(f"{INVERTED_LOG_PREFIX} {product_id} buy_skip no_tob")
+            return False
+
+        quote_usd = self._inverted_compute_buy_notional(
+            product_id=product_id,
+            equity_usd=equity_usd,
+            marker=marker,
+            is_rebuy=is_rebuy,
+        )
+        if quote_usd <= 0:
+            log(f"{INVERTED_LOG_PREFIX} {product_id} buy_skip zero_notional")
+            return False
+
+        entry_fee_bps = self._entry_fee_bps_for_mode(
+            execution_mode=ENTRY_EXECUTION_MODE
+        )
+        if not await self._live_can_afford(quote_usd, entry_fee_bps):
+            log(
+                f"{INVERTED_LOG_PREFIX} {product_id} buy_skip cannot_afford "
+                f"quote_usd={quote_usd:.2f}"
+            )
+            return False
+
+        trade_id = f"inverted-{product_id}-{int(now_ts())}-{uuid.uuid4().hex[:8]}"
+        log(
+            f"{INVERTED_LOG_PREFIX} {product_id} buy_attempt "
+            f"trade_id={trade_id} quote_usd={quote_usd:.2f} "
+            f"is_rebuy={is_rebuy} reason={reason} "
+            f"bid={float(tob.bid):.8f} ask={float(tob.ask):.8f}"
+        )
+        self.signal_events_log.log_event(
+            event_type="inverted_buy_attempt",
+            trade_id=trade_id,
+            product_id=product_id,
+            action="attempt_buy",
+            reason=reason,
+        )
+
+        fill = await self._execute_live_buy(
+            product_id=product_id,
+            quote_usd=float(quote_usd),
+            bid=float(tob.bid),
+            ask=float(tob.ask),
+            reason=reason,
+            execution_mode=ENTRY_EXECUTION_MODE,
+        )
+        if fill is None:
+            log(f"{INVERTED_LOG_PREFIX} {product_id} buy_failed reason={reason}")
+            return False
+
+        qty, avg_px, fee, filled_notional, order_id = fill
+        qty = float(qty)
+        avg_px = float(avg_px)
+        fee = float(fee)
+        filled_notional_f = float(filled_notional or quote_usd)
+        candidate = dict(marker.get("candidate") or {})
+        lot_meta = {
+            "trade_id": trade_id,
+            "order_id": order_id,
+            "strategy_mode": "inverted_stoploss_cycle",
+            "cycle_index": int(marker.get("cycle_index", 0)),
+            "entry_reason": reason,
+            "old_buy_marker_price": float(marker.get("sell_marker_price", 0.0)),
+            "inverted_buy_trigger_price": float(marker.get("buy_trigger_price", 0.0)),
+            "is_rebuy": bool(is_rebuy),
+            "rebuy_count": int(marker.get("rebuy_count", 0)),
+            "estimated_prob_up": float(candidate.get("estimated_prob_up", 0.0)),
+            "position_pct": float(candidate.get("position_pct", 0.0)),
+            "target_bps": float(candidate.get("target_bps", 0.0)),
+            "cost_bps": float(candidate.get("cost_bps", 0.0)),
+            "min_profitable_exit_price": None,
+        }
+        try:
+            lot_meta["min_profitable_exit_price"] = float(
+                required_exit_price_for_net_gain(
+                    effective_entry_price=avg_px,
+                    exit_fee_bps=self._exit_fee_bps_for_mode(),
+                    est_slippage_bps=EST_SLIPPAGE_BPS,
+                    est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                    min_net_gain_bps=max(
+                        MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                        MIN_NET_GAIN_AFTER_FEES_BPS,
+                    ),
+                )
+            )
+        except Exception:
+            pass
+
+        self.positions.setdefault(product_id, []).append(
+            PositionLot(
+                qty=qty,
+                price=avg_px,
+                tier=int(candidate.get("tier", TIER_LOW)),
+                score=float(candidate.get("score", 0.0)),
+                meta=lot_meta,
+            )
+        )
+        self.lot_tags.setdefault(product_id, []).append("INVERTED")
+        entry_ts = now_ts()
+        self.position_start_ts[product_id] = entry_ts
+        self.position_entry_price[product_id] = avg_px
+        self.last_buy_ts[product_id] = entry_ts
+        self.last_buy_price[product_id] = avg_px
+        self.peak_bid[product_id] = float(tob.bid)
+        self.anchor_ts[product_id] = entry_ts
+
+        marker["bought"] = True
+        marker["last_buy_notional"] = filled_notional_f
+        marker["last_entry_price"] = avg_px
+        marker["last_trade_id"] = trade_id
+        if is_rebuy:
+            marker["rebuy_count"] = int(marker.get("rebuy_count", 0)) + 1
+
+        self.tlog.log_trade(
+            event="BUY",
+            product_id=product_id,
+            side="BUY",
+            qty=qty,
+            price=avg_px,
+            fee_usd_val=fee,
+            gross_pnl_usd=0.0,
+            net_pnl_usd=-fee,
+            entry_price=avg_px,
+            exit_price=None,
+            weekly_bias=None,
+            note=(
+                f"inverted_stoploss_buy reason={reason} "
+                f"marker={float(marker.get('sell_marker_price', 0.0)):.8f} "
+                f"trigger={float(marker.get('buy_trigger_price', 0.0)):.8f} "
+                f"is_rebuy={is_rebuy}"
+            ),
+            filled_notional_usd=filled_notional_f,
+            entry_score=float(candidate.get("score", 0.0)),
+            entry_tier=int(candidate.get("tier", TIER_LOW)),
+            expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
+        )
+        self._record_trade_timestamp(product_id)
+        self._queue_post_buy_reviews(
+            trade_id=trade_id,
+            product_id=product_id,
+            entry_ts=entry_ts,
+            entry_price=avg_px,
+            candidate=candidate,
+        )
+        self.signal_events_log.log_event(
+            event_type="inverted_buy_fill",
+            trade_id=trade_id,
+            product_id=product_id,
+            action="buy_filled",
+            reason=(
+                f"qty={qty:.12f};avg_px={avg_px:.8f};"
+                f"notional={filled_notional_f:.6f}"
+            ),
+        )
+        log(
+            f"{INVERTED_LOG_PREFIX} {product_id} buy_success "
+            f"trade_id={trade_id} qty={qty:.12f} avg_px={avg_px:.8f} "
+            f"notional={filled_notional_f:.6f} fee={fee:.6f}"
+        )
+        return True
+
+    async def _execute_inverted_full_sell(
+        self,
+        *,
+        product_id: str,
+        reason: str,
+    ) -> bool:
+        tob = self.tob.get(product_id)
+        if not tob or tob.bid <= 0:
+            return False
+
+        qty = self._inverted_current_position_qty(product_id)
+        if qty <= 1e-12:
+            return False
+
+        log(
+            f"{INVERTED_LOG_PREFIX} {product_id} sell_attempt "
+            f"mode={EXIT_EXECUTION_MODE} qty={qty:.12f} "
+            f"reason={reason} bid={float(tob.bid):.8f}"
+        )
+        fill = await self._execute_live_sell(
+            product_id=product_id,
+            base_qty=float(qty),
+            bid=float(tob.bid),
+            ask=float(tob.ask),
+            reason=reason,
+        )
+        if fill is None:
+            self.last_sell_failure_ts_by_product[product_id] = now_ts()
+            log(f"{INVERTED_LOG_PREFIX} {product_id} sell_failed reason={reason}")
+            return False
+
+        filled_qty, avg_px, fee, filled_notional, order_id = fill
+        filled_qty = min(float(qty), float(filled_qty))
+        avg_px = float(avg_px)
+        fee = float(fee)
+        filled_notional_f = float(filled_notional or filled_qty * avg_px)
+        fifo_cost, fifo_avg_entry = self._fifo_cost_basis(
+            list(self.positions.get(product_id, [])),
+            filled_qty,
+        )
+        gross_pnl = filled_notional_f - float(fifo_cost)
+        net_pnl = gross_pnl - fee
+
+        self.tlog.log_trade(
+            event="SELL",
+            product_id=product_id,
+            side="SELL",
+            qty=filled_qty,
+            price=avg_px,
+            fee_usd_val=fee,
+            gross_pnl_usd=gross_pnl,
+            net_pnl_usd=net_pnl,
+            entry_price=fifo_avg_entry,
+            exit_price=avg_px,
+            weekly_bias=None,
+            note=f"inverted_cycle_sell reason={reason} order_id={order_id}",
+            filled_notional_usd=filled_notional_f,
+        )
+        self._record_trade_timestamp(product_id)
+        self._record_realized_trade_result(net_pnl)
+        self._fifo_reduce_lots(product_id, filled_qty)
+
+        fully_closed = self._inverted_current_position_qty(product_id) <= 1e-12
+        if fully_closed:
+            self.positions[product_id] = []
+            self.lot_tags[product_id] = []
+            self.position_start_ts[product_id] = None
+            self.position_entry_price[product_id] = None
+            self.peak_bid[product_id] = None
+            self.scale_add_count[product_id] = 0
+            self.trailing_active[product_id] = False
+            self.last_exit_ts = now_ts()
+            self.inverted_cycle_cooldown_until[product_id] = (
+                now_ts() + float(INVERTED_POST_CYCLE_COOLDOWN_SEC)
+            )
+        else:
+            log(
+                f"{INVERTED_LOG_PREFIX} {product_id} sell_partial "
+                f"remaining_qty={self._inverted_current_position_qty(product_id):.12f}"
+            )
+
+        log(
+            f"{INVERTED_LOG_PREFIX} {product_id} sell_success "
+            f"qty={filled_qty:.12f} avg_px={avg_px:.8f} "
+            f"net_pnl={net_pnl:.6f} reason={reason} fully_closed={fully_closed}"
+        )
+        return fully_closed
+
+    async def _process_inverted_stoploss_cycle(
+        self,
+        *,
+        equity_usd: float,
+    ) -> None:
+        """Process marker buys, marker exits, and larger loss-rotation rebuys."""
+        for product_id in PRODUCTS:
+            tob = self.tob.get(product_id)
+            if not tob or tob.bid <= 0 or tob.ask <= 0:
+                continue
+
+            cooldown_until = float(
+                self.inverted_cycle_cooldown_until.get(product_id, 0.0)
+            )
+            if cooldown_until > now_ts():
+                continue
+
+            marker = self.inverted_markers.get(product_id)
+            has_position = self._inverted_has_open_position(product_id)
+            if not marker and not has_position:
+                continue
+            if marker and not has_position and not self._inverted_marker_is_active(product_id):
+                continue
+
+            marker = self.inverted_markers.get(product_id)
+            if marker and not has_position:
+                buy_trigger = float(marker.get("buy_trigger_price") or 0.0)
+                if buy_trigger > 0 and float(tob.ask) <= buy_trigger:
+                    self.signal_events_log.log_event(
+                        event_type="inverted_buy_trigger_hit",
+                        product_id=product_id,
+                        action="buy_trigger",
+                        reason=f"ask={float(tob.ask):.8f};trigger={buy_trigger:.8f}",
+                    )
+                    await self._execute_inverted_buy(
+                        product_id=product_id,
+                        marker=marker,
+                        equity_usd=equity_usd,
+                        is_rebuy=False,
+                        reason=f"inverted_old_stoploss_buy ask<={buy_trigger:.8f}",
+                    )
+                continue
+
+            if not has_position:
+                continue
+
+            if not marker:
+                avg_entry = self._inverted_avg_entry(product_id)
+                if avg_entry:
+                    cycle_index = int(
+                        self.inverted_cycle_index_by_product.get(product_id, 0)
+                    ) + 1
+                    self.inverted_cycle_index_by_product[product_id] = cycle_index
+                    self.inverted_markers[product_id] = {
+                        "ts": now_ts(),
+                        "cycle_index": cycle_index,
+                        "product_id": product_id,
+                        "marker_price": float(avg_entry)
+                        * (1.0 + float(INVERTED_BUY_DROP_PCT)),
+                        "sell_marker_price": float(avg_entry)
+                        * (1.0 + float(INVERTED_BUY_DROP_PCT)),
+                        "buy_trigger_price": float(avg_entry),
+                        "source": "recovered_from_existing_position",
+                        "candidate": {},
+                        "bought": True,
+                        "rebuy_count": 0,
+                        "last_buy_notional": abs(
+                            float(avg_entry)
+                            * self._inverted_current_position_qty(product_id)
+                        ),
+                    }
+                    for recovered_lot in self.positions.get(product_id, []):
+                        recovered_lot.meta["strategy_mode"] = (
+                            "inverted_stoploss_cycle"
+                        )
+                        recovered_lot.meta["cycle_index"] = cycle_index
+                        recovered_lot.meta["entry_reason"] = (
+                            "recovered_from_existing_position"
+                        )
+                    marker = self.inverted_markers[product_id]
+            if not marker:
+                continue
+
+            target_sell = self._inverted_target_sell_price(product_id)
+            if target_sell is not None and float(tob.bid) >= float(target_sell):
+                self.signal_events_log.log_event(
+                    event_type="inverted_sell_marker_hit",
+                    product_id=product_id,
+                    action="sell_trigger",
+                    reason=(
+                        f"bid={float(tob.bid):.8f};"
+                        f"target={float(target_sell):.8f}"
+                    ),
+                )
+                sold = await self._execute_inverted_full_sell(
+                    product_id=product_id,
+                    reason=f"inverted_sell_marker_hit bid>={float(target_sell):.8f}",
+                )
+                if sold:
+                    self.inverted_markers.pop(product_id, None)
+                continue
+
+            next_loss_trigger = self._inverted_next_loss_trigger_price(product_id)
+            if (
+                INVERTED_ENABLE_LOSS_ROTATION
+                and next_loss_trigger is not None
+                and float(tob.bid) <= float(next_loss_trigger)
+            ):
+                log(
+                    f"{INVERTED_LOG_PREFIX} {product_id} rebuy_rotation_trigger "
+                    f"bid={float(tob.bid):.8f} trigger={next_loss_trigger:.8f}"
+                )
+                self.signal_events_log.log_event(
+                    event_type="inverted_loss_rotation_trigger",
+                    product_id=product_id,
+                    action="sell_old_buy_larger",
+                    reason=(
+                        f"bid={float(tob.bid):.8f};"
+                        f"trigger={float(next_loss_trigger):.8f}"
+                    ),
+                )
+                sold = await self._execute_inverted_full_sell(
+                    product_id=product_id,
+                    reason=(
+                        "inverted_rebuy_rotation_sell_old "
+                        f"bid<={next_loss_trigger:.8f}"
+                    ),
+                )
+                if sold:
+                    new_marker_price = float(tob.ask)
+                    new_buy_trigger = new_marker_price * (
+                        1.0 - float(INVERTED_BUY_DROP_PCT)
+                    )
+                    marker["ts"] = now_ts()
+                    marker["sell_marker_price"] = float(new_marker_price)
+                    marker["marker_price"] = float(new_marker_price)
+                    marker["buy_trigger_price"] = float(new_buy_trigger)
+                    await self._execute_inverted_buy(
+                        product_id=product_id,
+                        marker=marker,
+                        equity_usd=equity_usd,
+                        is_rebuy=True,
+                        reason=(
+                            "inverted_rebuy_larger_after_loss "
+                            f"new_marker={new_marker_price:.8f} "
+                            f"new_trigger={new_buy_trigger:.8f}"
+                        ),
+                    )
+
     def compute_entry_notional(
         self,
         *,
@@ -8822,6 +9466,16 @@ class TradingBot:
                 sigma_bps = self._compute_sigma_bps_from_1m(product_id)
 
                 lots = self.positions.get(product_id, [])
+                if ENABLE_INVERTED_STOPLOSS_CYCLE:
+                    inverted_lot = any(
+                        isinstance(lot.meta, dict)
+                        and lot.meta.get("strategy_mode") == "inverted_stoploss_cycle"
+                        for lot in lots
+                    )
+                    if inverted_lot:
+                        # Inverted positions are managed by the cycle processor.
+                        continue
+
                 position_qty = sum(l.qty for l in lots)
                 avg_entry_price = (sum(l.qty * l.price for l in lots) / position_qty) if position_qty > 0 else None
 
@@ -9595,6 +10249,24 @@ class TradingBot:
                 else timed_candidates[:1]
             )
 
+            if ENABLE_INVERTED_STOPLOSS_CYCLE:
+                for candidate in timed_candidates:
+                    product_id_for_marker = str(candidate.get("product_id", ""))
+                    if not product_id_for_marker:
+                        continue
+                    if self._inverted_has_open_position(product_id_for_marker):
+                        continue
+                    if self._inverted_marker_is_active(product_id_for_marker):
+                        continue
+                    self._set_inverted_marker_from_candidate(candidate=candidate)
+
+                # This runs every evaluation, including evaluations with no fresh
+                # candidate, so existing markers and positions remain managed.
+                await self._process_inverted_stoploss_cycle(equity_usd=equity_usd)
+                log(f"[loop] sleeping {EVAL_TICK_SEC:.1f}s until next evaluation")
+                await asyncio.sleep(EVAL_TICK_SEC)
+                continue
+
             for candidate in candidate_slice:
                 product_id = candidate["product_id"]
                 if product_id in self.pending_buy_reconciliations:
@@ -9704,7 +10376,11 @@ class TradingBot:
 
                 can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
 
-                if not can_afford and ENABLE_PROFITABLE_ROTATION:
+                if (
+                    not can_afford
+                    and ENABLE_PROFITABLE_ROTATION
+                    and not ENABLE_INVERTED_STOPLOSS_CYCLE
+                ):
                     # Refresh real cash before deciding how much is missing.
                     snap_before_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
                     live_cash_before = self.portfolio.get_tradable_usd(
@@ -9977,6 +10653,12 @@ class TradingBot:
                 "min_profitable_exit_price_from_lot": None,
                 "calibrated_forward_window_minutes": None,
                 "calibrated_post_profit_breathing_minutes": None,
+                "inverted_mode": bool(ENABLE_INVERTED_STOPLOSS_CYCLE),
+                "inverted_marker_price": None,
+                "inverted_buy_trigger_price": None,
+                "inverted_target_sell_price": None,
+                "inverted_next_loss_trigger_price": None,
+                "inverted_rebuy_count": 0,
                 "exit_plan_note": "no open position",
             }
 
@@ -10072,6 +10754,18 @@ class TradingBot:
                     f"core_armed={row.get('core_armed')} "
                     f"note={row.get('exit_plan_note')}"
                 )
+
+            marker = self.inverted_markers.get(product_id)
+            if marker:
+                row["inverted_marker_price"] = marker.get("marker_price")
+                row["inverted_buy_trigger_price"] = marker.get("buy_trigger_price")
+                row["inverted_target_sell_price"] = self._inverted_target_sell_price(
+                    product_id
+                )
+                row["inverted_next_loss_trigger_price"] = (
+                    self._inverted_next_loss_trigger_price(product_id)
+                )
+                row["inverted_rebuy_count"] = int(marker.get("rebuy_count", 0))
 
             rows.append(row)
 

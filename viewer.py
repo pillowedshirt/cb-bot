@@ -1681,6 +1681,50 @@ def render_live_dashboard() -> None:
             )
         st.caption(str(selected_pt.get("exit_plan_note", "")))
 
+    if selected_pt is not None and truthy_cell(
+        selected_pt.get("inverted_mode", False)
+    ):
+        st.markdown(
+            '<div class="cb-section">Inverted stop-loss cycle</div>',
+            unsafe_allow_html=True,
+        )
+        i1, i2, i3 = st.columns(3)
+        with i1:
+            mini_card(
+                "Old buy marker",
+                fmt_money(selected_pt.get("inverted_marker_price", np.nan), 8),
+                "future sell marker",
+            )
+        with i2:
+            mini_card(
+                "Inverted buy trigger",
+                fmt_money(selected_pt.get("inverted_buy_trigger_price", np.nan), 8),
+                "old stop-loss point",
+            )
+        with i3:
+            mini_card(
+                "Target sell",
+                fmt_money(selected_pt.get("inverted_target_sell_price", np.nan), 8),
+                "marker or fee-positive exit",
+            )
+
+        i4, i5 = st.columns(2)
+        with i4:
+            mini_card(
+                "Next loss rotation",
+                fmt_money(
+                    selected_pt.get("inverted_next_loss_trigger_price", np.nan),
+                    8,
+                ),
+                "sell old + buy larger",
+            )
+        with i5:
+            mini_card(
+                "Rebuy count",
+                fmt_num(selected_pt.get("inverted_rebuy_count", np.nan), 0),
+                "larger entries after deeper stop-loss",
+            )
+
 
     with st.expander(f"{product} calibration replay candidates"):
         if cr.empty or "product_id" not in cr.columns:

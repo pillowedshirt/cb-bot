@@ -13,6 +13,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SIGNAL_EVENTS_CSV = os.path.join(BASE_DIR, "signal_events.csv")
 TRADE_OUTCOMES_CSV = os.path.join(BASE_DIR, "trade_outcomes.csv")
+COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(BASE_DIR, "council_observation_outcomes.csv")
+COUNCIL_DECISIONS_CSV = os.path.join(BASE_DIR, "council_decisions.csv")
 AI_MODEL_PATH = os.path.join(BASE_DIR, "ai_brain.joblib")
 AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
 
@@ -79,65 +81,125 @@ class LocalAIBrain:
             return pd.DataFrame()
 
     def build_training_frame(self) -> pd.DataFrame:
-        outcomes = self._safe_read(TRADE_OUTCOMES_CSV)
+        """
+        Train from both real trade outcomes and Level 8 chart-only observation outcomes.
+
+        This lets the local AI learn from:
+        - actual filled buys
+        - missed opportunities
+        - WAIT / SHADOW decisions that later moved
+        - Level 8 council decisions reviewed at 5/15/30/60 minutes
+        """
         signals = self._safe_read(SIGNAL_EVENTS_CSV)
-        if outcomes.empty or signals.empty:
-            return pd.DataFrame()
-        if "event_type" not in signals.columns:
-            return pd.DataFrame()
-        if "trade_id" not in signals.columns or "trade_id" not in outcomes.columns:
+        trade_outcomes = self._safe_read(TRADE_OUTCOMES_CSV)
+        observation_outcomes = self._safe_read(COUNCIL_OBSERVATION_OUTCOMES_CSV)
+
+        frames = []
+
+        if not trade_outcomes.empty and not signals.empty:
+            if (
+                "event_type" in signals.columns
+                and "trade_id" in signals.columns
+                and "trade_id" in trade_outcomes.columns
+            ):
+                entry = signals[
+                    signals["event_type"].astype(str).isin(
+                        [
+                            "buy_attempt",
+                            "inverted_buy_attempt",
+                            "inverted_buy_fill",
+                            "buy_fill",
+                        ]
+                    )
+                ].copy()
+
+                if not entry.empty:
+                    if "ts" in entry.columns:
+                        entry["_entry_ts"] = pd.to_numeric(entry["ts"], errors="coerce")
+                        entry = entry.sort_values("_entry_ts")
+
+                    entry = entry.drop_duplicates(subset=["trade_id"], keep="last")
+
+                    trade_frame = trade_outcomes.merge(
+                        entry,
+                        on="trade_id",
+                        how="inner",
+                        suffixes=("_outcome", "_entry"),
+                    )
+
+                    if not trade_frame.empty:
+                        trade_frame["training_source"] = "trade_outcome"
+                        frames.append(trade_frame)
+
+        if not observation_outcomes.empty:
+            obs = observation_outcomes.copy()
+
+            if "review_minutes" in obs.columns:
+                obs["review_minutes"] = pd.to_numeric(obs["review_minutes"], errors="coerce")
+
+            if "move_bps" in obs.columns:
+                obs["move_bps"] = pd.to_numeric(obs["move_bps"], errors="coerce").fillna(0.0)
+
+            if (
+                not signals.empty
+                and "event_type" in signals.columns
+                and "trade_id" in signals.columns
+                and "decision_id" in obs.columns
+            ):
+                l8_events = signals[
+                    signals["event_type"].astype(str).isin(
+                        [
+                            "level8_council_heartbeat",
+                            "level8_council_decision",
+                        ]
+                    )
+                ].copy()
+
+                if not l8_events.empty:
+                    obs = obs.merge(
+                        l8_events,
+                        left_on="decision_id",
+                        right_on="trade_id",
+                        how="left",
+                        suffixes=("_outcome", "_entry"),
+                    )
+
+            obs["training_source"] = "level8_observation"
+            frames.append(obs)
+
+        if not frames:
             return pd.DataFrame()
 
-        entry = signals[
-            signals["event_type"].astype(str).isin(
-                [
-                    "buy_attempt",
-                    "inverted_buy_attempt",
-                    "inverted_buy_fill",
-                    "buy_fill",
-                ]
-            )
-        ].copy()
-        if entry.empty:
-            return pd.DataFrame()
+        frame = pd.concat(frames, ignore_index=True, sort=False)
 
-        # Keep one entry context per trade so duplicate attempt/fill events do not
-        # overweight a trade during training.
-        if "ts" in entry.columns:
-            entry["_entry_ts"] = pd.to_numeric(entry["ts"], errors="coerce")
-            entry = entry.sort_values("_entry_ts")
-        entry = entry.drop_duplicates(subset=["trade_id"], keep="last")
-
-        frame = outcomes.merge(
-            entry,
-            on="trade_id",
-            how="inner",
-            suffixes=("_outcome", "_entry"),
-        )
         if "review_minutes" not in frame.columns:
             return pd.DataFrame()
-        frame = frame[
-            pd.to_numeric(frame["review_minutes"], errors="coerce") == 30
-        ].copy()
+
+        frame["review_minutes"] = pd.to_numeric(frame["review_minutes"], errors="coerce")
+        frame = frame[frame["review_minutes"].isin([15, 30, 60])].copy()
+
         if frame.empty or "move_bps" not in frame.columns:
             return pd.DataFrame()
 
         for column in FEATURE_COLUMNS:
             if column not in frame.columns:
                 frame[column] = 0.0
+
             frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
 
-        frame["move_bps"] = pd.to_numeric(
-            frame["move_bps"], errors="coerce"
-        ).fillna(0.0)
+        frame["move_bps"] = pd.to_numeric(frame["move_bps"], errors="coerce").fillna(0.0)
+
         if "max_adverse_bps" not in frame.columns:
             frame["max_adverse_bps"] = 0.0
+
         frame["max_adverse_bps"] = pd.to_numeric(
             frame["max_adverse_bps"], errors="coerce"
         ).fillna(0.0)
+
         frame["y_up_30m"] = (frame["move_bps"] > 0.0).astype(int)
         frame["y_move_30m_bps"] = frame["move_bps"].astype(float)
         frame["y_adverse_bps"] = frame["max_adverse_bps"].abs().astype(float)
+
         return frame
 
     def train(self) -> Dict[str, Any]:

@@ -7640,20 +7640,20 @@ class TradingBot:
     ) -> Tuple[bool, Dict[str, Any]]:
         product_id = str(candidate.get("product_id", ""))
         fallback = {
-            "action": "ALLOW_BUY",
-            "strategy": candidate.get("manager_strategy", "LEGACY"),
-            "bucket": "LEGACY",
+            "action": "WAIT",
+            "strategy": candidate.get("manager_strategy", "LEVEL8_UNAVAILABLE"),
+            "bucket": "BLOCKED",
             "risk_mode": "NORMAL",
-            "recommended_position_pct": float(MAX_SINGLE_BUY_PCT_OF_EQUITY),
+            "recommended_position_pct": 0.0,
             "decision_id": "",
             "truth_score": 0.0,
             "final_buy_score": 0.0,
             "buy_threshold": 0.0,
             "confidence": 0.0,
-            "reason": "level8_disabled_or_unavailable",
+            "reason": "level8_unavailable_fail_closed",
         }
         if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
-            return True, fallback
+            return False, fallback
 
         try:
             try:
@@ -7662,49 +7662,42 @@ class TradingBot:
                     candidate=candidate,
                 )
             except TypeError:
-                probability = clamp_float(
-                    float(candidate.get("estimated_prob_up", 0.5)), 0.0, 1.0
-                )
-                score = clamp_float(
-                    float(candidate.get("score", 0.0)) / 100.0, 0.0, 1.0
-                )
-                expected_edge = float(
-                    candidate.get("expected_net_edge_bps", 0.0)
-                )
-                edge_score = clamp_float(
-                    0.5 + expected_edge / 200.0, 0.0, 1.0
-                )
-                buy_score = clamp_float(
-                    probability * 0.45 + score * 0.35 + edge_score * 0.20,
-                    0.0,
-                    1.0,
-                )
-                confidence = clamp_float(
-                    float(candidate.get("confidence", probability)), 0.0, 1.0
-                )
-                vote = {
-                    "agent": "technical_candidate",
-                    "buy": buy_score,
-                    "sell": 1.0 - buy_score,
-                    "hold": 0.0,
-                    "wait": 1.0 - confidence,
-                    "confidence": confidence,
-                }
-                truth_vote = {
-                    **vote,
-                    "agent": "candidate_truth",
-                    "buy": probability,
-                    "sell": 1.0 - probability,
-                }
-                decision = self.level8_council.decide_buy(
-                    product_id=product_id,
-                    strategy=str(candidate.get("manager_strategy", "LEGACY")),
-                    votes=[vote],
-                    truth_vote=truth_vote,
-                )
+                probability = clamp_float(float(candidate.get("estimated_prob_up", 0.5)), 0.0, 1.0)
+                score = clamp_float(float(candidate.get("score", 0.0)) / 100.0, 0.0, 1.0)
+                expected_edge = float(candidate.get("expected_net_edge_bps", 0.0))
+                edge_score = clamp_float(0.5 + expected_edge / 240.0, 0.0, 1.0)
+                spread_bps = float(candidate.get("spread_bps", 0.0))
+                spread_quality = clamp_float(1.0 - max(0.0, spread_bps) / 100.0, 0.0, 1.0)
+                projected_forward = float(candidate.get("projected_forward_gain_bps", 0.0))
+                forward_score = clamp_float(0.5 + projected_forward / 320.0, 0.0, 1.0)
+                cost_bps = float(candidate.get("cost_bps", 0.0))
+                cost_score = clamp_float(1.0 - max(0.0, cost_bps) / 400.0, 0.0, 1.0)
+
+                moms = self._entry_momentum_snapshot(product_id)
+                mom1 = float(moms.get("mom1", 0.0))
+                mom3 = float(moms.get("mom3", 0.0))
+                mom5 = float(moms.get("mom5", 0.0))
+                mom15 = float(moms.get("mom15", 0.0))
+                trend_score = clamp_float(0.50 + mom5 / 180.0 + mom15 / 300.0, 0.0, 1.0)
+                mean_reversion_score = clamp_float(0.45 + max(0.0, -mom5) / 180.0 + max(0.0, mom1) / 160.0, 0.0, 1.0)
+                breakout_score = clamp_float(0.45 + max(0.0, mom3) / 150.0 + max(0.0, mom5) / 220.0, 0.0, 1.0)
+                risk_vote = self.level8_council.risk_agent()
+                votes = [
+                    {"agent": "trend", "buy": trend_score, "sell": clamp_float(1.0-trend_score,0.0,1.0), "hold": clamp_float(0.40+trend_score*0.30,0.0,1.0), "wait": clamp_float(0.60-trend_score*0.35,0.0,1.0), "confidence": clamp_float(0.35+abs(mom5)/180.0,0.20,0.90)},
+                    {"agent": "mean_reversion", "buy": mean_reversion_score, "sell": clamp_float(1.0-mean_reversion_score,0.0,1.0), "hold": 0.45, "wait": clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), "confidence": clamp_float(0.35+abs(mom5)/220.0,0.20,0.85)},
+                    {"agent": "breakout", "buy": breakout_score, "sell": clamp_float(1.0-breakout_score,0.0,1.0), "hold": clamp_float(0.40+breakout_score*0.20,0.0,1.0), "wait": clamp_float(0.65-breakout_score*0.30,0.0,1.0), "confidence": clamp_float(0.30+max(0.0,mom3)/160.0,0.20,0.85)},
+                    {"agent": "ai_outcome", "buy": probability, "sell": clamp_float(1.0-probability,0.0,1.0), "hold": clamp_float(0.35+probability*0.35,0.0,1.0), "wait": clamp_float(0.70-probability*0.40,0.0,1.0), "confidence": clamp_float(0.25+abs(probability-0.5)*1.20,0.20,0.85)},
+                    {"agent": "execution", "buy": clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), "sell": clamp_float(1.0-spread_quality*0.60,0.0,1.0), "hold": 0.45, "wait": clamp_float(1.0-spread_quality,0.0,1.0), "confidence": clamp_float(0.30+spread_quality*0.55,0.20,0.95)},
+                    {"agent": "product_health", "buy": clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), "sell": clamp_float(1.0-forward_score,0.0,1.0), "hold": clamp_float(0.40+forward_score*0.30,0.0,1.0), "wait": clamp_float(0.65-forward_score*0.35,0.0,1.0), "confidence": clamp_float(0.30+score*0.50,0.20,0.85)},
+                    {"agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50))},
+                ]
+                truth_buy = clamp_float(spread_quality*0.25+cost_score*0.15+probability*0.25+score*0.20+forward_score*0.15,0.0,1.0)
+                truth_vote = {"agent":"truth", "buy":truth_buy, "sell":clamp_float(1.0-truth_buy,0.0,1.0), "hold":clamp_float(0.35+truth_buy*0.30,0.0,1.0), "wait":clamp_float(0.80-truth_buy*0.55,0.0,1.0), "confidence":clamp_float(0.30+truth_buy*0.55,0.20,0.90)}
+                strategy = str(candidate.get("manager_strategy", "LEVEL8_DIRECT"))
+                decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
         except Exception as exc:
             log(f"[level8] decision failed for {product_id}: {exc}")
-            return True, {**fallback, "reason": f"level8_decision_failed:{exc}"}
+            return False, {**fallback, "reason": f"level8_decision_failed_fail_closed:{exc}"}
 
         if isinstance(decision, dict):
             action = decision.get("action", "WAIT")
@@ -7744,6 +7737,19 @@ class TradingBot:
             "confidence": float(confidence),
             "reason": reason,
         }
+        try:
+            if isinstance(decision, dict):
+                self._append_level8_vote_snapshots(
+                    product_id=product_id,
+                    decision_id=str(info.get("decision_id", "")),
+                    strategy=str(info.get("strategy", candidate.get("manager_strategy", "LEVEL8_DIRECT"))),
+                    votes=decision.get("votes", []),
+                    truth_vote=decision.get("truth_vote", {}),
+                    reason=str(info.get("reason", "")),
+                )
+        except Exception as exc:
+            log(f"[level8] vote snapshot write failed {product_id}: {exc}")
+
         allow = str(action).upper() == "ALLOW_BUY"
         if str(action).upper() == "SHADOW":
             allow = False
@@ -7905,6 +7911,33 @@ class TradingBot:
             except Exception as exc:
                 log(f"[level8] council heartbeat failed {product_id}: {exc}")
 
+    def _append_level8_vote_snapshots(
+        self, *, product_id: str, decision_id: str, strategy: str,
+        votes: List[Dict[str, Any]], truth_vote: Dict[str, Any], reason: str,
+    ) -> None:
+        """Write council votes so each member can be graded against outcomes."""
+        try:
+            path = os.path.join(BASE_DIR, "council_votes.csv")
+            columns = ["ts", "dt_mst", "decision_id", "product_id", "agent", "strategy", "raw_buy_score", "raw_sell_score", "raw_hold_score", "raw_wait_score", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reliability", "product_adjustment", "strategy_adjustment", "recent_performance_adjustment", "weight", "reason"]
+            write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+            ts_val = now_ts()
+            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            rows = list(votes or [])
+            if truth_vote:
+                rows.append(dict(truth_vote))
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(columns)
+                for vote in rows:
+                    confidence = float(vote.get("confidence", 0.0) or 0.0)
+                    reliability = float(vote.get("reliability", 1.0) or 1.0)
+                    writer.writerow([f"{ts_val:.6f}", dt_mst, decision_id, product_id, str(vote.get("agent", "unknown")), strategy,
+                        f"{float(vote.get('buy', vote.get('raw_buy_score', 0.0)) or 0.0):.6f}", f"{float(vote.get('sell', vote.get('raw_sell_score', 0.0)) or 0.0):.6f}", f"{float(vote.get('hold', vote.get('raw_hold_score', 0.0)) or 0.0):.6f}", f"{float(vote.get('wait', vote.get('raw_wait_score', 0.0)) or 0.0):.6f}",
+                        f"{float(vote.get('adjusted_buy_score', vote.get('buy', 0.0)) or 0.0):.6f}", f"{float(vote.get('adjusted_sell_score', vote.get('sell', 0.0)) or 0.0):.6f}", f"{float(vote.get('adjusted_hold_score', vote.get('hold', 0.0)) or 0.0):.6f}", f"{float(vote.get('adjusted_wait_score', vote.get('wait', 0.0)) or 0.0):.6f}", f"{confidence:.6f}", f"{reliability:.6f}", "0.000000", "0.000000", "0.000000", f"{max(0.0, confidence * reliability):.6f}", reason])
+        except Exception as exc:
+            log(f"[level8] vote snapshot append failed: {exc}")
+
     def _append_level8_decision_snapshot(
         self,
         *,
@@ -8019,7 +8052,10 @@ class TradingBot:
                 )
             else:
                 sell_score = clamp_float(
-                    0.5 + (-float(unrealized_bps) + float(cost_bps)) / 400.0,
+                    0.42
+                    + max(0.0, float(unrealized_bps)) / 260.0
+                    + max(0.0, -float(unrealized_bps)) / 420.0
+                    + float(cost_bps) / 900.0,
                     0.0,
                     1.0,
                 )
@@ -8046,7 +8082,12 @@ class TradingBot:
             sell_threshold = float(decision.get("sell_threshold", 0.0))
             truth_score = float(decision.get("truth_score", 0.0))
             reason = str(decision.get("reason", "legacy_council_exit_review"))
-            action = "ALLOW_SELL" if final_sell_score >= sell_threshold else "HOLD"
+            if final_sell_score >= sell_threshold:
+                action = "ALLOW_SELL"
+            elif abs(float(unrealized_bps)) >= 90.0 and final_sell_score >= sell_threshold - 0.08:
+                action = "ALLOW_SELL"
+            else:
+                action = "HOLD"
         else:
             final_sell_score = float(decision.final_sell_score)
             sell_threshold = float(decision.sell_threshold)
@@ -11016,465 +11057,46 @@ class TradingBot:
                     targets = get_exit_targets(entry_price=avg_entry_price, sigma_bps=(sigma_bps or 35.0), tier=lot_tier)
 
                     sell_qty = 0.0
-                    exit_reason = None
-                    exit_role = None
-                    required_net_exit_px = required_exit_price_for_net_gain(
-                        effective_entry_price=avg_entry_price,
-                        exit_fee_bps=self._exit_fee_bps_for_mode(),
-                        est_slippage_bps=EST_SLIPPAGE_BPS,
-                        est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                        min_net_gain_bps=max(
-                            MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                            MIN_NET_GAIN_AFTER_FEES_BPS,
-                        ),
-                    )
-
-                    # Arm scalp target instead of instantly selling it.
-                    if (
-                        bid >= max(targets["scalp_target"], required_net_exit_px)
-                        and not lot_meta.get("scalp_done", False)
-                        and not lot_meta.get("scalp_armed", False)
-                    ):
-                        if can_exit_net_positive(
-                            entry_price=avg_entry_price,
-                            exit_price=bid,
-                            taker_fee_bps=self._exit_fee_bps_for_mode(),
-                            est_slippage_bps=EST_SLIPPAGE_BPS,
-                            est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                            min_net_profit_bps=max(
-                                MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                                MIN_NET_GAIN_AFTER_FEES_BPS,
-                            ),
-                        ):
-                            lot_meta["scalp_armed"] = True
-                            lot_meta["scalp_arm_price"] = float(bid)
-                            lot_meta["scalp_arm_peak"] = float(bid)
-                            log(f"[exit-arm] {product_id} scalp armed at {bid:.8f}")
-
-                    # Arm core target instead of instantly selling it.
-                    if (
-                        bid >= max(targets["core_target"], required_net_exit_px)
-                        and not lot_meta.get("core_done", False)
-                        and not lot_meta.get("core_armed", False)
-                    ):
-                        if can_exit_net_positive(
-                            entry_price=avg_entry_price,
-                            exit_price=bid,
-                            taker_fee_bps=self._exit_fee_bps_for_mode(),
-                            est_slippage_bps=EST_SLIPPAGE_BPS,
-                            est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                            min_net_profit_bps=max(
-                                MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                                MIN_NET_GAIN_AFTER_FEES_BPS,
-                            ),
-                        ):
-                            lot_meta["core_armed"] = True
-                            lot_meta["core_arm_price"] = float(bid)
-                            lot_meta["core_arm_peak"] = float(bid)
-                            log(f"[exit-arm] {product_id} core armed at {bid:.8f}")
-
-                    # If scalp is armed, keep tracking the highest bid after arming.
-                    # Sell only after a pullback from that post-arm high.
-                    if lot_meta.get("scalp_armed", False) and not lot_meta.get("scalp_done", False):
-                        scalp_peak = float(lot_meta.get("scalp_arm_peak") or bid)
-                        if bid > scalp_peak:
-                            scalp_peak = float(bid)
-                            lot_meta["scalp_arm_peak"] = scalp_peak
-
-                        scalp_drawdown = max(0.0, (scalp_peak - bid) / scalp_peak) if scalp_peak > 0 else 0.0
-
-                        profile = self.calibration_profiles.get(
-                            product_id,
-                            ProductCalibrationProfile(product_id=product_id),
-                        )
-                        scalp_pullback_pct = float(profile.scalp_pullback_pct)
-
-                        if scalp_drawdown >= scalp_pullback_pct:
-                            if can_exit_net_positive(
-                                entry_price=avg_entry_price,
-                                exit_price=bid,
-                                taker_fee_bps=self._exit_fee_bps_for_mode(),
-                                est_slippage_bps=EST_SLIPPAGE_BPS,
-                                est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                                min_net_profit_bps=max(
-                                    MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                                    MIN_NET_GAIN_AFTER_FEES_BPS,
-                                ),
-                            ):
-                                sell_qty = max(sell_qty, position_qty * exit_plan["scalp_frac"])
-                                exit_reason = (
-                                    f"scalp_armed_pullback peak={scalp_peak:.8f} "
-                                    f"drawdown={scalp_drawdown:.4%}"
-                                )
-                                exit_role = "scalp_armed_release"
-                                lot_meta["scalp_done"] = True
-                                lot_meta["scalp_armed"] = False
-
-                    # If core is armed, keep tracking the highest bid after arming.
-                    # Sell only after a larger pullback from that post-arm high.
-                    if lot_meta.get("core_armed", False) and not lot_meta.get("core_done", False):
-                        core_peak = float(lot_meta.get("core_arm_peak") or bid)
-                        if bid > core_peak:
-                            core_peak = float(bid)
-                            lot_meta["core_arm_peak"] = core_peak
-
-                        core_drawdown = max(0.0, (core_peak - bid) / core_peak) if core_peak > 0 else 0.0
-
-                        profile = self.calibration_profiles.get(
-                            product_id,
-                            ProductCalibrationProfile(product_id=product_id),
-                        )
-                        core_pullback_pct = float(profile.core_pullback_pct)
-
-                        if core_drawdown >= core_pullback_pct:
-                            if can_exit_net_positive(
-                                entry_price=avg_entry_price,
-                                exit_price=bid,
-                                taker_fee_bps=self._exit_fee_bps_for_mode(),
-                                est_slippage_bps=EST_SLIPPAGE_BPS,
-                                est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                                min_net_profit_bps=max(
-                                    MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                                    MIN_NET_GAIN_AFTER_FEES_BPS,
-                                ),
-                            ):
-                                sell_qty = max(sell_qty, position_qty * exit_plan["core_frac"])
-                                exit_reason = (
-                                    f"core_armed_pullback peak={core_peak:.8f} "
-                                    f"drawdown={core_drawdown:.4%}"
-                                )
-                                exit_role = "core_armed_release"
-                                lot_meta["core_done"] = True
-                                lot_meta["core_armed"] = False
-
-                    if ENABLE_PROFIT_LOCK:
-                        min_exit_px = lot_meta.get("min_profitable_exit_price")
-                        if min_exit_px is None:
-                            try:
-                                min_exit_px = required_exit_price_for_net_gain(
-                                    effective_entry_price=avg_entry_price,
-                                    exit_fee_bps=self._exit_fee_bps_for_mode(),
-                                    est_slippage_bps=EST_SLIPPAGE_BPS,
-                                    est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                                    min_net_gain_bps=max(
-                                        MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                                        MIN_NET_GAIN_AFTER_FEES_BPS,
-                                    ),
-                                )
-                                lot_meta["min_profitable_exit_price"] = float(min_exit_px)
-                            except Exception:
-                                min_exit_px = None
-                        if min_exit_px is not None and bid >= float(min_exit_px):
-                            if not lot_meta.get("profit_lock_armed", False):
-                                lot_meta["profit_lock_armed"] = True
-                                lot_meta["profit_lock_price"] = float(min_exit_px)
-                                log(f"[profit-lock] {product_id} armed at {float(min_exit_px):.8f}")
-                        if lot_meta.get("profit_lock_armed", False):
-                            lock_price = float(lot_meta.get("profit_lock_price") or 0.0)
-                            trigger_px = lock_price * bps_to_mult(-PROFIT_LOCK_BUFFER_BPS)
-                            if lock_price > 0 and bid <= trigger_px and can_exit_net_positive(
-                                entry_price=avg_entry_price,
-                                exit_price=bid,
-                                taker_fee_bps=self._exit_fee_bps_for_mode(),
-                                est_slippage_bps=EST_SLIPPAGE_BPS,
-                                est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                                min_net_profit_bps=max(
-                                    MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                                    MIN_NET_GAIN_AFTER_FEES_BPS,
-                                ),
-                            ):
-                                sell_qty = max(sell_qty, position_qty * PROFIT_LOCK_SELL_FRACTION)
-                                exit_reason = f"profit_lock_trigger lock={lock_price:.8f} trigger={trigger_px:.8f}"
-                                exit_role = "profit_lock"
-
-                    pos_start = self.position_start_ts.get(product_id)
-                    age_sec = ts_now - float(pos_start) if pos_start is not None else 0.0
-                    if ENABLE_STALE_POSITION_REVIEW and age_sec > 0:
-                        calibrated_window = float(
-                            lot_meta.get("calibrated_forward_window_minutes")
-                            or lot_meta.get("calibrated_time_to_min_profit_minutes")
-                            or 0.0
-                        )
-                        breathing_minutes = float(
-                            lot_meta.get("calibrated_post_profit_breathing_minutes")
-                            or CALIB_POST_PROFIT_BREATHING_MINUTES
-                        )
-                        review_after_minutes = calibrated_window + breathing_minutes
-                        if review_after_minutes > 0 and age_sec / 60.0 >= review_after_minutes:
-                            try:
-                                current_signal = self._latest_live_signal_for_product(product_id)
-                            except Exception:
-                                current_signal = None
-                            keep_position = bool(
-                                current_signal is not None
-                                and current_signal.score >= STALE_POSITION_MIN_SCORE_TO_KEEP
-                                and current_signal.estimated_prob_up >= STALE_POSITION_MIN_PROB_TO_KEEP
-                                and current_signal.expected_net_edge_bps >= STALE_POSITION_MIN_EV_TO_KEEP_BPS
-                            )
-                            if not keep_position:
-                                if can_exit_net_positive(
-                                    entry_price=avg_entry_price,
-                                    exit_price=bid,
-                                    taker_fee_bps=self._exit_fee_bps_for_mode(),
-                                    est_slippage_bps=EST_SLIPPAGE_BPS,
-                                    est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                                    min_net_profit_bps=0.0,
-                                ):
-                                    sell_qty = max(sell_qty, position_qty)
-                                    exit_reason = (
-                                        f"stale_position_profitable_exit age_min={age_sec / 60.0:.1f} "
-                                        f"review_after={review_after_minutes:.1f}"
-                                    )
-                                    exit_role = "stale_position_review"
-                                else:
-                                    log(
-                                        f"[stale-review] {product_id} stale but not net-positive; holding "
-                                        f"age_min={age_sec / 60.0:.1f} review_after={review_after_minutes:.1f}"
-                                    )
-
-                    remaining_qty = sum(l.qty for l in self.positions.get(product_id, []))
-                    peak_bid = float(self.peak_bid.get(product_id) or bid)
-                    if peak_bid <= 0:
-                        peak_bid = bid
-                    if bid > peak_bid:
-                        peak_bid = bid
-                        self.peak_bid[product_id] = peak_bid
-                    drawdown_from_peak = max(0.0, (peak_bid - bid) / peak_bid) if peak_bid and peak_bid > 0 else 0.0
-                    peak_profit = max(0.0, (peak_bid - avg_entry_price) / avg_entry_price) if peak_bid and avg_entry_price > 0 else 0.0
-
-                    # Hard peak stop: profitable exits remain allowed, but loss exits wait
-                    # until the position reaches the configured 1% loss threshold.
-                    if ENABLE_HARD_PEAK_STOP and drawdown_from_peak >= HARD_PEAK_STOP_PCT:
-                        if self._allow_exit_for_role(
-                            product_id=product_id,
-                            role="hard_peak_stop",
-                            entry_price=avg_entry_price,
-                            exit_price=bid,
-                            min_net_profit_bps=0.0,
-                        ):
-                            sell_qty = remaining_qty
-                            exit_reason = "hard_peak_stop_or_1pct_loss_stop"
-                            exit_role = "hard_peak_stop"
-                        else:
-                            log(
-                                f"[sell-skip] {product_id} hard_peak_stop triggered but blocked by 1pct-loss rule "
-                                f"drawdown_from_peak={drawdown_from_peak * 100:.3f}% "
-                                f"entry={avg_entry_price:.8f} bid={bid:.8f}"
-                            )
-
-                    # Discretionary trailing profit exit: only allowed if net positive after costs
-                    elif peak_profit >= TRAIL_ARM_PCT and drawdown_from_peak >= TRAIL_DRAWDOWN_PCT:
-                        if can_exit_net_positive(
-                            entry_price=avg_entry_price,
-                            exit_price=bid,
-                            taker_fee_bps=self._exit_fee_bps_for_mode(),
-                            est_slippage_bps=EST_SLIPPAGE_BPS,
-                            est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
-                            min_net_profit_bps=MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
-                        ):
-                            sell_qty = remaining_qty
-                            exit_reason = "armed_trailing_drawdown"
-                            exit_role = "runner_trail_exit"
-
-                    # Time stop / no-progress stop / invalidation stop.
-                    pos_start = self.position_start_ts.get(product_id)
-                    if pos_start is not None and position_qty > 0 and avg_entry_price and avg_entry_price > 0:
-                        age_sec = ts_now - float(pos_start)
-                        unrealized_bps = ((bid / avg_entry_price) - 1.0) * 10000.0
-
-                        if (
-                            ENABLE_NO_PROGRESS_STOP
-                            and age_sec >= NO_PROGRESS_STOP_SEC
-                            and unrealized_bps < MIN_PROGRESS_BPS_BEFORE_TIME_STOP
-                        ):
-                            if self._allow_exit_for_role(
-                                product_id=product_id,
-                                role="no_progress_stop",
-                                entry_price=avg_entry_price,
-                                exit_price=bid,
-                                min_net_profit_bps=0.0,
-                            ):
-                                exit_reason = (
-                                    f"no_progress_stop_or_1pct_loss_stop "
-                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
-                                )
-                                exit_role = "no_progress_stop"
-                                sell_qty = position_qty
-                            else:
-                                log(
-                                    f"[sell-skip] {product_id} no_progress_stop blocked by 1pct-loss rule "
-                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
-                                )
-
-                        if ENABLE_TIME_STOP and age_sec >= TIME_STOP_SEC:
-                            if self._allow_exit_for_role(
-                                product_id=product_id,
-                                role="time_stop",
-                                entry_price=avg_entry_price,
-                                exit_price=bid,
-                                min_net_profit_bps=0.0,
-                            ):
-                                exit_reason = (
-                                    f"time_stop_or_1pct_loss_stop "
-                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
-                                )
-                                exit_role = "time_stop"
-                                sell_qty = position_qty
-                            else:
-                                log(
-                                    f"[sell-skip] {product_id} time_stop blocked by 1pct-loss rule "
-                                    f"age_sec={age_sec:.0f} unrealized_bps={unrealized_bps:.1f}"
-                                )
-
-                        if ENABLE_INVALIDATION_STOP and levels_day and getattr(levels_day, "support_zone_low", 0) > 0:
-                            invalidation_px = float(levels_day.support_zone_low) * bps_to_mult(-INVALIDATION_BUFFER_BPS)
-                            if bid < invalidation_px:
-                                if self._allow_exit_for_role(
-                                    product_id=product_id,
-                                    role="invalidation_stop",
-                                    entry_price=avg_entry_price,
-                                    exit_price=bid,
-                                    min_net_profit_bps=0.0,
-                                ):
-                                    exit_reason = (
-                                        f"invalidation_stop_or_1pct_loss_stop "
-                                        f"bid<{invalidation_px:.8f}"
-                                    )
-                                    exit_role = "invalidation_stop"
-                                    sell_qty = position_qty
-                                else:
-                                    log(
-                                        f"[sell-skip] {product_id} invalidation_stop blocked by 1pct-loss rule "
-                                        f"entry={avg_entry_price:.8f} bid={bid:.8f} "
-                                        f"invalidation={invalidation_px:.8f}"
-                                    )
-
-                    sell_qty = min(position_qty, max(0.0, sell_qty))
-                    if sell_qty > 0:
-                        if not self._allow_exit_for_role(
-                            product_id=product_id,
-                            role=exit_role or "unknown_exit",
-                            entry_price=avg_entry_price,
-                            exit_price=bid,
-                            min_net_profit_bps=(
-                                MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT
-                                if exit_role not in (
-                                    "hard_peak_stop",
-                                    "no_progress_stop",
-                                    "time_stop",
-                                    "invalidation_stop",
-                                )
-                                else 0.0
-                            ),
-                        ):
-                            log(
-                                f"[sell-skip] {product_id} final sell permission blocked "
-                                f"role={exit_role} reason={exit_reason}"
-                            )
-                            sell_qty = 0.0
-
-                    if sell_qty > 0 and ENABLE_LEVEL8_COUNCIL:
-                        unrealized_bps = (
-                            ((float(bid) / float(avg_entry_price)) - 1.0) * 10000.0
-                        )
+                    exit_reason = ""
+                    exit_role = "level8_direct_exit_review"
+                    unrealized_bps = ((float(bid) / float(avg_entry_price)) - 1.0) * 10000.0
+                    if position_qty > 1e-12 and bid > 0 and ask > 0:
                         try:
-                            should_exit_l8, level8_exit_reason = (
-                                self._level8_should_hold_or_exit(
-                                    product_id=product_id,
-                                    entry_price=float(avg_entry_price),
-                                    current_price=float(bid),
-                                    unrealized_bps=float(unrealized_bps),
-                                    spread_bps=float(tob.spread_bps if tob else 0.0),
-                                    cost_bps=float(lot_meta.get("cost_bps", 0.0)),
-                                    default_exit_reason=str(exit_reason or "sell"),
-                                    hard_exit=bool(
-                                        exit_role
-                                        in {
-                                            "hard_peak_stop",
-                                            "loss_stop",
-                                            "time_stop",
-                                            "invalidation_stop",
-                                        }
-                                    ),
-                                )
+                            should_exit_l8, level8_exit_reason = self._level8_should_hold_or_exit(
+                                product_id=product_id, entry_price=float(avg_entry_price),
+                                current_price=float(bid), unrealized_bps=float(unrealized_bps),
+                                spread_bps=float(tob.spread_bps if tob else 0.0),
+                                cost_bps=float(self._round_trip_cost_bps(spread_bps=spread_bps)),
+                                default_exit_reason="level8_direct_exit_review", hard_exit=False,
                             )
-                            if not should_exit_l8:
-                                log(
-                                    f"[level8] exit blocked {product_id}: "
-                                    f"{level8_exit_reason}"
-                                )
-                                sell_qty = 0.0
+                            if should_exit_l8:
+                                sell_qty, exit_reason, exit_role = position_qty, level8_exit_reason, "level8_direct_exit"
                             else:
-                                exit_reason = (
-                                    f"{exit_reason or 'sell'};{level8_exit_reason}"
-                                )
+                                log(f"[level8] hold {product_id}: {level8_exit_reason}")
                         except Exception as exc:
-                            log(f"[level8] exit check failed {product_id}: {exc}")
-
+                            log(f"[level8] direct exit review failed {product_id}: {exc}")
                     if sell_qty > 0:
                         last_sell_fail = self.last_sell_failure_ts_by_product.get(product_id, 0.0)
                         if ts_now - float(last_sell_fail) < 5.0:
                             log(f"[sell-skip] {product_id} recent sell failure cooldown")
                             continue
-
-                        sell_trade_id = ""
-                        for sell_lot in lots:
-                            if isinstance(sell_lot.meta, dict) and sell_lot.meta.get("trade_id"):
-                                sell_trade_id = str(sell_lot.meta.get("trade_id"))
-                                break
-                        self.signal_events_log.log_event(
-                            event_type="sell_attempt", trade_id=sell_trade_id,
-                            product_id=product_id, action="attempt_sell",
-                            reason=str(exit_reason or "sell"),
-                        )
-                        log(
-                            f"[sell-attempt] {product_id} "
-                            f"qty={sell_qty:.12f} reason={exit_reason} role={exit_role} "
-                            f"bid={bid:.8f} ask={ask:.8f} "
-                            f"avg_entry={avg_entry_price:.8f}"
-                        )
-                        notional_usd = sell_qty * bid
-                        exec_price = bid
-                        fee = 0.0
-                        filled_notional = None
-                        fill = await self._execute_live_sell(
-                            product_id=product_id,
-                            base_qty=sell_qty,
-                            bid=bid,
-                            ask=ask,
-                            reason=exit_reason or "sell",
-                        )
+                        sell_trade_id = next((str(l.meta.get("trade_id")) for l in lots if isinstance(l.meta, dict) and l.meta.get("trade_id")), "")
+                        self.signal_events_log.log_event(event_type="sell_attempt", trade_id=sell_trade_id, product_id=product_id, action="attempt_sell", reason=str(exit_reason or "level8_direct_exit"))
+                        log(f"[sell-attempt] {product_id} qty={sell_qty:.12f} reason={exit_reason} role={exit_role} bid={bid:.8f} ask={ask:.8f} avg_entry={avg_entry_price:.8f}")
+                        notional_usd, exec_price, fee, filled_notional = sell_qty * bid, bid, 0.0, None
+                        fill = await self._execute_live_sell(product_id=product_id, base_qty=sell_qty, bid=bid, ask=ask, reason=exit_reason or "level8_direct_exit")
                         if fill is not None:
                             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
-                            self.signal_events_log.log_event(
-                                event_type="sell_fill", trade_id=sell_trade_id,
-                                product_id=product_id, action="sell_filled",
-                                reason=f"exit_role={exit_role};exit_reason={exit_reason}",
-                            )
-                            log(
-                                f"[sell-success] {product_id} "
-                                f"qty={float(filled_qty):.12f} avg_px={float(avg_px):.8f} "
-                                f"fee={float(fee_val):.6f} role={exit_role} reason={exit_reason}"
-                            )
-                            sell_qty = min(float(sell_qty), float(filled_qty))
-                            exec_price = float(avg_px)
-                            fee = float(fee_val)
-                            notional_usd = float(filled_notional) if filled_notional is not None else float(sell_qty) * float(avg_px)
+                            self.signal_events_log.log_event(event_type="sell_fill", trade_id=sell_trade_id, product_id=product_id, action="sell_filled", reason=f"exit_role={exit_role};exit_reason={exit_reason}")
+                            sell_qty, exec_price, fee = min(float(sell_qty), float(filled_qty)), float(avg_px), float(fee_val)
+                            notional_usd = float(filled_notional) if filled_notional is not None else sell_qty * exec_price
                         else:
                             self.last_sell_failure_ts_by_product[product_id] = ts_now
                             sell_qty = 0.0
-
                         if sell_qty > 0:
                             fifo_cost, fifo_avg_entry = self._fifo_cost_basis(list(lots), sell_qty)
                             pnl_gross = float(notional_usd) - float(fifo_cost)
-                            self.tlog.log_trade(
-                                event="SELL", product_id=product_id, side="SELL", qty=sell_qty, price=exec_price,
-                                fee_usd_val=fee, gross_pnl_usd=pnl_gross, net_pnl_usd=pnl_gross - fee,
-                                entry_price=(fifo_avg_entry if fifo_avg_entry is not None else avg_entry_price),
-                                exit_price=exec_price, weekly_bias=weekly_bias, note=exit_reason or "sell",
-                                filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
-                                exit_role=exit_role or "risk_off",
-                            )
+                            self.tlog.log_trade(event="SELL", product_id=product_id, side="SELL", qty=sell_qty, price=exec_price, fee_usd_val=fee, gross_pnl_usd=pnl_gross, net_pnl_usd=pnl_gross-fee, entry_price=fifo_avg_entry if fifo_avg_entry is not None else avg_entry_price, exit_price=exec_price, weekly_bias=weekly_bias, note=exit_reason or "level8_direct_exit", filled_notional_usd=float(filled_notional) if filled_notional is not None else None, exit_role=exit_role)
                             self._record_trade_timestamp(product_id)
                             self._record_realized_trade_result(pnl_gross - fee)
                             self._fifo_reduce_lots(product_id, sell_qty)
@@ -11563,257 +11185,31 @@ class TradingBot:
                     ),
                 })
 
-                if (
-                    live_signal.ok_to_trade
-                    and warmup_done
-                    and not self._risk_pause_active()
-                    and self._trade_rate_ok(product_id)
-                    and self._open_position_count() < MAX_OPEN_POSITIONS
-                ):
-                    spread_ok_for_buy, spread_buy_reason = self._spread_allows_buy(
-                        product_id, float(spread_bps)
-                    )
-                    if not spread_ok_for_buy:
-                        self.signal_events_log.log_event(
-                            event_type="buy_ready_rejected_spread", product_id=product_id,
-                            score=f"{float(live_signal.score):.6f}",
-                            probability=f"{float(live_signal.estimated_prob_up):.6f}",
-                            ev_bps=f"{float(live_signal.expected_net_edge_bps):.6f}",
-                            projected_forward_bps=f"{float(live_signal.projected_forward_gain_bps):.6f}",
-                            cost_bps=f"{float(live_signal.cost_bps):.6f}",
-                            spread_bps=f"{float(spread_bps):.6f}", action="reject",
-                            reason=spread_buy_reason,
-                        )
-                    else:
-                        candidates.append({
-                            "product_id": product_id,
-                            "mid": mid,
-                            "bid": bid,
-                            "ask": ask,
-                            "spread_bps": spread_bps,
-                            "score": scored.score,
-                            "tier": scored.tier,
-                            "entry_reason": scored.reason,
-                            "entry_score_obj": scored,
-                            "signal": live_signal,
-                            "entry_timing_ok": False,
-                            "entry_timing_reason": "",
-                            "expected_net_edge_bps": scored.expected_net_edge_bps,
-                            "estimated_prob_up": float(estimated_prob_up),
-                            "position_pct": float(position_pct),
-                            "target_bps": float(target_bps),
-                            "cost_bps": float(cost_bps),
-                            "projected_forward_gain_bps": float(live_signal.projected_forward_gain_bps),
-                            "min_score": float(profile.min_score),
-                            "min_probability": float(profile.min_probability),
-                            "min_expected_value_bps": float(profile.min_expected_value_bps),
-                            "calibrated_time_to_min_profit_minutes": float(live_signal.calibrated_time_to_min_profit_minutes),
-                            "calibrated_forward_window_minutes": float(live_signal.calibrated_forward_window_minutes),
-                            "calibrated_post_profit_breathing_minutes": float(
-                                self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id)).calibrated_post_profit_breathing_minutes
-                                or CALIB_POST_PROFIT_BREATHING_MINUTES
-                            ),
-                            "weekly_bias": weekly_bias,
-                        })
-
-                self.mlog.log_snapshot(
-                    ts=ts_now,
-                    source="eval",
-                    product_id=product_id,
-                    bid=bid,
-                    ask=ask,
-                    mid=mid,
-                    spread_bps=spread_bps,
-                    exposures_usd=self._current_product_exposure_usd(product_id),
-                    position_qty=position_qty,
-                    avg_entry_price=avg_entry_price,
-                    anchored_vwap=self._compute_anchored_vwap_24h(product_id, ts_now),
-                    fair_value=self._compute_fair_value(product_id, mid, self._compute_anchored_vwap_24h(product_id, ts_now)),
-                    sigma_bps=sigma_bps,
-                    weekly_bias=weekly_bias,
-                    state=("HOLD" if position_qty > 0 else "WATCH"),
-                    cash_usd=cash_usd,
-                    equity_usd=equity_usd,
-                    entry_score=scored.score,
-                    entry_tier=scored.tier,
-                    entry_reason=scored.reason,
-                    expected_net_edge_bps=scored.expected_net_edge_bps,
-                    estimated_prob_up=float(estimated_prob_up),
-                    position_pct=float(position_pct),
-                    target_bps=float(target_bps),
-                    projected_forward_gain_bps=live_signal.projected_forward_gain_bps,
-                    cost_bps=float(cost_bps),
-                    calibrated_time_to_min_profit_minutes=live_signal.calibrated_time_to_min_profit_minutes,
-                    calibrated_forward_window_minutes=live_signal.calibrated_forward_window_minutes,
-                    current_maker_fee_bps=self.current_maker_fee_bps,
-                    current_taker_fee_bps=self.current_taker_fee_bps,
-                    fee_tier_reason=self.last_fee_tier_reason,
-                    dip_depth_score=scored.dip_depth_score,
-                    dip_speed_score=scored.dip_speed_score,
-                    reversal_score=scored.reversal_score,
-                    support_score=scored.support_score,
-                    room_score=scored.room_score,
-                    regime_score=scored.regime_score,
-                    spread_penalty=scored.spread_penalty,
-                    cost_penalty=scored.cost_penalty,
-                    buy_gate_score_ok=live_signal.buy_gate_score_ok,
-                    buy_gate_prob_ok=live_signal.buy_gate_prob_ok,
-                    buy_gate_ev_ok=live_signal.buy_gate_ev_ok,
-                    buy_gate_fee_ok=live_signal.buy_gate_fee_ok,
-                    buy_gate_strict_ok=live_signal.buy_gate_strict_ok,
-                    buy_gate_target_cost_ok=live_signal.buy_gate_target_cost_ok,
-                    buy_gate_spread_ok=live_signal.buy_gate_spread_ok,
-                    buy_gate_calibrated_ok=live_signal.buy_gate_calibrated_ok,
-                    buy_gate_tradeable=live_signal.buy_gate_tradeable,
-                    buy_gate_blocker=live_signal.buy_gate_blocker,
-                )
-
             if ENABLE_LEVEL8_COUNCIL and LEVEL8_ENABLE_COUNCIL_HEARTBEAT:
                 self._run_level8_council_heartbeat(
                     watch_candidates=council_watch_candidates,
                 )
 
-            if ENABLE_LEVEL8_LEARNING_MODE and council_watch_candidates:
-                existing_products = {
-                    str(candidate.get("product_id", ""))
-                    for candidate in candidates
-                }
-
-                learning_candidates: List[Dict[str, Any]] = []
-
+            if ENABLE_LEVEL8_COUNCIL:
+                candidates = []
                 for watch_candidate in council_watch_candidates:
-                    product_id_lrn = str(watch_candidate.get("product_id", ""))
-
-                    if not product_id_lrn or product_id_lrn in existing_products:
+                    product_id_l8 = str(watch_candidate.get("product_id", ""))
+                    if not product_id_l8:
                         continue
-
-                    score_lrn = float(watch_candidate.get("score", 0.0))
-                    prob_lrn = float(watch_candidate.get("estimated_prob_up", 0.0))
-                    ev_lrn = float(watch_candidate.get("expected_net_edge_bps", 0.0))
-                    spread_lrn = float(watch_candidate.get("spread_bps", 999.0))
-
-                    # Mechanical quote sanity remains required.
-                    if spread_lrn > float(LEVEL8_LEARNING_MAX_SPREAD_BPS):
+                    bid_l8 = float(watch_candidate.get("bid", 0.0) or 0.0)
+                    ask_l8 = float(watch_candidate.get("ask", 0.0) or 0.0)
+                    mid_l8 = float(watch_candidate.get("mid", 0.0) or 0.0)
+                    spread_l8 = float(watch_candidate.get("spread_bps", 999.0) or 999.0)
+                    if bid_l8 <= 0 or ask_l8 <= 0 or mid_l8 <= 0 or ask_l8 < bid_l8 or spread_l8 > 250.0:
                         continue
-
-                    # Learning mode allows imperfect candidates, but not total noise.
-                    if score_lrn < float(LEVEL8_LEARNING_MIN_SCORE):
-                        continue
-
-                    if prob_lrn < float(LEVEL8_LEARNING_MIN_PROB):
-                        continue
-
-                    if ev_lrn < float(LEVEL8_LEARNING_MIN_EV_BPS):
-                        continue
-
                     c = dict(watch_candidate)
-                    c["manager_strategy"] = "LEVEL8_LEARNING_MODE"
-                    c["entry_reason"] = (
-                        f"level8_learning_mode;"
-                        f"score={score_lrn:.2f};"
-                        f"prob={prob_lrn:.3f};"
-                        f"ev={ev_lrn:.2f};"
-                        f"spread={spread_lrn:.2f}"
-                    )
-                    c["heartbeat_only"] = False
-                    c["learning_candidate"] = True
-                    c["rank_score"] = (
-                        score_lrn
-                        + ev_lrn * 0.05
-                        + prob_lrn * 25.0
-                    )
-
-                    learning_candidates.append(c)
-
-                learning_candidates.sort(
-                    key=lambda c: float(c.get("rank_score", 0.0)),
-                    reverse=True,
-                )
-
-                extra = learning_candidates[: int(LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES)]
-
-                if extra:
-                    candidates.extend(extra)
-                    log(
-                        f"[level8-learning] added {len(extra)} learning candidates "
-                        f"products={','.join(str(c.get('product_id', '')) for c in extra)}"
-                    )
-
-            for candidate in candidates:
-                candidate["rank_score"] = candidate_rank_score(candidate)
-            candidates.sort(key=lambda c: float(c.get("rank_score", 0.0)), reverse=True)
-            buy_ready_count = len(candidates)
-
-            if ENABLE_RELATIVE_CANDIDATE_SELECTIVITY and candidates:
-                rank_values = [float(c.get("rank_score", 0.0)) for c in candidates]
-                median_rank = float(np.median(rank_values)) if rank_values else 0.0
-                filtered_candidates: List[Dict[str, Any]] = []
-                for idx, candidate in enumerate(candidates, start=1):
-                    product_id_c = str(candidate.get("product_id", ""))
-                    rank_score = float(candidate.get("rank_score", 0.0))
-                    ev = float(candidate.get("expected_net_edge_bps", 0.0))
-                    score = float(candidate.get("score", 0.0))
-                    probability = float(candidate.get("estimated_prob_up", 0.0))
-                    spread = float(candidate.get("spread_bps", 0.0))
-                    spread_ok, spread_reason = self._spread_allows_buy(product_id_c, spread)
-                    median_edge_ok = (
-                        buy_ready_count == 1
-                        or rank_score >= median_rank + float(MIN_RANK_ADVANTAGE_OVER_MEDIAN)
-                    )
-                    rank_edge_ok = bool(
-                        rank_score >= float(MIN_CANDIDATE_RANK_SCORE_TO_BUY)
-                        and median_edge_ok
-                    )
-                    required_ev = float(MIN_LIVE_EV_BPS_FOR_ACTUAL_BUY)
-                    if score < 25.0 or probability < 0.25:
-                        required_ev += float(LOW_CONFIDENCE_EV_BONUS_REQUIREMENT_BPS)
-                    ev_ok = ev >= required_ev
-                    too_many_ready_without_edge = bool(
-                        buy_ready_count > int(MAX_SIMULTANEOUS_BUY_READY_WITHOUT_RANK_EDGE)
-                        and not rank_edge_ok
-                    )
-
-                    if not spread_ok:
-                        reason = spread_reason
-                        event_type = "candidate_rejected_spread"
-                        action = "reject"
-                    elif idx > int(MAX_BUYABLE_RANKED_CANDIDATES):
-                        reason = f"outside_top_ranked_candidates idx={idx}"
-                        event_type = "candidate_selectivity"
-                        action = "reject"
-                    elif not rank_edge_ok:
-                        reason = f"rank_edge_failed rank_score={rank_score:.3f} median={median_rank:.3f}"
-                        event_type = "candidate_selectivity"
-                        action = "reject"
-                    elif not ev_ok:
-                        reason = f"ev_not_strong_enough ev={ev:.3f} required={required_ev:.3f}"
-                        event_type = "candidate_selectivity"
-                        action = "reject"
-                    elif too_many_ready_without_edge:
-                        reason = f"too_many_buy_ready_without_edge count={buy_ready_count}"
-                        event_type = "candidate_selectivity"
-                        action = "reject"
-                    else:
-                        reason = "relative_selectivity_pass"
-                        event_type = "candidate_selectivity"
-                        action = "keep"
-                        filtered_candidates.append(candidate)
-
-                    self.signal_events_log.log_event(
-                        event_type=event_type, product_id=product_id_c, rank=idx,
-                        rank_score=f"{rank_score:.6f}", buy_ready_count=buy_ready_count,
-                        score=f"{score:.6f}", score_target=f"{float(candidate.get('min_score', 0.0)):.6f}",
-                        score_ok=True, probability=f"{probability:.6f}",
-                        probability_target=f"{float(candidate.get('min_probability', 0.0)):.6f}",
-                        probability_ok=True, ev_bps=f"{ev:.6f}",
-                        ev_target_bps=f"{float(candidate.get('min_expected_value_bps', 0.0)):.6f}",
-                        ev_ok=ev_ok,
-                        projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
-                        cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
-                        spread_bps=f"{spread:.6f}", candidate_rank_reason=reason,
-                        action=action, reason=reason,
-                    )
-                candidates = filtered_candidates
+                    c["manager_strategy"] = "LEVEL8_DIRECT"
+                    c["entry_reason"] = f"level8_direct_market_candidate;score={float(c.get('score',0.0)):.2f};prob={float(c.get('estimated_prob_up',0.0)):.3f};ev={float(c.get('expected_net_edge_bps',0.0)):.2f};spread={spread_l8:.2f}"
+                    c["heartbeat_only"], c["learning_candidate"] = False, True
+                    c["entry_timing_ok"], c["entry_timing_reason"] = True, "level8_direct_no_pre_l8_timing_gate"
+                    c["rank_score"] = float(c.get("score",0.0)) + float(c.get("expected_net_edge_bps",0.0))*0.03 + float(c.get("estimated_prob_up",0.0))*20.0
+                    candidates.append(c)
+                log(f"[level8-direct] direct market candidates={len(candidates)} from_watch={len(council_watch_candidates)}")
 
             if skip_new_buys_this_loop:
                 candidates = []
@@ -11926,158 +11322,29 @@ class TradingBot:
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
             max_deploy_this_eval = (
                 float(equity_usd)
-                * float(MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY)
+                * (float(LEVEL8_MAX_TOTAL_EXPOSURE_PCT) if ENABLE_LEVEL8_COUNCIL else float(MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY))
             )
             deployed_this_eval = 0.0
 
-            for armed_product, armed in list(self.armed_buy_signals.items()):
-                last_seen_ts = float(armed.get("last_seen_ts", armed.get("ts", ts_now)))
-                if ts_now - last_seen_ts > float(BUY_ARMED_SIGNAL_TTL_SEC):
-                    self.armed_buy_signals.pop(armed_product, None)
-
-            for candidate in candidates:
-                product_id_for_arm = str(candidate.get("product_id", ""))
-                if not product_id_for_arm:
-                    continue
-
-                armed = self.armed_buy_signals.get(product_id_for_arm)
-                if armed is None:
-                    armed = {
-                        "ts": ts_now,
-                        "last_seen_ts": ts_now,
-                        "candidate": candidate,
-                        "expired": False,
-                    }
-                    self.armed_buy_signals[product_id_for_arm] = armed
-                else:
-                    armed["last_seen_ts"] = ts_now
-                    armed["candidate"] = candidate
-
-                armed_age = ts_now - float(armed.get("ts", ts_now))
-                if armed_age > float(BUY_ARMED_SIGNAL_STALE_SEC):
-                    if not bool(armed.get("expired", False)):
-                        log(
-                            f"[buy-armed-expired] {product_id_for_arm} "
-                            f"armed signal expired age={armed_age:.1f}s"
-                        )
-                    armed["expired"] = True
-
             timed_candidates = []
-
             for candidate in candidates:
-                product_id_t = str(candidate.get("product_id", ""))
-                armed = self.armed_buy_signals.get(product_id_t)
-                if armed and bool(armed.get("expired", False)):
-                    continue
-
-                if not REQUIRE_ENTRY_TIMING_CONFIRMATION:
-                    candidate["entry_timing_ok"] = True
-                    candidate["entry_timing_reason"] = "timing_confirmation_disabled"
-                    timed_candidates.append(candidate)
-                    continue
-
-                last_timing_fail = float(
-                    self.last_entry_timing_fail_ts_by_product.get(product_id_t, 0.0)
-                )
-                fail_cooldown_left = float(ENTRY_TIMING_FAIL_COOLDOWN_SEC) - (ts_now - last_timing_fail)
-                if last_timing_fail > 0 and fail_cooldown_left > 0:
-                    timing_ok = False
-                    timing_reason = f"entry_timing_fail_cooldown remaining={fail_cooldown_left:.1f}s"
-                else:
-                    timing_ok, timing_reason = self._entry_timing_confirmation(
-                        product_id=product_id_t, signal=candidate.get("signal"),
-                    )
-                    manager_strategy = str(
-                        candidate.get("level8_strategy")
-                        or candidate.get("manager_strategy")
-                        or "LEVEL8_DIRECT"
-                    ).upper()
-                    if manager_strategy == "PULLBACK_CONTINUATION":
-                        if (
-                            "microtrend_down" in str(timing_reason)
-                            and "lower_low_sequence" in str(timing_reason)
-                        ):
-                            timing_ok = False
-                    elif manager_strategy == "MEAN_REVERSION_BOUNCE":
-                        if "no_confirmed_upturn" in str(timing_reason):
-                            timing_ok = False
-                    elif manager_strategy == "BREAKOUT_CONTINUATION":
-                        if "entry_confirmed" not in str(timing_reason):
-                            timing_ok = False
-                    elif manager_strategy in {"STAND_ASIDE", ""}:
-                        timing_ok = False
-                        timing_reason = (
-                            "level8_strategy_not_tradeable:"
-                            f"{manager_strategy}"
-                        )
-                    if not timing_ok:
-                        self.last_entry_timing_fail_ts_by_product[product_id_t] = ts_now
-
-                candidate["entry_timing_ok"] = bool(timing_ok)
-                candidate["entry_timing_reason"] = str(timing_reason)
-                moms = self._entry_momentum_snapshot(product_id_t)
-                green_count = self._recent_green_candle_count(
-                    product_id_t, ENTRY_GREEN_CANDLE_LOOKBACK
-                )
-                self.signal_events_log.log_event(
-                    event_type="entry_timing_check", product_id=product_id_t,
-                    rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
-                    buy_ready_count=buy_ready_count,
-                    score=f"{float(candidate.get('score', 0.0)):.6f}",
-                    score_target=f"{float(candidate.get('min_score', 0.0)):.6f}", score_ok=True,
-                    probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
-                    probability_target=f"{float(candidate.get('min_probability', 0.0)):.6f}", probability_ok=True,
-                    ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
-                    ev_target_bps=f"{float(candidate.get('min_expected_value_bps', 0.0)):.6f}", ev_ok=True,
-                    projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
-                    cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
-                    spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
-                    entry_timing_ok=bool(timing_ok), entry_timing_reason=str(timing_reason),
-                    momentum_1_bps=f"{moms['mom1']:.6f}", momentum_3_bps=f"{moms['mom3']:.6f}",
-                    momentum_5_bps=f"{moms['mom5']:.6f}", momentum_15_bps=f"{moms['mom15']:.6f}",
-                    green_candles=green_count, action="keep" if timing_ok else "wait",
-                    reason=str(timing_reason),
-                )
-
-                if timing_ok:
-                    self.last_entry_timing_fail_ts_by_product.pop(product_id_t, None)
-                    timed_candidates.append(candidate)
-                else:
-                    log(
-                        f"[buy-armed] {product_id_t} signal armed but "
-                        f"waiting for upturn reason={timing_reason}"
-                    )
+                candidate["entry_timing_ok"] = True
+                candidate["entry_timing_reason"] = "level8_direct_timing_gate_removed"
+                timed_candidates.append(candidate)
+                try:
+                    self.signal_events_log.log_event(event_type="entry_timing_check", product_id=str(candidate.get("product_id", "")), rank_score=f"{float(candidate.get('rank_score',0.0)):.6f}", buy_ready_count=len(candidates), score=f"{float(candidate.get('score',0.0)):.6f}", probability=f"{float(candidate.get('estimated_prob_up',0.0)):.6f}", ev_bps=f"{float(candidate.get('expected_net_edge_bps',0.0)):.6f}", projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps',0.0)):.6f}", cost_bps=f"{float(candidate.get('cost_bps',0.0)):.6f}", spread_bps=f"{float(candidate.get('spread_bps',0.0)):.6f}", entry_timing_ok=True, entry_timing_reason="level8_direct_timing_gate_removed", action="keep", reason="timing is now a Level 8 council input, not a pre-Level-8 blocker")
+                except Exception:
+                    pass
 
             ai_filtered_candidates = []
             for candidate in timed_candidates:
                 product_id_for_ai = str(candidate.get("product_id", ""))
-                ai_ok, ai_reason = self._ai_allows_candidate(candidate=candidate)
-                if ENABLE_LEVEL8_LEARNING_MODE:
-                    ai_ok = True
-                    ai_reason = f"learning_mode_ai_non_blocking;{ai_reason}"
-                candidate["ai_ok"] = bool(ai_ok)
-                candidate["ai_reason"] = str(ai_reason)
+                ai_reason = "ai_pre_l8_veto_removed_ai_is_council_input"
+                candidate["ai_ok"], candidate["ai_reason"] = True, ai_reason
                 try:
-                    self.signal_events_log.log_event(
-                        event_type="ai_candidate_filter",
-                        product_id=product_id_for_ai,
-                        rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
-                        score=f"{float(candidate.get('score', 0.0)):.6f}",
-                        probability=(
-                            f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}"
-                        ),
-                        ev_bps=(
-                            f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}"
-                        ),
-                        spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
-                        action="keep" if ai_ok else "reject",
-                        reason=ai_reason,
-                    )
+                    self.signal_events_log.log_event(event_type="ai_candidate_filter", product_id=product_id_for_ai, rank_score=f"{float(candidate.get('rank_score',0.0)):.6f}", score=f"{float(candidate.get('score',0.0)):.6f}", probability=f"{float(candidate.get('estimated_prob_up',0.0)):.6f}", ev_bps=f"{float(candidate.get('expected_net_edge_bps',0.0)):.6f}", spread_bps=f"{float(candidate.get('spread_bps',0.0)):.6f}", action="keep", reason=ai_reason)
                 except Exception:
                     pass
-                if not ai_ok:
-                    log(f"[ai] candidate blocked {product_id_for_ai}: {ai_reason}")
-                    continue
                 ai_filtered_candidates.append(candidate)
 
             if ENABLE_LEVEL8_LEARNING_MODE:
@@ -12137,43 +11404,13 @@ class TradingBot:
                 )
 
                 if existing_qty > 1e-12:
-                    if not ALLOW_SCALE_INTO_WINNERS:
-                        continue
-
                     current_adds = int(self.scale_add_count.get(product_id, 0))
-                    if current_adds >= MAX_SCALE_ADDS_PER_POSITION:
-                        continue
-
                     local_lots = self.positions.get(product_id, [])
                     local_qty = sum(l.qty for l in local_lots)
                     local_cost = sum(l.qty * l.price for l in local_lots)
-                    if local_qty <= 0 or local_cost <= 0:
-                        continue
-
-                    local_avg = local_cost / local_qty
-                    unrealized_net_bps = (
-                        ((candidate["bid"] / local_avg) - 1.0) * 10000.0
-                        - self._round_trip_cost_bps(spread_bps=candidate["spread_bps"])
-                    )
-                    if unrealized_net_bps < SCALE_ONLY_IF_UNREALIZED_NET_BPS_ABOVE:
-                        continue
-
-                    # Scale-ins are still probability/equity based, but smaller than initial entries.
-                    entry_notional = min(
-                        entry_notional,
-                        float(equity_usd)
-                        * float(MAX_SINGLE_BUY_PCT_OF_EQUITY)
-                        * float(SCALE_ADD_FRACTION_OF_ENTRY),
-                    )
-
-                    # Never allow total product exposure above 50% of equity.
-                    max_product_exposure = (
-                        float(equity_usd) * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
-                    )
-                    remaining_product_room = max(
-                        0.0,
-                        max_product_exposure - float(product_exposure),
-                    )
+                    local_avg = local_cost / local_qty if local_qty > 0 and local_cost > 0 else 0.0
+                    max_product_exposure = float(equity_usd) * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
+                    remaining_product_room = max(0.0, max_product_exposure - float(product_exposure))
                     entry_notional = min(entry_notional, remaining_product_room)
 
                 remaining_eval_budget = max(
@@ -12260,53 +11497,14 @@ class TradingBot:
                         entry_mode_for_this_trade = ENTRY_HIGH_EDGE_MODE
                     elif projected_net >= float(MEDIUM_EDGE_MIN_PROJECTED_NET_BPS):
                         entry_mode_for_this_trade = ENTRY_MEDIUM_EDGE_MODE
-                    elif projected_net >= float(LOW_EDGE_MIN_PROJECTED_NET_BPS):
-                        entry_mode_for_this_trade = ENTRY_LOW_EDGE_MODE
                     else:
-                        log(
-                            f"[buy-skip] {product_id} projected_net_too_low_for_execution "
-                            f"projected_net={projected_net:.3f}"
-                        )
-                        continue
+                        entry_mode_for_this_trade = ENTRY_LOW_EDGE_MODE
 
                 entry_fee_bps = self._entry_fee_bps_for_mode(
                     execution_mode=entry_mode_for_this_trade
                 )
 
                 can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
-
-                if (
-                    not can_afford
-                    and ENABLE_PROFITABLE_ROTATION
-                    and not (
-                        ENABLE_INVERTED_STOPLOSS_CYCLE
-                    )
-                ):
-                    # Refresh real cash before deciding how much is missing.
-                    snap_before_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                    live_cash_before = self.portfolio.get_tradable_usd(
-                        snapshot=snap_before_rotation or {}
-                    )
-
-                    required_with_fee = (
-                        entry_notional * (1.0 + entry_fee_bps / 10000.0)
-                        + float(RESERVE_USD)
-                    )
-                    needed_cash = max(0.0, required_with_fee - float(live_cash_before))
-
-                    if needed_cash > 0:
-                        await self._try_rotate_capital_for_candidate(
-                            candidate=candidate,
-                            needed_cash_usd=needed_cash,
-                            equity_usd=equity_usd,
-                        )
-
-                    # Re-check affordability after possible profitable rotation.
-                    snap_after_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                    cash_usd = self.portfolio.get_tradable_usd(
-                        snapshot=snap_after_rotation or {}
-                    )
-                    can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
 
                 if not can_afford:
                     log(

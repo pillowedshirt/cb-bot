@@ -206,54 +206,144 @@ class Level8Council:
         }
 
     def _outcome_stats(
-        self, *, agent: Optional[str] = None, product_id: Optional[str] = None,
+        self,
+        *,
+        agent: Optional[str] = None,
+        product_id: Optional[str] = None,
         strategy: Optional[str] = None,
     ) -> Dict[str, float]:
-        """Summarize real trades and chart-only observation outcomes."""
+        """
+        Summarize real trades, chart-only outcomes, and agent-specific credit.
+
+        If agent_credit_score exists, use it as the primary learning signal.
+        That lets the council learn which individual agents were useful, not just
+        whether the final trade won or lost.
+        """
         frames = []
+
         try:
             if os.path.exists(AGENT_PERFORMANCE_CSV):
                 perf = pd.read_csv(AGENT_PERFORMANCE_CSV)
+
                 if not perf.empty:
-                    frames.append(perf.rename(columns={"outcome_move_bps": "move_bps", "outcome_success": "success"}))
+                    perf = perf.rename(columns={
+                        "outcome_move_bps": "move_bps",
+                        "outcome_success": "success",
+                    })
+                    frames.append(perf)
         except Exception:
             pass
+
         try:
             if os.path.exists(COUNCIL_OBSERVATION_OUTCOMES_CSV):
                 obs = pd.read_csv(COUNCIL_OBSERVATION_OUTCOMES_CSV)
+
                 if not obs.empty:
-                    obs = obs.rename(columns={"decision_strategy": "strategy", "would_have_won": "success"})
+                    obs = obs.rename(columns={
+                        "decision_strategy": "strategy",
+                        "would_have_won": "success",
+                    })
                     obs["agent"] = obs.get("agent", "council_observation")
                     frames.append(obs)
         except Exception:
             pass
+
         try:
             trades = self._recent_trades(120)
+
             if not trades.empty:
                 if "net_pnl_usd" in trades.columns:
-                    trades["move_bps"] = pd.to_numeric(trades["net_pnl_usd"], errors="coerce").fillna(0.0)
+                    trades["move_bps"] = pd.to_numeric(
+                        trades["net_pnl_usd"], errors="coerce"
+                    ).fillna(0.0)
                 elif "move_bps" not in trades.columns:
                     trades["move_bps"] = 0.0
-                trades["success"] = (pd.to_numeric(trades["move_bps"], errors="coerce").fillna(0.0) > 0).astype(int)
+
+                trades["success"] = (
+                    pd.to_numeric(trades["move_bps"], errors="coerce").fillna(0.0) > 0
+                ).astype(int)
                 frames.append(trades)
         except Exception:
             pass
+
         if not frames:
-            return {"n": 0.0, "win_rate": 0.5, "avg_move": 0.0, "avg_adverse": 0.0}
+            return {
+                "n": 0.0,
+                "win_rate": 0.5,
+                "avg_move": 0.0,
+                "avg_adverse": 0.0,
+                "avg_credit": 0.5,
+            }
+
         data = pd.concat(frames, ignore_index=True, sort=False)
-        for column, value in (("agent", agent), ("product_id", product_id), ("strategy", strategy)):
+
+        if data.empty:
+            return {
+                "n": 0.0,
+                "win_rate": 0.5,
+                "avg_move": 0.0,
+                "avg_adverse": 0.0,
+                "avg_credit": 0.5,
+            }
+
+        for column, value in (
+            ("agent", agent),
+            ("product_id", product_id),
+            ("strategy", strategy),
+        ):
             if value is not None and column in data.columns:
                 rows = data[data[column].astype(str) == str(value)]
+
                 if not rows.empty:
                     data = rows
+
         if data.empty:
-            return {"n": 0.0, "win_rate": 0.5, "avg_move": 0.0, "avg_adverse": 0.0}
+            return {
+                "n": 0.0,
+                "win_rate": 0.5,
+                "avg_move": 0.0,
+                "avg_adverse": 0.0,
+                "avg_credit": 0.5,
+            }
+
         move_source = data["move_bps"] if "move_bps" in data.columns else pd.Series(0.0, index=data.index)
         move = pd.to_numeric(move_source, errors="coerce").fillna(0.0)
-        success = pd.to_numeric(data["success"], errors="coerce").fillna((move > 0).astype(int)) if "success" in data.columns else (move > 0).astype(int)
-        adverse_col = next((c for c in ("adverse_move_bps", "max_adverse_bps", "avg_adverse", "adverse") if c in data.columns), None)
-        adverse = pd.to_numeric(data[adverse_col], errors="coerce").fillna(0.0).abs() if adverse_col else pd.Series(0.0, index=data.index)
-        return {"n": float(len(data)), "win_rate": float(success.mean()), "avg_move": float(move.mean()), "avg_adverse": float(adverse.mean())}
+
+        if "agent_credit_score" in data.columns:
+            credit = pd.to_numeric(data["agent_credit_score"], errors="coerce").fillna(0.5)
+            success = (credit >= 0.5).astype(int)
+        elif "success" in data.columns:
+            success = pd.to_numeric(data["success"], errors="coerce").fillna((move > 0).astype(int))
+            credit = success.astype(float)
+        else:
+            success = (move > 0).astype(int)
+            credit = success.astype(float)
+
+        adverse_col = next(
+            (
+                c for c in (
+                    "adverse_move_bps",
+                    "max_adverse_bps",
+                    "avg_adverse",
+                    "adverse",
+                )
+                if c in data.columns
+            ),
+            None,
+        )
+
+        if adverse_col:
+            adverse = pd.to_numeric(data[adverse_col], errors="coerce").fillna(0.0).abs()
+        else:
+            adverse = pd.Series(0.0, index=data.index)
+
+        return {
+            "n": float(len(data)),
+            "win_rate": float(success.mean()),
+            "avg_move": float(move.mean()),
+            "avg_adverse": float(adverse.mean()),
+            "avg_credit": float(credit.mean()),
+        }
 
     def _agent_adjustments(
         self,
@@ -289,15 +379,16 @@ class Level8Council:
         }
         sample_factor = clamp(n / 12.0, 0.0, 1.0)
 
-        product_adj = (float(stats.get("product_win_rate", 0.5)) - 0.5) * 0.60 * sample_factor
-        strategy_adj = (float(stats.get("strategy_win_rate", 0.5)) - 0.5) * 0.55 * sample_factor
-        recent_adj = (float(stats.get("recent_win_rate", 0.5)) - 0.5) * 0.80 * sample_factor
+        product_adj = (float(stats.get("product_win_rate", 0.5)) - 0.5) * 0.65 * sample_factor
+        strategy_adj = (float(stats.get("strategy_win_rate", 0.5)) - 0.5) * 0.60 * sample_factor
+        recent_adj = (float(stats.get("recent_win_rate", 0.5)) - 0.5) * 0.85 * sample_factor
 
         product_adj = clamp(product_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         strategy_adj = clamp(strategy_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         recent_adj = clamp(recent_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
 
-        base_reliability = 0.80 + (float(stats.get("agent_win_rate", 0.5)) - 0.5) * 1.10 * sample_factor
+        avg_credit = float(agent_stats.get("avg_credit", stats.get("agent_win_rate", 0.5)))
+        base_reliability = 0.80 + (avg_credit - 0.5) * 1.35 * sample_factor
         return {
             "product": product_adj,
             "strategy": strategy_adj,
@@ -431,7 +522,27 @@ class Level8Council:
         combined = {
             "adj_buy": sum(v.adjusted_buy_score * w for v, w in weighted) / weight_total,
             "adj_sell": sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total,
+            "confidence": sum(v.confidence * w for v, w in weighted) / weight_total,
         }
+
+        raw_learning_scores = []
+
+        for vote in votes:
+            try:
+                raw_learning_scores.append(float(vote.get("learning_score", 0.0) or 0.0))
+            except Exception:
+                pass
+
+        learning_score = clamp(
+            sum(raw_learning_scores) / len(raw_learning_scores) if raw_learning_scores else 0.0,
+            0.0,
+            1.0,
+        )
+
+        experience_n = float(self._outcome_stats(product_id=product_id).get("n", 0.0))
+        exploration_decay = clamp(experience_n / 120.0, 0.0, 1.0)
+        exploration_weight = 0.38 * (1.0 - exploration_decay) + 0.08 * exploration_decay
+
         truth_score = clamp(
             (
                 adjusted_truth.adjusted_buy_score * 0.55
@@ -443,8 +554,15 @@ class Level8Council:
         )
         # Truth modulates the score, but learning mode should not let low early sample
         # quality completely suppress all buys.
-        final_buy = clamp(
+        base_final_buy = clamp(
             combined["adj_buy"] * (0.85 + truth_score * 0.15),
+            0.0,
+            1.0,
+        )
+
+        final_buy = clamp(
+            base_final_buy * (1.0 - exploration_weight)
+            + learning_score * exploration_weight,
             0.0,
             1.0,
         )
@@ -477,9 +595,175 @@ class Level8Council:
             "bucket": bucket,
             "position_pct": position_pct,
             "sizing_reason": sizing_reason,
+            "learning_score": learning_score,
+            "exploration_weight": exploration_weight,
+            "confidence": combined["confidence"],
             **thresholds,
             "votes": [asdict(vote) for vote in adjusted],
             "truth_vote": asdict(adjusted_truth),
+        }
+
+    def decide_exit(
+        self,
+        product_id: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Level 8 sell council.
+
+        This is separate from buy logic because selling answers a different question:
+        should we capture profit, hold for continuation, or exit a failing position?
+        """
+        unrealized_bps = float(context.get("unrealized_bps", 0.0) or 0.0)
+        spread_bps = float(context.get("spread_bps", 0.0) or 0.0)
+        cost_bps = float(context.get("cost_bps", 0.0) or 0.0)
+
+        profit_capture = clamp(
+            0.35 + max(0.0, unrealized_bps) / 220.0,
+            0.0,
+            1.0,
+        )
+
+        loss_exit = clamp(
+            0.30 + max(0.0, -unrealized_bps) / 260.0,
+            0.0,
+            1.0,
+        )
+
+        continuation_hold = clamp(
+            0.55 + max(0.0, unrealized_bps) / 400.0 - max(0.0, -unrealized_bps) / 300.0,
+            0.0,
+            1.0,
+        )
+
+        execution_sell_quality = clamp(
+            1.0 - max(0.0, spread_bps) / 120.0,
+            0.0,
+            1.0,
+        )
+
+        fee_recovery = clamp(
+            0.40 + (unrealized_bps - cost_bps) / 280.0,
+            0.0,
+            1.0,
+        )
+
+        votes = [
+            {
+                "agent": "profit_capture",
+                "buy": 0.0,
+                "sell": profit_capture,
+                "hold": 1.0 - profit_capture * 0.55,
+                "wait": 0.20,
+                "confidence": 0.70,
+            },
+            {
+                "agent": "drawdown_exit",
+                "buy": 0.0,
+                "sell": loss_exit,
+                "hold": 1.0 - loss_exit * 0.70,
+                "wait": 0.25,
+                "confidence": 0.70,
+            },
+            {
+                "agent": "continuation_hold",
+                "buy": 0.0,
+                "sell": 1.0 - continuation_hold,
+                "hold": continuation_hold,
+                "wait": 0.20,
+                "confidence": 0.60,
+            },
+            {
+                "agent": "execution",
+                "buy": 0.0,
+                "sell": execution_sell_quality,
+                "hold": 0.40,
+                "wait": 1.0 - execution_sell_quality,
+                "confidence": 0.65,
+            },
+            {
+                "agent": "fee_recovery",
+                "buy": 0.0,
+                "sell": fee_recovery,
+                "hold": 1.0 - fee_recovery * 0.50,
+                "wait": 0.30,
+                "confidence": 0.65,
+            },
+        ]
+
+        truth_vote = {
+            "agent": "exit_truth",
+            "buy": 0.0,
+            "sell": clamp(
+                profit_capture * 0.28
+                + loss_exit * 0.24
+                + execution_sell_quality * 0.18
+                + fee_recovery * 0.20
+                + (1.0 - continuation_hold) * 0.10,
+                0.0,
+                1.0,
+            ),
+            "hold": continuation_hold,
+            "wait": 1.0 - execution_sell_quality,
+            "confidence": 0.70,
+        }
+
+        adjusted = [self._adjust_vote(vote, product_id, "EXIT_REVIEW") for vote in votes]
+        adjusted_truth = self._adjust_vote(truth_vote, product_id, "EXIT_REVIEW")
+
+        weighted = [
+            (vote, max(0.0, vote.confidence * vote.reliability))
+            for vote in adjusted
+        ]
+
+        weight_total = sum(weight for _, weight in weighted) or 1.0
+
+        final_sell = clamp(
+            sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total,
+            0.0,
+            1.0,
+        )
+
+        final_hold = clamp(
+            sum(v.adjusted_hold_score * w for v, w in weighted) / weight_total,
+            0.0,
+            1.0,
+        )
+
+        truth_score = clamp(
+            adjusted_truth.adjusted_sell_score * 0.55
+            + adjusted_truth.confidence * 0.25
+            + adjusted_truth.reliability * 0.20,
+            0.0,
+            1.0,
+        )
+
+        thresholds = self.adaptive_thresholds(product_id, "EXIT_REVIEW")
+        sell_threshold = float(thresholds["sell_threshold"])
+
+        if final_sell >= sell_threshold:
+            action = "ALLOW_SELL"
+        elif abs(unrealized_bps) >= 90.0 and final_sell >= sell_threshold - 0.08:
+            action = "ALLOW_SELL"
+        else:
+            action = "HOLD"
+
+        return {
+            "action": action,
+            "final_sell": final_sell,
+            "final_hold": final_hold,
+            "truth_score": truth_score,
+            "sell_threshold": sell_threshold,
+            "buy_threshold": thresholds["buy_threshold"],
+            "risk_mode": thresholds["risk_mode"],
+            "votes": [asdict(vote) for vote in adjusted],
+            "truth_vote": asdict(adjusted_truth),
+            "reason": (
+                f"exit_council;unrealized_bps={unrealized_bps:.2f};"
+                f"spread_bps={spread_bps:.2f};cost_bps={cost_bps:.2f};"
+                f"final_sell={final_sell:.3f};threshold={sell_threshold:.3f};"
+                f"truth={truth_score:.3f}"
+            ),
         }
 
     def _position_pct_from_decision(

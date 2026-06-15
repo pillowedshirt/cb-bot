@@ -8153,7 +8153,7 @@ class TradingBot:
                 )
         except Exception as exc:
             log(f"[level8] exit decision failed {product_id}: {exc}")
-            return True, f"level8_exit_failed_allow_legacy;{default_exit_reason}"
+            return False, f"level8_exit_failed_fail_closed;{default_exit_reason}"
 
         if isinstance(decision, dict):
             final_sell_score = float(decision.get("final_sell", 0.0))
@@ -10763,7 +10763,11 @@ class TradingBot:
 
     def _append_agent_performance_from_outcomes(self) -> None:
         """
-        Connect council votes to trade and chart-only outcomes for learning.
+        Connect council votes to trade and chart-only outcomes.
+
+        This is the core intelligence improvement:
+        each agent gets credit or blame based on what that agent said, not merely
+        based on what the final council decided.
         """
         try:
             votes_path = os.path.join(BASE_DIR, "council_votes.csv")
@@ -10794,7 +10798,11 @@ class TradingBot:
             if not frames:
                 return
             outcomes = pd.concat(frames, ignore_index=True, sort=False)
-            required_vote_cols = {"decision_id", "ts", "product_id", "agent"}
+            required_vote_cols = {
+                "decision_id", "ts", "product_id", "agent",
+                "adjusted_buy_score", "adjusted_sell_score",
+                "adjusted_hold_score", "adjusted_wait_score",
+            }
             required_outcome_cols = {"ts", "product_id", "move_bps"}
             if (
                 votes.empty
@@ -10815,7 +10823,7 @@ class TradingBot:
                     outcomes["review_minutes"], errors="coerce"
                 )
                 outcomes = outcomes[
-                    outcomes["review_minutes"].isin([15, 30, 60])
+                    outcomes["review_minutes"].isin([5, 15, 30, 60])
                 ].copy()
 
             outcomes = outcomes.dropna(subset=["ts"])
@@ -10831,19 +10839,23 @@ class TradingBot:
                 except Exception:
                     existing_keys = set()
 
+            columns = [
+                "ts", "dt_mst", "perf_key", "decision_id", "product_id",
+                "agent", "strategy", "setup_tag", "market_regime", "execution_state",
+                "learning_score", "agent_direction",
+                "agent_buy_score", "agent_sell_score", "agent_hold_score", "agent_wait_score",
+                "confidence", "reliability",
+                "outcome_source", "review_minutes", "outcome_move_bps", "outcome_kind",
+                "agent_credit_score", "outcome_success", "reason",
+            ]
+
             write_header = not os.path.exists(out_path) or os.path.getsize(out_path) == 0
             with open(out_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if write_header:
-                    writer.writerow([
-                        "ts", "dt_mst", "perf_key", "decision_id", "product_id",
-                        "agent", "strategy", "agent_buy_score", "agent_sell_score",
-                        "agent_hold_score", "agent_wait_score", "confidence",
-                        "reliability", "outcome_move_bps", "outcome_success",
-                        "reason",
-                    ])
+                    writer.writerow(columns)
 
-                for _, vote in votes.tail(2000).iterrows():
+                for _, vote in votes.tail(5000).iterrows():
                     product_id = str(vote.get("product_id", ""))
                     vote_ts = float(vote.get("ts", 0.0) or 0.0)
                     agent = str(vote.get("agent", ""))
@@ -10854,6 +10866,10 @@ class TradingBot:
                     product_outcomes = outcomes[
                         outcomes["product_id"].astype(str) == product_id
                     ].copy()
+
+                    if product_outcomes.empty:
+                        continue
+
                     if decision_id and "decision_id" in product_outcomes.columns:
                         decision_matches = product_outcomes[
                             product_outcomes["decision_id"].astype(str)
@@ -10869,23 +10885,75 @@ class TradingBot:
 
                     product_outcomes["time_delta"] = product_outcomes["ts"] - vote_ts
                     outcome = product_outcomes.sort_values("time_delta").iloc[0]
-                    move_bps = float(outcome.get("move_bps", 0.0))
-                    decision_action = str(
-                        outcome.get("decision_action", outcome.get("action", ""))
-                    ).upper()
-                    if (
-                        decision_action in {"WAIT", "SHADOW"}
-                        and move_bps >= float(LEVEL8_MISSED_BIG_MOVE_BPS)
-                    ):
-                        success = 0
-                    elif move_bps > 0:
-                        success = 1
+
+                    move_bps = float(outcome.get("move_bps", 0.0) or 0.0)
+                    review_minutes = int(float(outcome.get("review_minutes", 0.0) or 0.0))
+                    outcome_source = str(outcome.get("source", "unknown"))
+
+                    buy_score = float(vote.get("adjusted_buy_score", 0.0) or 0.0)
+                    sell_score = float(vote.get("adjusted_sell_score", 0.0) or 0.0)
+                    hold_score = float(vote.get("adjusted_hold_score", 0.0) or 0.0)
+                    wait_score = float(vote.get("adjusted_wait_score", 0.0) or 0.0)
+                    confidence = float(vote.get("confidence", 0.0) or 0.0)
+                    reliability = float(vote.get("reliability", 1.0) or 1.0)
+
+                    score_map = {
+                        "BUY": buy_score,
+                        "SELL": sell_score,
+                        "HOLD": hold_score,
+                        "WAIT": wait_score,
+                    }
+
+                    agent_direction = max(score_map, key=score_map.get)
+
+                    if move_bps >= float(LEVEL8_BIG_UP_MOVE_BPS):
+                        outcome_kind = "big_up"
+                        correct_pressure = buy_score + hold_score * 0.15
+                        wrong_pressure = sell_score + wait_score * 0.80
+                    elif move_bps >= float(LEVEL8_GOOD_UP_MOVE_BPS):
+                        outcome_kind = "up"
+                        correct_pressure = buy_score + hold_score * 0.25
+                        wrong_pressure = sell_score + wait_score * 0.60
+                    elif move_bps <= float(LEVEL8_BIG_DOWN_MOVE_BPS):
+                        outcome_kind = "big_down"
+                        correct_pressure = sell_score + wait_score * 0.80
+                        wrong_pressure = buy_score + hold_score * 0.20
+                    elif move_bps <= float(LEVEL8_BAD_DOWN_MOVE_BPS):
+                        outcome_kind = "down"
+                        correct_pressure = sell_score + wait_score * 0.60
+                        wrong_pressure = buy_score + hold_score * 0.20
+                    elif abs(move_bps) <= float(LEVEL8_FLAT_MOVE_BPS):
+                        outcome_kind = "flat"
+                        correct_pressure = hold_score + wait_score * 0.45
+                        wrong_pressure = buy_score * 0.35 + sell_score * 0.35
                     else:
-                        success = 0
+                        outcome_kind = "mixed"
+                        if move_bps > 0:
+                            correct_pressure = buy_score + hold_score * 0.25
+                            wrong_pressure = sell_score + wait_score * 0.40
+                        else:
+                            correct_pressure = sell_score + wait_score * 0.35
+                            wrong_pressure = buy_score + hold_score * 0.20
+
+                    confidence_mult = clamp_float(
+                        confidence * float(LEVEL8_AGENT_CREDIT_CONFIDENCE_MULT),
+                        0.0,
+                        1.0,
+                    )
+
+                    raw_credit = 0.50 + (correct_pressure - wrong_pressure) * 0.50 * confidence_mult
+                    agent_credit_score = clamp_float(
+                        raw_credit,
+                        float(LEVEL8_AGENT_CREDIT_MIN_SCORE),
+                        float(LEVEL8_AGENT_CREDIT_MAX_SCORE),
+                    )
+
+                    outcome_success = 1 if agent_credit_score >= 0.50 else 0
+
                     perf_key = (
-                        f"{str(vote.get('decision_id', ''))}|"
-                        f"{product_id}|{agent}|"
-                        f"{int(float(outcome.get('ts', 0.0) or 0.0))}"
+                        f"{decision_id}|{product_id}|{agent}|"
+                        f"{int(float(outcome.get('ts', 0.0) or 0.0))}|"
+                        f"{review_minutes}"
                     )
                     if perf_key in existing_keys:
                         continue
@@ -10898,16 +10966,35 @@ class TradingBot:
                         .strftime("%Y-%m-%d %H:%M:%S")
                     )
                     writer.writerow([
-                        f"{ts_val:.6f}", dt_mst, perf_key,
-                        vote.get("decision_id", ""), product_id, agent,
+                        f"{ts_val:.6f}",
+                        dt_mst,
+                        perf_key,
+                        decision_id,
+                        product_id,
+                        agent,
                         vote.get("strategy", ""),
-                        vote.get("adjusted_buy_score", ""),
-                        vote.get("adjusted_sell_score", ""),
-                        vote.get("adjusted_hold_score", ""),
-                        vote.get("adjusted_wait_score", ""),
-                        vote.get("confidence", ""), vote.get("reliability", ""),
-                        f"{move_bps:.6f}", success,
-                        f"matched_30m_outcome move_bps={move_bps:.3f}",
+                        vote.get("setup_tag", ""),
+                        vote.get("market_regime", ""),
+                        vote.get("execution_state", ""),
+                        f"{float(vote.get('learning_score', 0.0) or 0.0):.6f}",
+                        agent_direction,
+                        f"{buy_score:.6f}",
+                        f"{sell_score:.6f}",
+                        f"{hold_score:.6f}",
+                        f"{wait_score:.6f}",
+                        f"{confidence:.6f}",
+                        f"{reliability:.6f}",
+                        outcome_source,
+                        review_minutes,
+                        f"{move_bps:.6f}",
+                        outcome_kind,
+                        f"{agent_credit_score:.6f}",
+                        outcome_success,
+                        (
+                            f"agent_credit;agent={agent};direction={agent_direction};"
+                            f"move_bps={move_bps:.2f};kind={outcome_kind};"
+                            f"credit={agent_credit_score:.3f};source={outcome_source}"
+                        ),
                     ])
         except Exception as exc:
             log(f"[level8] agent performance update failed: {exc}")

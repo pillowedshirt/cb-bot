@@ -124,6 +124,12 @@ COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH: str = os.path.join(
 )
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
+
+# Sell outcome classification.
+LEVEL8_SELL_REVIEW_MINUTES: List[int] = [5, 15, 30]
+LEVEL8_SELL_TOO_EARLY_BPS: float = 80.0
+LEVEL8_SELL_GOOD_EXIT_BPS: float = 30.0
+
 DEBUG_LOG_ENABLED: bool = True
 DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
@@ -10906,6 +10912,103 @@ class TradingBot:
         except Exception as exc:
             log(f"[level8-learning] missed opportunity review failed: {exc}")
 
+
+    def _classify_level8_sell_outcomes(self) -> None:
+        """
+        Review Level 8 sell decisions after the fact and classify sell quality.
+        """
+        try:
+            decisions_path = LEVEL8_COUNCIL_DECISIONS_CSV_PATH
+            if not os.path.exists(decisions_path):
+                return
+            decisions = pd.read_csv(decisions_path)
+            if decisions.empty:
+                return
+            required = {"ts", "decision_id", "product_id", "action", "strategy"}
+            if not required.issubset(set(decisions.columns)):
+                return
+            decisions["ts"] = pd.to_numeric(decisions["ts"], errors="coerce")
+            decisions = decisions.dropna(subset=["ts"])
+            sell_decisions = decisions[
+                (decisions["strategy"].astype(str) == "EXIT_REVIEW")
+                & (decisions["action"].astype(str).str.upper().isin(["ALLOW_SELL", "HOLD"]))
+            ].copy()
+            if sell_decisions.empty:
+                return
+            out_path = os.path.join(BASE_DIR, "sell_outcomes.csv")
+            existing_keys = set()
+            if os.path.exists(out_path):
+                try:
+                    existing = pd.read_csv(out_path)
+                    if not existing.empty and "outcome_key" in existing.columns:
+                        existing_keys = set(existing["outcome_key"].astype(str).tolist())
+                except Exception:
+                    existing_keys = set()
+            columns = [
+                "ts", "dt_mst", "outcome_key", "decision_id", "product_id",
+                "decision_action", "review_minutes", "sell_price",
+                "review_price", "move_after_sell_bps", "sell_outcome_kind",
+                "reason",
+            ]
+            write_header = not os.path.exists(out_path) or os.path.getsize(out_path) == 0
+            with open(out_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(columns)
+                now_value = now_ts()
+                for _, row in sell_decisions.tail(800).iterrows():
+                    product_id = str(row.get("product_id", ""))
+                    decision_id = str(row.get("decision_id", ""))
+                    decision_ts = float(row.get("ts", 0.0) or 0.0)
+                    action = str(row.get("action", "")).upper()
+                    if not product_id or not decision_id or decision_ts <= 0:
+                        continue
+                    sell_price = self._market_price_near_ts(product_id=product_id, target_ts=decision_ts, max_age_sec=120.0)
+                    if not sell_price:
+                        continue
+                    for review_minutes in LEVEL8_SELL_REVIEW_MINUTES:
+                        review_ts = decision_ts + float(review_minutes) * 60.0
+                        if review_ts > now_value - 10.0:
+                            continue
+                        key = f"{decision_id}|{product_id}|{review_minutes}"
+                        if key in existing_keys:
+                            continue
+                        review_price = self._market_price_near_ts(product_id=product_id, target_ts=review_ts, max_age_sec=120.0)
+                        if not review_price:
+                            continue
+                        move_after_sell_bps = ((float(review_price) / float(sell_price)) - 1.0) * 10000.0
+                        if action == "ALLOW_SELL":
+                            if move_after_sell_bps >= float(LEVEL8_SELL_TOO_EARLY_BPS):
+                                kind = "sold_too_early"
+                            elif move_after_sell_bps >= float(LEVEL8_SELL_GOOD_EXIT_BPS):
+                                kind = "missed_continuation"
+                            elif move_after_sell_bps <= -float(LEVEL8_SELL_TOO_EARLY_BPS):
+                                kind = "avoided_loss"
+                            elif move_after_sell_bps <= -float(LEVEL8_SELL_GOOD_EXIT_BPS):
+                                kind = "exited_correctly"
+                            else:
+                                kind = "neutral_sell"
+                        else:
+                            if move_after_sell_bps >= float(LEVEL8_SELL_GOOD_EXIT_BPS):
+                                kind = "held_correctly"
+                            elif move_after_sell_bps <= -float(LEVEL8_SELL_TOO_EARLY_BPS):
+                                kind = "sold_too_late"
+                            elif move_after_sell_bps <= -float(LEVEL8_SELL_GOOD_EXIT_BPS):
+                                kind = "held_too_long"
+                            else:
+                                kind = "neutral_hold"
+                        ts_value = now_ts()
+                        dt_mst = datetime.fromtimestamp(ts_value, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                        writer.writerow([
+                            f"{ts_value:.6f}", dt_mst, key, decision_id, product_id, action,
+                            int(review_minutes), f"{float(sell_price):.12f}",
+                            f"{float(review_price):.12f}", f"{float(move_after_sell_bps):.6f}",
+                            kind, f"sell_outcome_review;action={action};move_after_sell={move_after_sell_bps:.2f};kind={kind}",
+                        ])
+                        existing_keys.add(key)
+        except Exception as exc:
+            log(f"[level8] sell outcome classification failed: {exc}")
+
     def _append_agent_performance_from_outcomes(self) -> None:
         """
         Connect council votes to trade and chart-only outcomes.
@@ -10989,9 +11092,12 @@ class TradingBot:
                 "agent", "strategy", "setup_tag", "market_regime", "execution_state",
                 "learning_score", "agent_direction",
                 "agent_buy_score", "agent_sell_score", "agent_hold_score", "agent_wait_score",
-                "confidence", "reliability",
-                "outcome_source", "review_minutes", "outcome_move_bps", "outcome_kind",
-                "agent_credit_score", "outcome_success", "reason",
+                "confidence", "reliability", "weight",
+                "leaderboard_rank", "leaderboard_score", "leader_bonus", "leader_penalty",
+                "outcome_source", "outcome_weight", "review_minutes",
+                "outcome_move_bps", "outcome_kind",
+                "agent_credit_score", "weighted_agent_credit_score",
+                "outcome_success", "reason",
             ]
 
             write_header = not os.path.exists(out_path) or os.path.getsize(out_path) == 0
@@ -11034,6 +11140,12 @@ class TradingBot:
                     move_bps = float(outcome.get("move_bps", 0.0) or 0.0)
                     review_minutes = int(float(outcome.get("review_minutes", 0.0) or 0.0))
                     outcome_source = str(outcome.get("source", "unknown"))
+                    if outcome_source in {"trade_outcome", "real_trade"}:
+                        outcome_weight = 1.00
+                    elif outcome_source in {"observation_outcome", "level8_observation"}:
+                        outcome_weight = 0.40
+                    else:
+                        outcome_weight = 0.35
 
                     buy_score = float(vote.get("adjusted_buy_score", 0.0) or 0.0)
                     sell_score = float(vote.get("adjusted_sell_score", 0.0) or 0.0)
@@ -11041,6 +11153,11 @@ class TradingBot:
                     wait_score = float(vote.get("adjusted_wait_score", 0.0) or 0.0)
                     confidence = float(vote.get("confidence", 0.0) or 0.0)
                     reliability = float(vote.get("reliability", 1.0) or 1.0)
+                    vote_weight = float(vote.get("weight", confidence * reliability) or 0.0)
+                    leaderboard_rank = float(vote.get("leaderboard_rank", 999.0) or 999.0)
+                    leaderboard_score = float(vote.get("leaderboard_score", 0.5) or 0.5)
+                    leader_bonus = float(vote.get("leader_bonus", 0.0) or 0.0)
+                    leader_penalty = float(vote.get("leader_penalty", 0.0) or 0.0)
 
                     score_map = {
                         "BUY": buy_score,
@@ -11093,7 +11210,13 @@ class TradingBot:
                         float(LEVEL8_AGENT_CREDIT_MAX_SCORE),
                     )
 
-                    outcome_success = 1 if agent_credit_score >= 0.50 else 0
+                    weighted_agent_credit_score = clamp_float(
+                        0.5 + (agent_credit_score - 0.5) * outcome_weight,
+                        0.0,
+                        1.0,
+                    )
+
+                    outcome_success = 1 if weighted_agent_credit_score >= 0.50 else 0
 
                     perf_key = (
                         f"{decision_id}|{product_id}|{agent}|"
@@ -11129,16 +11252,23 @@ class TradingBot:
                         f"{wait_score:.6f}",
                         f"{confidence:.6f}",
                         f"{reliability:.6f}",
+                        f"{vote_weight:.6f}",
+                        f"{leaderboard_rank:.0f}",
+                        f"{leaderboard_score:.6f}",
+                        f"{leader_bonus:.6f}",
+                        f"{leader_penalty:.6f}",
                         outcome_source,
+                        f"{outcome_weight:.6f}",
                         review_minutes,
                         f"{move_bps:.6f}",
                         outcome_kind,
                         f"{agent_credit_score:.6f}",
+                        f"{weighted_agent_credit_score:.6f}",
                         outcome_success,
                         (
                             f"agent_credit;agent={agent};direction={agent_direction};"
                             f"move_bps={move_bps:.2f};kind={outcome_kind};"
-                            f"credit={agent_credit_score:.3f};source={outcome_source}"
+                            f"credit={agent_credit_score:.3f};weighted_credit={weighted_agent_credit_score:.3f};source={outcome_source};weight={outcome_weight:.2f}"
                         ),
                     ])
         except Exception as exc:
@@ -11154,6 +11284,7 @@ class TradingBot:
                 and ts_now - float(self.last_agent_performance_update_ts) >= 60.0
             ):
                 self.last_agent_performance_update_ts = ts_now
+                self._classify_level8_sell_outcomes()
                 self._append_agent_performance_from_outcomes()
             self._maybe_train_ai_brain()
             loop_gap = ts_now - float(self.last_loop_lag_check_ts or ts_now)

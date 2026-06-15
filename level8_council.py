@@ -1,7 +1,9 @@
 """Level 8 trading council capital allocation and risk guidance."""
 
 import csv
+import json
 import os
+import sqlite3
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,6 +20,8 @@ COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(BASE_DIR, "council_observation_o
 AGENT_ADJUSTMENTS_CSV = os.path.join(BASE_DIR, "agent_adjustments.csv")
 ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
 SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
+AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
+LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -34,6 +38,69 @@ def utc_dt(ts: Optional[float] = None) -> str:
     return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def append_sqlite_event(
+    *,
+    event_type: str,
+    source_path: str,
+    row: Dict[str, Any],
+) -> None:
+    """
+    Durable Level 8 event mirror.
+
+    CSV remains the viewer-friendly format.
+    SQLite becomes the safer long-term learning/event ledger.
+    """
+    try:
+        payload = json.dumps(row, default=str)
+
+        conn = sqlite3.connect(LEVEL8_EVENTS_DB)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS level8_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL,
+                    dt_utc TEXT,
+                    event_type TEXT,
+                    source_path TEXT,
+                    decision_id TEXT,
+                    product_id TEXT,
+                    agent TEXT,
+                    strategy TEXT,
+                    payload_json TEXT
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                INSERT INTO level8_events (
+                    ts, dt_utc, event_type, source_path, decision_id,
+                    product_id, agent, strategy, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    float(row.get("ts", utc_ts()) or utc_ts()),
+                    str(row.get("dt_utc", utc_dt())),
+                    event_type,
+                    os.path.basename(source_path),
+                    str(row.get("decision_id", "")),
+                    str(row.get("product_id", "")),
+                    str(row.get("agent", "")),
+                    str(row.get("strategy", "")),
+                    payload,
+                ),
+            )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    except Exception:
+        pass
+
+
 def append_csv_row(path: str, columns: list[str], row: Dict[str, Any]) -> None:
     exists = os.path.exists(path) and os.path.getsize(path) > 0
 
@@ -44,6 +111,12 @@ def append_csv_row(path: str, columns: list[str], row: Dict[str, Any]) -> None:
             writer.writerow(columns)
 
         writer.writerow([row.get(column, "") for column in columns])
+
+    append_sqlite_event(
+        event_type=os.path.splitext(os.path.basename(path))[0],
+        source_path=path,
+        row=row,
+    )
 
 
 @dataclass
@@ -67,6 +140,10 @@ class AgentVote:
     strategy_adjustment: float = 0.0
     recent_performance_adjustment: float = 0.0
     weight: float = 0.0
+    leaderboard_rank: float = 999.0
+    leaderboard_score: float = 0.5
+    leader_bonus: float = 0.0
+    leader_penalty: float = 0.0
     reason: str = ""
 
 
@@ -106,6 +183,19 @@ class Level8Council:
         self.core_bucket_pct = 0.70
 
         self.last_summary: Dict[str, Any] = {}
+
+    def _neutral_stats(self, reason: str = "no_matching_data") -> Dict[str, float]:
+        return {
+            "n": 0.0,
+            "win_rate": 0.5,
+            "avg_move": 0.0,
+            "avg_adverse": 0.0,
+            "avg_credit": 0.5,
+            "weighted_credit": 0.5,
+            "real_trade_n": 0.0,
+            "observation_n": 0.0,
+            "reason": reason,
+        }
 
     def _missed_opportunity_relief(self, product_id: str) -> float:
         """Reduce strictness after repeated WAIT/SHADOW decisions missed jumps."""
@@ -249,9 +339,11 @@ class Level8Council:
         """
         Summarize real trades, chart-only outcomes, and agent-specific credit.
 
-        If agent_credit_score exists, use it as the primary learning signal.
-        That lets the council learn which individual agents were useful, not just
-        whether the final trade won or lost.
+        Important behavior:
+        - Real filled trade outcomes are weighted more heavily than observations.
+        - Heartbeat/observation outcomes still teach, but they do not overwhelm fills.
+        - Missing agent/product/strategy data returns neutral stats instead of silently
+          falling back to broad unrelated data.
         """
         frames = []
 
@@ -264,6 +356,12 @@ class Level8Council:
                         "outcome_move_bps": "move_bps",
                         "outcome_success": "success",
                     })
+
+                    if "outcome_source" in perf.columns:
+                        perf["source"] = perf["outcome_source"].astype(str)
+                    elif "source" not in perf.columns:
+                        perf["source"] = "agent_performance"
+
                     frames.append(perf)
         except Exception:
             pass
@@ -278,12 +376,13 @@ class Level8Council:
                         "would_have_won": "success",
                     })
                     obs["agent"] = obs.get("agent", "council_observation")
+                    obs["source"] = "observation_outcome"
                     frames.append(obs)
         except Exception:
             pass
 
         try:
-            trades = self._recent_trades(120)
+            trades = self._recent_trades(240)
 
             if not trades.empty:
                 if "net_pnl_usd" in trades.columns:
@@ -296,54 +395,46 @@ class Level8Council:
                 trades["success"] = (
                     pd.to_numeric(trades["move_bps"], errors="coerce").fillna(0.0) > 0
                 ).astype(int)
+
+                trades["source"] = "real_trade"
                 frames.append(trades)
         except Exception:
             pass
 
         if not frames:
-            return {
-                "n": 0.0,
-                "win_rate": 0.5,
-                "avg_move": 0.0,
-                "avg_adverse": 0.0,
-                "avg_credit": 0.5,
-            }
+            return self._neutral_stats("no_frames")
 
         data = pd.concat(frames, ignore_index=True, sort=False)
 
         if data.empty:
-            return {
-                "n": 0.0,
-                "win_rate": 0.5,
-                "avg_move": 0.0,
-                "avg_adverse": 0.0,
-                "avg_credit": 0.5,
-            }
+            return self._neutral_stats("empty_data")
 
         for column, value in (
             ("agent", agent),
             ("product_id", product_id),
             ("strategy", strategy),
         ):
-            if value is not None and column in data.columns:
-                rows = data[data[column].astype(str) == str(value)]
+            if value is not None:
+                if column not in data.columns:
+                    return self._neutral_stats(f"missing_column:{column}")
 
-                if not rows.empty:
-                    data = rows
+                rows = data[data[column].astype(str) == str(value)].copy()
+
+                if rows.empty:
+                    return self._neutral_stats(f"no_match:{column}={value}")
+
+                data = rows
 
         if data.empty:
-            return {
-                "n": 0.0,
-                "win_rate": 0.5,
-                "avg_move": 0.0,
-                "avg_adverse": 0.0,
-                "avg_credit": 0.5,
-            }
+            return self._neutral_stats("empty_after_filters")
 
         move_source = data["move_bps"] if "move_bps" in data.columns else pd.Series(0.0, index=data.index)
         move = pd.to_numeric(move_source, errors="coerce").fillna(0.0)
 
-        if "agent_credit_score" in data.columns:
+        if "weighted_agent_credit_score" in data.columns:
+            credit = pd.to_numeric(data["weighted_agent_credit_score"], errors="coerce").fillna(0.5)
+            success = (credit >= 0.5).astype(int)
+        elif "agent_credit_score" in data.columns:
             credit = pd.to_numeric(data["agent_credit_score"], errors="coerce").fillna(0.5)
             success = (credit >= 0.5).astype(int)
         elif "success" in data.columns:
@@ -371,13 +462,171 @@ class Level8Council:
         else:
             adverse = pd.Series(0.0, index=data.index)
 
+        source = data["source"].astype(str) if "source" in data.columns else pd.Series("unknown", index=data.index)
+        source_weight = source.map({
+            "real_trade": 1.00,
+            "trade_outcome": 1.00,
+            "agent_performance": 0.80,
+            "level8_observation": 0.45,
+            "observation_outcome": 0.35,
+            "unknown": 0.35,
+        }).fillna(0.35).astype(float)
+
+        if source_weight.sum() > 0:
+            weighted_credit = float((credit * source_weight).sum() / source_weight.sum())
+            weighted_success = float((success * source_weight).sum() / source_weight.sum())
+            weighted_move = float((move * source_weight).sum() / source_weight.sum())
+            weighted_adverse = float((adverse * source_weight).sum() / source_weight.sum())
+        else:
+            weighted_credit = 0.5
+            weighted_success = 0.5
+            weighted_move = 0.0
+            weighted_adverse = 0.0
+
+        real_trade_n = float(source.isin(["real_trade", "trade_outcome"]).sum())
+        observation_n = float(source.isin(["level8_observation", "observation_outcome"]).sum())
+
         return {
             "n": float(len(data)),
-            "win_rate": float(success.mean()),
-            "avg_move": float(move.mean()),
-            "avg_adverse": float(adverse.mean()),
+            "win_rate": weighted_success,
+            "avg_move": weighted_move,
+            "avg_adverse": weighted_adverse,
             "avg_credit": float(credit.mean()),
+            "weighted_credit": weighted_credit,
+            "real_trade_n": real_trade_n,
+            "observation_n": observation_n,
+            "reason": "weighted_stats",
         }
+
+    def _agent_competition_score(self, agent: str) -> Dict[str, float]:
+        """Give each council member a bounded competitive score."""
+        neutral = {
+            "leaderboard_rank": 999.0,
+            "leaderboard_score": 0.5,
+            "leader_bonus": 0.0,
+            "leader_penalty": 0.0,
+            "sample_size": 0.0,
+        }
+        try:
+            if not os.path.exists(AGENT_PERFORMANCE_CSV):
+                return neutral
+
+            frame = pd.read_csv(AGENT_PERFORMANCE_CSV)
+            if frame.empty or "agent" not in frame.columns or "agent_credit_score" not in frame.columns:
+                return neutral
+
+            credit_col = "weighted_agent_credit_score" if "weighted_agent_credit_score" in frame.columns else "agent_credit_score"
+            frame[credit_col] = pd.to_numeric(frame[credit_col], errors="coerce").fillna(0.5)
+            source = frame["outcome_source"].astype(str) if "outcome_source" in frame.columns else pd.Series("unknown", index=frame.index)
+            frame["_source_weight"] = source.map({
+                "trade_outcome": 1.00,
+                "real_trade": 1.00,
+                "observation_outcome": 0.40,
+                "level8_observation": 0.40,
+                "unknown": 0.35,
+            }).fillna(0.35).astype(float)
+
+            rows = []
+            for name, group in frame.groupby(frame["agent"].astype(str)):
+                n = float(len(group))
+                if n <= 0:
+                    continue
+                weighted_credit = float(
+                    (group[credit_col] * group["_source_weight"]).sum()
+                    / max(group["_source_weight"].sum(), 1e-9)
+                )
+                recent = group.tail(50)
+                recent_credit = float(recent[credit_col].mean()) if not recent.empty else weighted_credit
+                sample_factor = clamp(n / 30.0, 0.0, 1.0)
+                leaderboard_score = clamp(
+                    weighted_credit * 0.70 + recent_credit * 0.20 + sample_factor * 0.10,
+                    0.0,
+                    1.0,
+                )
+                rows.append({
+                    "agent": str(name),
+                    "sample_size": n,
+                    "weighted_credit": weighted_credit,
+                    "recent_credit": recent_credit,
+                    "leaderboard_score": leaderboard_score,
+                })
+
+            if not rows:
+                return neutral
+
+            board = pd.DataFrame(rows).sort_values("leaderboard_score", ascending=False).reset_index(drop=True)
+            board["leaderboard_rank"] = board.index + 1
+            ts = utc_ts()
+            for _, row in board.iterrows():
+                try:
+                    rank = float(row["leaderboard_rank"])
+                    score = float(row["leaderboard_score"])
+                    n = float(row["sample_size"])
+                    leader_bonus = 0.0
+                    leader_penalty = 0.0
+                    if n >= 10:
+                        if rank == 1 and score > 0.56:
+                            leader_bonus = 0.060
+                        elif rank <= 3 and score > 0.54:
+                            leader_bonus = 0.035
+                        elif score < 0.46:
+                            leader_penalty = 0.050
+                        elif score < 0.49:
+                            leader_penalty = 0.025
+                    append_csv_row(
+                        AGENT_LEADERBOARD_CSV,
+                        [
+                            "ts", "dt_utc", "agent", "leaderboard_rank",
+                            "leaderboard_score", "weighted_credit", "recent_credit",
+                            "sample_size", "leader_bonus", "leader_penalty", "reason",
+                        ],
+                        {
+                            "ts": f"{ts:.6f}",
+                            "dt_utc": utc_dt(ts),
+                            "agent": str(row["agent"]),
+                            "leaderboard_rank": f"{rank:.0f}",
+                            "leaderboard_score": f"{score:.6f}",
+                            "weighted_credit": f"{float(row['weighted_credit']):.6f}",
+                            "recent_credit": f"{float(row['recent_credit']):.6f}",
+                            "sample_size": f"{n:.0f}",
+                            "leader_bonus": f"{leader_bonus:.6f}",
+                            "leader_penalty": f"{leader_penalty:.6f}",
+                            "reason": (
+                                f"competitive_agent_goal;rank={rank:.0f};score={score:.3f};"
+                                f"bonus={leader_bonus:.3f};penalty={leader_penalty:.3f}"
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
+
+            own = board[board["agent"].astype(str) == str(agent)]
+            if own.empty:
+                return neutral
+            row = own.iloc[0]
+            rank = float(row["leaderboard_rank"])
+            score = float(row["leaderboard_score"])
+            n = float(row["sample_size"])
+            leader_bonus = 0.0
+            leader_penalty = 0.0
+            if n >= 10:
+                if rank == 1 and score > 0.56:
+                    leader_bonus = 0.060
+                elif rank <= 3 and score > 0.54:
+                    leader_bonus = 0.035
+                elif score < 0.46:
+                    leader_penalty = 0.050
+                elif score < 0.49:
+                    leader_penalty = 0.025
+            return {
+                "leaderboard_rank": rank,
+                "leaderboard_score": score,
+                "leader_bonus": leader_bonus,
+                "leader_penalty": leader_penalty,
+                "sample_size": n,
+            }
+        except Exception:
+            return neutral
 
     def _agent_adjustments(
         self,
@@ -385,58 +634,39 @@ class Level8Council:
         product_id: str,
         strategy: str,
     ) -> Dict[str, float]:
-        """Calculate bounded adjustments from an agent's historical outcomes."""
+        """Calculate bounded adjustments from outcomes and agent competition."""
         agent_stats = self._outcome_stats(agent=agent)
         product_stats = self._outcome_stats(agent=agent, product_id=product_id)
         strategy_stats = self._outcome_stats(agent=agent, strategy=strategy)
 
         recent = self._recent_trades(20)
-
         if "agent" in recent.columns:
             recent = recent[recent["agent"].astype(str) == str(agent)]
-
         if "event" in recent.columns:
             recent = recent[recent["event"].astype(str).str.upper() == "SELL"]
-
-        pnl_column = next(
-            (column for column in ("net_pnl_usd", "pnl", "move_bps") if column in recent),
-            None,
-        )
-
+        pnl_column = next((column for column in ("net_pnl_usd", "pnl", "move_bps") if column in recent), None)
         recent_win_rate = 0.5
-
         if not recent.empty and pnl_column:
             pnl = pd.to_numeric(recent[pnl_column], errors="coerce").fillna(0.0)
             recent_win_rate = float((pnl > 0.0).mean())
 
         n = float(agent_stats.get("n", 0.0))
-
         sample_factor = clamp(n / 12.0, 0.0, 1.0)
-
-        agent_credit = float(agent_stats.get("avg_credit", agent_stats.get("win_rate", 0.5)))
+        agent_credit = float(agent_stats.get("weighted_credit", agent_stats.get("avg_credit", 0.5)))
         product_win_rate = float(product_stats.get("win_rate", 0.5))
         strategy_win_rate = float(strategy_stats.get("win_rate", 0.5))
-
         product_adj = (product_win_rate - 0.5) * 0.65 * sample_factor
         strategy_adj = (strategy_win_rate - 0.5) * 0.60 * sample_factor
         recent_adj = (recent_win_rate - 0.5) * 0.85 * sample_factor
-
+        competition = self._agent_competition_score(agent)
+        leader_bonus = float(competition.get("leader_bonus", 0.0))
+        leader_penalty = float(competition.get("leader_penalty", 0.0))
         product_adj = clamp(product_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         strategy_adj = clamp(strategy_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         recent_adj = clamp(recent_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
-
-        directional = clamp(
-            product_adj + strategy_adj + recent_adj,
-            -self.max_agent_adjustment,
-            self.max_agent_adjustment,
-        )
-
+        directional = clamp(product_adj + strategy_adj + recent_adj + leader_bonus - leader_penalty, -self.max_agent_adjustment, self.max_agent_adjustment)
         base_reliability = 0.80 + (agent_credit - 0.5) * 1.35 * sample_factor
-        reliability = clamp(
-            base_reliability,
-            self.min_agent_reliability,
-            self.max_agent_reliability,
-        )
+        reliability = clamp(base_reliability + leader_bonus - leader_penalty, self.min_agent_reliability, self.max_agent_reliability)
 
         try:
             ts = utc_ts()
@@ -448,14 +678,12 @@ class Level8Council:
                     "recent_performance_adjustment", "directional_adjustment",
                     "final_reliability", "sample_size", "agent_credit",
                     "product_win_rate", "strategy_win_rate", "recent_win_rate",
-                    "reason",
+                    "leaderboard_rank", "leaderboard_score", "leader_bonus",
+                    "leader_penalty", "reason",
                 ],
                 {
-                    "ts": f"{ts:.6f}",
-                    "dt_utc": utc_dt(ts),
-                    "agent": agent,
-                    "product_id": product_id,
-                    "strategy": strategy,
+                    "ts": f"{ts:.6f}", "dt_utc": utc_dt(ts), "agent": agent,
+                    "product_id": product_id, "strategy": strategy,
                     "base_reliability": f"{base_reliability:.6f}",
                     "product_adjustment": f"{product_adj:.6f}",
                     "strategy_adjustment": f"{strategy_adj:.6f}",
@@ -467,23 +695,26 @@ class Level8Council:
                     "product_win_rate": f"{product_win_rate:.6f}",
                     "strategy_win_rate": f"{strategy_win_rate:.6f}",
                     "recent_win_rate": f"{recent_win_rate:.6f}",
+                    "leaderboard_rank": f"{float(competition.get('leaderboard_rank', 999.0)):.0f}",
+                    "leaderboard_score": f"{float(competition.get('leaderboard_score', 0.5)):.6f}",
+                    "leader_bonus": f"{leader_bonus:.6f}",
+                    "leader_penalty": f"{leader_penalty:.6f}",
                     "reason": (
-                        f"agent={agent};credit={agent_credit:.3f};"
-                        f"product_wr={product_win_rate:.3f};"
-                        f"strategy_wr={strategy_win_rate:.3f};"
-                        f"recent_wr={recent_win_rate:.3f}"
+                        f"agent={agent};competitive_goal=highest_weight;credit={agent_credit:.3f};"
+                        f"leader_rank={float(competition.get('leaderboard_rank', 999.0)):.0f};"
+                        f"leader_score={float(competition.get('leaderboard_score', 0.5)):.3f};"
+                        f"bonus={leader_bonus:.3f};penalty={leader_penalty:.3f}"
                     ),
                 },
             )
         except Exception:
             pass
-
         return {
-            "product": product_adj,
-            "strategy": strategy_adj,
-            "recent": recent_adj,
-            "directional": directional,
-            "reliability": reliability,
+            "product": product_adj, "strategy": strategy_adj, "recent": recent_adj,
+            "directional": directional, "reliability": reliability,
+            "leaderboard_rank": float(competition.get("leaderboard_rank", 999.0)),
+            "leaderboard_score": float(competition.get("leaderboard_score", 0.5)),
+            "leader_bonus": leader_bonus, "leader_penalty": leader_penalty,
         }
 
     def _adjust_vote(
@@ -533,6 +764,10 @@ class Level8Council:
             strategy_adjustment=float(adjustments["strategy"]),
             recent_performance_adjustment=float(adjustments["recent"]),
             weight=weight,
+            leaderboard_rank=float(adjustments.get("leaderboard_rank", 999.0)),
+            leaderboard_score=float(adjustments.get("leaderboard_score", 0.5)),
+            leader_bonus=float(adjustments.get("leader_bonus", 0.0)),
+            leader_penalty=float(adjustments.get("leader_penalty", 0.0)),
             reason=str(vote.get("reason", "")),
         )
 

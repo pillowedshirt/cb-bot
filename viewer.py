@@ -39,6 +39,9 @@ AGENT_PERFORMANCE_CSV = os.path.join(BASE_DIR, "agent_performance.csv")
 AGENT_ADJUSTMENTS_CSV = os.path.join(BASE_DIR, "agent_adjustments.csv")
 ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
 SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
+AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
+SELL_OUTCOMES_CSV = os.path.join(BASE_DIR, "sell_outcomes.csv")
+LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 MISSED_OPPORTUNITIES_CSV = os.path.join(BASE_DIR, "missed_opportunities.csv")
 COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(
     BASE_DIR, "council_observation_outcomes.csv"
@@ -1454,6 +1457,8 @@ def render_council_intelligence_snapshot(
     shadow_trades: pd.DataFrame,
     missed_opportunities: pd.DataFrame,
     council_observation_outcomes: pd.DataFrame,
+    agent_leaderboard: pd.DataFrame,
+    sell_outcomes: pd.DataFrame,
     selected_product: str | None = None,
 ) -> None:
     """Render product-specific Level 8 votes and learning telemetry."""
@@ -1499,33 +1504,98 @@ def render_council_intelligence_snapshot(
 
     with st.expander("Council learning tables"):
         tabs = st.tabs([
-            "Agent performance", "Agent adjustments", "Adaptive thresholds",
-            "Shadow trades", "Missed opportunities", "Observation outcomes",
+            "Agent performance", "Agent adjustments", "Agent leaderboard",
+            "Adaptive thresholds", "Shadow trades", "Missed opportunities",
+            "Observation outcomes", "Sell outcomes",
         ])
         table_specs = [
-            (agent_performance, ["dt_mst", "product_id", "agent", "strategy", "agent_buy_score",
-                                 "agent_sell_score", "confidence", "reliability", "outcome_move_bps",
-                                 "outcome_success", "reason"], "No agent performance rows yet."),
-            (agent_adjustments, ["dt_utc", "agent", "product_id", "strategy", "base_reliability",
-                                 "product_adjustment", "strategy_adjustment", "recent_performance_adjustment",
-                                 "final_reliability", "sample_size", "reason"], "No agent adjustment rows yet."),
-            (adaptive_thresholds, ["dt_utc", "scope", "product_id", "strategy", "buy_threshold",
-                                   "sell_threshold", "risk_mode", "sample_size", "reason"],
-             "No adaptive threshold rows yet."),
-            (shadow_trades, ["dt_utc", "product_id", "strategy", "shadow_action", "shadow_entry_price",
-                             "council_buy_score", "buy_threshold", "reason"], "No shadow trades yet."),
-            (missed_opportunities, ["dt_mst", "product_id", "review_minutes",
-                                    "decision_action", "decision_bucket", "decision_strategy",
-                                    "final_buy_score", "buy_threshold", "truth_score",
-                                    "recommended_position_pct", "entry_price", "review_price",
-                                    "move_bps", "missed_type", "reason"],
-             "No missed opportunity rows yet."),
-            (council_observation_outcomes, ["dt_mst", "product_id", "review_minutes",
-                                            "decision_action", "decision_bucket", "decision_strategy",
-                                            "final_buy_score", "buy_threshold", "truth_score",
-                                            "recommended_position_pct", "entry_price", "review_price",
-                                            "move_bps", "would_have_won", "missed_big_move", "reason"],
-             "No council observation outcomes yet."),
+            (
+                agent_performance,
+                [
+                    "dt_mst", "product_id", "agent", "strategy",
+                    "setup_tag", "market_regime", "execution_state",
+                    "learning_score", "agent_direction",
+                    "agent_buy_score", "agent_sell_score",
+                    "agent_hold_score", "agent_wait_score",
+                    "confidence", "reliability", "weight",
+                    "leaderboard_rank", "leaderboard_score", "leader_bonus", "leader_penalty",
+                    "outcome_source", "outcome_weight", "review_minutes",
+                    "outcome_move_bps", "outcome_kind",
+                    "agent_credit_score", "weighted_agent_credit_score",
+                    "outcome_success", "reason",
+                ],
+                "No agent performance rows yet.",
+            ),
+            (
+                agent_adjustments,
+                [
+                    "dt_utc", "agent", "product_id", "strategy", "base_reliability",
+                    "product_adjustment", "strategy_adjustment",
+                    "recent_performance_adjustment", "directional_adjustment",
+                    "final_reliability", "sample_size", "agent_credit",
+                    "leaderboard_rank", "leaderboard_score", "leader_bonus",
+                    "leader_penalty", "reason",
+                ],
+                "No agent adjustment rows yet.",
+            ),
+            (
+                agent_leaderboard,
+                [
+                    "dt_utc", "agent", "leaderboard_rank", "leaderboard_score",
+                    "weighted_credit", "recent_credit", "sample_size",
+                    "leader_bonus", "leader_penalty", "reason",
+                ],
+                "No agent leaderboard rows yet.",
+            ),
+            (
+                adaptive_thresholds,
+                [
+                    "dt_utc", "scope", "product_id", "strategy", "buy_threshold",
+                    "sell_threshold", "risk_mode", "sample_size", "win_rate",
+                    "avg_move", "avg_adverse", "missed_opportunity_relief", "reason",
+                ],
+                "No adaptive threshold rows yet.",
+            ),
+            (
+                shadow_trades,
+                [
+                    "dt_utc", "product_id", "strategy", "shadow_action",
+                    "council_buy_score", "buy_threshold", "truth_score",
+                    "recommended_position_pct", "reason",
+                ],
+                "No shadow trades yet.",
+            ),
+            (
+                missed_opportunities,
+                [
+                    "dt_mst", "product_id", "review_minutes",
+                    "decision_action", "decision_bucket", "decision_strategy",
+                    "final_buy_score", "buy_threshold", "truth_score",
+                    "recommended_position_pct", "entry_price", "review_price",
+                    "move_bps", "missed_type", "reason",
+                ],
+                "No missed opportunity rows yet.",
+            ),
+            (
+                council_observation_outcomes,
+                [
+                    "dt_mst", "product_id", "review_minutes",
+                    "decision_action", "decision_bucket", "decision_strategy",
+                    "final_buy_score", "buy_threshold", "truth_score",
+                    "recommended_position_pct", "entry_price", "review_price",
+                    "move_bps", "would_have_won", "missed_big_move", "reason",
+                ],
+                "No council observation outcomes yet.",
+            ),
+            (
+                sell_outcomes,
+                [
+                    "dt_mst", "product_id", "decision_action", "review_minutes",
+                    "sell_price", "review_price", "move_after_sell_bps",
+                    "sell_outcome_kind", "reason",
+                ],
+                "No sell outcome rows yet.",
+            ),
         ]
         for tab, (data, desired_columns, empty_message) in zip(tabs, table_specs):
             with tab:
@@ -1992,6 +2062,8 @@ def render_live_dashboard() -> None:
     shadow_trades = load_csv(SHADOW_TRADES_CSV)
     missed_opportunities = load_csv(MISSED_OPPORTUNITIES_CSV)
     council_observation_outcomes = load_csv(COUNCIL_OBSERVATION_OUTCOMES_CSV)
+    agent_leaderboard = load_csv(AGENT_LEADERBOARD_CSV)
+    sell_outcomes = load_csv(SELL_OUTCOMES_CSV)
 
     signal_events = numeric(signal_events, [
         "ts", "rank", "rank_score", "buy_ready_count",
@@ -2031,12 +2103,24 @@ def render_live_dashboard() -> None:
     ])
     agent_performance = numeric(agent_performance, [
         "ts", "agent_buy_score", "agent_sell_score", "agent_hold_score",
-        "agent_wait_score", "confidence", "reliability", "outcome_move_bps",
-        "outcome_success",
+        "agent_wait_score", "confidence", "reliability", "weight",
+        "leaderboard_rank", "leaderboard_score", "leader_bonus", "leader_penalty",
+        "outcome_weight", "outcome_move_bps", "agent_credit_score",
+        "weighted_agent_credit_score", "outcome_success",
     ])
     agent_adjustments = numeric(agent_adjustments, [
         "ts", "base_reliability", "product_adjustment", "strategy_adjustment",
-        "recent_performance_adjustment", "final_reliability", "sample_size",
+        "recent_performance_adjustment", "directional_adjustment",
+        "final_reliability", "sample_size", "agent_credit",
+        "product_win_rate", "strategy_win_rate", "recent_win_rate",
+        "leaderboard_rank", "leaderboard_score", "leader_bonus", "leader_penalty",
+    ])
+    agent_leaderboard = numeric(agent_leaderboard, [
+        "ts", "leaderboard_rank", "leaderboard_score", "weighted_credit",
+        "recent_credit", "sample_size", "leader_bonus", "leader_penalty",
+    ])
+    sell_outcomes = numeric(sell_outcomes, [
+        "ts", "review_minutes", "sell_price", "review_price", "move_after_sell_bps",
     ])
     adaptive_thresholds = numeric(adaptive_thresholds, [
         "ts", "buy_threshold", "sell_threshold", "sample_size",
@@ -2093,6 +2177,8 @@ def render_live_dashboard() -> None:
             shadow_trades=shadow_trades,
             missed_opportunities=missed_opportunities,
             council_observation_outcomes=council_observation_outcomes,
+            agent_leaderboard=agent_leaderboard,
+            sell_outcomes=sell_outcomes,
             selected_product=visual_product,
         )
 
@@ -2627,7 +2713,9 @@ def render_live_dashboard() -> None:
         default_idx = products.index("BTC-USD") if "BTC-USD" in products else 0
         product = st.selectbox("Selected coin", products, index=default_idx, label_visibility="collapsed")
 
-    if show_council_tables:
+    # Product-specific council telemetry is already shown at the top.
+    # Keep this section from duplicating the same council tables in the middle of the viewer.
+    if False and show_council_tables:
         render_council_intelligence_snapshot(
             council_votes=council_votes,
             council_decisions=council_decisions,
@@ -2637,6 +2725,8 @@ def render_live_dashboard() -> None:
             shadow_trades=shadow_trades,
             missed_opportunities=missed_opportunities,
             council_observation_outcomes=council_observation_outcomes,
+            agent_leaderboard=agent_leaderboard,
+            sell_outcomes=sell_outcomes,
             selected_product=product,
         )
 

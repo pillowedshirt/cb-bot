@@ -210,6 +210,13 @@ LEVEL5_MAX_POSITION_PCT: float = 0.08
 
 ENABLE_LEVEL8_COUNCIL: bool = True
 
+# Always-on council commentary.
+# This makes the Level 8 council evaluate current market conditions even when
+# nothing passes the normal buy gate, so the viewer always has council dialogue.
+LEVEL8_ENABLE_COUNCIL_HEARTBEAT: bool = True
+LEVEL8_COUNCIL_HEARTBEAT_EVERY_SEC: float = 8.0
+LEVEL8_COUNCIL_HEARTBEAT_MAX_PRODUCTS: int = 15
+
 # Active mode. No observe-only staged approach.
 LEVEL8_MODE: str = "FILTER_AND_SIZE"
 
@@ -4427,6 +4434,7 @@ class TradingBot:
         self.ai_brain = None
         self.level5_manager = None
         self.level8_council = None
+        self.last_level8_council_heartbeat_ts: float = 0.0
         self.last_ai_train_ts: float = 0.0
         self.last_agent_performance_update_ts: float = 0.0
         if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
@@ -7754,6 +7762,113 @@ class TradingBot:
             allow = False
         return bool(allow), info
 
+    def _run_level8_council_heartbeat(
+        self,
+        *,
+        watch_candidates: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Runs Level 8 council commentary even when no live buy candidate passes.
+
+        This keeps:
+        - council_votes.csv
+        - council_decisions.csv
+        - agent_adjustments.csv
+        - adaptive_thresholds.csv
+        - shadow_trades.csv
+
+        actively updating so the viewer can show the council discussing both
+        positive and negative market conditions.
+        """
+        if not ENABLE_LEVEL8_COUNCIL:
+            return
+
+        if not LEVEL8_ENABLE_COUNCIL_HEARTBEAT:
+            return
+
+        if self.level8_council is None:
+            return
+
+        nowv = now_ts()
+        if (
+            nowv - float(self.last_level8_council_heartbeat_ts)
+            < float(LEVEL8_COUNCIL_HEARTBEAT_EVERY_SEC)
+        ):
+            return
+
+        self.last_level8_council_heartbeat_ts = nowv
+
+        usable = [
+            dict(c)
+            for c in watch_candidates
+            if str(c.get("product_id", "")).strip()
+        ]
+
+        if not usable:
+            return
+
+        usable.sort(
+            key=lambda c: (
+                float(c.get("expected_net_edge_bps", 0.0)),
+                float(c.get("score", 0.0)),
+                float(c.get("estimated_prob_up", 0.0)),
+            ),
+            reverse=True,
+        )
+
+        for candidate in usable[: int(LEVEL8_COUNCIL_HEARTBEAT_MAX_PRODUCTS)]:
+            product_id = str(candidate.get("product_id", ""))
+
+            candidate["heartbeat_only"] = True
+            candidate["manager_strategy"] = (
+                candidate.get("manager_strategy") or "COUNCIL_HEARTBEAT"
+            )
+
+            try:
+                decision = self.level8_council.decide_buy(
+                    product_id=product_id,
+                    candidate=candidate,
+                )
+
+                self.signal_events_log.log_event(
+                    event_type="level8_council_heartbeat",
+                    trade_id=decision.decision_id,
+                    product_id=product_id,
+                    rank_score=(
+                        f"{float(candidate.get('rank_score', 0.0)):.6f}"
+                    ),
+                    buy_ready_count=0,
+                    score=f"{float(candidate.get('score', 0.0)):.6f}",
+                    probability=(
+                        f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}"
+                    ),
+                    ev_bps=(
+                        f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}"
+                    ),
+                    projected_forward_bps=(
+                        f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}"
+                    ),
+                    cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
+                    spread_bps=(
+                        f"{float(candidate.get('spread_bps', 0.0)):.6f}"
+                    ),
+                    action="commentary",
+                    reason=(
+                        f"heartbeat_only=True;"
+                        f"decision={decision.action};"
+                        f"strategy={decision.strategy};"
+                        f"bucket={decision.bucket};"
+                        f"truth={decision.truth_score:.3f};"
+                        f"final_buy={decision.final_buy_score:.3f};"
+                        f"threshold={decision.buy_threshold:.3f};"
+                        f"why_not_ready={candidate.get('why_not_ready', '')};"
+                        f"{decision.reason}"
+                    ),
+                )
+
+            except Exception as exc:
+                log(f"[level8] council heartbeat failed {product_id}: {exc}")
+
     def _level5_should_hold_or_exit(
         self,
         *,
@@ -10484,6 +10599,7 @@ class TradingBot:
                     log(f"[level5] session health check failed: {exc}")
 
             candidates = []
+            council_watch_candidates: List[Dict[str, Any]] = []
             for product_id in PRODUCTS:
                 tob = self.tob.get(product_id)
                 if REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY:
@@ -11061,6 +11177,58 @@ class TradingBot:
                 target_bps = live_signal.target_bps
                 cost_bps = live_signal.cost_bps
 
+                profile = self.calibration_profiles.get(
+                    product_id,
+                    ProductCalibrationProfile(product_id=product_id),
+                )
+
+                council_watch_candidates.append({
+                    "product_id": product_id,
+                    "mid": float(mid),
+                    "bid": float(bid),
+                    "ask": float(ask),
+                    "spread_bps": float(spread_bps),
+                    "score": float(scored.score),
+                    "tier": int(scored.tier),
+                    "entry_reason": str(scored.reason),
+                    "entry_score_obj": scored,
+                    "signal": live_signal,
+                    "entry_timing_ok": False,
+                    "entry_timing_reason": "heartbeat_market_watch",
+                    "expected_net_edge_bps": float(scored.expected_net_edge_bps),
+                    "estimated_prob_up": float(estimated_prob_up),
+                    "position_pct": float(position_pct),
+                    "target_bps": float(target_bps),
+                    "cost_bps": float(cost_bps),
+                    "projected_forward_gain_bps": float(
+                        live_signal.projected_forward_gain_bps
+                    ),
+                    "min_score": float(profile.min_score),
+                    "min_probability": float(profile.min_probability),
+                    "min_expected_value_bps": float(
+                        profile.min_expected_value_bps
+                    ),
+                    "calibrated_time_to_min_profit_minutes": float(
+                        live_signal.calibrated_time_to_min_profit_minutes
+                    ),
+                    "calibrated_forward_window_minutes": float(
+                        live_signal.calibrated_forward_window_minutes
+                    ),
+                    "rank_score": (
+                        float(scored.score)
+                        + float(scored.expected_net_edge_bps) * 0.10
+                    ),
+                    "buy_ready_count": 0,
+                    "manager_strategy": "COUNCIL_HEARTBEAT",
+                    "heartbeat_only": True,
+                    "ok_to_trade": bool(live_signal.ok_to_trade),
+                    "why_not_ready": (
+                        "passes_basic_live_signal"
+                        if bool(live_signal.ok_to_trade)
+                        else str(live_signal.reason)
+                    ),
+                })
+
                 if (
                     live_signal.ok_to_trade
                     and warmup_done
@@ -11083,9 +11251,6 @@ class TradingBot:
                             reason=spread_buy_reason,
                         )
                     else:
-                        profile = self.calibration_profiles.get(
-                            product_id, ProductCalibrationProfile(product_id=product_id)
-                        )
                         candidates.append({
                             "product_id": product_id,
                             "mid": mid,
@@ -11167,6 +11332,11 @@ class TradingBot:
                     buy_gate_calibrated_ok=live_signal.buy_gate_calibrated_ok,
                     buy_gate_tradeable=live_signal.buy_gate_tradeable,
                     buy_gate_blocker=live_signal.buy_gate_blocker,
+                )
+
+            if ENABLE_LEVEL8_COUNCIL and LEVEL8_ENABLE_COUNCIL_HEARTBEAT:
+                self._run_level8_council_heartbeat(
+                    watch_candidates=council_watch_candidates,
                 )
 
             for candidate in candidates:

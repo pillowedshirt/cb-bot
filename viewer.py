@@ -305,7 +305,7 @@ hr {
 
 .round-table-wrap {
   position: relative;
-  min-height: 420px;
+  min-height: 510px;
   border-radius: 20px;
   border: 1px solid rgba(148,163,184,0.14);
   background:
@@ -344,8 +344,8 @@ hr {
 
 .agent-knight {
   position: absolute;
-  width: 172px;
-  min-height: 136px;
+  width: 196px;
+  min-height: 176px;
   transform: translate(-50%, -50%);
   border: 1px solid rgba(148,163,184,0.20);
   border-radius: 17px;
@@ -405,7 +405,9 @@ hr {
   color: #CBD5E1;
   font-size: 0.63rem;
   line-height: 1.22;
-  min-height: 3.2rem;
+  min-height: 4.9rem;
+  max-height: 7.2rem;
+  overflow: hidden;
 }
 
 .agent-knight.speaking .knight-bubble {
@@ -675,6 +677,153 @@ def agent_knight_profile(agent: str) -> dict[str, str]:
     return {"name": name, "role": role, "icon": icon, "flair": flair}
 
 
+def synthetic_council_vote_rows(
+    selected_product: str | None = None,
+) -> pd.DataFrame:
+    """
+    Creates always-visible council members before real council_votes.csv exists.
+
+    These are display-only rows. They do not represent real bot trades.
+    They prevent the top council animation from looking empty on startup.
+    """
+    ts = pd.Timestamp.utcnow().timestamp()
+    product = selected_product or "ALL"
+
+    rows = []
+    agents = [
+        ("trend", 0.30, 0.35, 0.35, 0.78, "No firm trend hath yet taken the field; I counsel patience."),
+        ("mean_reversion", 0.36, 0.34, 0.42, 0.64, "The dip is not yet a proven valley; I watch for exhaustion."),
+        ("breakout", 0.28, 0.38, 0.34, 0.74, "No rampart is breached; the breakout horn remains silent."),
+        ("ai_outcome", 0.32, 0.32, 0.44, 0.62, "The oracle awaits enough outcome scrolls to speak with force."),
+        ("risk", 0.34, 0.40, 0.46, 0.66, "The treasury is guarded, yet not sealed; I await stronger cause."),
+        ("execution", 0.38, 0.35, 0.40, 0.55, "The order-book gate is watched for spread and fill."),
+        ("product_health", 0.33, 0.36, 0.42, 0.65, "This coin’s constitution is still under review."),
+        ("truth", 0.30, 0.30, 0.42, 0.78, "Evidence is thin; truth demandeth more candles and more proof."),
+    ]
+
+    for agent, buy, sell, hold, wait, reason in agents:
+        rows.append({
+            "ts": ts,
+            "dt_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "decision_id": "viewer-fallback",
+            "product_id": product,
+            "agent": agent,
+            "strategy": "AWAITING_REAL_COUNCIL_DATA",
+            "raw_buy_score": buy,
+            "raw_sell_score": sell,
+            "raw_hold_score": hold,
+            "raw_wait_score": wait,
+            "adjusted_buy_score": buy,
+            "adjusted_sell_score": sell,
+            "adjusted_hold_score": hold,
+            "adjusted_wait_score": wait,
+            "confidence": 0.20,
+            "reliability": 0.50,
+            "product_adjustment": 0.0,
+            "strategy_adjustment": 0.0,
+            "recent_performance_adjustment": 0.0,
+            "weight": 0.20,
+            "reason": reason,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _agent_memory_key(agent: str, product: str | None = None) -> str:
+    product_key = str(product or "ALL")
+    return f"council_knight_memory::{product_key}::{agent}"
+
+
+def agent_memory_previous(agent: str, product: str | None = None) -> str:
+    return str(st.session_state.get(_agent_memory_key(agent, product), ""))
+
+
+def agent_memory_update(
+    agent: str,
+    product: str | None,
+    statement: str,
+) -> None:
+    st.session_state[_agent_memory_key(agent, product)] = str(statement)
+
+
+def action_phrase_for_knight(action: str) -> str:
+    action = str(action).upper()
+    if action == "BUY":
+        return "I lean toward a BUY, should the king demand action"
+    if action == "SELL":
+        return "I counsel a SELL ere the tide turneth against us"
+    if action == "HOLD":
+        return "Hold fast; the field hath not yet betrayed us"
+    return "Stay thy blade; I recommend no investment at this moment"
+
+
+def agent_commentary_prefix(agent: str) -> str:
+    agent = str(agent).lower()
+    prefixes = {
+        "trend": "Upon the road of momentum",
+        "mean_reversion": "Within the valley of dips",
+        "breakout": "Before the breached rampart",
+        "ai_outcome": "By the oracle’s prior scrolls",
+        "risk": "From the treasury watchtower",
+        "execution": "At the order-book gate",
+        "product_health": "By this coin’s constitution",
+        "truth": "By the candle of evidence",
+    }
+    return prefixes.get(agent, "At this council seat")
+
+
+def build_threaded_knight_dialogue(
+    row: pd.Series,
+    selected_product: str | None = None,
+) -> str:
+    """
+    Builds commentary that references the knight's prior statement, so the visual
+    feels like a live chain of thought/commentary over time.
+
+    This is display narration only.
+    """
+    agent = str(row.get("agent", "council"))
+    action, score = dominant_agent_action(row)
+
+    confidence = safe_float(row.get("confidence", np.nan), 0.0)
+    reliability = safe_float(row.get("reliability", np.nan), 0.0)
+
+    reason = str(row.get("reason", "")).strip()
+    if len(reason) > 145:
+        reason = reason[:142] + "..."
+
+    previous = agent_memory_previous(agent, selected_product)
+
+    if previous:
+        bridge_options = [
+            "As I last proclaimed,",
+            "Continuing mine watch,",
+            "The matter hath shifted thus:",
+            "My prior caution still echoeth, yet now",
+            "From my former decree, I add:",
+        ]
+        bridge_index = int(pd.Timestamp.utcnow().timestamp()) % len(bridge_options)
+        bridge = bridge_options[bridge_index]
+    else:
+        bridge = "I take mine seat and report:"
+
+    statement = (
+        f"{bridge} {agent_commentary_prefix(agent)}, "
+        f"{action_phrase_for_knight(action)}. "
+        f"My present force is {score * 100:.0f}%, "
+        f"confidence {confidence * 100:.0f}%, "
+        f"reliability {reliability * 100:.0f}%. "
+        f"{reason}"
+    )
+
+    if len(statement) > 285:
+        statement = statement[:282] + "..."
+
+    agent_memory_update(agent, selected_product, statement)
+
+    return statement
+
+
 def dominant_agent_action(row: pd.Series) -> tuple[str, float]:
     scores = {
         "BUY": safe_float(row.get("adjusted_buy_score", np.nan)),
@@ -689,26 +838,11 @@ def dominant_agent_action(row: pd.Series) -> tuple[str, float]:
     return action, float(finite_scores[action])
 
 
-def knight_dialogue(row: pd.Series) -> str:
-    profile = agent_knight_profile(str(row.get("agent", "council")))
-    action, score = dominant_agent_action(row)
-    confidence = safe_float(row.get("confidence", np.nan), 0.0)
-    reliability = safe_float(row.get("reliability", np.nan), 0.0)
-    old_words = {
-        "BUY": "I cast mine favor toward a BUY",
-        "SELL": "I counsel a SELL ere the tide turneth",
-        "HOLD": "Hold fast, good lords",
-        "WAIT": "Stay thy blade and WAIT",
-    }
-    reason = str(row.get("reason", "")).strip()
-    if len(reason) > 115:
-        reason = reason[:112] + "..."
-    return (
-        f"{old_words.get(action, 'I counsel patience')}; "
-        f"{profile['flair']} speaketh at {score * 100:.0f}% strength. "
-        f"Confidence {confidence * 100:.0f}%, reliability {reliability * 100:.0f}%. "
-        f"{reason}"
-    )
+def knight_dialogue(
+    row: pd.Series,
+    selected_product: str | None = None,
+) -> str:
+    return build_threaded_knight_dialogue(row, selected_product)
 
 
 def knight_position(index: int, total: int) -> tuple[float, float]:
@@ -732,20 +866,13 @@ def render_council_visual_representation(
     latest_decision = latest_council_decision(council_decisions, selected_product)
     latest_votes = latest_rows_by_agent(council_votes, selected_product)
 
-    if latest_decision is None and latest_votes.empty:
-        st.markdown(
-            """
-            <div class="council-stage"><div class="council-header"><div>
-              <div class="council-title">Council Visual Representation</div>
-              <div class="council-subtitle">The round table awaits council_votes.csv and council_decisions.csv.</div>
-            </div><div class="council-decision-pill">Awaiting the first council session</div></div></div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    decision_action = decision_strategy = decision_bucket = "—"
-    decision_reason = ""
+    decision_action = "WAIT"
+    decision_strategy = "MARKET_WATCH"
+    decision_bucket = "COMMENTARY"
+    decision_reason = (
+        "The council is watching the field and arguing from current evidence; "
+        "no live council decision hath yet been logged."
+    )
     final_buy = buy_threshold = truth_score = position_pct = np.nan
     if latest_decision is not None:
         decision_action = html.escape(str(latest_decision.get("action", "—")))
@@ -758,10 +885,7 @@ def render_council_visual_representation(
         position_pct = latest_decision.get("recommended_position_pct", np.nan)
 
     if latest_votes.empty:
-        latest_votes = pd.DataFrame([{
-            "agent": "truth", "adjusted_wait_score": 1.0, "confidence": 0.0,
-            "reliability": 0.0, "reason": "No votes yet.",
-        }])
+        latest_votes = synthetic_council_vote_rows(selected_product)
 
     order = ["trend", "mean_reversion", "breakout", "ai_outcome", "risk",
              "execution", "product_health", "truth"]
@@ -770,6 +894,29 @@ def render_council_visual_representation(
         {agent: index for index, agent in enumerate(order)}
     ).fillna(99)
     latest_votes = latest_votes.sort_values("_agent_order").head(8)
+
+    expected_agents = [
+        "trend",
+        "mean_reversion",
+        "breakout",
+        "ai_outcome",
+        "risk",
+        "execution",
+        "product_health",
+        "truth",
+    ]
+
+    existing_agents = set(latest_votes["agent"].astype(str).tolist())
+    missing_agents = [a for a in expected_agents if a not in existing_agents]
+
+    if missing_agents:
+        fallback = synthetic_council_vote_rows(selected_product)
+        fallback = fallback[fallback["agent"].astype(str).isin(missing_agents)]
+        latest_votes = pd.concat([latest_votes, fallback], ignore_index=True)
+        latest_votes["_agent_order"] = latest_votes["agent"].astype(str).map(
+            {agent: index for index, agent in enumerate(expected_agents)}
+        ).fillna(99)
+        latest_votes = latest_votes.sort_values("_agent_order").head(8)
 
     strongest_agent = ""
     strongest_score = -1.0
@@ -793,7 +940,7 @@ def render_council_visual_representation(
               <div><div class="knight-name">{html.escape(profile["name"])}</div>
               <div class="knight-role">{html.escape(profile["role"])}</div></div>
             </div>
-            <div class="knight-bubble">{html.escape(knight_dialogue(row))}</div>
+            <div class="knight-bubble">{html.escape(knight_dialogue(row, selected_product))}</div>
             <div class="knight-stats">
               <div class="knight-stat">Vote <b>{html.escape(action)}</b></div>
               <div class="knight-stat">Score <b>{score * 100:.0f}%</b></div>
@@ -1434,13 +1581,11 @@ def render_live_dashboard() -> None:
     )
 
     if show_council_visual:
-        # Use the latest decision product if no coin has been selected yet.
         visual_product = None
+
         if not council_decisions.empty and "product_id" in council_decisions.columns:
             try:
-                visual_product = str(
-                    council_decisions.sort_values("ts").iloc[-1].get("product_id", "")
-                )
+                visual_product = str(council_decisions.sort_values("ts").iloc[-1].get("product_id", ""))
             except Exception:
                 visual_product = None
 

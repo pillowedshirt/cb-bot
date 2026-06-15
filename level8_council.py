@@ -38,20 +38,22 @@ class Level8Council:
     """Outcome-adaptive council with an 80% maximum portfolio deployment."""
 
     def __init__(self) -> None:
-        self.base_buy_threshold = 0.58
-        self.base_sell_threshold = 0.55
+        # Lenient learning-mode thresholds.
+        # The council starts permissive so it generates real outcomes to learn from.
+        self.base_buy_threshold = 0.36
+        self.base_sell_threshold = 0.52
 
-        self.min_buy_threshold = 0.46
-        self.max_buy_threshold = 0.78
-        self.min_sell_threshold = 0.46
-        self.max_sell_threshold = 0.76
+        self.min_buy_threshold = 0.24
+        self.max_buy_threshold = 0.72
+        self.min_sell_threshold = 0.40
+        self.max_sell_threshold = 0.74
 
         self.max_agent_adjustment = 0.25
         self.min_agent_reliability = 0.25
         self.max_agent_reliability = 1.50
 
-        self.min_truth_to_trade = 0.35
-        self.min_truth_to_core_trade = 0.50
+        self.min_truth_to_trade = 0.12
+        self.min_truth_to_core_trade = 0.25
 
         # Portfolio allocation model.
         # The only hard spending ceiling is 80% deployed / 20% reserve.
@@ -89,8 +91,9 @@ class Level8Council:
             recent = frame.tail(20)
             big_misses = int((recent["move_bps"] >= 120.0).sum())
             huge_misses = int((recent["move_bps"] >= 250.0).sum())
-            relief = big_misses * 0.008 + huge_misses * 0.014
-            return clamp(relief, 0.0, 0.12)
+            # Missed jumps should strongly teach the council that it was too strict.
+            relief = big_misses * 0.018 + huge_misses * 0.030
+            return clamp(relief, 0.0, 0.20)
         except Exception:
             return 0.0
 
@@ -361,13 +364,13 @@ class Level8Council:
         risk_mode_u = str(risk_mode).upper()
 
         if risk_mode_u == "DEFENSIVE":
-            buy += 0.08
-            sell += 0.03
-        elif risk_mode_u == "CAUTIOUS":
-            buy += 0.04
+            buy += 0.03
             sell += 0.02
+        elif risk_mode_u == "CAUTIOUS":
+            buy += 0.015
+            sell += 0.01
         elif risk_mode_u == "AGGRESSIVE":
-            buy -= 0.05
+            buy -= 0.06
             sell -= 0.02
 
         n = float(product_stats.get("n", 0.0))
@@ -377,10 +380,11 @@ class Level8Council:
 
         if n >= 10:
             if wr < 0.38 or avg < -60:
-                buy += 0.08
-                sell += 0.03
-            elif wr > 0.62 and avg > 35:
-                buy -= 0.06
+                # Still tighten after bad learning outcomes, but do not shut down learning.
+                buy += 0.035
+                sell += 0.02
+            elif wr > 0.58 and avg > 20:
+                buy -= 0.07
                 sell -= 0.02
 
         if n >= 20:
@@ -438,8 +442,10 @@ class Level8Council:
             0.0,
             1.0,
         )
+        # Truth modulates the score, but learning mode should not let low early sample
+        # quality completely suppress all buys.
         final_buy = clamp(
-            combined["adj_buy"] * (0.65 + truth_score * 0.35),
+            combined["adj_buy"] * (0.85 + truth_score * 0.15),
             0.0,
             1.0,
         )
@@ -457,7 +463,7 @@ class Level8Council:
             risk_mode=thresholds["risk_mode"],
         )
 
-        if final_buy >= buy_threshold and bucket in ("TEST", "CORE"):
+        if bucket in ("TEST", "CORE"):
             action = "ALLOW_BUY"
         elif final_buy >= buy_threshold and bucket == "SHADOW":
             action = "SHADOW"
@@ -493,8 +499,16 @@ class Level8Council:
         """
         margin = float(final_buy_score) - float(threshold)
 
-        if margin < 0:
-            return "SHADOW", 0.0, "below_threshold_shadow_only"
+        if margin < -0.08:
+            return "SHADOW", 0.0, "far_below_threshold_shadow_only"
+
+        # Allow tiny below-threshold learning trades if truth is not completely absent.
+        if margin < 0 and truth_score >= self.min_truth_to_trade:
+            pct = self.test_bucket_trade_pct
+            return "TEST", pct, (
+                f"slightly_below_threshold_learning_test margin={margin:.3f};"
+                f"truth={truth_score:.3f}"
+            )
 
         if truth_score < self.min_truth_to_trade:
             return "SHADOW", 0.0, "truth_below_live_trade_min"

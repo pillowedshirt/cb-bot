@@ -102,6 +102,13 @@ def append_sqlite_event(
 
 
 def append_csv_row(path: str, columns: list[str], row: Dict[str, Any]) -> None:
+    """
+    Append a CSV row and mirror only high-value Level 8 events to SQLite.
+
+    Do NOT mirror high-frequency agent_adjustments / agent_leaderboard rows to
+    SQLite on every vote. Those rows are useful in CSV for the viewer, but they
+    can overwhelm the bot if every agent vote opens SQLite and writes a row.
+    """
     exists = os.path.exists(path) and os.path.getsize(path) > 0
 
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -112,8 +119,20 @@ def append_csv_row(path: str, columns: list[str], row: Dict[str, Any]) -> None:
 
         writer.writerow([row.get(column, "") for column in columns])
 
+    basename = os.path.basename(path)
+
+    # Keep SQLite for higher-value event ledgers.
+    # Skip the very noisy per-vote adjustment/leaderboard telemetry.
+    noisy_sqlite_skip = {
+        "agent_adjustments.csv",
+        "agent_leaderboard.csv",
+    }
+
+    if basename in noisy_sqlite_skip:
+        return
+
     append_sqlite_event(
-        event_type=os.path.splitext(os.path.basename(path))[0],
+        event_type=os.path.splitext(basename)[0],
         source_path=path,
         row=row,
     )
@@ -186,6 +205,12 @@ class Level8Council:
         self._agent_leaderboard_cache: Dict[str, Dict[str, float]] = {}
         self._agent_leaderboard_cache_ts: float = 0.0
         self._agent_leaderboard_cache_sec: float = 60.0
+        # Lightweight in-process caches prevent every agent vote from re-reading
+        # the same large CSV files over and over.
+        self._csv_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+        self._outcome_stats_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, float]]] = {}
+        self._csv_cache_sec: float = 20.0
+        self._outcome_stats_cache_sec: float = 20.0
 
     def _neutral_stats(self, reason: str = "no_matching_data") -> Dict[str, float]:
         return {
@@ -200,12 +225,47 @@ class Level8Council:
             "reason": reason,
         }
 
+    def _read_csv_cached(self, path: str, *, ttl_sec: Optional[float] = None) -> pd.DataFrame:
+        """
+        Read a CSV with a short TTL cache.
+
+        Level 8 calls outcome stats many times per evaluation. Without this cache,
+        every agent vote repeatedly re-reads agent_performance.csv,
+        council_observation_outcomes.csv, trades.csv, and missed_opportunities.csv.
+        """
+        try:
+            ttl = float(ttl_sec if ttl_sec is not None else self._csv_cache_sec)
+            now_value = utc_ts()
+
+            cached = self._csv_cache.get(path)
+
+            if cached is not None:
+                cached_ts, cached_frame = cached
+                if now_value - float(cached_ts) <= ttl:
+                    return cached_frame.copy()
+
+            if not os.path.exists(path):
+                frame = pd.DataFrame()
+            else:
+                frame = pd.read_csv(path)
+
+            self._csv_cache[path] = (now_value, frame.copy())
+            return frame.copy()
+
+        except Exception:
+            return pd.DataFrame()
+
+    def _clear_level8_memory_cache(self) -> None:
+        """Clear short-lived caches after heavy learning updates if needed."""
+        self._csv_cache = {}
+        self._outcome_stats_cache = {}
+
     def _missed_opportunity_relief(self, product_id: str) -> float:
         """Reduce strictness after repeated WAIT/SHADOW decisions missed jumps."""
         try:
             if not os.path.exists(MISSED_OPPORTUNITIES_CSV):
                 return 0.0
-            frame = pd.read_csv(MISSED_OPPORTUNITIES_CSV)
+            frame = self._read_csv_cached(MISSED_OPPORTUNITIES_CSV, ttl_sec=20.0)
             if frame.empty or "product_id" not in frame.columns:
                 return 0.0
             frame = frame[
@@ -227,19 +287,20 @@ class Level8Council:
 
     def _recent_trades(self, lookback_rows: int = 80) -> pd.DataFrame:
         """Return recent trades, tolerating absent or malformed history."""
-        try:
-            if not os.path.exists(TRADES_CSV):
-                return pd.DataFrame()
-            trades = pd.read_csv(TRADES_CSV)
-        except Exception:
-            return pd.DataFrame()
+        trades = self._read_csv_cached(TRADES_CSV, ttl_sec=20.0)
 
         if trades.empty:
             return pd.DataFrame()
-        if "ts" in trades.columns:
-            trades["ts"] = pd.to_numeric(trades["ts"], errors="coerce")
-            trades = trades.sort_values("ts")
-        return trades.tail(lookback_rows).copy()
+
+        try:
+            if "ts" in trades.columns:
+                trades["ts"] = pd.to_numeric(trades["ts"], errors="coerce")
+                trades = trades.sort_values("ts")
+
+            return trades.tail(lookback_rows).copy()
+
+        except Exception:
+            return pd.DataFrame()
 
     def session_health(self) -> Dict[str, Any]:
         """Summarize session outcomes without imposing a hard pause mode."""
@@ -348,11 +409,25 @@ class Level8Council:
         - Missing agent/product/strategy data returns neutral stats instead of silently
           falling back to broad unrelated data.
         """
+        cache_key = (
+            str(agent) if agent is not None else "",
+            str(product_id) if product_id is not None else "",
+            str(strategy) if strategy is not None else "",
+        )
+
+        now_value = utc_ts()
+        cached_stats = self._outcome_stats_cache.get(cache_key)
+
+        if cached_stats is not None:
+            cached_ts, cached_result = cached_stats
+            if now_value - float(cached_ts) <= float(self._outcome_stats_cache_sec):
+                return dict(cached_result)
+
         frames = []
 
         try:
             if os.path.exists(AGENT_PERFORMANCE_CSV):
-                perf = pd.read_csv(AGENT_PERFORMANCE_CSV)
+                perf = self._read_csv_cached(AGENT_PERFORMANCE_CSV, ttl_sec=20.0)
 
                 if not perf.empty:
                     perf = perf.rename(columns={
@@ -371,7 +446,7 @@ class Level8Council:
 
         try:
             if os.path.exists(COUNCIL_OBSERVATION_OUTCOMES_CSV):
-                obs = pd.read_csv(COUNCIL_OBSERVATION_OUTCOMES_CSV)
+                obs = self._read_csv_cached(COUNCIL_OBSERVATION_OUTCOMES_CSV, ttl_sec=20.0)
 
                 if not obs.empty:
                     obs = obs.rename(columns={
@@ -504,7 +579,7 @@ class Level8Council:
         real_trade_n = float(source.isin(["real_trade", "trade_outcome", "sell_outcome"]).sum())
         observation_n = float(source.isin(["level8_observation", "observation_outcome"]).sum())
 
-        return {
+        result = {
             "n": float(len(data)),
             "win_rate": weighted_success,
             "avg_move": weighted_move,
@@ -515,6 +590,9 @@ class Level8Council:
             "observation_n": observation_n,
             "reason": "weighted_stats",
         }
+
+        self._outcome_stats_cache[cache_key] = (now_value, dict(result))
+        return result
 
     def _leaderboard_bonus_penalty(
         self,
@@ -557,7 +635,7 @@ class Level8Council:
             if not os.path.exists(AGENT_PERFORMANCE_CSV):
                 return
 
-            frame = pd.read_csv(AGENT_PERFORMANCE_CSV)
+            frame = self._read_csv_cached(AGENT_PERFORMANCE_CSV, ttl_sec=30.0)
 
             if frame.empty or "agent" not in frame.columns:
                 return

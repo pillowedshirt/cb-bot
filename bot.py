@@ -249,8 +249,15 @@ LEVEL8_AGENT_CREDIT_MAX_SCORE: float = 1.0
 # This makes the Level 8 council evaluate current market conditions even when
 # nothing passes the normal buy gate, so the viewer always has council dialogue.
 LEVEL8_ENABLE_COUNCIL_HEARTBEAT: bool = True
-LEVEL8_COUNCIL_HEARTBEAT_EVERY_SEC: float = 8.0
-LEVEL8_COUNCIL_HEARTBEAT_MAX_PRODUCTS: int = 15
+# The heartbeat is only viewer commentary / learning telemetry.
+# Keep it lighter than the live buy-evaluation loop.
+LEVEL8_COUNCIL_HEARTBEAT_EVERY_SEC: float = 20.0
+LEVEL8_COUNCIL_HEARTBEAT_MAX_PRODUCTS: int = 3
+
+# Heavy learning update cadence.
+# Agent-performance updates read/join large CSVs. Keep them frequent enough to
+# learn, but not so frequent that they stall live trading.
+LEVEL8_AGENT_PERFORMANCE_UPDATE_EVERY_SEC: float = 180.0
 
 # Active mode. No observe-only staged approach.
 LEVEL8_MODE: str = "FILTER_AND_SIZE"
@@ -7969,7 +7976,8 @@ class TradingBot:
                 )
 
                 decision_id = str(level8_info.get("decision_id", ""))
-                action = str(level8_info.get("action", "WAIT"))
+                raw_action = str(level8_info.get("action", "WAIT"))
+                action = "COMMENTARY"
                 strategy = str(
                     level8_info.get(
                         "strategy",
@@ -8012,6 +8020,7 @@ class TradingBot:
                     confidence=confidence,
                     reason=(
                         f"heartbeat_only=True;"
+                        f"raw_level8_action={raw_action};"
                         f"why_not_ready={candidate.get('why_not_ready', '')};"
                         f"{reason}"
                     ),
@@ -8042,6 +8051,7 @@ class TradingBot:
                     action="commentary",
                     reason=(
                         f"heartbeat_only=True;"
+                        f"raw_level8_action={raw_action};"
                         f"decision={action};"
                         f"strategy={strategy};"
                         f"bucket={bucket};"
@@ -11305,11 +11315,26 @@ class TradingBot:
                 self._review_level8_missed_opportunities()
             if (
                 ENABLE_LEVEL8_COUNCIL
-                and ts_now - float(self.last_agent_performance_update_ts) >= 60.0
+                and ts_now - float(self.last_agent_performance_update_ts)
+                >= float(LEVEL8_AGENT_PERFORMANCE_UPDATE_EVERY_SEC)
             ):
                 self.last_agent_performance_update_ts = ts_now
-                self._classify_level8_sell_outcomes()
-                self._append_agent_performance_from_outcomes()
+
+                try:
+                    self._classify_level8_sell_outcomes()
+                except Exception as exc:
+                    log_exception("level8 sell outcome classification failed", exc)
+
+                try:
+                    self._append_agent_performance_from_outcomes()
+                except Exception as exc:
+                    log_exception("level8 agent performance update failed", exc)
+
+                try:
+                    if self.level8_council is not None and hasattr(self.level8_council, "_clear_level8_memory_cache"):
+                        self.level8_council._clear_level8_memory_cache()
+                except Exception:
+                    pass
             self._maybe_train_ai_brain()
             loop_gap = ts_now - float(self.last_loop_lag_check_ts or ts_now)
             if loop_gap > EVENT_LOOP_LAG_WARN_SEC:
@@ -11719,97 +11744,119 @@ class TradingBot:
             if ENABLE_LEVEL8_COUNCIL and candidates:
                 level8_filtered_candidates: List[Dict[str, Any]] = []
                 pre_level8_candidate_count = int(buy_ready_count or len(candidates))
+
+                log(
+                    f"[level8-filter] starting direct candidate review "
+                    f"count={len(candidates)} pre_count={pre_level8_candidate_count}"
+                )
+
                 for candidate in candidates:
                     product_id_l8 = str(candidate.get("product_id", ""))
-                    candidate["manager_strategy"] = str(
-                        candidate.get("level8_strategy")
-                        or candidate.get("manager_strategy")
-                        or candidate.get("entry_reason")
-                        or "LEVEL8_DIRECT"
-                    )
-                    level8_ok, level8_info = self._level8_decision_for_candidate(
-                        candidate=candidate
-                    )
-                    candidate["level8_ok"] = bool(level8_ok)
-                    candidate["level8_action"] = level8_info.get("action", "")
-                    candidate["level8_strategy"] = level8_info.get("strategy", "")
-                    candidate["level8_bucket"] = level8_info.get("bucket", "")
-                    candidate["level8_risk_mode"] = level8_info.get("risk_mode", "")
-                    candidate["level8_decision_id"] = level8_info.get("decision_id", "")
-                    candidate["level8_truth_score"] = float(
-                        level8_info.get("truth_score", 0.0) or 0.0
-                    )
-                    candidate["level8_final_buy_score"] = float(
-                        level8_info.get("final_buy_score", 0.0) or 0.0
-                    )
-                    candidate["level8_buy_threshold"] = float(
-                        level8_info.get("buy_threshold", 0.0) or 0.0
-                    )
-                    candidate["level8_recommended_position_pct"] = float(
-                        level8_info.get("recommended_position_pct", 0.0) or 0.0
-                    )
-                    candidate["level8_reason"] = str(level8_info.get("reason", ""))
-                    self._append_level8_decision_snapshot(
-                        product_id=product_id_l8,
-                        decision_id=str(level8_info.get("decision_id", "")),
-                        action=str(level8_info.get("action", "WAIT")),
-                        strategy=str(level8_info.get("strategy", "")),
-                        bucket=str(level8_info.get("bucket", "")),
-                        risk_mode=str(
-                            level8_info.get("risk_mode", "NORMAL")
-                        ),
-                        truth_score=float(
-                            level8_info.get("truth_score", 0.0) or 0.0
-                        ),
-                        final_buy_score=float(
-                            level8_info.get("final_buy_score", 0.0) or 0.0
-                        ),
-                        final_sell_score=0.0,
-                        buy_threshold=float(
-                            level8_info.get("buy_threshold", 0.0) or 0.0
-                        ),
-                        sell_threshold=0.0,
-                        recommended_position_pct=float(
-                            level8_info.get(
-                                "recommended_position_pct", 0.0
-                            )
-                            or 0.0
-                        ),
-                        confidence=float(
-                            level8_info.get("confidence", 0.0) or 0.0
-                        ),
-                        reason=str(level8_info.get("reason", "")),
-                    )
+
                     try:
-                        self.signal_events_log.log_event(
-                            event_type="level8_council_decision",
-                            trade_id=level8_info.get("decision_id", ""),
+                        decision_start_ts = now_ts()
+
+                        candidate["manager_strategy"] = str(
+                            candidate.get("level8_strategy")
+                            or candidate.get("manager_strategy")
+                            or candidate.get("entry_reason")
+                            or "LEVEL8_DIRECT"
+                        )
+
+                        level8_ok, level8_info = self._level8_decision_for_candidate(
+                            candidate=candidate
+                        )
+
+                        elapsed = now_ts() - float(decision_start_ts)
+
+                        if elapsed >= 3.0:
+                            log(
+                                f"[level8-filter] slow decision product={product_id_l8} "
+                                f"elapsed={elapsed:.3f}s action={level8_info.get('action', '')}"
+                            )
+
+                        candidate["level8_ok"] = bool(level8_ok)
+                        candidate["level8_action"] = level8_info.get("action", "")
+                        candidate["level8_strategy"] = level8_info.get("strategy", "")
+                        candidate["level8_bucket"] = level8_info.get("bucket", "")
+                        candidate["level8_risk_mode"] = level8_info.get("risk_mode", "")
+                        candidate["level8_decision_id"] = level8_info.get("decision_id", "")
+                        candidate["level8_truth_score"] = float(
+                            level8_info.get("truth_score", 0.0) or 0.0
+                        )
+                        candidate["level8_final_buy_score"] = float(
+                            level8_info.get("final_buy_score", 0.0) or 0.0
+                        )
+                        candidate["level8_buy_threshold"] = float(
+                            level8_info.get("buy_threshold", 0.0) or 0.0
+                        )
+                        candidate["level8_recommended_position_pct"] = float(
+                            level8_info.get("recommended_position_pct", 0.0) or 0.0
+                        )
+                        candidate["level8_reason"] = str(level8_info.get("reason", ""))
+
+                        self._append_level8_decision_snapshot(
                             product_id=product_id_l8,
-                            rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
-                            buy_ready_count=pre_level8_candidate_count,
-                            score=f"{float(candidate.get('score', 0.0)):.6f}",
-                            probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
-                            ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
-                            projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
-                            cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
-                            spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
-                            action="keep" if level8_ok else "reject",
-                            reason=level8_info.get("reason", ""),
+                            decision_id=str(level8_info.get("decision_id", "")),
+                            action=str(level8_info.get("action", "WAIT")),
+                            strategy=str(level8_info.get("strategy", "")),
+                            bucket=str(level8_info.get("bucket", "")),
+                            risk_mode=str(level8_info.get("risk_mode", "NORMAL")),
+                            truth_score=float(level8_info.get("truth_score", 0.0) or 0.0),
+                            final_buy_score=float(level8_info.get("final_buy_score", 0.0) or 0.0),
+                            final_sell_score=0.0,
+                            buy_threshold=float(level8_info.get("buy_threshold", 0.0) or 0.0),
+                            sell_threshold=0.0,
+                            recommended_position_pct=float(
+                                level8_info.get("recommended_position_pct", 0.0) or 0.0
+                            ),
+                            confidence=float(level8_info.get("confidence", 0.0) or 0.0),
+                            reason=str(level8_info.get("reason", "")),
                         )
-                    except Exception:
-                        pass
-                    if level8_ok:
-                        level8_filtered_candidates.append(candidate)
-                    else:
-                        log(
-                            f"[level8] blocked {product_id_l8}: "
-                            f"action={level8_info.get('action')} "
-                            f"bucket={level8_info.get('bucket')} "
-                            f"reason={level8_info.get('reason')}"
-                        )
+
+                        try:
+                            self.signal_events_log.log_event(
+                                event_type="level8_council_decision",
+                                trade_id=level8_info.get("decision_id", ""),
+                                product_id=product_id_l8,
+                                rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
+                                buy_ready_count=pre_level8_candidate_count,
+                                score=f"{float(candidate.get('score', 0.0)):.6f}",
+                                probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
+                                ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                                projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
+                                cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
+                                spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
+                                action="keep" if level8_ok else "reject",
+                                reason=level8_info.get("reason", ""),
+                            )
+                        except Exception:
+                            pass
+
+                        if level8_ok:
+                            level8_filtered_candidates.append(candidate)
+                        else:
+                            log(
+                                f"[level8] blocked {product_id_l8}: "
+                                f"action={level8_info.get('action')} "
+                                f"bucket={level8_info.get('bucket')} "
+                                f"reason={level8_info.get('reason')}"
+                            )
+
+                    except Exception as exc:
+                        # One broken Level 8 candidate should not kill the whole bot.
+                        log_exception(f"level8 direct candidate failed product={product_id_l8}", exc)
+                        continue
+
                 candidates = level8_filtered_candidates
+
                 for c in candidates:
                     c["buy_ready_count"] = pre_level8_candidate_count
+
+                log(
+                    f"[level8-filter] finished direct candidate review "
+                    f"selectable={len(candidates)} pre_count={pre_level8_candidate_count}"
+                )
 
             safe_buy_ready_count = int(buy_ready_count or 0)
 
@@ -11831,6 +11878,11 @@ class TradingBot:
                     f"[buy-candidates] buy_ready={safe_buy_ready_count} "
                     f"selectable=0"
                 )
+
+            log(
+                f"[eval-loop] after Level 8 filter "
+                f"buy_ready={safe_buy_ready_count} selectable={len(candidates)}"
+            )
 
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
             max_deploy_this_eval = (
@@ -11870,6 +11922,12 @@ class TradingBot:
                     if ENABLE_MULTI_CANDIDATE_BUYS
                     else ai_filtered_candidates[:1]
                 )
+
+            log(
+                f"[buy-loop] candidate_slice={len(candidate_slice)} "
+                f"ai_filtered={len(ai_filtered_candidates)} "
+                f"timed={len(timed_candidates)}"
+            )
 
             if ENABLE_INVERTED_STOPLOSS_CYCLE:
                 for candidate in ai_filtered_candidates:

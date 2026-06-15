@@ -183,6 +183,9 @@ class Level8Council:
         self.core_bucket_pct = 0.70
 
         self.last_summary: Dict[str, Any] = {}
+        self._agent_leaderboard_cache: Dict[str, Dict[str, float]] = {}
+        self._agent_leaderboard_cache_ts: float = 0.0
+        self._agent_leaderboard_cache_sec: float = 60.0
 
     def _neutral_stats(self, reason: str = "no_matching_data") -> Dict[str, float]:
         return {
@@ -385,16 +388,30 @@ class Level8Council:
             trades = self._recent_trades(240)
 
             if not trades.empty:
-                if "net_pnl_usd" in trades.columns:
+                # Do not treat dollar P&L as basis points. Use true move_bps when
+                # available, derive it from entry/exit prices when possible, and
+                # reserve dollar P&L for win/loss classification.
+                if "move_bps" in trades.columns:
                     trades["move_bps"] = pd.to_numeric(
-                        trades["net_pnl_usd"], errors="coerce"
+                        trades["move_bps"], errors="coerce"
                     ).fillna(0.0)
-                elif "move_bps" not in trades.columns:
+                elif "entry_price" in trades.columns and "exit_price" in trades.columns:
+                    entry_px = pd.to_numeric(trades["entry_price"], errors="coerce")
+                    exit_px = pd.to_numeric(trades["exit_price"], errors="coerce")
+                    trades["move_bps"] = (((exit_px / entry_px) - 1.0) * 10000.0).replace(
+                        [pd.NA, pd.NaT, float("inf"), float("-inf")],
+                        0.0,
+                    ).fillna(0.0)
+                else:
                     trades["move_bps"] = 0.0
 
-                trades["success"] = (
-                    pd.to_numeric(trades["move_bps"], errors="coerce").fillna(0.0) > 0
-                ).astype(int)
+                if "net_pnl_usd" in trades.columns:
+                    pnl = pd.to_numeric(trades["net_pnl_usd"], errors="coerce").fillna(0.0)
+                    trades["success"] = (pnl > 0.0).astype(int)
+                else:
+                    trades["success"] = (
+                        pd.to_numeric(trades["move_bps"], errors="coerce").fillna(0.0) > 0.0
+                    ).astype(int)
 
                 trades["source"] = "real_trade"
                 frames.append(trades)
@@ -466,6 +483,7 @@ class Level8Council:
         source_weight = source.map({
             "real_trade": 1.00,
             "trade_outcome": 1.00,
+            "sell_outcome": 1.00,
             "agent_performance": 0.80,
             "level8_observation": 0.45,
             "observation_outcome": 0.35,
@@ -483,7 +501,7 @@ class Level8Council:
             weighted_move = 0.0
             weighted_adverse = 0.0
 
-        real_trade_n = float(source.isin(["real_trade", "trade_outcome"]).sum())
+        real_trade_n = float(source.isin(["real_trade", "trade_outcome", "sell_outcome"]).sum())
         observation_n = float(source.isin(["level8_observation", "observation_outcome"]).sum())
 
         return {
@@ -498,81 +516,150 @@ class Level8Council:
             "reason": "weighted_stats",
         }
 
-    def _agent_competition_score(self, agent: str) -> Dict[str, float]:
-        """Give each council member a bounded competitive score."""
-        neutral = {
-            "leaderboard_rank": 999.0,
-            "leaderboard_score": 0.5,
-            "leader_bonus": 0.0,
-            "leader_penalty": 0.0,
-            "sample_size": 0.0,
-        }
+    def _leaderboard_bonus_penalty(
+        self,
+        *,
+        rank: float,
+        score: float,
+        sample_size: float,
+    ) -> Tuple[float, float]:
+        """Convert leaderboard rank into a bounded influence adjustment."""
+        leader_bonus = 0.0
+        leader_penalty = 0.0
+
+        if sample_size >= 25:
+            if rank == 1 and score > 0.58:
+                leader_bonus = 0.060
+            elif rank <= 3 and score > 0.55:
+                leader_bonus = 0.035
+            elif score < 0.45:
+                leader_penalty = 0.050
+            elif score < 0.49:
+                leader_penalty = 0.025
+
+        return leader_bonus, leader_penalty
+
+    def _refresh_agent_leaderboard_cache(self, *, force: bool = False) -> None:
+        """Rebuild and log the competitive leaderboard at most once per cache window."""
+        now_value = utc_ts()
+
+        if (
+            not force
+            and self._agent_leaderboard_cache
+            and now_value - float(self._agent_leaderboard_cache_ts) < float(self._agent_leaderboard_cache_sec)
+        ):
+            return
+
+        self._agent_leaderboard_cache_ts = now_value
+        self._agent_leaderboard_cache = {}
+
         try:
             if not os.path.exists(AGENT_PERFORMANCE_CSV):
-                return neutral
+                return
 
             frame = pd.read_csv(AGENT_PERFORMANCE_CSV)
-            if frame.empty or "agent" not in frame.columns or "agent_credit_score" not in frame.columns:
-                return neutral
 
-            credit_col = "weighted_agent_credit_score" if "weighted_agent_credit_score" in frame.columns else "agent_credit_score"
+            if frame.empty or "agent" not in frame.columns:
+                return
+
+            credit_col = (
+                "weighted_agent_credit_score"
+                if "weighted_agent_credit_score" in frame.columns
+                else "agent_credit_score"
+            )
+
+            if credit_col not in frame.columns:
+                return
+
             frame[credit_col] = pd.to_numeric(frame[credit_col], errors="coerce").fillna(0.5)
-            source = frame["outcome_source"].astype(str) if "outcome_source" in frame.columns else pd.Series("unknown", index=frame.index)
+
+            if "outcome_source" in frame.columns:
+                source = frame["outcome_source"].astype(str)
+            else:
+                source = pd.Series("unknown", index=frame.index)
+
             frame["_source_weight"] = source.map({
                 "trade_outcome": 1.00,
                 "real_trade": 1.00,
+                "sell_outcome": 1.00,
+                "agent_performance": 0.80,
                 "observation_outcome": 0.40,
                 "level8_observation": 0.40,
                 "unknown": 0.35,
             }).fillna(0.35).astype(float)
 
             rows = []
+
             for name, group in frame.groupby(frame["agent"].astype(str)):
-                n = float(len(group))
-                if n <= 0:
+                sample_size = float(len(group))
+
+                if sample_size <= 0:
                     continue
+
                 weighted_credit = float(
                     (group[credit_col] * group["_source_weight"]).sum()
                     / max(group["_source_weight"].sum(), 1e-9)
                 )
+
                 recent = group.tail(50)
-                recent_credit = float(recent[credit_col].mean()) if not recent.empty else weighted_credit
-                sample_factor = clamp(n / 30.0, 0.0, 1.0)
+                recent_credit = (
+                    float(recent[credit_col].mean())
+                    if not recent.empty
+                    else weighted_credit
+                )
+
+                sample_factor = clamp(sample_size / 50.0, 0.0, 1.0)
+
                 leaderboard_score = clamp(
-                    weighted_credit * 0.70 + recent_credit * 0.20 + sample_factor * 0.10,
+                    weighted_credit * 0.70
+                    + recent_credit * 0.20
+                    + sample_factor * 0.10,
                     0.0,
                     1.0,
                 )
+
                 rows.append({
                     "agent": str(name),
-                    "sample_size": n,
+                    "sample_size": sample_size,
                     "weighted_credit": weighted_credit,
                     "recent_credit": recent_credit,
                     "leaderboard_score": leaderboard_score,
                 })
 
             if not rows:
-                return neutral
+                return
 
-            board = pd.DataFrame(rows).sort_values("leaderboard_score", ascending=False).reset_index(drop=True)
+            board = (
+                pd.DataFrame(rows)
+                .sort_values("leaderboard_score", ascending=False)
+                .reset_index(drop=True)
+            )
             board["leaderboard_rank"] = board.index + 1
-            ts = utc_ts()
+
             for _, row in board.iterrows():
+                agent_name = str(row["agent"])
+                rank = float(row["leaderboard_rank"])
+                score = float(row["leaderboard_score"])
+                sample_size = float(row["sample_size"])
+                leader_bonus, leader_penalty = self._leaderboard_bonus_penalty(
+                    rank=rank,
+                    score=score,
+                    sample_size=sample_size,
+                )
+
+                record = {
+                    "leaderboard_rank": rank,
+                    "leaderboard_score": score,
+                    "leader_bonus": leader_bonus,
+                    "leader_penalty": leader_penalty,
+                    "sample_size": sample_size,
+                    "weighted_credit": float(row["weighted_credit"]),
+                    "recent_credit": float(row["recent_credit"]),
+                }
+
+                self._agent_leaderboard_cache[agent_name] = record
+
                 try:
-                    rank = float(row["leaderboard_rank"])
-                    score = float(row["leaderboard_score"])
-                    n = float(row["sample_size"])
-                    leader_bonus = 0.0
-                    leader_penalty = 0.0
-                    if n >= 10:
-                        if rank == 1 and score > 0.56:
-                            leader_bonus = 0.060
-                        elif rank <= 3 and score > 0.54:
-                            leader_bonus = 0.035
-                        elif score < 0.46:
-                            leader_penalty = 0.050
-                        elif score < 0.49:
-                            leader_penalty = 0.025
                     append_csv_row(
                         AGENT_LEADERBOARD_CSV,
                         [
@@ -581,18 +668,19 @@ class Level8Council:
                             "sample_size", "leader_bonus", "leader_penalty", "reason",
                         ],
                         {
-                            "ts": f"{ts:.6f}",
-                            "dt_utc": utc_dt(ts),
-                            "agent": str(row["agent"]),
+                            "ts": f"{now_value:.6f}",
+                            "dt_utc": utc_dt(now_value),
+                            "agent": agent_name,
                             "leaderboard_rank": f"{rank:.0f}",
                             "leaderboard_score": f"{score:.6f}",
                             "weighted_credit": f"{float(row['weighted_credit']):.6f}",
                             "recent_credit": f"{float(row['recent_credit']):.6f}",
-                            "sample_size": f"{n:.0f}",
+                            "sample_size": f"{sample_size:.0f}",
                             "leader_bonus": f"{leader_bonus:.6f}",
                             "leader_penalty": f"{leader_penalty:.6f}",
                             "reason": (
-                                f"competitive_agent_goal;rank={rank:.0f};score={score:.3f};"
+                                f"competitive_agent_goal_cached;"
+                                f"rank={rank:.0f};score={score:.3f};"
                                 f"bonus={leader_bonus:.3f};penalty={leader_penalty:.3f}"
                             ),
                         },
@@ -600,31 +688,24 @@ class Level8Council:
                 except Exception:
                     pass
 
-            own = board[board["agent"].astype(str) == str(agent)]
-            if own.empty:
-                return neutral
-            row = own.iloc[0]
-            rank = float(row["leaderboard_rank"])
-            score = float(row["leaderboard_score"])
-            n = float(row["sample_size"])
-            leader_bonus = 0.0
-            leader_penalty = 0.0
-            if n >= 10:
-                if rank == 1 and score > 0.56:
-                    leader_bonus = 0.060
-                elif rank <= 3 and score > 0.54:
-                    leader_bonus = 0.035
-                elif score < 0.46:
-                    leader_penalty = 0.050
-                elif score < 0.49:
-                    leader_penalty = 0.025
-            return {
-                "leaderboard_rank": rank,
-                "leaderboard_score": score,
-                "leader_bonus": leader_bonus,
-                "leader_penalty": leader_penalty,
-                "sample_size": n,
-            }
+        except Exception:
+            self._agent_leaderboard_cache = {}
+
+    def _agent_competition_score(self, agent: str) -> Dict[str, float]:
+        """Return the current competitive score for an agent."""
+        neutral = {
+            "leaderboard_rank": 999.0,
+            "leaderboard_score": 0.5,
+            "leader_bonus": 0.0,
+            "leader_penalty": 0.0,
+            "sample_size": 0.0,
+            "weighted_credit": 0.5,
+            "recent_credit": 0.5,
+        }
+
+        try:
+            self._refresh_agent_leaderboard_cache(force=False)
+            return dict(self._agent_leaderboard_cache.get(str(agent), neutral))
         except Exception:
             return neutral
 

@@ -7418,7 +7418,7 @@ class TradingBot:
 
         if should_log_buy_gate and ok_to_trade:
             log(
-                f"[buy-gate] {product_id} BUY_READY "
+                f"[legacy-signal-diagnostic] {product_id} BUY_READY "
                 f"mode={buy_gate_mode} "
                 f"diagnostics={diagnostic_note} "
                 f"calibrated={buy_gate_calibration_ready} "
@@ -7443,7 +7443,7 @@ class TradingBot:
             )
         elif should_log_buy_gate:
             log(
-                f"[buy-gate] {product_id} BLOCKED "
+                f"[legacy-signal-diagnostic] {product_id} BLOCKED "
                 f"mode={buy_gate_mode} "
                 f"blocker={buy_gate_blocker} "
                 f"diagnostics={diagnostic_note} "
@@ -11469,6 +11469,9 @@ class TradingBot:
 
             candidates = []
             council_watch_candidates: List[Dict[str, Any]] = []
+            # Level 8-direct mode no longer uses the old pre-Level-8 buy-ready gate.
+            # Keep a stable candidate counter for logging and signal_events rows.
+            buy_ready_count = 0
             for product_id in PRODUCTS:
                 tob = self.tob.get(product_id)
                 if REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY:
@@ -11659,28 +11662,63 @@ class TradingBot:
                 candidates = []
                 for watch_candidate in council_watch_candidates:
                     product_id_l8 = str(watch_candidate.get("product_id", ""))
+
                     if not product_id_l8:
                         continue
+
                     bid_l8 = float(watch_candidate.get("bid", 0.0) or 0.0)
                     ask_l8 = float(watch_candidate.get("ask", 0.0) or 0.0)
                     mid_l8 = float(watch_candidate.get("mid", 0.0) or 0.0)
                     spread_l8 = float(watch_candidate.get("spread_bps", 999.0) or 999.0)
-                    if bid_l8 <= 0 or ask_l8 <= 0 or mid_l8 <= 0 or ask_l8 < bid_l8 or spread_l8 > 250.0:
+
+                    # Mechanical quote sanity only.
+                    # Level 8 should judge the strategy quality after this point.
+                    if (
+                        bid_l8 <= 0
+                        or ask_l8 <= 0
+                        or mid_l8 <= 0
+                        or ask_l8 < bid_l8
+                        or spread_l8 > 250.0
+                    ):
                         continue
+
                     c = dict(watch_candidate)
                     c["manager_strategy"] = "LEVEL8_DIRECT"
-                    c["entry_reason"] = f"level8_direct_market_candidate;score={float(c.get('score',0.0)):.2f};prob={float(c.get('estimated_prob_up',0.0)):.3f};ev={float(c.get('expected_net_edge_bps',0.0)):.2f};spread={spread_l8:.2f}"
-                    c["heartbeat_only"], c["learning_candidate"] = False, True
-                    c["entry_timing_ok"], c["entry_timing_reason"] = True, "level8_direct_no_pre_l8_timing_gate"
-                    c["rank_score"] = float(c.get("score",0.0)) + float(c.get("expected_net_edge_bps",0.0))*0.03 + float(c.get("estimated_prob_up",0.0))*20.0
+                    c["entry_reason"] = (
+                        f"level8_direct_market_candidate;"
+                        f"score={float(c.get('score', 0.0)):.2f};"
+                        f"prob={float(c.get('estimated_prob_up', 0.0)):.3f};"
+                        f"ev={float(c.get('expected_net_edge_bps', 0.0)):.2f};"
+                        f"spread={spread_l8:.2f}"
+                    )
+                    c["heartbeat_only"] = False
+                    c["learning_candidate"] = True
+                    c["entry_timing_ok"] = True
+                    c["entry_timing_reason"] = "level8_direct_no_pre_l8_timing_gate"
+                    c["rank_score"] = (
+                        float(c.get("score", 0.0))
+                        + float(c.get("expected_net_edge_bps", 0.0)) * 0.03
+                        + float(c.get("estimated_prob_up", 0.0)) * 20.0
+                    )
+
                     candidates.append(c)
-                log(f"[level8-direct] direct market candidates={len(candidates)} from_watch={len(council_watch_candidates)}")
+
+                buy_ready_count = len(candidates)
+
+                for c in candidates:
+                    c["buy_ready_count"] = buy_ready_count
+
+                log(
+                    f"[level8-direct] direct market candidates={buy_ready_count} "
+                    f"from_watch={len(council_watch_candidates)}"
+                )
 
             if skip_new_buys_this_loop:
                 candidates = []
 
             if ENABLE_LEVEL8_COUNCIL and candidates:
                 level8_filtered_candidates: List[Dict[str, Any]] = []
+                pre_level8_candidate_count = int(buy_ready_count or len(candidates))
                 for candidate in candidates:
                     product_id_l8 = str(candidate.get("product_id", ""))
                     candidate["manager_strategy"] = str(
@@ -11748,7 +11786,7 @@ class TradingBot:
                             trade_id=level8_info.get("decision_id", ""),
                             product_id=product_id_l8,
                             rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
-                            buy_ready_count=len(candidates),
+                            buy_ready_count=pre_level8_candidate_count,
                             score=f"{float(candidate.get('score', 0.0)):.6f}",
                             probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
                             ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
@@ -11770,6 +11808,10 @@ class TradingBot:
                             f"reason={level8_info.get('reason')}"
                         )
                 candidates = level8_filtered_candidates
+                for c in candidates:
+                    c["buy_ready_count"] = pre_level8_candidate_count
+
+            safe_buy_ready_count = int(buy_ready_count or 0)
 
             if candidates:
                 top_preview = ", ".join(
@@ -11777,12 +11819,18 @@ class TradingBot:
                     f"score={float(candidate.get('score', 0.0)):.1f},"
                     f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f},"
                     f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.1f},"
-                    f"pct={float(candidate.get('position_pct', 0.0)):.3f})"
+                    f"l8_pct={float(candidate.get('level8_recommended_position_pct', candidate.get('position_pct', 0.0))):.3f})"
                     for candidate in candidates[:5]
                 )
-                log(f"[buy-candidates] buy_ready={buy_ready_count} selectable={len(candidates)} top={top_preview}")
+                log(
+                    f"[buy-candidates] buy_ready={safe_buy_ready_count} "
+                    f"selectable={len(candidates)} top={top_preview}"
+                )
             else:
-                log(f"[buy-candidates] buy_ready={buy_ready_count} selectable=0")
+                log(
+                    f"[buy-candidates] buy_ready={safe_buy_ready_count} "
+                    f"selectable=0"
+                )
 
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
             max_deploy_this_eval = (
@@ -11797,7 +11845,7 @@ class TradingBot:
                 candidate["entry_timing_reason"] = "level8_direct_timing_gate_removed"
                 timed_candidates.append(candidate)
                 try:
-                    self.signal_events_log.log_event(event_type="entry_timing_check", product_id=str(candidate.get("product_id", "")), rank_score=f"{float(candidate.get('rank_score',0.0)):.6f}", buy_ready_count=len(candidates), score=f"{float(candidate.get('score',0.0)):.6f}", probability=f"{float(candidate.get('estimated_prob_up',0.0)):.6f}", ev_bps=f"{float(candidate.get('expected_net_edge_bps',0.0)):.6f}", projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps',0.0)):.6f}", cost_bps=f"{float(candidate.get('cost_bps',0.0)):.6f}", spread_bps=f"{float(candidate.get('spread_bps',0.0)):.6f}", entry_timing_ok=True, entry_timing_reason="level8_direct_timing_gate_removed", action="keep", reason="timing is now a Level 8 council input, not a pre-Level-8 blocker")
+                    self.signal_events_log.log_event(event_type="entry_timing_check", product_id=str(candidate.get("product_id", "")), rank_score=f"{float(candidate.get('rank_score',0.0)):.6f}", buy_ready_count=safe_buy_ready_count, score=f"{float(candidate.get('score',0.0)):.6f}", probability=f"{float(candidate.get('estimated_prob_up',0.0)):.6f}", ev_bps=f"{float(candidate.get('expected_net_edge_bps',0.0)):.6f}", projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps',0.0)):.6f}", cost_bps=f"{float(candidate.get('cost_bps',0.0)):.6f}", spread_bps=f"{float(candidate.get('spread_bps',0.0)):.6f}", entry_timing_ok=True, entry_timing_reason="level8_direct_timing_gate_removed", action="keep", reason="timing is now a Level 8 council input, not a pre-Level-8 blocker")
                 except Exception:
                     pass
 
@@ -12012,7 +12060,8 @@ class TradingBot:
                 self.signal_events_log.log_event(
                     event_type="buy_attempt", trade_id=trade_id, product_id=product_id,
                     rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
-                    buy_ready_count=buy_ready_count, score=f"{float(candidate.get('score', 0.0)):.6f}",
+                    buy_ready_count=int(candidate.get("buy_ready_count", safe_buy_ready_count) or 0),
+                    score=f"{float(candidate.get('score', 0.0)):.6f}",
                     probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
                     ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
                     projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",

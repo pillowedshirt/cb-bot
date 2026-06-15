@@ -32,6 +32,12 @@ TRADE_OUTCOMES_CSV = os.path.join(BASE_DIR, "trade_outcomes.csv")
 RECONCILIATION_CSV = os.path.join(BASE_DIR, "reconciliation.csv")
 AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
 MANAGER_STATUS_CSV = os.path.join(BASE_DIR, "manager_status.csv")
+COUNCIL_VOTES_CSV = os.path.join(BASE_DIR, "council_votes.csv")
+COUNCIL_DECISIONS_CSV = os.path.join(BASE_DIR, "council_decisions.csv")
+AGENT_PERFORMANCE_CSV = os.path.join(BASE_DIR, "agent_performance.csv")
+AGENT_ADJUSTMENTS_CSV = os.path.join(BASE_DIR, "agent_adjustments.csv")
+ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
+SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -810,6 +816,12 @@ def render_live_dashboard() -> None:
     reconciliation = load_csv(RECONCILIATION_CSV)
     ai_predictions = load_csv(AI_PREDICTIONS_CSV)
     manager_status = load_csv(MANAGER_STATUS_CSV)
+    council_votes = load_csv(COUNCIL_VOTES_CSV)
+    council_decisions = load_csv(COUNCIL_DECISIONS_CSV)
+    agent_performance = load_csv(AGENT_PERFORMANCE_CSV)
+    agent_adjustments = load_csv(AGENT_ADJUSTMENTS_CSV)
+    adaptive_thresholds = load_csv(ADAPTIVE_THRESHOLDS_CSV)
+    shadow_trades = load_csv(SHADOW_TRADES_CSV)
 
     signal_events = numeric(signal_events, [
         "ts", "rank", "rank_score", "buy_ready_count",
@@ -836,6 +848,31 @@ def render_live_dashboard() -> None:
     ])
     manager_status = numeric(manager_status, [
         "ts", "session_net", "loss_streak", "closed_count",
+    ])
+    council_votes = numeric(council_votes, [
+        "ts", "raw_buy_score", "raw_sell_score", "raw_hold_score", "raw_wait_score",
+        "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score",
+        "adjusted_wait_score", "confidence", "reliability", "product_adjustment",
+        "strategy_adjustment", "recent_performance_adjustment", "weight",
+    ])
+    council_decisions = numeric(council_decisions, [
+        "ts", "raw_buy_score", "raw_sell_score", "raw_hold_score", "raw_wait_score",
+        "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score",
+        "adjusted_wait_score", "truth_score", "final_buy_score", "final_sell_score",
+        "final_hold_score", "final_wait_score", "buy_threshold", "sell_threshold",
+        "recommended_position_pct", "confidence",
+    ])
+    agent_performance = numeric(agent_performance, [
+        "ts", "agent_buy_score", "agent_sell_score", "agent_hold_score",
+        "agent_wait_score", "confidence", "reliability", "outcome_move_bps",
+        "outcome_success",
+    ])
+    agent_adjustments = numeric(agent_adjustments, [
+        "ts", "base_reliability", "product_adjustment", "strategy_adjustment",
+        "recent_performance_adjustment", "final_reliability", "sample_size",
+    ])
+    adaptive_thresholds = numeric(adaptive_thresholds, [
+        "ts", "buy_threshold", "sell_threshold", "sample_size",
     ])
 
     st.markdown(
@@ -1128,6 +1165,35 @@ def render_live_dashboard() -> None:
                 "Loss streak",
                 fmt_num(manager_row.get("loss_streak", np.nan), 0),
                 "closed sell streak",
+            )
+
+    st.markdown(
+        '<div class="cb-section">Level 8 evidence council</div>',
+        unsafe_allow_html=True,
+    )
+    if council_decisions.empty:
+        st.info("No council_decisions.csv rows yet.")
+    else:
+        latest_cd = council_decisions.sort_values("ts").iloc[-1]
+        council_col_1, council_col_2, council_col_3 = st.columns(3)
+        with council_col_1:
+            mini_card(
+                "Council action",
+                str(latest_cd.get("action", "—")),
+                str(latest_cd.get("strategy", "")),
+            )
+        with council_col_2:
+            mini_card(
+                "Buy score / threshold",
+                f"{fmt_pct(latest_cd.get('final_buy_score', np.nan), 1)} / "
+                f"{fmt_pct(latest_cd.get('buy_threshold', np.nan), 1)}",
+                f"truth {fmt_pct(latest_cd.get('truth_score', np.nan), 1)}",
+            )
+        with council_col_3:
+            mini_card(
+                "Bucket / size",
+                str(latest_cd.get("bucket", "—")),
+                fmt_pct(latest_cd.get("recommended_position_pct", np.nan), 1),
             )
 
 
@@ -1947,6 +2013,49 @@ def render_live_dashboard() -> None:
                 ai_predictions.sort_values("ts", ascending=False)[show_cols].head(300),
                 width="stretch",
             )
+
+    level8_tables = [
+        ("Level 8 council decisions", council_decisions, [
+            "dt_utc", "product_id", "action", "strategy", "bucket", "risk_mode",
+            "truth_score", "final_buy_score", "buy_threshold", "final_sell_score",
+            "sell_threshold", "recommended_position_pct", "reason",
+        ], "No council decisions yet.", 300),
+        ("Level 8 agent votes", council_votes, [
+            "dt_utc", "product_id", "agent", "strategy", "raw_buy_score",
+            "adjusted_buy_score", "raw_sell_score", "adjusted_sell_score",
+            "confidence", "reliability", "product_adjustment",
+            "strategy_adjustment", "recent_performance_adjustment", "reason",
+        ], "No council votes yet.", 500),
+        ("Level 8 agent performance", agent_performance, [
+            "dt_mst", "product_id", "agent", "strategy", "agent_buy_score",
+            "agent_sell_score", "confidence", "reliability", "outcome_move_bps",
+            "outcome_success", "reason",
+        ], "No agent performance rows yet.", 500),
+        ("Level 8 agent adjustments", agent_adjustments, [
+            "dt_utc", "agent", "product_id", "strategy", "base_reliability",
+            "product_adjustment", "strategy_adjustment",
+            "recent_performance_adjustment", "final_reliability", "sample_size",
+            "reason",
+        ], "No agent adjustment rows yet.", 500),
+        ("Adaptive thresholds", adaptive_thresholds, [
+            "dt_utc", "scope", "product_id", "strategy", "buy_threshold",
+            "sell_threshold", "risk_mode", "sample_size", "reason",
+        ], "No adaptive threshold rows yet.", 500),
+        ("Shadow trades", shadow_trades, [
+            "dt_utc", "product_id", "strategy", "shadow_action",
+            "shadow_entry_price", "council_buy_score", "buy_threshold", "reason",
+        ], "No shadow trades yet.", 500),
+    ]
+    for title, frame, columns, empty_message, row_limit in level8_tables:
+        with st.expander(title):
+            if frame.empty:
+                st.info(empty_message)
+            else:
+                columns = [column for column in columns if column in frame.columns]
+                st.dataframe(
+                    frame.sort_values("ts", ascending=False)[columns].head(row_limit),
+                    width="stretch",
+                )
 
     with st.expander("Older order attempts"):
         if o_sorted.empty:

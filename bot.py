@@ -122,6 +122,7 @@ SIGNAL_EVENTS_CSV_PATH: str = os.path.join(BASE_DIR, "signal_events.csv")
 TRADE_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "trade_outcomes.csv")
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 MANAGER_STATUS_CSV_PATH: str = os.path.join(BASE_DIR, "manager_status.csv")
+AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
 DEBUG_LOG_ENABLED: bool = True
 DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
@@ -4427,6 +4428,7 @@ class TradingBot:
         self.level5_manager = None
         self.level8_council = None
         self.last_ai_train_ts: float = 0.0
+        self.last_agent_performance_update_ts: float = 0.0
         if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
             try:
                 self.ai_brain = LocalAIBrain(
@@ -10191,9 +10193,126 @@ class TradingBot:
             return True, reason
         return True, f"control_mode_not_enabled_for_direct_trading;{reason}"
 
+    def _append_agent_performance_from_outcomes(self) -> None:
+        """
+        Connect council votes to 30-minute trade outcomes for agent learning.
+        """
+        try:
+            votes_path = os.path.join(BASE_DIR, "council_votes.csv")
+            outcomes_path = TRADE_OUTCOMES_CSV_PATH
+            out_path = AGENT_PERFORMANCE_CSV_PATH
+
+            if not os.path.exists(votes_path) or not os.path.exists(outcomes_path):
+                return
+
+            votes = pd.read_csv(votes_path)
+            outcomes = pd.read_csv(outcomes_path)
+            required_vote_cols = {"decision_id", "ts", "product_id", "agent"}
+            required_outcome_cols = {"ts", "product_id", "move_bps"}
+            if (
+                votes.empty
+                or outcomes.empty
+                or not required_vote_cols.issubset(votes.columns)
+                or not required_outcome_cols.issubset(outcomes.columns)
+            ):
+                return
+
+            votes["ts"] = pd.to_numeric(votes["ts"], errors="coerce")
+            outcomes["ts"] = pd.to_numeric(outcomes["ts"], errors="coerce")
+            outcomes["move_bps"] = pd.to_numeric(
+                outcomes["move_bps"], errors="coerce"
+            ).fillna(0.0)
+
+            if "review_minutes" in outcomes.columns:
+                outcomes["review_minutes"] = pd.to_numeric(
+                    outcomes["review_minutes"], errors="coerce"
+                )
+                outcomes = outcomes[outcomes["review_minutes"] == 30].copy()
+
+            outcomes = outcomes.dropna(subset=["ts"])
+            if outcomes.empty:
+                return
+
+            existing_keys = set()
+            if os.path.exists(out_path):
+                try:
+                    existing = pd.read_csv(out_path)
+                    if not existing.empty and "perf_key" in existing.columns:
+                        existing_keys = set(existing["perf_key"].astype(str).tolist())
+                except Exception:
+                    existing_keys = set()
+
+            write_header = not os.path.exists(out_path) or os.path.getsize(out_path) == 0
+            with open(out_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow([
+                        "ts", "dt_mst", "perf_key", "decision_id", "product_id",
+                        "agent", "strategy", "agent_buy_score", "agent_sell_score",
+                        "agent_hold_score", "agent_wait_score", "confidence",
+                        "reliability", "outcome_move_bps", "outcome_success",
+                        "reason",
+                    ])
+
+                for _, vote in votes.tail(2000).iterrows():
+                    product_id = str(vote.get("product_id", ""))
+                    vote_ts = float(vote.get("ts", 0.0) or 0.0)
+                    agent = str(vote.get("agent", ""))
+                    if not product_id or not math.isfinite(vote_ts) or vote_ts <= 0 or not agent:
+                        continue
+
+                    product_outcomes = outcomes[
+                        outcomes["product_id"].astype(str) == product_id
+                    ].copy()
+                    product_outcomes = product_outcomes[
+                        product_outcomes["ts"] >= vote_ts
+                    ].copy()
+                    if product_outcomes.empty:
+                        continue
+
+                    product_outcomes["time_delta"] = product_outcomes["ts"] - vote_ts
+                    outcome = product_outcomes.sort_values("time_delta").iloc[0]
+                    move_bps = float(outcome.get("move_bps", 0.0))
+                    success = 1 if move_bps > 0 else 0
+                    perf_key = (
+                        f"{str(vote.get('decision_id', ''))}|"
+                        f"{product_id}|{agent}|"
+                        f"{int(float(outcome.get('ts', 0.0) or 0.0))}"
+                    )
+                    if perf_key in existing_keys:
+                        continue
+                    existing_keys.add(perf_key)
+
+                    ts_val = now_ts()
+                    dt_mst = (
+                        datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                        .astimezone(TZ)
+                        .strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                    writer.writerow([
+                        f"{ts_val:.6f}", dt_mst, perf_key,
+                        vote.get("decision_id", ""), product_id, agent,
+                        vote.get("strategy", ""),
+                        vote.get("adjusted_buy_score", ""),
+                        vote.get("adjusted_sell_score", ""),
+                        vote.get("adjusted_hold_score", ""),
+                        vote.get("adjusted_wait_score", ""),
+                        vote.get("confidence", ""), vote.get("reliability", ""),
+                        f"{move_bps:.6f}", success,
+                        f"matched_30m_outcome move_bps={move_bps:.3f}",
+                    ])
+        except Exception as exc:
+            log(f"[level8] agent performance update failed: {exc}")
+
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
+            if (
+                ENABLE_LEVEL8_COUNCIL
+                and ts_now - float(self.last_agent_performance_update_ts) >= 60.0
+            ):
+                self.last_agent_performance_update_ts = ts_now
+                self._append_agent_performance_from_outcomes()
             self._maybe_train_ai_brain()
             loop_gap = ts_now - float(self.last_loop_lag_check_ts or ts_now)
             if loop_gap > EVENT_LOOP_LAG_WARN_SEC:

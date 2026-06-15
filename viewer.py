@@ -30,6 +30,7 @@ PRODUCTS_ACTIVE_CSV = os.path.join(BASE_DIR, "products_active.csv")
 SIGNAL_EVENTS_CSV = os.path.join(BASE_DIR, "signal_events.csv")
 TRADE_OUTCOMES_CSV = os.path.join(BASE_DIR, "trade_outcomes.csv")
 RECONCILIATION_CSV = os.path.join(BASE_DIR, "reconciliation.csv")
+AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -806,6 +807,7 @@ def render_live_dashboard() -> None:
     signal_events = load_csv(SIGNAL_EVENTS_CSV)
     trade_outcomes = load_csv(TRADE_OUTCOMES_CSV)
     reconciliation = load_csv(RECONCILIATION_CSV)
+    ai_predictions = load_csv(AI_PREDICTIONS_CSV)
 
     signal_events = numeric(signal_events, [
         "ts", "rank", "rank_score", "buy_ready_count",
@@ -823,6 +825,12 @@ def render_live_dashboard() -> None:
     reconciliation = numeric(reconciliation, [
         "ts", "requested_quote_usd", "expected_base_delta", "actual_base_delta",
         "before_base", "after_base", "before_cash", "after_cash",
+    ])
+    ai_predictions = numeric(ai_predictions, [
+        "ts", "confidence", "prob_up_30m", "expected_move_30m_bps",
+        "expected_adverse_bps", "score", "probability", "ev_bps",
+        "spread_bps", "momentum_1_bps", "momentum_3_bps",
+        "momentum_5_bps", "momentum_15_bps",
     ])
 
     st.markdown(
@@ -1889,6 +1897,21 @@ def render_live_dashboard() -> None:
             show_cols = [c for c in show_cols if c in reconciliation.columns]
             st.dataframe(
                 reconciliation.sort_values("ts", ascending=False)[show_cols].head(300),
+                width="stretch",
+            )
+
+    with st.expander("AI predictions"):
+        if ai_predictions.empty:
+            st.info("No ai_predictions.csv rows yet.")
+        else:
+            show_cols = [
+                "ts", "product_id", "action", "confidence", "prob_up_30m",
+                "expected_move_30m_bps", "expected_adverse_bps", "score",
+                "probability", "ev_bps", "spread_bps", "reason",
+            ]
+            show_cols = [c for c in show_cols if c in ai_predictions.columns]
+            st.dataframe(
+                ai_predictions.sort_values("ts", ascending=False)[show_cols].head(300),
                 width="stretch",
             )
 

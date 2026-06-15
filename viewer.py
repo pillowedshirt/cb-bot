@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import html
 from typing import Any, Callable, Dict, List
 
 import pandas as pd
@@ -251,6 +252,242 @@ hr {
   background: rgba(15,23,42,0.48) !important;
 }
 
+/* =============================================================================
+   Level 8 council visual representation
+   ============================================================================= */
+
+.council-stage {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(251,191,36,0.28);
+  border-radius: 22px;
+  padding: 0.78rem 0.75rem 0.86rem;
+  margin-bottom: 0.64rem;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(251,191,36,0.13), transparent 28%),
+    radial-gradient(circle at 8% 8%, rgba(96,165,250,0.13), transparent 24%),
+    radial-gradient(circle at 92% 12%, rgba(167,139,250,0.14), transparent 26%),
+    linear-gradient(180deg, rgba(15,23,42,0.92), rgba(6,9,18,0.94));
+  box-shadow: 0 16px 46px rgba(0,0,0,0.34);
+}
+
+.council-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.8rem;
+  margin-bottom: 0.50rem;
+}
+
+.council-title {
+  color: #FDE68A;
+  font-size: 1.06rem;
+  line-height: 1.1;
+  font-weight: 880;
+  letter-spacing: 0.01em;
+}
+
+.council-subtitle {
+  color: #CBD5E1;
+  font-size: 0.74rem;
+  margin-top: 0.12rem;
+}
+
+.council-decision-pill {
+  border: 1px solid rgba(251,191,36,0.32);
+  border-radius: 999px;
+  padding: 0.28rem 0.56rem;
+  color: #FDE68A;
+  background: rgba(120,53,15,0.22);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.round-table-wrap {
+  position: relative;
+  min-height: 420px;
+  border-radius: 20px;
+  border: 1px solid rgba(148,163,184,0.14);
+  background:
+    radial-gradient(ellipse at center, rgba(146,64,14,0.40) 0%, rgba(120,53,15,0.30) 22%, rgba(15,23,42,0.10) 36%, transparent 48%),
+    radial-gradient(circle at center, rgba(251,191,36,0.18) 0%, transparent 34%);
+}
+
+.round-table-core {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 218px;
+  height: 218px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  border: 2px solid rgba(251,191,36,0.38);
+  background:
+    radial-gradient(circle at 38% 32%, rgba(254,243,199,0.16), transparent 20%),
+    radial-gradient(circle at 50% 50%, rgba(146,64,14,0.72), rgba(69,26,3,0.82));
+  box-shadow: inset 0 0 30px rgba(0,0,0,0.34), 0 0 44px rgba(251,191,36,0.10);
+}
+
+.round-table-core::after {
+  content: "⚔ Level VIII Council ⚔";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: #FDE68A;
+  font-size: 0.76rem;
+  font-weight: 850;
+  padding: 1.5rem;
+}
+
+.agent-knight {
+  position: absolute;
+  width: 172px;
+  min-height: 136px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(148,163,184,0.20);
+  border-radius: 17px;
+  padding: 0.46rem 0.48rem;
+  background: rgba(15,23,42,0.86);
+  box-shadow: 0 10px 26px rgba(0,0,0,0.28);
+  animation: knight-bob 2.6s ease-in-out infinite;
+}
+
+.agent-knight.speaking {
+  border-color: rgba(251,191,36,0.58);
+  box-shadow: 0 0 0 1px rgba(251,191,36,0.18), 0 12px 30px rgba(0,0,0,0.32);
+}
+
+@keyframes knight-bob {
+  0%, 100% { margin-top: 0; }
+  50% { margin-top: -4px; }
+}
+
+.knight-face {
+  display: flex;
+  align-items: center;
+  gap: 0.38rem;
+  margin-bottom: 0.24rem;
+}
+
+.knight-avatar {
+  width: 2.0rem;
+  height: 2.0rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(96,165,250,0.22), rgba(167,139,250,0.18));
+  font-size: 1.18rem;
+}
+
+.knight-name {
+  color: #E5E7EB;
+  font-size: 0.72rem;
+  font-weight: 850;
+  line-height: 1.0;
+}
+
+.knight-role {
+  color: #94A3B8;
+  font-size: 0.61rem;
+  margin-top: 0.08rem;
+}
+
+.knight-bubble {
+  position: relative;
+  border: 1px solid rgba(148,163,184,0.16);
+  border-radius: 13px;
+  padding: 0.38rem 0.43rem;
+  background: rgba(2,6,23,0.54);
+  color: #CBD5E1;
+  font-size: 0.63rem;
+  line-height: 1.22;
+  min-height: 3.2rem;
+}
+
+.agent-knight.speaking .knight-bubble {
+  color: #FDE68A;
+  animation: bubble-glow 1.8s ease-in-out infinite;
+}
+
+@keyframes bubble-glow {
+  0%, 100% { border-color: rgba(251,191,36,0.22); }
+  50% { border-color: rgba(251,191,36,0.58); }
+}
+
+.knight-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.22rem;
+  margin-top: 0.36rem;
+}
+
+.knight-stat {
+  border-radius: 9px;
+  padding: 0.18rem 0.22rem;
+  background: rgba(148,163,184,0.08);
+  color: #94A3B8;
+  font-size: 0.56rem;
+  line-height: 1.15;
+}
+
+.knight-stat b {
+  display: block;
+  color: #E5E7EB;
+  font-size: 0.62rem;
+}
+
+.council-ledger {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.38rem;
+  margin-top: 0.55rem;
+}
+
+.council-ledger-card {
+  border: 1px solid rgba(148,163,184,0.16);
+  border-radius: 14px;
+  padding: 0.40rem 0.46rem;
+  background: rgba(2,6,23,0.42);
+}
+
+.council-ledger-label {
+  color: #94A3B8;
+  font-size: 0.61rem;
+}
+
+.council-ledger-value {
+  color: #E5E7EB;
+  font-weight: 850;
+  font-size: 0.86rem;
+  line-height: 1.12;
+  margin-top: 0.08rem;
+}
+
+@media (max-width: 900px) {
+  .round-table-wrap {
+    min-height: auto;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.42rem;
+    padding: 0.48rem;
+  }
+
+  .round-table-core { display: none; }
+
+  .agent-knight {
+    position: static;
+    transform: none;
+    width: auto;
+    min-height: auto;
+  }
+
+  .council-ledger { grid-template-columns: 1fr 1fr; }
+}
+
 @media (max-width: 1100px) {
   .block-container {
     max-width: 100vw;
@@ -372,6 +609,310 @@ def safe_float(x: Any, default: float = np.nan) -> float:
         return float(x)
     except Exception:
         return default
+
+
+def fmt_pct_score(value: Any, digits: int = 0) -> str:
+    """Format a zero-to-one score as a percentage."""
+    return fmt_pct(value, digits)
+
+
+def fmt_signed_adj(value: Any, digits: int = 1) -> str:
+    try:
+        if pd.isna(value):
+            return "—"
+        return f"{float(value) * 100.0:+.{digits}f}%"
+    except Exception:
+        return "—"
+
+
+def latest_rows_by_agent(
+    council_votes: pd.DataFrame,
+    product: str | None = None,
+) -> pd.DataFrame:
+    if council_votes.empty or not {"agent", "ts"}.issubset(council_votes.columns):
+        return pd.DataFrame()
+
+    d = council_votes.copy()
+    if product and "product_id" in d.columns:
+        product_rows = d[d["product_id"].astype(str) == str(product)].copy()
+        if not product_rows.empty:
+            d = product_rows
+
+    return d.sort_values("ts").groupby("agent", as_index=False).tail(1).sort_values("agent")
+
+
+def latest_council_decision(
+    council_decisions: pd.DataFrame,
+    product: str | None = None,
+) -> pd.Series | None:
+    if council_decisions.empty or "ts" not in council_decisions.columns:
+        return None
+
+    d = council_decisions.copy()
+    if product and "product_id" in d.columns:
+        product_rows = d[d["product_id"].astype(str) == str(product)].copy()
+        if not product_rows.empty:
+            d = product_rows
+    return None if d.empty else d.sort_values("ts").iloc[-1]
+
+
+def agent_knight_profile(agent: str) -> dict[str, str]:
+    profiles = {
+        "trend": ("Sir Trendelot", "Trend Knight", "🛡️", "the lane of momentum"),
+        "mean_reversion": ("Dame Dipwyn", "Mean-Reversion Knight", "🌙", "the valley of the dip"),
+        "breakout": ("Sir Breakspire", "Breakout Knight", "⚔️", "the breached rampart"),
+        "ai_outcome": ("Oracle Byte", "AI Outcome Seer", "🔮", "the scrolls of prior outcomes"),
+        "risk": ("Warden Riskhelm", "Risk Knight", "🏰", "the treasury vault"),
+        "execution": ("Sir Fillwise", "Execution Knight", "🏹", "the order book gate"),
+        "product_health": ("Dame Coinheart", "Product Health Knight", "💎", "the health of this coin"),
+        "truth": ("Sage Veritas", "Truth Knight", "📜", "the weight of evidence"),
+    }
+    key = str(agent).strip().lower()
+    name, role, icon, flair = profiles.get(
+        key,
+        (str(agent).replace("_", " ").title(), "Council Knight", "✨", "the council ledger"),
+    )
+    return {"name": name, "role": role, "icon": icon, "flair": flair}
+
+
+def dominant_agent_action(row: pd.Series) -> tuple[str, float]:
+    scores = {
+        "BUY": safe_float(row.get("adjusted_buy_score", np.nan)),
+        "SELL": safe_float(row.get("adjusted_sell_score", np.nan)),
+        "HOLD": safe_float(row.get("adjusted_hold_score", np.nan)),
+        "WAIT": safe_float(row.get("adjusted_wait_score", np.nan)),
+    }
+    finite_scores = {key: value for key, value in scores.items() if np.isfinite(value)}
+    if not finite_scores:
+        return "WAIT", 0.0
+    action = max(finite_scores, key=finite_scores.get)
+    return action, float(finite_scores[action])
+
+
+def knight_dialogue(row: pd.Series) -> str:
+    profile = agent_knight_profile(str(row.get("agent", "council")))
+    action, score = dominant_agent_action(row)
+    confidence = safe_float(row.get("confidence", np.nan), 0.0)
+    reliability = safe_float(row.get("reliability", np.nan), 0.0)
+    old_words = {
+        "BUY": "I cast mine favor toward a BUY",
+        "SELL": "I counsel a SELL ere the tide turneth",
+        "HOLD": "Hold fast, good lords",
+        "WAIT": "Stay thy blade and WAIT",
+    }
+    reason = str(row.get("reason", "")).strip()
+    if len(reason) > 115:
+        reason = reason[:112] + "..."
+    return (
+        f"{old_words.get(action, 'I counsel patience')}; "
+        f"{profile['flair']} speaketh at {score * 100:.0f}% strength. "
+        f"Confidence {confidence * 100:.0f}%, reliability {reliability * 100:.0f}%. "
+        f"{reason}"
+    )
+
+
+def knight_position(index: int, total: int) -> tuple[float, float]:
+    """Position a knight around the oval council table."""
+    if total <= 0:
+        return 50.0, 50.0
+    rad = np.deg2rad(-90.0 + (360.0 * index / total))
+    return float(50.0 + 39.0 * np.cos(rad)), float(50.0 + 31.0 * np.sin(rad))
+
+
+def render_council_visual_representation(
+    *,
+    council_votes: pd.DataFrame,
+    council_decisions: pd.DataFrame,
+    agent_adjustments: pd.DataFrame,
+    adaptive_thresholds: pd.DataFrame,
+    selected_product: str | None = None,
+) -> None:
+    """Render the animated, text-and-CSS Level 8 council scene."""
+    del agent_adjustments, adaptive_thresholds  # Reserved for richer visual overlays.
+    latest_decision = latest_council_decision(council_decisions, selected_product)
+    latest_votes = latest_rows_by_agent(council_votes, selected_product)
+
+    if latest_decision is None and latest_votes.empty:
+        st.markdown(
+            """
+            <div class="council-stage"><div class="council-header"><div>
+              <div class="council-title">Council Visual Representation</div>
+              <div class="council-subtitle">The round table awaits council_votes.csv and council_decisions.csv.</div>
+            </div><div class="council-decision-pill">Awaiting the first council session</div></div></div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    decision_action = decision_strategy = decision_bucket = "—"
+    decision_reason = ""
+    final_buy = buy_threshold = truth_score = position_pct = np.nan
+    if latest_decision is not None:
+        decision_action = html.escape(str(latest_decision.get("action", "—")))
+        decision_strategy = html.escape(str(latest_decision.get("strategy", "—")))
+        decision_bucket = html.escape(str(latest_decision.get("bucket", "—")))
+        decision_reason = html.escape(str(latest_decision.get("reason", ""))[:180])
+        final_buy = latest_decision.get("final_buy_score", np.nan)
+        buy_threshold = latest_decision.get("buy_threshold", np.nan)
+        truth_score = latest_decision.get("truth_score", np.nan)
+        position_pct = latest_decision.get("recommended_position_pct", np.nan)
+
+    if latest_votes.empty:
+        latest_votes = pd.DataFrame([{
+            "agent": "truth", "adjusted_wait_score": 1.0, "confidence": 0.0,
+            "reliability": 0.0, "reason": "No votes yet.",
+        }])
+
+    order = ["trend", "mean_reversion", "breakout", "ai_outcome", "risk",
+             "execution", "product_health", "truth"]
+    latest_votes = latest_votes.copy()
+    latest_votes["_agent_order"] = latest_votes["agent"].astype(str).map(
+        {agent: index for index, agent in enumerate(order)}
+    ).fillna(99)
+    latest_votes = latest_votes.sort_values("_agent_order").head(8)
+
+    strongest_agent = ""
+    strongest_score = -1.0
+    for _, row in latest_votes.iterrows():
+        _, score = dominant_agent_action(row)
+        if score > strongest_score:
+            strongest_agent = str(row.get("agent", ""))
+            strongest_score = score
+
+    knights_html = []
+    for index, (_, row) in enumerate(latest_votes.iterrows()):
+        agent = str(row.get("agent", "agent"))
+        profile = agent_knight_profile(agent)
+        action, score = dominant_agent_action(row)
+        x, y = knight_position(index, len(latest_votes))
+        speaking = " speaking" if agent == strongest_agent else ""
+        knights_html.append(f"""
+          <div class="agent-knight{speaking}" style="left:{x:.1f}%; top:{y:.1f}%;">
+            <div class="knight-face">
+              <div class="knight-avatar">{html.escape(profile["icon"])}</div>
+              <div><div class="knight-name">{html.escape(profile["name"])}</div>
+              <div class="knight-role">{html.escape(profile["role"])}</div></div>
+            </div>
+            <div class="knight-bubble">{html.escape(knight_dialogue(row))}</div>
+            <div class="knight-stats">
+              <div class="knight-stat">Vote <b>{html.escape(action)}</b></div>
+              <div class="knight-stat">Score <b>{score * 100:.0f}%</b></div>
+              <div class="knight-stat">Conf <b>{fmt_pct_score(row.get("confidence", np.nan))}</b></div>
+              <div class="knight-stat">Rel <b>{fmt_pct_score(row.get("reliability", np.nan))}</b></div>
+            </div>
+          </div>
+        """)
+
+    st.markdown(
+        f"""
+        <div class="council-stage">
+          <div class="council-header"><div>
+            <div class="council-title">Council Visual Representation</div>
+            <div class="council-subtitle">Chibi knights at the round table · live agent votes · latest selected coin:
+              {html.escape(str(selected_product or "all products"))}</div>
+          </div><div class="council-decision-pill">{decision_action} · {decision_strategy} · {decision_bucket}</div></div>
+          <div class="round-table-wrap"><div class="round-table-core"></div>{''.join(knights_html)}</div>
+          <div class="council-ledger">
+            <div class="council-ledger-card"><div class="council-ledger-label">Final buy score</div>
+              <div class="council-ledger-value">{fmt_pct_score(final_buy, 1)}</div></div>
+            <div class="council-ledger-card"><div class="council-ledger-label">Buy threshold</div>
+              <div class="council-ledger-value">{fmt_pct_score(buy_threshold, 1)}</div></div>
+            <div class="council-ledger-card"><div class="council-ledger-label">Truth score</div>
+              <div class="council-ledger-value">{fmt_pct_score(truth_score, 1)}</div></div>
+            <div class="council-ledger-card"><div class="council-ledger-label">Recommended size</div>
+              <div class="council-ledger-value">{fmt_pct_score(position_pct, 1)}</div></div>
+          </div>
+          <div class="cb-small" style="margin-top:0.45rem;">Latest decree: {decision_reason}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _latest_table_rows(data: pd.DataFrame, product: str | None) -> pd.DataFrame:
+    """Filter a learning table by product and put its newest rows first."""
+    d = data.copy()
+    if product and "product_id" in d.columns:
+        product_rows = d[d["product_id"].astype(str) == str(product)].copy()
+        if not product_rows.empty:
+            d = product_rows
+    return d.sort_values("ts", ascending=False) if "ts" in d.columns else d
+
+
+def render_council_intelligence_snapshot(
+    *,
+    council_votes: pd.DataFrame,
+    council_decisions: pd.DataFrame,
+    agent_performance: pd.DataFrame,
+    agent_adjustments: pd.DataFrame,
+    adaptive_thresholds: pd.DataFrame,
+    shadow_trades: pd.DataFrame,
+    selected_product: str | None = None,
+) -> None:
+    """Render product-specific Level 8 votes and learning telemetry."""
+    latest_votes = latest_rows_by_agent(council_votes, selected_product)
+    latest_decision = latest_council_decision(council_decisions, selected_product)
+    st.markdown('<div class="cb-section">Council intelligence telemetry</div>', unsafe_allow_html=True)
+
+    if latest_decision is None:
+        st.info("No Level 8 council decision yet.")
+    else:
+        columns = st.columns(4)
+        cards = [
+            ("Decision", str(latest_decision.get("action", "—")), str(latest_decision.get("strategy", ""))),
+            ("Buy score", fmt_pct_score(latest_decision.get("final_buy_score", np.nan), 1),
+             f"threshold {fmt_pct_score(latest_decision.get('buy_threshold', np.nan), 1)}"),
+            ("Sell score", fmt_pct_score(latest_decision.get("final_sell_score", np.nan), 1),
+             f"threshold {fmt_pct_score(latest_decision.get('sell_threshold', np.nan), 1)}"),
+            ("Truth / size", fmt_pct_score(latest_decision.get("truth_score", np.nan), 1),
+             fmt_pct_score(latest_decision.get("recommended_position_pct", np.nan), 1)),
+        ]
+        for column, card in zip(columns, cards):
+            with column:
+                mini_card(*card)
+
+    if latest_votes.empty:
+        st.info("No agent votes yet.")
+    else:
+        rows = []
+        for _, row in latest_votes.iterrows():
+            action, score = dominant_agent_action(row)
+            profile = agent_knight_profile(str(row.get("agent", "")))
+            rows.append({
+                "Agent": profile["name"], "Role": profile["role"], "Vote": action,
+                "Adjusted Score": fmt_pct_score(score, 1),
+                "Confidence": fmt_pct_score(row.get("confidence", np.nan), 1),
+                "Reliability": fmt_pct_score(row.get("reliability", np.nan), 1),
+                "Product Adj": fmt_signed_adj(row.get("product_adjustment", np.nan)),
+                "Strategy Adj": fmt_signed_adj(row.get("strategy_adjustment", np.nan)),
+                "Recent Adj": fmt_signed_adj(row.get("recent_performance_adjustment", np.nan)),
+                "Reason": str(row.get("reason", ""))[:180],
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    with st.expander("Council learning tables"):
+        tabs = st.tabs(["Agent performance", "Agent adjustments", "Adaptive thresholds", "Shadow trades"])
+        table_specs = [
+            (agent_performance, ["dt_mst", "product_id", "agent", "strategy", "agent_buy_score",
+                                 "agent_sell_score", "confidence", "reliability", "outcome_move_bps",
+                                 "outcome_success", "reason"], "No agent performance rows yet."),
+            (agent_adjustments, ["dt_utc", "agent", "product_id", "strategy", "base_reliability",
+                                 "product_adjustment", "strategy_adjustment", "recent_performance_adjustment",
+                                 "final_reliability", "sample_size", "reason"], "No agent adjustment rows yet."),
+            (adaptive_thresholds, ["dt_utc", "scope", "product_id", "strategy", "buy_threshold",
+                                   "sell_threshold", "risk_mode", "sample_size", "reason"],
+             "No adaptive threshold rows yet."),
+            (shadow_trades, ["dt_utc", "product_id", "strategy", "shadow_action", "shadow_entry_price",
+                             "council_buy_score", "buy_threshold", "reason"], "No shadow trades yet."),
+        ]
+        for tab, (data, desired_columns, empty_message) in zip(tabs, table_specs):
+            with tab:
+                if data.empty:
+                    st.info(empty_message)
+                else:
+                    d = _latest_table_rows(data, selected_product)
+                    columns = [column for column in desired_columns if column in d.columns]
+                    st.dataframe(d[columns].head(250), width="stretch", hide_index=True)
 
 
 def latest_by_product(m: pd.DataFrame) -> pd.DataFrame:
@@ -761,6 +1302,8 @@ with st.sidebar:
     show_bid_ask = st.checkbox("Show bid/ask lines", value=True)
     show_macro = st.checkbox("Show macro tabs", value=False)
     show_debug_tables = st.checkbox("Show debug telemetry table", value=False)
+    show_council_visual = st.checkbox("Show council visual", value=True)
+    show_council_tables = st.checkbox("Show council learning tables", value=True)
 
 # Keep a viewer session start time so the display does not feel like it resets.
 if "viewer_started_at_ts" not in st.session_state:
@@ -889,6 +1432,25 @@ def render_live_dashboard() -> None:
     """,
         unsafe_allow_html=True,
     )
+
+    if show_council_visual:
+        # Use the latest decision product if no coin has been selected yet.
+        visual_product = None
+        if not council_decisions.empty and "product_id" in council_decisions.columns:
+            try:
+                visual_product = str(
+                    council_decisions.sort_values("ts").iloc[-1].get("product_id", "")
+                )
+            except Exception:
+                visual_product = None
+
+        render_council_visual_representation(
+            council_votes=council_votes,
+            council_decisions=council_decisions,
+            agent_adjustments=agent_adjustments,
+            adaptive_thresholds=adaptive_thresholds,
+            selected_product=visual_product,
+        )
 
     if m.empty:
         st.info(
@@ -1448,6 +2010,24 @@ def render_live_dashboard() -> None:
     with top_a:
         default_idx = products.index("BTC-USD") if "BTC-USD" in products else 0
         product = st.selectbox("Selected coin", products, index=default_idx, label_visibility="collapsed")
+
+    if show_council_tables:
+        render_council_visual_representation(
+            council_votes=council_votes,
+            council_decisions=council_decisions,
+            agent_adjustments=agent_adjustments,
+            adaptive_thresholds=adaptive_thresholds,
+            selected_product=product,
+        )
+        render_council_intelligence_snapshot(
+            council_votes=council_votes,
+            council_decisions=council_decisions,
+            agent_performance=agent_performance,
+            agent_adjustments=agent_adjustments,
+            adaptive_thresholds=adaptive_thresholds,
+            shadow_trades=shadow_trades,
+            selected_product=product,
+        )
 
     if pd.notna(latest_market_ts):
         cutoff = float(latest_market_ts) - float(window_minutes) * 60.0

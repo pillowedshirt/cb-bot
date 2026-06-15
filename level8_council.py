@@ -1,7 +1,10 @@
 """Level 8 trading council capital allocation and risk guidance."""
 
+import csv
 import os
+import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
@@ -12,11 +15,35 @@ TRADES_CSV = os.path.join(BASE_DIR, "trades.csv")
 MISSED_OPPORTUNITIES_CSV = os.path.join(BASE_DIR, "missed_opportunities.csv")
 AGENT_PERFORMANCE_CSV = os.path.join(BASE_DIR, "agent_performance.csv")
 COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(BASE_DIR, "council_observation_outcomes.csv")
+AGENT_ADJUSTMENTS_CSV = os.path.join(BASE_DIR, "agent_adjustments.csv")
+ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
+SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     """Clamp ``value`` to the inclusive range bounded by minimum and maximum."""
     return max(minimum, min(maximum, value))
+
+
+def utc_ts() -> float:
+    return datetime.now(tz=timezone.utc).timestamp()
+
+
+def utc_dt(ts: Optional[float] = None) -> str:
+    value = float(ts if ts is not None else utc_ts())
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def append_csv_row(path: str, columns: list[str], row: Dict[str, Any]) -> None:
+    exists = os.path.exists(path) and os.path.getsize(path) > 0
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        if not exists:
+            writer.writerow(columns)
+
+        writer.writerow([row.get(column, "") for column in columns])
 
 
 @dataclass
@@ -30,10 +57,17 @@ class AgentVote:
     wait: float
     confidence: float
     reliability: float = 0.80
+
     adjusted_buy_score: float = 0.0
     adjusted_sell_score: float = 0.0
     adjusted_hold_score: float = 0.0
     adjusted_wait_score: float = 0.0
+
+    product_adjustment: float = 0.0
+    strategy_adjustment: float = 0.0
+    recent_performance_adjustment: float = 0.0
+    weight: float = 0.0
+    reason: str = ""
 
 
 class Level8Council:
@@ -357,52 +391,99 @@ class Level8Council:
         strategy_stats = self._outcome_stats(agent=agent, strategy=strategy)
 
         recent = self._recent_trades(20)
+
         if "agent" in recent.columns:
             recent = recent[recent["agent"].astype(str) == str(agent)]
+
         if "event" in recent.columns:
             recent = recent[recent["event"].astype(str).str.upper() == "SELL"]
+
         pnl_column = next(
             (column for column in ("net_pnl_usd", "pnl", "move_bps") if column in recent),
             None,
         )
+
         recent_win_rate = 0.5
+
         if not recent.empty and pnl_column:
             pnl = pd.to_numeric(recent[pnl_column], errors="coerce").fillna(0.0)
             recent_win_rate = float((pnl > 0.0).mean())
 
-        n = float(agent_stats["n"])
-        stats = {
-            "agent_win_rate": agent_stats["win_rate"],
-            "product_win_rate": product_stats["win_rate"],
-            "strategy_win_rate": strategy_stats["win_rate"],
-            "recent_win_rate": recent_win_rate,
-        }
+        n = float(agent_stats.get("n", 0.0))
+
         sample_factor = clamp(n / 12.0, 0.0, 1.0)
 
-        product_adj = (float(stats.get("product_win_rate", 0.5)) - 0.5) * 0.65 * sample_factor
-        strategy_adj = (float(stats.get("strategy_win_rate", 0.5)) - 0.5) * 0.60 * sample_factor
-        recent_adj = (float(stats.get("recent_win_rate", 0.5)) - 0.5) * 0.85 * sample_factor
+        agent_credit = float(agent_stats.get("avg_credit", agent_stats.get("win_rate", 0.5)))
+        product_win_rate = float(product_stats.get("win_rate", 0.5))
+        strategy_win_rate = float(strategy_stats.get("win_rate", 0.5))
+
+        product_adj = (product_win_rate - 0.5) * 0.65 * sample_factor
+        strategy_adj = (strategy_win_rate - 0.5) * 0.60 * sample_factor
+        recent_adj = (recent_win_rate - 0.5) * 0.85 * sample_factor
 
         product_adj = clamp(product_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         strategy_adj = clamp(strategy_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         recent_adj = clamp(recent_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
 
-        avg_credit = float(agent_stats.get("avg_credit", stats.get("agent_win_rate", 0.5)))
-        base_reliability = 0.80 + (avg_credit - 0.5) * 1.35 * sample_factor
+        directional = clamp(
+            product_adj + strategy_adj + recent_adj,
+            -self.max_agent_adjustment,
+            self.max_agent_adjustment,
+        )
+
+        base_reliability = 0.80 + (agent_credit - 0.5) * 1.35 * sample_factor
+        reliability = clamp(
+            base_reliability,
+            self.min_agent_reliability,
+            self.max_agent_reliability,
+        )
+
+        try:
+            ts = utc_ts()
+            append_csv_row(
+                AGENT_ADJUSTMENTS_CSV,
+                [
+                    "ts", "dt_utc", "agent", "product_id", "strategy",
+                    "base_reliability", "product_adjustment", "strategy_adjustment",
+                    "recent_performance_adjustment", "directional_adjustment",
+                    "final_reliability", "sample_size", "agent_credit",
+                    "product_win_rate", "strategy_win_rate", "recent_win_rate",
+                    "reason",
+                ],
+                {
+                    "ts": f"{ts:.6f}",
+                    "dt_utc": utc_dt(ts),
+                    "agent": agent,
+                    "product_id": product_id,
+                    "strategy": strategy,
+                    "base_reliability": f"{base_reliability:.6f}",
+                    "product_adjustment": f"{product_adj:.6f}",
+                    "strategy_adjustment": f"{strategy_adj:.6f}",
+                    "recent_performance_adjustment": f"{recent_adj:.6f}",
+                    "directional_adjustment": f"{directional:.6f}",
+                    "final_reliability": f"{reliability:.6f}",
+                    "sample_size": f"{n:.0f}",
+                    "agent_credit": f"{agent_credit:.6f}",
+                    "product_win_rate": f"{product_win_rate:.6f}",
+                    "strategy_win_rate": f"{strategy_win_rate:.6f}",
+                    "recent_win_rate": f"{recent_win_rate:.6f}",
+                    "reason": (
+                        f"agent={agent};credit={agent_credit:.3f};"
+                        f"product_wr={product_win_rate:.3f};"
+                        f"strategy_wr={strategy_win_rate:.3f};"
+                        f"recent_wr={recent_win_rate:.3f}"
+                    ),
+                },
+            )
+        except Exception:
+            pass
+
         return {
             "product": product_adj,
             "strategy": strategy_adj,
             "recent": recent_adj,
-            "directional": clamp(
-                product_adj + strategy_adj + recent_adj,
-                -self.max_agent_adjustment,
-                self.max_agent_adjustment,
-            ),
-            "reliability": clamp(
-                base_reliability,
-                self.min_agent_reliability,
-                self.max_agent_reliability,
-            ),
+            "directional": directional,
+            "reliability": reliability,
         }
 
     def _adjust_vote(
@@ -412,26 +493,32 @@ class Level8Council:
         strategy: str,
     ) -> AgentVote:
         """Apply outcome-derived direction and reliability to a raw vote."""
-        adjustments = self._agent_adjustments(
-            str(vote.get("agent", "unknown")), product_id, strategy
-        )
-        directional_adj = adjustments["directional"]
-        raw_buy = float(vote.get("buy", 0.0))
-        raw_sell = float(vote.get("sell", 0.0))
-        raw_hold = float(vote.get("hold", 0.0))
-        raw_wait = float(vote.get("wait", 0.0))
+        agent_name = str(vote.get("agent", "unknown"))
 
-        # Directional adjustment rewards agents when their category has been right.
-        # It does not make one agent infinite; reliability and truth still control final weight.
+        adjustments = self._agent_adjustments(
+            agent_name,
+            product_id,
+            strategy,
+        )
+
+        directional_adj = float(adjustments["directional"])
+
+        raw_buy = float(vote.get("buy", 0.0) or 0.0)
+        raw_sell = float(vote.get("sell", 0.0) or 0.0)
+        raw_hold = float(vote.get("hold", 0.0) or 0.0)
+        raw_wait = float(vote.get("wait", 0.0) or 0.0)
+
         buy = clamp(raw_buy + directional_adj, 0.0, 1.0)
         sell = clamp(raw_sell + directional_adj, 0.0, 1.0)
         hold = clamp(raw_hold + directional_adj * 0.25, 0.0, 1.0)
         wait = clamp(raw_wait - directional_adj * 0.75, 0.0, 1.0)
-        confidence = clamp(float(vote.get("confidence", 0.5)), 0.0, 1.0)
-        reliability = adjustments["reliability"]
+
+        confidence = clamp(float(vote.get("confidence", 0.5) or 0.5), 0.0, 1.0)
+        reliability = float(adjustments["reliability"])
+        weight = max(0.0, confidence * reliability)
 
         return AgentVote(
-            agent=str(vote.get("agent", "unknown")),
+            agent=agent_name,
             buy=raw_buy,
             sell=raw_sell,
             hold=raw_hold,
@@ -442,6 +529,11 @@ class Level8Council:
             adjusted_sell_score=sell,
             adjusted_hold_score=hold,
             adjusted_wait_score=wait,
+            product_adjustment=float(adjustments["product"]),
+            strategy_adjustment=float(adjustments["strategy"]),
+            recent_performance_adjustment=float(adjustments["recent"]),
+            weight=weight,
+            reason=str(vote.get("reason", "")),
         )
 
     def adaptive_thresholds(self, product_id: str, strategy: str) -> Dict[str, Any]:
@@ -496,6 +588,42 @@ class Level8Council:
         buy -= missed_relief
         buy = clamp(buy, self.min_buy_threshold, self.max_buy_threshold)
         sell = clamp(sell, self.min_sell_threshold, self.max_sell_threshold)
+
+        try:
+            ts = utc_ts()
+
+            append_csv_row(
+                ADAPTIVE_THRESHOLDS_CSV,
+                [
+                    "ts", "dt_utc", "scope", "product_id", "strategy",
+                    "buy_threshold", "sell_threshold", "risk_mode",
+                    "sample_size", "win_rate", "avg_move", "avg_adverse",
+                    "missed_opportunity_relief", "reason",
+                ],
+                {
+                    "ts": f"{ts:.6f}",
+                    "dt_utc": utc_dt(ts),
+                    "scope": "product_strategy",
+                    "product_id": product_id,
+                    "strategy": strategy,
+                    "buy_threshold": f"{buy:.6f}",
+                    "sell_threshold": f"{sell:.6f}",
+                    "risk_mode": risk_mode_u,
+                    "sample_size": f"{n:.0f}",
+                    "win_rate": f"{wr:.6f}",
+                    "avg_move": f"{avg:.6f}",
+                    "avg_adverse": f"{adverse:.6f}",
+                    "missed_opportunity_relief": f"{missed_relief:.6f}",
+                    "reason": (
+                        f"risk={risk_mode_u};n={n:.0f};wr={wr:.3f};"
+                        f"avg={avg:.2f};adverse={adverse:.2f};"
+                        f"missed_relief={missed_relief:.3f}"
+                    ),
+                },
+            )
+        except Exception:
+            pass
+
         return {
             "buy_threshold": buy,
             "sell_threshold": sell,
@@ -512,6 +640,7 @@ class Level8Council:
         truth_vote: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Combine adjusted votes into a buy, shadow, or wait decision."""
+        decision_id = f"l8buy-{product_id}-{int(utc_ts())}-{uuid.uuid4().hex[:8]}"
         adjusted = [self._adjust_vote(vote, product_id, strategy) for vote in votes]
         adjusted_truth = self._adjust_vote(truth_vote, product_id, strategy)
         weighted = [
@@ -587,7 +716,36 @@ class Level8Council:
         else:
             action = "WAIT"
 
+        if action == "SHADOW":
+            try:
+                ts = utc_ts()
+
+                append_csv_row(
+                    SHADOW_TRADES_CSV,
+                    [
+                        "ts", "dt_utc", "decision_id", "product_id", "strategy",
+                        "shadow_action", "council_buy_score", "buy_threshold",
+                        "truth_score", "recommended_position_pct", "reason",
+                    ],
+                    {
+                        "ts": f"{ts:.6f}",
+                        "dt_utc": utc_dt(ts),
+                        "decision_id": decision_id,
+                        "product_id": product_id,
+                        "strategy": strategy,
+                        "shadow_action": "BUY",
+                        "council_buy_score": f"{final_buy:.6f}",
+                        "buy_threshold": f"{buy_threshold:.6f}",
+                        "truth_score": f"{truth_score:.6f}",
+                        "recommended_position_pct": f"{position_pct:.6f}",
+                        "reason": sizing_reason,
+                    },
+                )
+            except Exception:
+                pass
+
         return {
+            "decision_id": decision_id,
             "action": action,
             "final_buy": final_buy,
             "final_sell": final_sell,
@@ -614,6 +772,7 @@ class Level8Council:
         This is separate from buy logic because selling answers a different question:
         should we capture profit, hold for continuation, or exit a failing position?
         """
+        decision_id = f"l8exit-{product_id}-{int(utc_ts())}-{uuid.uuid4().hex[:8]}"
         unrealized_bps = float(context.get("unrealized_bps", 0.0) or 0.0)
         spread_bps = float(context.get("spread_bps", 0.0) or 0.0)
         cost_bps = float(context.get("cost_bps", 0.0) or 0.0)
@@ -749,6 +908,7 @@ class Level8Council:
             action = "HOLD"
 
         return {
+            "decision_id": decision_id,
             "action": action,
             "final_sell": final_sell,
             "final_hold": final_hold,

@@ -28,6 +28,11 @@ from dotenv import load_dotenv
 from coinbase.rest import RESTClient
 from coinbase import jwt_generator
 
+try:
+    from ai_brain import LocalAIBrain
+except Exception:
+    LocalAIBrain = None
+
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 TZ_NAME: str = "America/Phoenix"
@@ -231,6 +236,19 @@ TOP_OF_BOOK_MAX_STALE_SEC: float = 15.0
 
 # If a product has no fresh quote, do not buy it.
 REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY: bool = True
+
+# ============================================================
+# LOCAL AI BRAIN
+# ============================================================
+
+ENABLE_LOCAL_AI_BRAIN: bool = True
+AI_MODE: str = "FILTER"  # OFF, OBSERVE, FILTER, CONTROL
+AI_MIN_TRAINING_ROWS: int = 30
+AI_RETRAIN_EVERY_SEC: float = 30 * 60
+AI_ALLOW_BUY_ACTIONS: Set[str] = {"ALLOW_BUY"}
+AI_BLOCK_BUY_ACTIONS: Set[str] = {"BLOCK_BUY"}
+AI_MIN_CONFIDENCE_TO_BLOCK: float = 0.20
+AI_MIN_CONFIDENCE_TO_ALLOW: float = 0.20
 
 TARGET_UTIL_MIN: float = 0.35
 TARGET_UTIL_MID: float = 0.65
@@ -4346,6 +4364,17 @@ class TradingBot:
         self.last_loop_lag_check_ts: float = now_ts()
         self.cached_account_snapshot: Optional[Dict[str, Dict[str, float]]] = None
         self.cached_account_snapshot_ts: float = 0.0
+        self.ai_brain = None
+        self.last_ai_train_ts: float = 0.0
+        if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
+            try:
+                self.ai_brain = LocalAIBrain(
+                    min_training_rows=AI_MIN_TRAINING_ROWS
+                )
+                log("[ai] LocalAIBrain initialized")
+            except Exception as exc:
+                self.ai_brain = None
+                log(f"[ai] failed to initialize LocalAIBrain: {exc}")
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
         self.inverted_markers: Dict[str, Dict[str, Any]] = {}
@@ -9720,9 +9749,99 @@ class TradingBot:
 
         return float(proposed)
 
+    def _maybe_train_ai_brain(self) -> None:
+        if not ENABLE_LOCAL_AI_BRAIN or self.ai_brain is None:
+            return
+        current_ts = now_ts()
+        if current_ts - self.last_ai_train_ts < AI_RETRAIN_EVERY_SEC:
+            return
+        self.last_ai_train_ts = current_ts
+        try:
+            result = self.ai_brain.train()
+            log(f"[ai] train_result={result}")
+        except Exception as exc:
+            log(f"[ai] training failed: {exc}")
+
+    def _ai_context_from_candidate(
+        self, candidate: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        product_id = str(candidate.get("product_id", ""))
+        moms = {"mom1": 0.0, "mom3": 0.0, "mom5": 0.0, "mom15": 0.0}
+        try:
+            moms = self._entry_momentum_snapshot(product_id)
+        except Exception:
+            pass
+
+        green = 0
+        try:
+            green = self._recent_green_candle_count(
+                product_id, ENTRY_GREEN_CANDLE_LOOKBACK
+            )
+        except Exception:
+            pass
+
+        return {
+            "ts": now_ts(),
+            "score": float(candidate.get("score", 0.0)),
+            "probability": float(candidate.get("estimated_prob_up", 0.0)),
+            "ev_bps": float(candidate.get("expected_net_edge_bps", 0.0)),
+            "projected_forward_bps": float(
+                candidate.get("projected_forward_gain_bps", 0.0)
+            ),
+            "cost_bps": float(candidate.get("cost_bps", 0.0)),
+            "spread_bps": float(candidate.get("spread_bps", 0.0)),
+            "momentum_1_bps": float(moms.get("mom1", 0.0)),
+            "momentum_3_bps": float(moms.get("mom3", 0.0)),
+            "momentum_5_bps": float(moms.get("mom5", 0.0)),
+            "momentum_15_bps": float(moms.get("mom15", 0.0)),
+            "green_candles": float(green),
+            "rank_score": float(candidate.get("rank_score", 0.0)),
+            "buy_ready_count": float(candidate.get("buy_ready_count", 0.0)),
+        }
+
+    def _ai_allows_candidate(
+        self, *, candidate: Dict[str, Any]
+    ) -> Tuple[bool, str]:
+        if not ENABLE_LOCAL_AI_BRAIN:
+            return True, "ai_disabled"
+        if self.ai_brain is None:
+            return True, "ai_unavailable"
+
+        mode = str(AI_MODE).upper()
+        if mode == "OFF":
+            return True, "ai_mode_off"
+
+        product_id = str(candidate.get("product_id", ""))
+        try:
+            decision = self.ai_brain.predict(
+                product_id, self._ai_context_from_candidate(candidate)
+            )
+        except Exception as exc:
+            return True, f"ai_prediction_failed:{exc}"
+
+        reason = (
+            f"ai_action={decision.action};"
+            f"confidence={decision.confidence:.3f};"
+            f"prob_up_30m={decision.prob_up_30m:.3f};"
+            f"expected_move={decision.expected_move_30m_bps:.2f};"
+            f"expected_adverse={decision.expected_adverse_bps:.2f};"
+            f"{decision.reason}"
+        )
+        if mode == "OBSERVE":
+            return True, f"observe_only;{reason}"
+        if mode == "FILTER":
+            if (
+                decision.action in AI_BLOCK_BUY_ACTIONS
+                and decision.confidence >= AI_MIN_CONFIDENCE_TO_BLOCK
+            ):
+                return False, reason
+            return True, reason
+        return True, f"control_mode_not_enabled_for_direct_trading;{reason}"
+
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
+            self._maybe_train_ai_brain()
             loop_gap = ts_now - float(self.last_loop_lag_check_ts or ts_now)
             if loop_gap > EVENT_LOOP_LAG_WARN_SEC:
                 log(f"[lag] eval_loop gap={loop_gap:.2f}s; possible blocking work or REST delay")
@@ -10687,14 +10806,43 @@ class TradingBot:
                         f"waiting for upturn reason={timing_reason}"
                     )
 
+            ai_filtered_candidates = []
+            for candidate in timed_candidates:
+                product_id_for_ai = str(candidate.get("product_id", ""))
+                ai_ok, ai_reason = self._ai_allows_candidate(candidate=candidate)
+                candidate["ai_ok"] = bool(ai_ok)
+                candidate["ai_reason"] = str(ai_reason)
+                try:
+                    self.signal_events_log.log_event(
+                        event_type="ai_candidate_filter",
+                        product_id=product_id_for_ai,
+                        rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
+                        score=f"{float(candidate.get('score', 0.0)):.6f}",
+                        probability=(
+                            f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}"
+                        ),
+                        ev_bps=(
+                            f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}"
+                        ),
+                        spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
+                        action="keep" if ai_ok else "reject",
+                        reason=ai_reason,
+                    )
+                except Exception:
+                    pass
+                if not ai_ok:
+                    log(f"[ai] candidate blocked {product_id_for_ai}: {ai_reason}")
+                    continue
+                ai_filtered_candidates.append(candidate)
+
             candidate_slice = (
-                timed_candidates[:MAX_NEW_ENTRIES_PER_EVAL]
+                ai_filtered_candidates[:MAX_NEW_ENTRIES_PER_EVAL]
                 if ENABLE_MULTI_CANDIDATE_BUYS
-                else timed_candidates[:1]
+                else ai_filtered_candidates[:1]
             )
 
             if ENABLE_INVERTED_STOPLOSS_CYCLE:
-                for candidate in timed_candidates:
+                for candidate in ai_filtered_candidates:
                     product_id_for_marker = str(candidate.get("product_id", ""))
                     if not product_id_for_marker:
                         continue

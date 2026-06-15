@@ -8080,7 +8080,8 @@ class TradingBot:
                 "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score",
                 "confidence", "reliability",
                 "product_adjustment", "strategy_adjustment", "recent_performance_adjustment",
-                "weight", "reason",
+                "weight", "leaderboard_rank", "leaderboard_score",
+                "leader_bonus", "leader_penalty", "reason",
             ]
 
             write_header = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -8114,6 +8115,10 @@ class TradingBot:
                     confidence = float(vote.get("confidence", 0.0) or 0.0)
                     reliability = float(vote.get("reliability", 1.0) or 1.0)
                     weight = float(vote.get("weight", confidence * reliability) or 0.0)
+                    leaderboard_rank = float(vote.get("leaderboard_rank", 999.0) or 999.0)
+                    leaderboard_score = float(vote.get("leaderboard_score", 0.5) or 0.5)
+                    leader_bonus = float(vote.get("leader_bonus", 0.0) or 0.0)
+                    leader_penalty = float(vote.get("leader_penalty", 0.0) or 0.0)
 
                     writer.writerow([
                         f"{ts_val:.6f}", dt_utc, dt_mst, decision_id, product_id,
@@ -8127,7 +8132,12 @@ class TradingBot:
                         f"{float(vote.get('product_adjustment', 0.0) or 0.0):.6f}",
                         f"{float(vote.get('strategy_adjustment', 0.0) or 0.0):.6f}",
                         f"{float(vote.get('recent_performance_adjustment', 0.0) or 0.0):.6f}",
-                        f"{weight:.6f}", str(vote.get("reason", reason)),
+                        f"{weight:.6f}",
+                        f"{leaderboard_rank:.0f}",
+                        f"{leaderboard_score:.6f}",
+                        f"{leader_bonus:.6f}",
+                        f"{leader_penalty:.6f}",
+                        str(vote.get("reason", reason)),
                     ])
 
         except Exception as exc:
@@ -11021,6 +11031,7 @@ class TradingBot:
             votes_path = os.path.join(BASE_DIR, "council_votes.csv")
             trade_outcomes_path = TRADE_OUTCOMES_CSV_PATH
             observation_outcomes_path = COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH
+            sell_outcomes_path = os.path.join(BASE_DIR, "sell_outcomes.csv")
             out_path = AGENT_PERFORMANCE_CSV_PATH
 
             if not os.path.exists(votes_path):
@@ -11028,6 +11039,7 @@ class TradingBot:
             if (
                 not os.path.exists(trade_outcomes_path)
                 and not os.path.exists(observation_outcomes_path)
+                and not os.path.exists(sell_outcomes_path)
             ):
                 return
 
@@ -11043,6 +11055,14 @@ class TradingBot:
                 if not observation_outcomes.empty:
                     observation_outcomes["source"] = "observation_outcome"
                     frames.append(observation_outcomes)
+            if os.path.exists(sell_outcomes_path):
+                sell_outcomes = pd.read_csv(sell_outcomes_path)
+                if not sell_outcomes.empty:
+                    sell_outcomes = sell_outcomes.rename(columns={
+                        "move_after_sell_bps": "move_bps",
+                    })
+                    sell_outcomes["source"] = "sell_outcome"
+                    frames.append(sell_outcomes)
             if not frames:
                 return
             outcomes = pd.concat(frames, ignore_index=True, sort=False)
@@ -11128,6 +11148,10 @@ class TradingBot:
                         ].copy()
                         if not decision_matches.empty:
                             product_outcomes = decision_matches
+                        elif str(vote.get("strategy", "")).upper() == "EXIT_REVIEW":
+                            # EXIT_REVIEW votes must match their own sell outcome decision_id.
+                            # Do not let sell agents learn from unrelated product movement.
+                            continue
                     product_outcomes = product_outcomes[
                         product_outcomes["ts"] >= vote_ts
                     ].copy()
@@ -11140,7 +11164,7 @@ class TradingBot:
                     move_bps = float(outcome.get("move_bps", 0.0) or 0.0)
                     review_minutes = int(float(outcome.get("review_minutes", 0.0) or 0.0))
                     outcome_source = str(outcome.get("source", "unknown"))
-                    if outcome_source in {"trade_outcome", "real_trade"}:
+                    if outcome_source in {"trade_outcome", "real_trade", "sell_outcome"}:
                         outcome_weight = 1.00
                     elif outcome_source in {"observation_outcome", "level8_observation"}:
                         outcome_weight = 0.40

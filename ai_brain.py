@@ -187,6 +187,24 @@ class LocalAIBrain:
 
             frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
 
+        # Observation rows are useful, but only if they actually carried enough
+        # feature context. If the merge failed and most features are zero, do not
+        # let those sparse rows teach the AI model.
+        feature_activity = (frame[FEATURE_COLUMNS].abs() > 1e-12).sum(axis=1)
+        frame["feature_quality"] = feature_activity / max(float(len(FEATURE_COLUMNS)), 1.0)
+
+        if "training_source" in frame.columns:
+            keep_quality = (
+                frame["training_source"].astype(str).ne("level8_observation")
+                | frame["feature_quality"].ge(0.25)
+            )
+            frame = frame[keep_quality].copy()
+        else:
+            frame = frame[frame["feature_quality"].ge(0.25)].copy()
+
+        if frame.empty:
+            return pd.DataFrame()
+
         frame["move_bps"] = pd.to_numeric(frame["move_bps"], errors="coerce").fillna(0.0)
 
         if "max_adverse_bps" not in frame.columns:

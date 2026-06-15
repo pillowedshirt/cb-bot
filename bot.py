@@ -119,6 +119,9 @@ DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
 SIGNAL_EVENTS_CSV_PATH: str = os.path.join(BASE_DIR, "signal_events.csv")
+LEVEL8_COUNCIL_DECISIONS_CSV_PATH: str = os.path.join(
+    BASE_DIR, "council_decisions.csv"
+)
 TRADE_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "trade_outcomes.csv")
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 MANAGER_STATUS_CSV_PATH: str = os.path.join(BASE_DIR, "manager_status.csv")
@@ -7825,14 +7828,62 @@ class TradingBot:
             )
 
             try:
-                decision = self.level8_council.decide_buy(
-                    product_id=product_id,
+                level8_ok, level8_info = self._level8_decision_for_candidate(
                     candidate=candidate,
+                )
+
+                decision_id = str(level8_info.get("decision_id", ""))
+                action = str(level8_info.get("action", "WAIT"))
+                strategy = str(
+                    level8_info.get(
+                        "strategy",
+                        candidate.get(
+                            "manager_strategy", "COUNCIL_HEARTBEAT"
+                        ),
+                    )
+                )
+                bucket = str(level8_info.get("bucket", "SHADOW"))
+                truth_score = float(
+                    level8_info.get("truth_score", 0.0) or 0.0
+                )
+                final_buy = float(
+                    level8_info.get("final_buy_score", 0.0) or 0.0
+                )
+                buy_threshold = float(
+                    level8_info.get("buy_threshold", 0.0) or 0.0
+                )
+                recommended_pct = float(
+                    level8_info.get("recommended_position_pct", 0.0) or 0.0
+                )
+                confidence = float(
+                    level8_info.get("confidence", truth_score) or 0.0
+                )
+                reason = str(level8_info.get("reason", ""))
+
+                self._append_level8_decision_snapshot(
+                    product_id=product_id,
+                    decision_id=decision_id,
+                    action=action,
+                    strategy=strategy,
+                    bucket=bucket,
+                    risk_mode=str(level8_info.get("risk_mode", "NORMAL")),
+                    truth_score=truth_score,
+                    final_buy_score=final_buy,
+                    final_sell_score=0.0,
+                    buy_threshold=buy_threshold,
+                    sell_threshold=0.0,
+                    recommended_position_pct=recommended_pct,
+                    confidence=confidence,
+                    reason=(
+                        f"heartbeat_only=True;"
+                        f"why_not_ready={candidate.get('why_not_ready', '')};"
+                        f"{reason}"
+                    ),
                 )
 
                 self.signal_events_log.log_event(
                     event_type="level8_council_heartbeat",
-                    trade_id=decision.decision_id,
+                    trade_id=decision_id,
                     product_id=product_id,
                     rank_score=(
                         f"{float(candidate.get('rank_score', 0.0)):.6f}"
@@ -7855,19 +7906,100 @@ class TradingBot:
                     action="commentary",
                     reason=(
                         f"heartbeat_only=True;"
-                        f"decision={decision.action};"
-                        f"strategy={decision.strategy};"
-                        f"bucket={decision.bucket};"
-                        f"truth={decision.truth_score:.3f};"
-                        f"final_buy={decision.final_buy_score:.3f};"
-                        f"threshold={decision.buy_threshold:.3f};"
+                        f"decision={action};"
+                        f"strategy={strategy};"
+                        f"bucket={bucket};"
+                        f"truth={truth_score:.3f};"
+                        f"final_buy={final_buy:.3f};"
+                        f"threshold={buy_threshold:.3f};"
+                        f"recommended_pct={recommended_pct:.3f};"
                         f"why_not_ready={candidate.get('why_not_ready', '')};"
-                        f"{decision.reason}"
+                        f"{reason}"
                     ),
                 )
 
             except Exception as exc:
                 log(f"[level8] council heartbeat failed {product_id}: {exc}")
+
+    def _append_level8_decision_snapshot(
+        self,
+        *,
+        product_id: str,
+        decision_id: str,
+        action: str,
+        strategy: str,
+        bucket: str,
+        risk_mode: str,
+        truth_score: float,
+        final_buy_score: float,
+        final_sell_score: float,
+        buy_threshold: float,
+        sell_threshold: float,
+        recommended_position_pct: float,
+        confidence: float,
+        reason: str,
+    ) -> None:
+        """
+        Write a normalized Level 8 decision row for live and heartbeat decisions.
+        """
+        try:
+            columns = [
+                "ts",
+                "dt_mst",
+                "decision_id",
+                "product_id",
+                "action",
+                "strategy",
+                "bucket",
+                "risk_mode",
+                "truth_score",
+                "final_buy_score",
+                "final_sell_score",
+                "buy_threshold",
+                "sell_threshold",
+                "recommended_position_pct",
+                "confidence",
+                "reason",
+            ]
+            write_header = not os.path.exists(
+                LEVEL8_COUNCIL_DECISIONS_CSV_PATH
+            )
+            ts_val = now_ts()
+            dt_mst = (
+                datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                .astimezone(TZ)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+
+            with open(
+                LEVEL8_COUNCIL_DECISIONS_CSV_PATH,
+                "a",
+                newline="",
+                encoding="utf-8",
+            ) as file:
+                writer = csv.writer(file)
+                if write_header:
+                    writer.writerow(columns)
+                writer.writerow([
+                    f"{ts_val:.6f}",
+                    dt_mst,
+                    decision_id,
+                    product_id,
+                    action,
+                    strategy,
+                    bucket,
+                    risk_mode,
+                    f"{float(truth_score):.6f}",
+                    f"{float(final_buy_score):.6f}",
+                    f"{float(final_sell_score):.6f}",
+                    f"{float(buy_threshold):.6f}",
+                    f"{float(sell_threshold):.6f}",
+                    f"{float(recommended_position_pct):.6f}",
+                    f"{float(confidence):.6f}",
+                    reason,
+                ])
+        except Exception as exc:
+            log(f"[level8] decision snapshot write failed: {exc}")
 
     def _level5_should_hold_or_exit(
         self,
@@ -11507,6 +11639,37 @@ class TradingBot:
                         level8_info.get("recommended_position_pct", 0.0) or 0.0
                     )
                     candidate["level8_reason"] = str(level8_info.get("reason", ""))
+                    self._append_level8_decision_snapshot(
+                        product_id=product_id_l8,
+                        decision_id=str(level8_info.get("decision_id", "")),
+                        action=str(level8_info.get("action", "WAIT")),
+                        strategy=str(level8_info.get("strategy", "")),
+                        bucket=str(level8_info.get("bucket", "")),
+                        risk_mode=str(
+                            level8_info.get("risk_mode", "NORMAL")
+                        ),
+                        truth_score=float(
+                            level8_info.get("truth_score", 0.0) or 0.0
+                        ),
+                        final_buy_score=float(
+                            level8_info.get("final_buy_score", 0.0) or 0.0
+                        ),
+                        final_sell_score=0.0,
+                        buy_threshold=float(
+                            level8_info.get("buy_threshold", 0.0) or 0.0
+                        ),
+                        sell_threshold=0.0,
+                        recommended_position_pct=float(
+                            level8_info.get(
+                                "recommended_position_pct", 0.0
+                            )
+                            or 0.0
+                        ),
+                        confidence=float(
+                            level8_info.get("confidence", 0.0) or 0.0
+                        ),
+                        reason=str(level8_info.get("reason", "")),
+                    )
                     try:
                         self.signal_events_log.log_event(
                             event_type="level8_council_decision",

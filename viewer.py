@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import html
+import re
 from typing import Any, Callable, Dict, List
 
 import pandas as pd
@@ -469,6 +470,137 @@ hr {
   margin-top: 0.08rem;
 }
 
+/* =============================================================================
+   Level 8 notable council report overlay
+   ============================================================================= */
+
+.council-report-overlay {
+  margin-top: 0.70rem;
+  border: 1px solid rgba(251,191,36,0.30);
+  border-radius: 22px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 18% 12%, rgba(96,165,250,0.17), transparent 28%),
+    radial-gradient(circle at 88% 16%, rgba(251,191,36,0.13), transparent 26%),
+    linear-gradient(135deg, rgba(15,23,42,0.98), rgba(2,6,23,0.98));
+  box-shadow: 0 18px 50px rgba(0,0,0,0.38);
+}
+
+.council-report-scene {
+  display: grid;
+  grid-template-columns: 145px 1fr;
+  gap: 0.75rem;
+  padding: 0.72rem;
+  min-height: 178px;
+}
+
+.council-report-portrait {
+  position: relative;
+  border: 1px solid rgba(148,163,184,0.18);
+  border-radius: 20px;
+  background:
+    radial-gradient(circle at 50% 26%, rgba(254,243,199,0.18), transparent 24%),
+    linear-gradient(180deg, rgba(30,41,59,0.95), rgba(15,23,42,0.98));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 150px;
+  overflow: hidden;
+}
+
+.council-report-portrait::before {
+  content: "";
+  position: absolute;
+  width: 92px;
+  height: 92px;
+  top: 27px;
+  border-radius: 50%;
+  background: rgba(251,191,36,0.13);
+  filter: blur(2px);
+}
+
+.report-knight-big {
+  position: relative;
+  z-index: 2;
+  font-size: 4.2rem;
+  animation: report-speaker-bob 1.7s ease-in-out infinite;
+}
+
+@keyframes report-speaker-bob {
+  0%, 100% { transform: translateY(0) scale(1); }
+  50% { transform: translateY(-5px) scale(1.03); }
+}
+
+.council-report-box {
+  border: 1px solid rgba(148,163,184,0.18);
+  border-radius: 18px;
+  padding: 0.62rem 0.72rem;
+  background: rgba(2,6,23,0.62);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.report-speaker-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.55rem;
+  align-items: center;
+  margin-bottom: 0.40rem;
+}
+
+.report-speaker-name {
+  color: #FDE68A;
+  font-weight: 900;
+  font-size: 0.86rem;
+}
+
+.report-speaker-meta {
+  color: #94A3B8;
+  font-size: 0.63rem;
+}
+
+.report-dialogue {
+  color: #E5E7EB;
+  font-size: 0.79rem;
+  line-height: 1.36;
+  min-height: 4.1rem;
+}
+
+.report-dialogue.typing {
+  overflow: hidden;
+  border-right: 2px solid rgba(251,191,36,0.75);
+  animation: report-caret 0.9s step-end infinite;
+}
+
+@keyframes report-caret {
+  50% { border-color: transparent; }
+}
+
+.report-metrics-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.34rem;
+  margin-top: 0.58rem;
+}
+
+.report-metric {
+  border-radius: 12px;
+  background: rgba(148,163,184,0.08);
+  padding: 0.30rem 0.36rem;
+}
+
+.report-metric-label {
+  color: #94A3B8;
+  font-size: 0.55rem;
+}
+
+.report-metric-value {
+  color: #E5E7EB;
+  font-size: 0.72rem;
+  font-weight: 850;
+}
+
 @media (max-width: 900px) {
   .round-table-wrap {
     min-height: auto;
@@ -488,6 +620,11 @@ hr {
   }
 
   .council-ledger { grid-template-columns: 1fr 1fr; }
+
+  .council-report-scene { grid-template-columns: 1fr; }
+  .council-report-portrait { min-height: 95px; }
+  .report-knight-big { font-size: 3.3rem; }
+  .report-metrics-row { grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 1100px) {
@@ -656,6 +793,142 @@ def latest_council_decision(
         if not product_rows.empty:
             d = product_rows
     return None if d.empty else d.sort_values("ts").iloc[-1]
+
+
+def parse_level8_reason_value(
+    reason: Any,
+    key: str,
+    default: float = np.nan,
+) -> float:
+    """Pull numeric telemetry such as ``final_buy=0.512`` from a reason."""
+    try:
+        text = str(reason or "")
+        match = re.search(
+            rf"{re.escape(key)}=([-+]?[0-9]*\.?[0-9]+)",
+            text,
+        )
+        return default if not match else float(match.group(1))
+    except Exception:
+        return default
+
+
+def parse_text_key(text: Any, key: str, default: str = "") -> str:
+    """Pull a semicolon-delimited text value from a telemetry reason."""
+    try:
+        match = re.search(rf"{re.escape(key)}=([^;]+)", str(text or ""))
+        return default if not match else str(match.group(1)).strip()
+    except Exception:
+        return default
+
+
+def latest_level8_summary(
+    *,
+    council_decisions: pd.DataFrame,
+    signal_events: pd.DataFrame,
+    selected_product: str | None = None,
+) -> dict[str, Any]:
+    """Return the best Level 8 summary from decisions, events, or defaults."""
+    if not council_decisions.empty and "ts" in council_decisions.columns:
+        decisions = council_decisions.copy()
+        if selected_product and "product_id" in decisions.columns:
+            product_rows = decisions[
+                decisions["product_id"].astype(str) == str(selected_product)
+            ].copy()
+            if not product_rows.empty:
+                decisions = product_rows
+
+        if not decisions.empty:
+            row = decisions.sort_values("ts").iloc[-1]
+            return {
+                "source": "council_decisions",
+                "product_id": row.get(
+                    "product_id", selected_product or "ALL"
+                ),
+                "action": row.get("action", "WAIT"),
+                "strategy": row.get("strategy", "COUNCIL"),
+                "bucket": row.get("bucket", "COMMENTARY"),
+                "final_buy_score": safe_float(
+                    row.get("final_buy_score"), 0.0
+                ),
+                "final_sell_score": safe_float(
+                    row.get("final_sell_score"), 0.0
+                ),
+                "buy_threshold": safe_float(
+                    row.get("buy_threshold"), 0.0
+                ),
+                "sell_threshold": safe_float(
+                    row.get("sell_threshold"), 0.0
+                ),
+                "truth_score": safe_float(row.get("truth_score"), 0.0),
+                "recommended_position_pct": safe_float(
+                    row.get("recommended_position_pct"), 0.0
+                ),
+                "confidence": safe_float(row.get("confidence"), 0.0),
+                "reason": str(row.get("reason", "")),
+            }
+
+    if not signal_events.empty and "event_type" in signal_events.columns:
+        events = signal_events[
+            signal_events["event_type"].astype(str).isin([
+                "level8_council_heartbeat",
+                "level8_council_decision",
+            ])
+        ].copy()
+        if selected_product and "product_id" in events.columns:
+            product_rows = events[
+                events["product_id"].astype(str) == str(selected_product)
+            ].copy()
+            if not product_rows.empty:
+                events = product_rows
+
+        if not events.empty:
+            row = events.sort_values("ts").iloc[-1]
+            reason = str(row.get("reason", ""))
+            return {
+                "source": "signal_events",
+                "product_id": row.get(
+                    "product_id", selected_product or "ALL"
+                ),
+                "action": parse_text_key(reason, "decision", "WAIT"),
+                "strategy": parse_text_key(
+                    reason, "strategy", "COUNCIL_HEARTBEAT"
+                ),
+                "bucket": parse_text_key(
+                    reason, "bucket", "COMMENTARY"
+                ),
+                "final_buy_score": parse_level8_reason_value(
+                    reason, "final_buy", 0.0
+                ),
+                "final_sell_score": 0.0,
+                "buy_threshold": parse_level8_reason_value(
+                    reason, "threshold", 0.0
+                ),
+                "sell_threshold": 0.0,
+                "truth_score": parse_level8_reason_value(
+                    reason, "truth", 0.0
+                ),
+                "recommended_position_pct": parse_level8_reason_value(
+                    reason, "recommended_pct", 0.0
+                ),
+                "confidence": 0.0,
+                "reason": reason,
+            }
+
+    return {
+        "source": "fallback",
+        "product_id": selected_product or "ALL",
+        "action": "WAIT",
+        "strategy": "MARKET_WATCH",
+        "bucket": "COMMENTARY",
+        "final_buy_score": 0.0,
+        "final_sell_score": 0.0,
+        "buy_threshold": 0.0,
+        "sell_threshold": 0.0,
+        "truth_score": 0.0,
+        "recommended_position_pct": 0.0,
+        "confidence": 0.0,
+        "reason": "Awaiting first real Level 8 telemetry row.",
+    }
 
 
 def agent_knight_profile(agent: str) -> dict[str, str]:
@@ -845,6 +1118,169 @@ def knight_dialogue(
     return build_threaded_knight_dialogue(row, selected_product)
 
 
+def notable_importance_score(row: pd.Series) -> float:
+    """Score how strongly a current council reading merits a featured report."""
+    try:
+        action, dominant = dominant_agent_action(row)
+        confidence = safe_float(row.get("confidence"), 0.0)
+        reliability = safe_float(row.get("reliability"), 0.0)
+        buy = safe_float(row.get("adjusted_buy_score"), 0.0)
+        sell = safe_float(row.get("adjusted_sell_score"), 0.0)
+        wait = safe_float(row.get("adjusted_wait_score"), 0.0)
+        spread = abs(buy - sell)
+        caution = max(wait, sell)
+        action_bonus = 0.15 if action in {"BUY", "SELL"} else 0.0
+        return float(
+            dominant * 0.35
+            + confidence * 0.20
+            + reliability * 0.20
+            + spread * 0.15
+            + caution * 0.10
+            + action_bonus
+        )
+    except Exception:
+        return 0.0
+
+
+def select_notable_council_report(
+    *,
+    council_votes: pd.DataFrame,
+    selected_product: str | None = None,
+) -> pd.Series | None:
+    """Rotate a notable agent report every 45 seconds or on a major signal."""
+    latest_votes = latest_rows_by_agent(council_votes, selected_product)
+    if latest_votes.empty:
+        latest_votes = synthetic_council_vote_rows(selected_product)
+    if latest_votes.empty:
+        return None
+
+    ranked = latest_votes.copy()
+    ranked["_importance"] = ranked.apply(
+        notable_importance_score, axis=1
+    )
+    ranked = ranked.sort_values(
+        "_importance", ascending=False
+    ).reset_index(drop=True)
+
+    now = pd.Timestamp.utcnow().timestamp()
+    last_switch = float(
+        st.session_state.get("council_report_last_switch", 0.0)
+    )
+    current_index = int(
+        st.session_state.get("council_report_index", 0)
+    )
+    top_importance = float(ranked.iloc[0].get("_importance", 0.0))
+    should_switch = (now - last_switch) >= 45.0 or top_importance >= 0.82
+
+    if should_switch:
+        current_index = (
+            0
+            if top_importance >= 0.82
+            else (current_index + 1) % len(ranked)
+        )
+        st.session_state["council_report_index"] = current_index
+        st.session_state["council_report_last_switch"] = now
+
+    current_index = max(0, min(current_index, len(ranked) - 1))
+    return ranked.iloc[current_index]
+
+
+def build_visual_novel_report_text(
+    row: pd.Series,
+    selected_product: str | None = None,
+) -> str:
+    """Build narrative dialogue covering positive, neutral, and adverse votes."""
+    agent = str(row.get("agent", "truth"))
+    action, score = dominant_agent_action(row)
+    profile = agent_knight_profile(agent)
+    confidence = safe_float(row.get("confidence"), 0.0)
+    reliability = safe_float(row.get("reliability"), 0.0)
+    reason = str(row.get("reason", "")).strip()
+    if len(reason) > 190:
+        reason = reason[:187] + "..."
+    product_text = str(
+        selected_product or row.get("product_id", "the market")
+    )
+    openings = {
+        "BUY": "Hear me, the field brighteneth.",
+        "SELL": "Mark this warning, the tide bends against us.",
+        "HOLD": "Steady now, our position need not flee.",
+        "WAIT": "Stay thy purse; the omen is not yet worthy.",
+    }
+    return (
+        f"{openings.get(action, 'Attend the council.')} "
+        f"For {product_text}, I, {profile['name']}, see {action} pressure at "
+        f"{score * 100:.0f}% strength. My confidence stands at "
+        f"{confidence * 100:.0f}% and my reliability at "
+        f"{reliability * 100:.0f}%. {reason}"
+    )
+
+
+def render_council_notable_report(
+    *,
+    council_votes: pd.DataFrame,
+    selected_product: str | None,
+    summary: dict[str, Any],
+) -> None:
+    """Render the visual-novel report beneath the persistent council table."""
+    row = select_notable_council_report(
+        council_votes=council_votes,
+        selected_product=selected_product,
+    )
+    if row is None:
+        return
+
+    profile = agent_knight_profile(str(row.get("agent", "truth")))
+    action, score = dominant_agent_action(row)
+    text = html.escape(
+        build_visual_novel_report_text(row, selected_product)
+    )
+    st.markdown(
+        f"""
+        <div class="council-report-overlay">
+          <div class="council-report-scene">
+            <div class="council-report-portrait">
+              <div class="report-knight-big">{html.escape(profile["icon"])}</div>
+            </div>
+            <div class="council-report-box">
+              <div>
+                <div class="report-speaker-line">
+                  <div>
+                    <div class="report-speaker-name">{html.escape(profile["name"])}</div>
+                    <div class="report-speaker-meta">{html.escape(profile["role"])} · {html.escape(action)} · strength {score * 100:.0f}%</div>
+                  </div>
+                  <div class="council-decision-pill">
+                    {html.escape(str(summary.get("action", "WAIT")))} · {html.escape(str(summary.get("bucket", "COMMENTARY")))}
+                  </div>
+                </div>
+                <div class="report-dialogue typing">{text}</div>
+              </div>
+              <div class="report-metrics-row">
+                <div class="report-metric">
+                  <div class="report-metric-label">Final buy</div>
+                  <div class="report-metric-value">{fmt_pct_score(summary.get("final_buy_score", 0.0), 1)}</div>
+                </div>
+                <div class="report-metric">
+                  <div class="report-metric-label">Threshold</div>
+                  <div class="report-metric-value">{fmt_pct_score(summary.get("buy_threshold", 0.0), 1)}</div>
+                </div>
+                <div class="report-metric">
+                  <div class="report-metric-label">Truth</div>
+                  <div class="report-metric-value">{fmt_pct_score(summary.get("truth_score", 0.0), 1)}</div>
+                </div>
+                <div class="report-metric">
+                  <div class="report-metric-label">Rec. size</div>
+                  <div class="report-metric-value">{fmt_pct_score(summary.get("recommended_position_pct", 0.0), 1)}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def knight_position(index: int, total: int) -> tuple[float, float]:
     """Position a knight around the oval council table."""
     if total <= 0:
@@ -857,32 +1293,28 @@ def render_council_visual_representation(
     *,
     council_votes: pd.DataFrame,
     council_decisions: pd.DataFrame,
+    signal_events: pd.DataFrame,
     agent_adjustments: pd.DataFrame,
     adaptive_thresholds: pd.DataFrame,
     selected_product: str | None = None,
 ) -> None:
     """Render the animated, text-and-CSS Level 8 council scene."""
     del agent_adjustments, adaptive_thresholds  # Reserved for richer visual overlays.
-    latest_decision = latest_council_decision(council_decisions, selected_product)
+    summary = latest_level8_summary(
+        council_decisions=council_decisions,
+        signal_events=signal_events,
+        selected_product=selected_product,
+    )
     latest_votes = latest_rows_by_agent(council_votes, selected_product)
 
-    decision_action = "WAIT"
-    decision_strategy = "MARKET_WATCH"
-    decision_bucket = "COMMENTARY"
-    decision_reason = (
-        "The council is watching the field and arguing from current evidence; "
-        "no live council decision hath yet been logged."
+    decision_action = html.escape(str(summary.get("action", "WAIT")))
+    decision_strategy = html.escape(
+        str(summary.get("strategy", "MARKET_WATCH"))
     )
-    final_buy = buy_threshold = truth_score = position_pct = np.nan
-    if latest_decision is not None:
-        decision_action = html.escape(str(latest_decision.get("action", "—")))
-        decision_strategy = html.escape(str(latest_decision.get("strategy", "—")))
-        decision_bucket = html.escape(str(latest_decision.get("bucket", "—")))
-        decision_reason = html.escape(str(latest_decision.get("reason", ""))[:180])
-        final_buy = latest_decision.get("final_buy_score", np.nan)
-        buy_threshold = latest_decision.get("buy_threshold", np.nan)
-        truth_score = latest_decision.get("truth_score", np.nan)
-        position_pct = latest_decision.get("recommended_position_pct", np.nan)
+    decision_bucket = html.escape(
+        str(summary.get("bucket", "COMMENTARY"))
+    )
+    decision_reason = html.escape(str(summary.get("reason", ""))[:220])
 
     if latest_votes.empty:
         latest_votes = synthetic_council_vote_rows(selected_product)
@@ -961,18 +1393,23 @@ def render_council_visual_representation(
           <div class="round-table-wrap"><div class="round-table-core"></div>{''.join(knights_html)}</div>
           <div class="council-ledger">
             <div class="council-ledger-card"><div class="council-ledger-label">Final buy score</div>
-              <div class="council-ledger-value">{fmt_pct_score(final_buy, 1)}</div></div>
+              <div class="council-ledger-value">{fmt_pct_score(summary.get("final_buy_score", 0.0), 1)}</div></div>
             <div class="council-ledger-card"><div class="council-ledger-label">Buy threshold</div>
-              <div class="council-ledger-value">{fmt_pct_score(buy_threshold, 1)}</div></div>
+              <div class="council-ledger-value">{fmt_pct_score(summary.get("buy_threshold", 0.0), 1)}</div></div>
             <div class="council-ledger-card"><div class="council-ledger-label">Truth score</div>
-              <div class="council-ledger-value">{fmt_pct_score(truth_score, 1)}</div></div>
+              <div class="council-ledger-value">{fmt_pct_score(summary.get("truth_score", 0.0), 1)}</div></div>
             <div class="council-ledger-card"><div class="council-ledger-label">Recommended size</div>
-              <div class="council-ledger-value">{fmt_pct_score(position_pct, 1)}</div></div>
+              <div class="council-ledger-value">{fmt_pct_score(summary.get("recommended_position_pct", 0.0), 1)}</div></div>
           </div>
           <div class="cb-small" style="margin-top:0.45rem;">Latest decree: {decision_reason}</div>
         </div>
         """,
         unsafe_allow_html=True,
+    )
+    render_council_notable_report(
+        council_votes=council_votes,
+        selected_product=selected_product,
+        summary=summary,
     )
 
 
@@ -1592,6 +2029,7 @@ def render_live_dashboard() -> None:
         render_council_visual_representation(
             council_votes=council_votes,
             council_decisions=council_decisions,
+            signal_events=signal_events,
             agent_adjustments=agent_adjustments,
             adaptive_thresholds=adaptive_thresholds,
             selected_product=visual_product,
@@ -2160,6 +2598,7 @@ def render_live_dashboard() -> None:
         render_council_visual_representation(
             council_votes=council_votes,
             council_decisions=council_decisions,
+            signal_events=signal_events,
             agent_adjustments=agent_adjustments,
             adaptive_thresholds=adaptive_thresholds,
             selected_product=product,

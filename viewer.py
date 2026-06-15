@@ -31,6 +31,7 @@ SIGNAL_EVENTS_CSV = os.path.join(BASE_DIR, "signal_events.csv")
 TRADE_OUTCOMES_CSV = os.path.join(BASE_DIR, "trade_outcomes.csv")
 RECONCILIATION_CSV = os.path.join(BASE_DIR, "reconciliation.csv")
 AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
+MANAGER_STATUS_CSV = os.path.join(BASE_DIR, "manager_status.csv")
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -808,6 +809,7 @@ def render_live_dashboard() -> None:
     trade_outcomes = load_csv(TRADE_OUTCOMES_CSV)
     reconciliation = load_csv(RECONCILIATION_CSV)
     ai_predictions = load_csv(AI_PREDICTIONS_CSV)
+    manager_status = load_csv(MANAGER_STATUS_CSV)
 
     signal_events = numeric(signal_events, [
         "ts", "rank", "rank_score", "buy_ready_count",
@@ -831,6 +833,9 @@ def render_live_dashboard() -> None:
         "expected_adverse_bps", "score", "probability", "ev_bps",
         "spread_bps", "momentum_1_bps", "momentum_3_bps",
         "momentum_5_bps", "momentum_15_bps",
+    ])
+    manager_status = numeric(manager_status, [
+        "ts", "session_net", "loss_streak", "closed_count",
     ])
 
     st.markdown(
@@ -1096,6 +1101,34 @@ def render_live_dashboard() -> None:
     """,
         unsafe_allow_html=True,
     )
+
+    st.markdown(
+        '<div class="cb-section">Level 5 manager</div>',
+        unsafe_allow_html=True,
+    )
+    if manager_status.empty:
+        st.info("No manager_status.csv rows yet.")
+    else:
+        manager_row = manager_status.sort_values("ts").iloc[-1]
+        manager_col_1, manager_col_2, manager_col_3 = st.columns(3)
+        with manager_col_1:
+            mini_card(
+                "Risk mode",
+                str(manager_row.get("risk_mode", "—")),
+                str(manager_row.get("reason", "")),
+            )
+        with manager_col_2:
+            mini_card(
+                "Session net",
+                fmt_money(manager_row.get("session_net", np.nan), 4),
+                "recent logged P/L",
+            )
+        with manager_col_3:
+            mini_card(
+                "Loss streak",
+                fmt_num(manager_row.get("loss_streak", np.nan), 0),
+                "closed sell streak",
+            )
 
 
     # =============================================================================

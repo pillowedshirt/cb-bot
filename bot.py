@@ -33,6 +33,11 @@ try:
 except Exception:
     LocalAIBrain = None
 
+try:
+    from level5_manager import Level5TradingManager
+except Exception:
+    Level5TradingManager = None
+
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 TZ_NAME: str = "America/Phoenix"
@@ -111,6 +116,7 @@ PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
 SIGNAL_EVENTS_CSV_PATH: str = os.path.join(BASE_DIR, "signal_events.csv")
 TRADE_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "trade_outcomes.csv")
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
+MANAGER_STATUS_CSV_PATH: str = os.path.join(BASE_DIR, "manager_status.csv")
 DEBUG_LOG_ENABLED: bool = True
 DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
@@ -177,6 +183,20 @@ USE_EQUITY_PERCENT_POSITION_SIZING: bool = True
 # Total equity means cash + positions valued using live mids.
 MIN_POSITION_PCT_OF_EQUITY: float = 0.05
 MAX_SINGLE_BUY_PCT_OF_EQUITY: float = 0.20
+
+# ============================================================
+# LEVEL 5 TRADING MANAGER
+# ============================================================
+
+ENABLE_LEVEL5_MANAGER: bool = True
+LEVEL5_DISABLE_INVERTED_CYCLE: bool = True
+LEVEL5_MODE: str = "FILTER_AND_SIZE"  # OBSERVE, FILTER, FILTER_AND_SIZE
+LEVEL5_MAX_CLOSED_LOSS_STREAK: int = 4
+LEVEL5_DAILY_SOFT_LOSS_USD: float = 1.00
+LEVEL5_DAILY_HARD_LOSS_USD: float = 2.00
+LEVEL5_PRODUCT_COOLDOWN_AFTER_BAD_OUTCOMES_SEC: float = 30 * 60
+LEVEL5_MIN_POSITION_PCT: float = 0.03
+LEVEL5_MAX_POSITION_PCT: float = 0.08
 
 # Max total exposure per product can reach 50% of total equity through scale-ins.
 MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.50
@@ -622,7 +642,7 @@ MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT: float = 0.01
 #   old loss-stop point -> buy
 #   next old loss-stop point while holding -> sell old position and buy larger
 #   return to sell marker -> sell
-ENABLE_INVERTED_STOPLOSS_CYCLE: bool = True
+ENABLE_INVERTED_STOPLOSS_CYCLE: bool = False
 
 # Use the existing 1% loss threshold as the inverted buy trigger.
 INVERTED_BUY_DROP_PCT: float = MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT
@@ -1572,6 +1592,18 @@ class SignalEventsLogger(_ResearchCSVLogger):
 
     def log_event(self, **kwargs: Any) -> None:
         self._write(kwargs)
+
+
+class ManagerStatusLogger(_ResearchCSVLogger):
+    """Log the latest Level 5 session-risk posture for the live viewer."""
+
+    columns = [
+        "ts", "dt_mst", "risk_mode", "session_net", "loss_streak",
+        "closed_count", "active_strategy_note", "reason",
+    ]
+
+    def log_status(self, status: Dict[str, Any]) -> None:
+        self._write(status)
 
 
 class TradeOutcomeLogger(_ResearchCSVLogger):
@@ -4333,6 +4365,7 @@ class TradingBot:
         self.candidate_replay_log = CandidateReplayLogger(CANDIDATE_REPLAY_CSV_PATH)
         self.active_products_log = ActiveProductsLogger(PRODUCTS_ACTIVE_CSV_PATH)
         self.signal_events_log = SignalEventsLogger(SIGNAL_EVENTS_CSV_PATH)
+        self.manager_status_log = ManagerStatusLogger(MANAGER_STATUS_CSV_PATH)
         self.trade_outcomes_log = TradeOutcomeLogger(TRADE_OUTCOMES_CSV_PATH)
         self.reconciliation_log = ReconciliationLogger(RECONCILIATION_CSV_PATH)
         self.mlog = MarketLogger(MARKET_CSV_PATH)
@@ -4365,6 +4398,7 @@ class TradingBot:
         self.cached_account_snapshot: Optional[Dict[str, Dict[str, float]]] = None
         self.cached_account_snapshot_ts: float = 0.0
         self.ai_brain = None
+        self.level5_manager = None
         self.last_ai_train_ts: float = 0.0
         if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
             try:
@@ -4375,6 +4409,13 @@ class TradingBot:
             except Exception as exc:
                 self.ai_brain = None
                 log(f"[ai] failed to initialize LocalAIBrain: {exc}")
+        if ENABLE_LEVEL5_MANAGER and Level5TradingManager is not None:
+            try:
+                self.level5_manager = Level5TradingManager()
+                log("[level5] manager initialized")
+            except Exception as exc:
+                self.level5_manager = None
+                log(f"[level5] manager initialization failed: {exc}")
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
         self.inverted_markers: Dict[str, Dict[str, Any]] = {}
@@ -7511,6 +7552,85 @@ class TradingBot:
             return False, f"spread_too_high spread={float(spread_bps):.3f} max={max_spread:.3f}"
         return True, f"spread_ok spread={float(spread_bps):.3f} max={max_spread:.3f}"
 
+    def _level5_decision_for_candidate(
+        self, *, candidate: Dict[str, Any]
+    ) -> Tuple[bool, Dict[str, Any]]:
+        product_id = str(candidate.get("product_id", ""))
+        fallback = {
+            "action": "ALLOW_BUY",
+            "strategy": "LEGACY",
+            "risk_mode": "NORMAL",
+            "max_position_pct": float(MAX_SINGLE_BUY_PCT_OF_EQUITY),
+        }
+        if not ENABLE_LEVEL5_MANAGER:
+            return True, {**fallback, "reason": "level5_disabled"}
+        if self.level5_manager is None:
+            return True, {**fallback, "reason": "level5_unavailable"}
+
+        try:
+            has_open = self._inverted_has_open_position(product_id)
+        except Exception:
+            has_open = bool(self.positions.get(product_id))
+
+        try:
+            decision = self.level5_manager.decide(
+                product_id=product_id,
+                candidate=candidate,
+                has_open_position=has_open,
+            )
+        except Exception as exc:
+            return True, {
+                **fallback,
+                "reason": f"level5_decision_failed:{exc}",
+            }
+
+        info = {
+            "action": decision.action,
+            "strategy": decision.strategy,
+            "risk_mode": decision.risk_mode,
+            "confidence": float(decision.confidence),
+            "max_position_pct": clamp_float(
+                float(decision.max_position_pct),
+                0.0,
+                float(LEVEL5_MAX_POSITION_PCT),
+            ),
+            "reason": decision.reason,
+        }
+        allow = str(decision.action).upper() in {"ALLOW_BUY", "HOLD"}
+        if str(LEVEL5_MODE).upper() == "OBSERVE":
+            allow = True
+            info["max_position_pct"] = float(MAX_SINGLE_BUY_PCT_OF_EQUITY)
+        return bool(allow), info
+
+    def _level5_should_hold_or_exit(
+        self,
+        *,
+        product_id: str,
+        entry_price: float,
+        current_price: float,
+        unrealized_bps: float,
+        default_exit_reason: str,
+    ) -> Tuple[bool, str]:
+        """Allow risk/profit exits while suppressing fee-heavy small-loss churn."""
+        del product_id, entry_price, current_price
+        if not ENABLE_LEVEL5_MANAGER or self.level5_manager is None:
+            return True, f"legacy_exit_allowed:{default_exit_reason}"
+
+        try:
+            risk_mode = str(
+                self.level5_manager.session_health().get("risk_mode", "NORMAL")
+            ).upper()
+        except Exception:
+            risk_mode = "NORMAL"
+
+        if risk_mode == "PAUSE":
+            return True, f"level5_pause_exit;{default_exit_reason}"
+        if unrealized_bps > 0:
+            return True, f"profit_exit_allowed;{default_exit_reason}"
+        if unrealized_bps <= -100:
+            return True, f"loss_stop_exit_allowed;{default_exit_reason}"
+        return False, f"level5_blocks_small_loss_churn;{default_exit_reason}"
+
     def _entry_timing_confirmation(
         self,
         *,
@@ -9996,6 +10116,21 @@ class TradingBot:
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
 
+            skip_new_buys_this_loop = False
+            if ENABLE_LEVEL5_MANAGER and self.level5_manager is not None:
+                try:
+                    manager_status = self.level5_manager.session_health()
+                    manager_status["active_strategy_note"] = "level5_manager_active"
+                    self.manager_status_log.log_status(manager_status)
+                    if str(manager_status.get("risk_mode", "")).upper() == "PAUSE":
+                        skip_new_buys_this_loop = True
+                        log(
+                            "[level5] session pause active: "
+                            f"{manager_status.get('reason')}"
+                        )
+                except Exception as exc:
+                    log(f"[level5] session health check failed: {exc}")
+
             candidates = []
             for product_id in PRODUCTS:
                 tob = self.tob.get(product_id)
@@ -10029,7 +10164,9 @@ class TradingBot:
                 sigma_bps = self._compute_sigma_bps_from_1m(product_id)
 
                 lots = self.positions.get(product_id, [])
-                if ENABLE_INVERTED_STOPLOSS_CYCLE:
+                if ENABLE_INVERTED_STOPLOSS_CYCLE and not (
+                    ENABLE_LEVEL5_MANAGER and LEVEL5_DISABLE_INVERTED_CYCLE
+                ):
                     inverted_lot = any(
                         isinstance(lot.meta, dict)
                         and lot.meta.get("strategy_mode") == "inverted_stoploss_cycle"
@@ -10407,6 +10544,33 @@ class TradingBot:
                             )
                             sell_qty = 0.0
 
+                    if sell_qty > 0 and ENABLE_LEVEL5_MANAGER:
+                        unrealized_bps = (
+                            ((float(bid) / float(avg_entry_price)) - 1.0) * 10000.0
+                        )
+                        try:
+                            should_exit_l5, level5_exit_reason = (
+                                self._level5_should_hold_or_exit(
+                                    product_id=product_id,
+                                    entry_price=float(avg_entry_price),
+                                    current_price=float(bid),
+                                    unrealized_bps=float(unrealized_bps),
+                                    default_exit_reason=str(exit_reason or "sell"),
+                                )
+                            )
+                            if not should_exit_l5:
+                                log(
+                                    f"[level5] exit blocked {product_id}: "
+                                    f"{level5_exit_reason}"
+                                )
+                                sell_qty = 0.0
+                            else:
+                                exit_reason = (
+                                    f"{exit_reason or 'sell'};{level5_exit_reason}"
+                                )
+                        except Exception as exc:
+                            log(f"[level5] exit check failed {product_id}: {exc}")
+
                     if sell_qty > 0:
                         last_sell_fail = self.last_sell_failure_ts_by_product.get(product_id, 0.0)
                         if ts_now - float(last_sell_fail) < 5.0:
@@ -10691,6 +10855,72 @@ class TradingBot:
                     )
                 candidates = filtered_candidates
 
+            if skip_new_buys_this_loop:
+                candidates = []
+
+            if ENABLE_LEVEL5_MANAGER and candidates:
+                manager_filtered_candidates: List[Dict[str, Any]] = []
+                for candidate in candidates:
+                    product_id_m = str(candidate.get("product_id", ""))
+                    manager_ok, manager_info = self._level5_decision_for_candidate(
+                        candidate=candidate
+                    )
+                    candidate["manager_ok"] = bool(manager_ok)
+                    candidate["manager_action"] = manager_info.get("action", "")
+                    candidate["manager_strategy"] = manager_info.get("strategy", "")
+                    candidate["manager_risk_mode"] = manager_info.get("risk_mode", "")
+                    candidate["manager_reason"] = manager_info.get("reason", "")
+                    candidate["manager_max_position_pct"] = float(
+                        manager_info.get(
+                            "max_position_pct", MAX_SINGLE_BUY_PCT_OF_EQUITY
+                        )
+                    )
+                    try:
+                        self.signal_events_log.log_event(
+                            event_type="level5_manager_decision",
+                            product_id=product_id_m,
+                            rank_score=(
+                                f"{float(candidate.get('rank_score', 0.0)):.6f}"
+                            ),
+                            buy_ready_count=len(candidates),
+                            score=f"{float(candidate.get('score', 0.0)):.6f}",
+                            probability=(
+                                f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}"
+                            ),
+                            ev_bps=(
+                                f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}"
+                            ),
+                            projected_forward_bps=(
+                                f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}"
+                            ),
+                            cost_bps=(
+                                f"{float(candidate.get('cost_bps', 0.0)):.6f}"
+                            ),
+                            spread_bps=(
+                                f"{float(candidate.get('spread_bps', 0.0)):.6f}"
+                            ),
+                            action="keep" if manager_ok else "reject",
+                            reason=(
+                                f"action={manager_info.get('action')};"
+                                f"strategy={manager_info.get('strategy')};"
+                                f"risk={manager_info.get('risk_mode')};"
+                                f"{manager_info.get('reason')}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    if manager_ok:
+                        manager_filtered_candidates.append(candidate)
+                    else:
+                        log(
+                            f"[level5] blocked {product_id_m}: "
+                            f"action={manager_info.get('action')} "
+                            f"strategy={manager_info.get('strategy')} "
+                            f"risk={manager_info.get('risk_mode')} "
+                            f"reason={manager_info.get('reason')}"
+                        )
+                candidates = manager_filtered_candidates
+
             if candidates:
                 top_preview = ", ".join(
                     f"{candidate.get('product_id')}(rank={float(candidate.get('rank_score', 0.0)):.2f},"
@@ -10768,6 +10998,29 @@ class TradingBot:
                     timing_ok, timing_reason = self._entry_timing_confirmation(
                         product_id=product_id_t, signal=candidate.get("signal"),
                     )
+                    manager_strategy = str(
+                        candidate.get("manager_strategy", "")
+                    ).upper()
+                    if manager_strategy == "PULLBACK_CONTINUATION":
+                        if (
+                            "microtrend_down" in str(timing_reason)
+                            and "lower_low_sequence" in str(timing_reason)
+                        ):
+                            timing_ok = False
+                    elif manager_strategy == "MEAN_REVERSION_BOUNCE":
+                        if "no_confirmed_upturn" in str(timing_reason):
+                            timing_ok = False
+                    elif manager_strategy == "BREAKOUT_CONTINUATION":
+                        if "entry_confirmed" not in str(timing_reason):
+                            timing_ok = False
+                    elif ENABLE_LEVEL5_MANAGER and manager_strategy in {
+                        "STAND_ASIDE", "",
+                    }:
+                        timing_ok = False
+                        timing_reason = (
+                            "manager_strategy_not_tradeable:"
+                            f"{manager_strategy}"
+                        )
                     if not timing_ok:
                         self.last_entry_timing_fail_ts_by_product[product_id_t] = ts_now
 
@@ -10841,7 +11094,9 @@ class TradingBot:
                 else ai_filtered_candidates[:1]
             )
 
-            if ENABLE_INVERTED_STOPLOSS_CYCLE:
+            if ENABLE_INVERTED_STOPLOSS_CYCLE and not (
+                ENABLE_LEVEL5_MANAGER and LEVEL5_DISABLE_INVERTED_CYCLE
+            ):
                 for candidate in ai_filtered_candidates:
                     product_id_for_marker = str(candidate.get("product_id", ""))
                     if not product_id_for_marker:
@@ -10930,6 +11185,53 @@ class TradingBot:
                     0.0,
                     float(max_deploy_this_eval) - float(deployed_this_eval),
                 )
+                manager_max_pct = float(
+                    candidate.get(
+                        "manager_max_position_pct",
+                        MAX_SINGLE_BUY_PCT_OF_EQUITY,
+                    )
+                )
+                if (
+                    ENABLE_LEVEL5_MANAGER
+                    and str(LEVEL5_MODE).upper() == "FILTER_AND_SIZE"
+                ):
+                    manager_max_pct = clamp_float(
+                        manager_max_pct,
+                        0.0,
+                        float(LEVEL5_MAX_POSITION_PCT),
+                    )
+                    entry_notional = min(
+                        float(entry_notional),
+                        float(equity_usd) * manager_max_pct,
+                    )
+
+                    max_product_exposure = (
+                        float(equity_usd)
+                        * float(MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY)
+                    )
+                    product_room = max(
+                        0.0,
+                        max_product_exposure - float(product_exposure),
+                    )
+                    cash_room = max(0.0, float(cash_usd) - float(RESERVE_USD))
+                    sizing_room = min(
+                        remaining_eval_budget,
+                        product_room,
+                        cash_room,
+                    )
+                    manager_min_notional = (
+                        float(equity_usd) * float(LEVEL5_MIN_POSITION_PCT)
+                    )
+                    if (
+                        entry_notional > 0
+                        and manager_min_notional <= sizing_room
+                        and manager_min_notional
+                        <= float(equity_usd) * manager_max_pct
+                    ):
+                        entry_notional = max(
+                            float(entry_notional), manager_min_notional
+                        )
+
                 entry_notional = min(float(entry_notional), remaining_eval_budget)
 
                 min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
@@ -10971,7 +11273,13 @@ class TradingBot:
                 if (
                     not can_afford
                     and ENABLE_PROFITABLE_ROTATION
-                    and not ENABLE_INVERTED_STOPLOSS_CYCLE
+                    and not (
+                        ENABLE_INVERTED_STOPLOSS_CYCLE
+                        and not (
+                            ENABLE_LEVEL5_MANAGER
+                            and LEVEL5_DISABLE_INVERTED_CYCLE
+                        )
+                    )
                 ):
                     # Refresh real cash before deciding how much is missing.
                     snap_before_rotation = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)

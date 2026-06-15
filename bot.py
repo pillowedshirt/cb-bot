@@ -38,6 +38,11 @@ try:
 except Exception:
     Level5TradingManager = None
 
+try:
+    from level8_council import Level8Council
+except Exception:
+    Level8Council = None
+
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 TZ_NAME: str = "America/Phoenix"
@@ -197,6 +202,27 @@ LEVEL5_DAILY_HARD_LOSS_USD: float = 2.00
 LEVEL5_PRODUCT_COOLDOWN_AFTER_BAD_OUTCOMES_SEC: float = 30 * 60
 LEVEL5_MIN_POSITION_PCT: float = 0.03
 LEVEL5_MAX_POSITION_PCT: float = 0.08
+
+# ============================================================
+# LEVEL 8 EVIDENCE-WEIGHTED COUNCIL
+# ============================================================
+
+ENABLE_LEVEL8_COUNCIL: bool = True
+
+# Active mode. No observe-only staged approach.
+LEVEL8_MODE: str = "FILTER_AND_SIZE"
+
+LEVEL8_ALLOW_TEST_BUCKET_LIVE_TRADES: bool = True
+LEVEL8_ALLOW_CORE_BUCKET_LIVE_TRADES: bool = True
+
+# Only hard spending ceiling: max 80% deployed, 20% reserve.
+LEVEL8_RESERVE_CASH_PCT: float = 0.20
+LEVEL8_MAX_SINGLE_TRADE_PCT: float = 0.80
+LEVEL8_MAX_PRODUCT_EXPOSURE_PCT: float = 0.80
+LEVEL8_MAX_TOTAL_EXPOSURE_PCT: float = 0.80
+
+LEVEL8_MIN_TEST_TRADE_USD: float = MIN_LIVE_ORDER_USD
+LEVEL8_SUPERSEDES_LEVEL5: bool = False
 
 # Max total exposure per product can reach 50% of total equity through scale-ins.
 MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.50
@@ -4399,6 +4425,7 @@ class TradingBot:
         self.cached_account_snapshot_ts: float = 0.0
         self.ai_brain = None
         self.level5_manager = None
+        self.level8_council = None
         self.last_ai_train_ts: float = 0.0
         if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
             try:
@@ -4416,6 +4443,13 @@ class TradingBot:
             except Exception as exc:
                 self.level5_manager = None
                 log(f"[level5] manager initialization failed: {exc}")
+        if ENABLE_LEVEL8_COUNCIL and Level8Council is not None:
+            try:
+                self.level8_council = Level8Council()
+                log("[level8] council initialized")
+            except Exception as exc:
+                self.level8_council = None
+                log(f"[level8] council initialization failed: {exc}")
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
         self.inverted_markers: Dict[str, Dict[str, Any]] = {}
@@ -7602,6 +7636,122 @@ class TradingBot:
             info["max_position_pct"] = float(MAX_SINGLE_BUY_PCT_OF_EQUITY)
         return bool(allow), info
 
+    def _level8_decision_for_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        product_id = str(candidate.get("product_id", ""))
+        fallback = {
+            "action": "ALLOW_BUY",
+            "strategy": candidate.get("manager_strategy", "LEGACY"),
+            "bucket": "LEGACY",
+            "risk_mode": "NORMAL",
+            "recommended_position_pct": float(MAX_SINGLE_BUY_PCT_OF_EQUITY),
+            "decision_id": "",
+            "truth_score": 0.0,
+            "final_buy_score": 0.0,
+            "buy_threshold": 0.0,
+            "confidence": 0.0,
+            "reason": "level8_disabled_or_unavailable",
+        }
+        if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
+            return True, fallback
+
+        try:
+            try:
+                decision = self.level8_council.decide_buy(
+                    product_id=product_id,
+                    candidate=candidate,
+                )
+            except TypeError:
+                probability = clamp_float(
+                    float(candidate.get("estimated_prob_up", 0.5)), 0.0, 1.0
+                )
+                score = clamp_float(
+                    float(candidate.get("score", 0.0)) / 100.0, 0.0, 1.0
+                )
+                expected_edge = float(
+                    candidate.get("expected_net_edge_bps", 0.0)
+                )
+                edge_score = clamp_float(
+                    0.5 + expected_edge / 200.0, 0.0, 1.0
+                )
+                buy_score = clamp_float(
+                    probability * 0.45 + score * 0.35 + edge_score * 0.20,
+                    0.0,
+                    1.0,
+                )
+                confidence = clamp_float(
+                    float(candidate.get("confidence", probability)), 0.0, 1.0
+                )
+                vote = {
+                    "agent": "level5_candidate",
+                    "buy": buy_score,
+                    "sell": 1.0 - buy_score,
+                    "hold": 0.0,
+                    "wait": 1.0 - confidence,
+                    "confidence": confidence,
+                }
+                truth_vote = {
+                    **vote,
+                    "agent": "candidate_truth",
+                    "buy": probability,
+                    "sell": 1.0 - probability,
+                }
+                decision = self.level8_council.decide_buy(
+                    product_id=product_id,
+                    strategy=str(candidate.get("manager_strategy", "LEGACY")),
+                    votes=[vote],
+                    truth_vote=truth_vote,
+                )
+        except Exception as exc:
+            log(f"[level8] decision failed for {product_id}: {exc}")
+            return True, {**fallback, "reason": f"level8_decision_failed:{exc}"}
+
+        if isinstance(decision, dict):
+            action = decision.get("action", "WAIT")
+            strategy = candidate.get("manager_strategy", "LEGACY")
+            bucket = decision.get("bucket", "SHADOW")
+            risk_mode = decision.get("risk_mode", "NORMAL")
+            recommended_position_pct = decision.get("position_pct", 0.0)
+            decision_id = decision.get("decision_id", str(uuid.uuid4()))
+            truth_score = decision.get("truth_score", 0.0)
+            final_buy_score = decision.get("final_buy", 0.0)
+            buy_threshold = decision.get("buy_threshold", 0.0)
+            confidence = decision.get("confidence", truth_score)
+            reason = decision.get("sizing_reason", decision.get("reason", ""))
+        else:
+            action = decision.action
+            strategy = decision.strategy
+            bucket = decision.bucket
+            risk_mode = decision.risk_mode
+            recommended_position_pct = decision.recommended_position_pct
+            decision_id = decision.decision_id
+            truth_score = decision.truth_score
+            final_buy_score = decision.final_buy_score
+            buy_threshold = decision.buy_threshold
+            confidence = decision.confidence
+            reason = decision.reason
+
+        info = {
+            "action": action,
+            "strategy": strategy,
+            "bucket": bucket,
+            "risk_mode": risk_mode,
+            "recommended_position_pct": float(recommended_position_pct),
+            "decision_id": decision_id,
+            "truth_score": float(truth_score),
+            "final_buy_score": float(final_buy_score),
+            "buy_threshold": float(buy_threshold),
+            "confidence": float(confidence),
+            "reason": reason,
+        }
+        allow = str(action).upper() == "ALLOW_BUY"
+        if str(action).upper() == "SHADOW":
+            allow = False
+        return bool(allow), info
+
     def _level5_should_hold_or_exit(
         self,
         *,
@@ -7630,6 +7780,89 @@ class TradingBot:
         if unrealized_bps <= -100:
             return True, f"loss_stop_exit_allowed;{default_exit_reason}"
         return False, f"level5_blocks_small_loss_churn;{default_exit_reason}"
+
+    def _level8_should_hold_or_exit(
+        self,
+        *,
+        product_id: str,
+        entry_price: float,
+        current_price: float,
+        unrealized_bps: float,
+        spread_bps: float,
+        cost_bps: float,
+        default_exit_reason: str,
+        hard_exit: bool = False,
+    ) -> Tuple[bool, str]:
+        if hard_exit:
+            return True, f"level8_hard_exit_bypass;{default_exit_reason}"
+        if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
+            return True, f"level8_disabled;{default_exit_reason}"
+
+        try:
+            context = {
+                "entry_price": float(entry_price),
+                "current_price": float(current_price),
+                "unrealized_bps": float(unrealized_bps),
+                "spread_bps": float(spread_bps),
+                "cost_bps": float(cost_bps),
+                "hard_exit": bool(hard_exit),
+                "strategy": "EXIT_REVIEW",
+            }
+            if hasattr(self.level8_council, "decide_exit"):
+                decision = self.level8_council.decide_exit(
+                    product_id=product_id,
+                    context=context,
+                )
+            else:
+                sell_score = clamp_float(
+                    0.5 + (-float(unrealized_bps) + float(cost_bps)) / 400.0,
+                    0.0,
+                    1.0,
+                )
+                vote = {
+                    "agent": "exit_review",
+                    "buy": 1.0 - sell_score,
+                    "sell": sell_score,
+                    "hold": 1.0 - sell_score,
+                    "wait": 0.0,
+                    "confidence": 0.80,
+                }
+                decision = self.level8_council.decide_buy(
+                    product_id=product_id,
+                    strategy="EXIT_REVIEW",
+                    votes=[vote],
+                    truth_vote={**vote, "agent": "exit_truth"},
+                )
+        except Exception as exc:
+            log(f"[level8] exit decision failed {product_id}: {exc}")
+            return True, f"level8_exit_failed_allow_legacy;{default_exit_reason}"
+
+        if isinstance(decision, dict):
+            final_sell_score = float(decision.get("final_sell", 0.0))
+            sell_threshold = float(decision.get("sell_threshold", 0.0))
+            truth_score = float(decision.get("truth_score", 0.0))
+            reason = str(decision.get("reason", "legacy_council_exit_review"))
+            action = "ALLOW_SELL" if final_sell_score >= sell_threshold else "HOLD"
+        else:
+            final_sell_score = float(decision.final_sell_score)
+            sell_threshold = float(decision.sell_threshold)
+            truth_score = float(decision.truth_score)
+            reason = str(decision.reason)
+            action = str(decision.action).upper()
+
+        if action == "ALLOW_SELL":
+            return True, (
+                f"level8_sell_allowed final_sell={final_sell_score:.3f};"
+                f"threshold={sell_threshold:.3f};"
+                f"truth={truth_score:.3f};"
+                f"{reason};{default_exit_reason}"
+            )
+        return False, (
+            f"level8_hold final_sell={final_sell_score:.3f};"
+            f"threshold={sell_threshold:.3f};"
+            f"truth={truth_score:.3f};"
+            f"{reason};{default_exit_reason}"
+        )
 
     def _entry_timing_confirmation(
         self,
@@ -10571,6 +10804,44 @@ class TradingBot:
                         except Exception as exc:
                             log(f"[level5] exit check failed {product_id}: {exc}")
 
+                    if sell_qty > 0 and ENABLE_LEVEL8_COUNCIL:
+                        unrealized_bps = (
+                            ((float(bid) / float(avg_entry_price)) - 1.0) * 10000.0
+                        )
+                        try:
+                            should_exit_l8, level8_exit_reason = (
+                                self._level8_should_hold_or_exit(
+                                    product_id=product_id,
+                                    entry_price=float(avg_entry_price),
+                                    current_price=float(bid),
+                                    unrealized_bps=float(unrealized_bps),
+                                    spread_bps=float(tob.spread_bps if tob else 0.0),
+                                    cost_bps=float(lot_meta.get("cost_bps", 0.0)),
+                                    default_exit_reason=str(exit_reason or "sell"),
+                                    hard_exit=bool(
+                                        exit_role
+                                        in {
+                                            "hard_peak_stop",
+                                            "loss_stop",
+                                            "time_stop",
+                                            "invalidation_stop",
+                                        }
+                                    ),
+                                )
+                            )
+                            if not should_exit_l8:
+                                log(
+                                    f"[level8] exit blocked {product_id}: "
+                                    f"{level8_exit_reason}"
+                                )
+                                sell_qty = 0.0
+                            else:
+                                exit_reason = (
+                                    f"{exit_reason or 'sell'};{level8_exit_reason}"
+                                )
+                        except Exception as exc:
+                            log(f"[level8] exit check failed {product_id}: {exc}")
+
                     if sell_qty > 0:
                         last_sell_fail = self.last_sell_failure_ts_by_product.get(product_id, 0.0)
                         if ts_now - float(last_sell_fail) < 5.0:
@@ -10921,6 +11192,61 @@ class TradingBot:
                         )
                 candidates = manager_filtered_candidates
 
+            if ENABLE_LEVEL8_COUNCIL and candidates:
+                level8_filtered_candidates: List[Dict[str, Any]] = []
+                for candidate in candidates:
+                    product_id_l8 = str(candidate.get("product_id", ""))
+                    level8_ok, level8_info = self._level8_decision_for_candidate(
+                        candidate=candidate
+                    )
+                    candidate["level8_ok"] = bool(level8_ok)
+                    candidate["level8_action"] = level8_info.get("action", "")
+                    candidate["level8_strategy"] = level8_info.get("strategy", "")
+                    candidate["level8_bucket"] = level8_info.get("bucket", "")
+                    candidate["level8_risk_mode"] = level8_info.get("risk_mode", "")
+                    candidate["level8_decision_id"] = level8_info.get("decision_id", "")
+                    candidate["level8_truth_score"] = float(
+                        level8_info.get("truth_score", 0.0) or 0.0
+                    )
+                    candidate["level8_final_buy_score"] = float(
+                        level8_info.get("final_buy_score", 0.0) or 0.0
+                    )
+                    candidate["level8_buy_threshold"] = float(
+                        level8_info.get("buy_threshold", 0.0) or 0.0
+                    )
+                    candidate["level8_recommended_position_pct"] = float(
+                        level8_info.get("recommended_position_pct", 0.0) or 0.0
+                    )
+                    candidate["level8_reason"] = str(level8_info.get("reason", ""))
+                    try:
+                        self.signal_events_log.log_event(
+                            event_type="level8_council_decision",
+                            trade_id=level8_info.get("decision_id", ""),
+                            product_id=product_id_l8,
+                            rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
+                            buy_ready_count=len(candidates),
+                            score=f"{float(candidate.get('score', 0.0)):.6f}",
+                            probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
+                            ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                            projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
+                            cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
+                            spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
+                            action="keep" if level8_ok else "reject",
+                            reason=level8_info.get("reason", ""),
+                        )
+                    except Exception:
+                        pass
+                    if level8_ok:
+                        level8_filtered_candidates.append(candidate)
+                    else:
+                        log(
+                            f"[level8] blocked {product_id_l8}: "
+                            f"action={level8_info.get('action')} "
+                            f"bucket={level8_info.get('bucket')} "
+                            f"reason={level8_info.get('reason')}"
+                        )
+                candidates = level8_filtered_candidates
+
             if candidates:
                 top_preview = ", ".join(
                     f"{candidate.get('product_id')}(rank={float(candidate.get('rank_score', 0.0)):.2f},"
@@ -11234,6 +11560,43 @@ class TradingBot:
 
                 entry_notional = min(float(entry_notional), remaining_eval_budget)
 
+                if ENABLE_LEVEL8_COUNCIL and str(LEVEL8_MODE).upper() in {
+                    "FILTER_AND_SIZE",
+                    "COUNCIL_CONTROL",
+                }:
+                    l8_pct = float(
+                        candidate.get(
+                            "level8_recommended_position_pct",
+                            candidate.get(
+                                "manager_max_position_pct",
+                                MAX_SINGLE_BUY_PCT_OF_EQUITY,
+                            ),
+                        )
+                        or 0.0
+                    )
+                    if l8_pct > 0:
+                        level8_cap = float(equity_usd) * min(
+                            float(l8_pct),
+                            float(LEVEL8_MAX_SINGLE_TRADE_PCT),
+                        )
+                        entry_notional = min(float(entry_notional), level8_cap)
+
+                    reserve_cash_required = (
+                        float(equity_usd) * float(LEVEL8_RESERVE_CASH_PCT)
+                    )
+                    spendable_cash = max(
+                        0.0, float(cash_usd) - reserve_cash_required
+                    )
+                    entry_notional = min(float(entry_notional), spendable_cash)
+                    if entry_notional <= 0:
+                        log(
+                            f"[level8] {product_id} entry_notional blocked by "
+                            f"20pct reserve cash={cash_usd:.6f} "
+                            f"equity={equity_usd:.6f} "
+                            f"reserve={reserve_cash_required:.6f}"
+                        )
+                        continue
+
                 min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
 
                 if entry_notional < min_order:
@@ -11355,6 +11718,12 @@ class TradingBot:
                     f"score={float(candidate.get('score', 0.0)):.3f} "
                     f"prob={float(candidate.get('estimated_prob_up', 0.0)):.6f} "
                     f"ev={float(candidate.get('expected_net_edge_bps', 0.0)):.3f} "
+                    f"level8_action={candidate.get('level8_action', '')} "
+                    f"level8_strategy={candidate.get('level8_strategy', '')} "
+                    f"level8_bucket={candidate.get('level8_bucket', '')} "
+                    f"level8_truth={float(candidate.get('level8_truth_score', 0.0)):.3f} "
+                    f"level8_buy_score={float(candidate.get('level8_final_buy_score', 0.0)):.3f} "
+                    f"level8_threshold={float(candidate.get('level8_buy_threshold', 0.0)):.3f} "
                     f"bid={bid:.8f} ask={ask:.8f}"
                 )
                 fill = await self._execute_live_buy(
@@ -11453,6 +11822,14 @@ class TradingBot:
                         "calibrated_time_to_min_profit_minutes": float(candidate.get("calibrated_time_to_min_profit_minutes", 0.0)),
                         "calibrated_forward_window_minutes": float(candidate.get("calibrated_forward_window_minutes", 0.0)),
                         "calibrated_post_profit_breathing_minutes": float(candidate.get("calibrated_post_profit_breathing_minutes", CALIB_POST_PROFIT_BREATHING_MINUTES)),
+                        "level8_decision_id": candidate.get("level8_decision_id", ""),
+                        "level8_action": candidate.get("level8_action", ""),
+                        "level8_strategy": candidate.get("level8_strategy", ""),
+                        "level8_bucket": candidate.get("level8_bucket", ""),
+                        "level8_truth_score": float(candidate.get("level8_truth_score", 0.0)),
+                        "level8_final_buy_score": float(candidate.get("level8_final_buy_score", 0.0)),
+                        "level8_buy_threshold": float(candidate.get("level8_buy_threshold", 0.0)),
+                        "level8_reason": candidate.get("level8_reason", ""),
                     }
                     lot_meta["min_profitable_exit_price"] = float(required_exit_price_for_net_gain(
                         effective_entry_price=eff_price1,

@@ -10,6 +10,8 @@ import pandas as pd
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADES_CSV = os.path.join(BASE_DIR, "trades.csv")
 MISSED_OPPORTUNITIES_CSV = os.path.join(BASE_DIR, "missed_opportunities.csv")
+AGENT_PERFORMANCE_CSV = os.path.join(BASE_DIR, "agent_performance.csv")
+COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(BASE_DIR, "council_observation_outcomes.csv")
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -38,22 +40,21 @@ class Level8Council:
     """Outcome-adaptive council with an 80% maximum portfolio deployment."""
 
     def __init__(self) -> None:
-        # Lenient learning-mode thresholds.
-        # The council starts permissive so it generates real outcomes to learn from.
-        self.base_buy_threshold = 0.36
-        self.base_sell_threshold = 0.52
+        # Start risky so the bot learns from real outcomes.
+        self.base_buy_threshold = 0.30
+        self.base_sell_threshold = 0.44
 
-        self.min_buy_threshold = 0.24
-        self.max_buy_threshold = 0.72
-        self.min_sell_threshold = 0.40
-        self.max_sell_threshold = 0.74
+        self.min_buy_threshold = 0.18
+        self.max_buy_threshold = 0.76
+        self.min_sell_threshold = 0.30
+        self.max_sell_threshold = 0.76
 
-        self.max_agent_adjustment = 0.25
-        self.min_agent_reliability = 0.25
-        self.max_agent_reliability = 1.50
+        self.max_agent_adjustment = 0.32
+        self.min_agent_reliability = 0.20
+        self.max_agent_reliability = 1.65
 
-        self.min_truth_to_trade = 0.12
-        self.min_truth_to_core_trade = 0.25
+        self.min_truth_to_trade = 0.05
+        self.min_truth_to_core_trade = 0.16
 
         # Portfolio allocation model.
         # The only hard spending ceiling is 80% deployed / 20% reserve.
@@ -62,8 +63,8 @@ class Level8Council:
         self.max_total_exposure_pct = 0.80
 
         # Council-controlled sizing.
-        self.test_bucket_trade_pct = 0.05
-        self.min_core_trade_pct = 0.10
+        self.test_bucket_trade_pct = 0.08
+        self.min_core_trade_pct = 0.14
         self.max_core_trade_pct = 0.80
 
         # These are descriptive only now; they do not hard-block spending.
@@ -205,55 +206,54 @@ class Level8Council:
         }
 
     def _outcome_stats(
-        self,
-        *,
-        agent: Optional[str] = None,
-        product_id: Optional[str] = None,
+        self, *, agent: Optional[str] = None, product_id: Optional[str] = None,
         strategy: Optional[str] = None,
     ) -> Dict[str, float]:
-        """Summarize closed outcomes for adaptive votes and thresholds."""
-        trades = self._recent_trades(80)
-        if trades.empty:
+        """Summarize real trades and chart-only observation outcomes."""
+        frames = []
+        try:
+            if os.path.exists(AGENT_PERFORMANCE_CSV):
+                perf = pd.read_csv(AGENT_PERFORMANCE_CSV)
+                if not perf.empty:
+                    frames.append(perf.rename(columns={"outcome_move_bps": "move_bps", "outcome_success": "success"}))
+        except Exception:
+            pass
+        try:
+            if os.path.exists(COUNCIL_OBSERVATION_OUTCOMES_CSV):
+                obs = pd.read_csv(COUNCIL_OBSERVATION_OUTCOMES_CSV)
+                if not obs.empty:
+                    obs = obs.rename(columns={"decision_strategy": "strategy", "would_have_won": "success"})
+                    obs["agent"] = obs.get("agent", "council_observation")
+                    frames.append(obs)
+        except Exception:
+            pass
+        try:
+            trades = self._recent_trades(120)
+            if not trades.empty:
+                if "net_pnl_usd" in trades.columns:
+                    trades["move_bps"] = pd.to_numeric(trades["net_pnl_usd"], errors="coerce").fillna(0.0)
+                elif "move_bps" not in trades.columns:
+                    trades["move_bps"] = 0.0
+                trades["success"] = (pd.to_numeric(trades["move_bps"], errors="coerce").fillna(0.0) > 0).astype(int)
+                frames.append(trades)
+        except Exception:
+            pass
+        if not frames:
             return {"n": 0.0, "win_rate": 0.5, "avg_move": 0.0, "avg_adverse": 0.0}
-
-        filters = (
-            ("agent", agent),
-            ("product_id", product_id),
-            ("strategy", strategy),
-        )
-        for column, value in filters:
-            if value is not None and column in trades.columns:
-                trades = trades[trades[column].astype(str) == str(value)]
-
-        if "event" in trades.columns:
-            trades = trades[trades["event"].astype(str).str.upper() == "SELL"]
-        if trades.empty:
+        data = pd.concat(frames, ignore_index=True, sort=False)
+        for column, value in (("agent", agent), ("product_id", product_id), ("strategy", strategy)):
+            if value is not None and column in data.columns:
+                rows = data[data[column].astype(str) == str(value)]
+                if not rows.empty:
+                    data = rows
+        if data.empty:
             return {"n": 0.0, "win_rate": 0.5, "avg_move": 0.0, "avg_adverse": 0.0}
-
-        pnl_column = next(
-            (column for column in ("net_pnl_usd", "pnl", "move_bps") if column in trades),
-            None,
-        )
-        pnl = (
-            pd.to_numeric(trades[pnl_column], errors="coerce").fillna(0.0)
-            if pnl_column
-            else pd.Series(0.0, index=trades.index)
-        )
-        adverse_column = next(
-            (column for column in ("adverse_move_bps", "max_adverse_bps", "adverse") if column in trades),
-            None,
-        )
-        adverse = (
-            pd.to_numeric(trades[adverse_column], errors="coerce").fillna(0.0).abs()
-            if adverse_column
-            else pd.Series(0.0, index=trades.index)
-        )
-        return {
-            "n": float(len(trades)),
-            "win_rate": float((pnl > 0.0).mean()),
-            "avg_move": float(pnl.mean()),
-            "avg_adverse": float(adverse.mean()),
-        }
+        move_source = data["move_bps"] if "move_bps" in data.columns else pd.Series(0.0, index=data.index)
+        move = pd.to_numeric(move_source, errors="coerce").fillna(0.0)
+        success = pd.to_numeric(data["success"], errors="coerce").fillna((move > 0).astype(int)) if "success" in data.columns else (move > 0).astype(int)
+        adverse_col = next((c for c in ("adverse_move_bps", "max_adverse_bps", "avg_adverse", "adverse") if c in data.columns), None)
+        adverse = pd.to_numeric(data[adverse_col], errors="coerce").fillna(0.0).abs() if adverse_col else pd.Series(0.0, index=data.index)
+        return {"n": float(len(data)), "win_rate": float(success.mean()), "avg_move": float(move.mean()), "avg_adverse": float(adverse.mean())}
 
     def _agent_adjustments(
         self,
@@ -287,17 +287,17 @@ class Level8Council:
             "strategy_win_rate": strategy_stats["win_rate"],
             "recent_win_rate": recent_win_rate,
         }
-        sample_factor = clamp(n / 20.0, 0.0, 1.0)
+        sample_factor = clamp(n / 12.0, 0.0, 1.0)
 
-        product_adj = (float(stats.get("product_win_rate", 0.5)) - 0.5) * 0.45 * sample_factor
-        strategy_adj = (float(stats.get("strategy_win_rate", 0.5)) - 0.5) * 0.40 * sample_factor
-        recent_adj = (float(stats.get("recent_win_rate", 0.5)) - 0.5) * 0.60 * sample_factor
+        product_adj = (float(stats.get("product_win_rate", 0.5)) - 0.5) * 0.60 * sample_factor
+        strategy_adj = (float(stats.get("strategy_win_rate", 0.5)) - 0.5) * 0.55 * sample_factor
+        recent_adj = (float(stats.get("recent_win_rate", 0.5)) - 0.5) * 0.80 * sample_factor
 
         product_adj = clamp(product_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         strategy_adj = clamp(strategy_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         recent_adj = clamp(recent_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
 
-        base_reliability = 0.80 + (float(stats.get("agent_win_rate", 0.5)) - 0.5) * 0.85 * sample_factor
+        base_reliability = 0.80 + (float(stats.get("agent_win_rate", 0.5)) - 0.5) * 1.10 * sample_factor
         return {
             "product": product_adj,
             "strategy": strategy_adj,
@@ -364,28 +364,27 @@ class Level8Council:
         risk_mode_u = str(risk_mode).upper()
 
         if risk_mode_u == "DEFENSIVE":
-            buy += 0.03
-            sell += 0.02
+            buy += 0.020
+            sell += 0.015
         elif risk_mode_u == "CAUTIOUS":
-            buy += 0.015
-            sell += 0.01
+            buy += 0.010
+            sell += 0.008
         elif risk_mode_u == "AGGRESSIVE":
-            buy -= 0.06
-            sell -= 0.02
+            buy -= 0.065
+            sell -= 0.020
 
         n = float(product_stats.get("n", 0.0))
         wr = float(product_stats.get("win_rate", 0.5))
         avg = float(product_stats.get("avg_move", 0.0))
         adverse = float(product_stats.get("avg_adverse", 0.0))
 
-        if n >= 10:
-            if wr < 0.38 or avg < -60:
-                # Still tighten after bad learning outcomes, but do not shut down learning.
-                buy += 0.035
-                sell += 0.02
-            elif wr > 0.58 and avg > 20:
-                buy -= 0.07
-                sell -= 0.02
+        if n >= 8:
+            if wr < 0.35 or avg < -60:
+                buy += 0.025
+                sell += 0.015
+            elif wr > 0.55 and avg > 15:
+                buy -= 0.075
+                sell -= 0.020
 
         if n >= 20:
             if adverse > 120:

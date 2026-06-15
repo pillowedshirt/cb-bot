@@ -39,6 +39,10 @@ AGENT_PERFORMANCE_CSV = os.path.join(BASE_DIR, "agent_performance.csv")
 AGENT_ADJUSTMENTS_CSV = os.path.join(BASE_DIR, "agent_adjustments.csv")
 ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
 SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
+MISSED_OPPORTUNITIES_CSV = os.path.join(BASE_DIR, "missed_opportunities.csv")
+COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(
+    BASE_DIR, "council_observation_outcomes.csv"
+)
 MACRO_FILES = {
     "Past day": os.path.join(BASE_DIR, "macro_day.csv"),
     "Past week": os.path.join(BASE_DIR, "macro_week.csv"),
@@ -632,6 +636,24 @@ hr {
     padding-left: 0.45rem;
     padding-right: 0.45rem;
   }
+}
+
+[data-testid="stStatusWidget"],
+[data-testid="stDecoration"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+}
+
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stVerticalBlock"],
+[data-testid="stElementContainer"],
+.staleWidget,
+.element-container,
+div[data-testid="stElementContainer"][aria-busy="true"] {
+  opacity: 1 !important;
+  filter: none !important;
 }
 </style>
 """,
@@ -1430,6 +1452,8 @@ def render_council_intelligence_snapshot(
     agent_adjustments: pd.DataFrame,
     adaptive_thresholds: pd.DataFrame,
     shadow_trades: pd.DataFrame,
+    missed_opportunities: pd.DataFrame,
+    council_observation_outcomes: pd.DataFrame,
     selected_product: str | None = None,
 ) -> None:
     """Render product-specific Level 8 votes and learning telemetry."""
@@ -1474,7 +1498,10 @@ def render_council_intelligence_snapshot(
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     with st.expander("Council learning tables"):
-        tabs = st.tabs(["Agent performance", "Agent adjustments", "Adaptive thresholds", "Shadow trades"])
+        tabs = st.tabs([
+            "Agent performance", "Agent adjustments", "Adaptive thresholds",
+            "Shadow trades", "Missed opportunities", "Observation outcomes",
+        ])
         table_specs = [
             (agent_performance, ["dt_mst", "product_id", "agent", "strategy", "agent_buy_score",
                                  "agent_sell_score", "confidence", "reliability", "outcome_move_bps",
@@ -1487,6 +1514,18 @@ def render_council_intelligence_snapshot(
              "No adaptive threshold rows yet."),
             (shadow_trades, ["dt_utc", "product_id", "strategy", "shadow_action", "shadow_entry_price",
                              "council_buy_score", "buy_threshold", "reason"], "No shadow trades yet."),
+            (missed_opportunities, ["dt_mst", "product_id", "review_minutes",
+                                    "decision_action", "decision_bucket", "decision_strategy",
+                                    "final_buy_score", "buy_threshold", "truth_score",
+                                    "recommended_position_pct", "entry_price", "review_price",
+                                    "move_bps", "missed_type", "reason"],
+             "No missed opportunity rows yet."),
+            (council_observation_outcomes, ["dt_mst", "product_id", "review_minutes",
+                                            "decision_action", "decision_bucket", "decision_strategy",
+                                            "final_buy_score", "buy_threshold", "truth_score",
+                                            "recommended_position_pct", "entry_price", "review_price",
+                                            "move_bps", "would_have_won", "missed_big_move", "reason"],
+             "No council observation outcomes yet."),
         ]
         for tab, (data, desired_columns, empty_message) in zip(tabs, table_specs):
             with tab:
@@ -1947,6 +1986,8 @@ def render_live_dashboard() -> None:
     agent_adjustments = load_csv(AGENT_ADJUSTMENTS_CSV)
     adaptive_thresholds = load_csv(ADAPTIVE_THRESHOLDS_CSV)
     shadow_trades = load_csv(SHADOW_TRADES_CSV)
+    missed_opportunities = load_csv(MISSED_OPPORTUNITIES_CSV)
+    council_observation_outcomes = load_csv(COUNCIL_OBSERVATION_OUTCOMES_CSV)
 
     signal_events = numeric(signal_events, [
         "ts", "rank", "rank_score", "buy_ready_count",
@@ -1996,6 +2037,16 @@ def render_live_dashboard() -> None:
     adaptive_thresholds = numeric(adaptive_thresholds, [
         "ts", "buy_threshold", "sell_threshold", "sample_size",
     ])
+    missed_opportunities = numeric(missed_opportunities, [
+        "ts", "review_minutes", "final_buy_score", "buy_threshold",
+        "truth_score", "recommended_position_pct", "entry_price",
+        "review_price", "move_bps",
+    ])
+    council_observation_outcomes = numeric(council_observation_outcomes, [
+        "ts", "review_minutes", "final_buy_score", "buy_threshold",
+        "truth_score", "recommended_position_pct", "entry_price",
+        "review_price", "move_bps", "would_have_won", "missed_big_move",
+    ])
 
     st.markdown(
         """
@@ -2027,6 +2078,17 @@ def render_live_dashboard() -> None:
             signal_events=signal_events,
             agent_adjustments=agent_adjustments,
             adaptive_thresholds=adaptive_thresholds,
+            selected_product=visual_product,
+        )
+        render_council_intelligence_snapshot(
+            council_votes=council_votes,
+            council_decisions=council_decisions,
+            agent_performance=agent_performance,
+            agent_adjustments=agent_adjustments,
+            adaptive_thresholds=adaptive_thresholds,
+            shadow_trades=shadow_trades,
+            missed_opportunities=missed_opportunities,
+            council_observation_outcomes=council_observation_outcomes,
             selected_product=visual_product,
         )
 
@@ -2562,14 +2624,6 @@ def render_live_dashboard() -> None:
         product = st.selectbox("Selected coin", products, index=default_idx, label_visibility="collapsed")
 
     if show_council_tables:
-        render_council_visual_representation(
-            council_votes=council_votes,
-            council_decisions=council_decisions,
-            signal_events=signal_events,
-            agent_adjustments=agent_adjustments,
-            adaptive_thresholds=adaptive_thresholds,
-            selected_product=product,
-        )
         render_council_intelligence_snapshot(
             council_votes=council_votes,
             council_decisions=council_decisions,
@@ -2577,6 +2631,8 @@ def render_live_dashboard() -> None:
             agent_adjustments=agent_adjustments,
             adaptive_thresholds=adaptive_thresholds,
             shadow_trades=shadow_trades,
+            missed_opportunities=missed_opportunities,
+            council_observation_outcomes=council_observation_outcomes,
             selected_product=product,
         )
 

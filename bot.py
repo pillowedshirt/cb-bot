@@ -118,6 +118,10 @@ LEVEL8_COUNCIL_DECISIONS_CSV_PATH: str = os.path.join(
     BASE_DIR, "council_decisions.csv"
 )
 TRADE_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "trade_outcomes.csv")
+MISSED_OPPORTUNITIES_CSV_PATH: str = os.path.join(BASE_DIR, "missed_opportunities.csv")
+COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH: str = os.path.join(
+    BASE_DIR, "council_observation_outcomes.csv"
+)
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
 DEBUG_LOG_ENABLED: bool = True
@@ -232,6 +236,18 @@ LEVEL8_MAX_TOTAL_EXPOSURE_PCT: float = 0.80
 
 LEVEL8_MIN_TEST_TRADE_USD: float = MIN_LIVE_ORDER_USD
 LEVEL8_SUPERSEDES_LEVEL5: bool = True
+
+# ============================================================
+# LEVEL 8 CHART-ONLY OPPORTUNITY LEARNING
+# ============================================================
+
+ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING: bool = True
+LEVEL8_OBSERVATION_REVIEW_WINDOWS_MIN: List[int] = [5, 15, 30, 60]
+LEVEL8_MISSED_BIG_MOVE_BPS: float = 120.0
+LEVEL8_MISSED_HUGE_MOVE_BPS: float = 250.0
+LEVEL8_MISSED_REVIEW_EVERY_SEC: float = 60.0
+LEVEL8_MISSED_MOVE_THRESHOLD_RELIEF: float = 0.04
+LEVEL8_MISSED_MOVE_MAX_RELIEF: float = 0.12
 
 # Max total exposure per product can reach 50% of total equity through scale-ins.
 MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.50
@@ -4436,6 +4452,7 @@ class TradingBot:
         self.last_level8_council_heartbeat_ts: float = 0.0
         self.last_ai_train_ts: float = 0.0
         self.last_agent_performance_update_ts: float = 0.0
+        self.last_level8_missed_opportunity_review_ts: float = 0.0
         if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
             try:
                 self.ai_brain = LocalAIBrain(
@@ -10350,20 +10367,286 @@ class TradingBot:
             return True, reason
         return True, f"control_mode_not_enabled_for_direct_trading;{reason}"
 
+    def _market_price_near_ts(
+        self,
+        *,
+        product_id: str,
+        target_ts: float,
+        max_age_sec: float = 90.0,
+    ) -> Optional[float]:
+        """Return the closest recorded market mid near a timestamp."""
+        try:
+            if not os.path.exists(MARKET_CSV_PATH):
+                return None
+            frame = pd.read_csv(
+                MARKET_CSV_PATH,
+                usecols=lambda column: column in {"ts", "product_id", "mid"},
+            )
+            if frame.empty or not {"ts", "product_id", "mid"}.issubset(frame.columns):
+                return None
+            frame = frame[
+                frame["product_id"].astype(str) == str(product_id)
+            ].copy()
+            frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce")
+            frame["mid"] = pd.to_numeric(frame["mid"], errors="coerce")
+            frame = frame.dropna(subset=["ts", "mid"])
+            if frame.empty:
+                return None
+            frame["delta"] = (frame["ts"] - float(target_ts)).abs()
+            row = frame.sort_values("delta").iloc[0]
+            price = float(row["mid"])
+            if float(row["delta"]) > float(max_age_sec) or price <= 0:
+                return None
+            return price
+        except Exception as exc:
+            log(f"[level8-learning] market price lookup failed {product_id}: {exc}")
+            return None
+
+    def _append_missed_opportunity_row(
+        self,
+        *,
+        decision_row: Dict[str, Any],
+        review_minutes: int,
+        entry_price: float,
+        review_price: float,
+        move_bps: float,
+        missed_type: str,
+    ) -> None:
+        """Append a chart move the council missed by choosing WAIT or SHADOW."""
+        try:
+            columns = [
+                "ts", "dt_mst", "decision_id", "product_id", "review_minutes",
+                "decision_action", "decision_bucket", "decision_strategy",
+                "final_buy_score", "buy_threshold", "truth_score",
+                "recommended_position_pct", "entry_price", "review_price",
+                "move_bps", "missed_type", "reason",
+            ]
+            write_header = (
+                not os.path.exists(MISSED_OPPORTUNITIES_CSV_PATH)
+                or os.path.getsize(MISSED_OPPORTUNITIES_CSV_PATH) == 0
+            )
+            ts_val = now_ts()
+            dt_mst = (
+                datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                .astimezone(TZ)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+            with open(
+                MISSED_OPPORTUNITIES_CSV_PATH, "a", newline="", encoding="utf-8"
+            ) as file:
+                writer = csv.writer(file)
+                if write_header:
+                    writer.writerow(columns)
+                writer.writerow([
+                    f"{ts_val:.6f}", dt_mst, decision_row.get("decision_id", ""),
+                    decision_row.get("product_id", ""), int(review_minutes),
+                    decision_row.get("action", ""), decision_row.get("bucket", ""),
+                    decision_row.get("strategy", ""),
+                    f"{float(decision_row.get('final_buy_score', 0.0) or 0.0):.6f}",
+                    f"{float(decision_row.get('buy_threshold', 0.0) or 0.0):.6f}",
+                    f"{float(decision_row.get('truth_score', 0.0) or 0.0):.6f}",
+                    f"{float(decision_row.get('recommended_position_pct', 0.0) or 0.0):.6f}",
+                    f"{float(entry_price):.12f}", f"{float(review_price):.12f}",
+                    f"{float(move_bps):.6f}", missed_type,
+                    (
+                        f"chart_only_review;decision={decision_row.get('action', '')};"
+                        f"bucket={decision_row.get('bucket', '')};"
+                        f"move_bps={float(move_bps):.2f};"
+                        f"review_minutes={int(review_minutes)}"
+                    ),
+                ])
+        except Exception as exc:
+            log(f"[level8-learning] missed opportunity append failed: {exc}")
+
+    def _append_council_observation_outcome(
+        self,
+        *,
+        decision_row: Dict[str, Any],
+        review_minutes: int,
+        entry_price: float,
+        review_price: float,
+        move_bps: float,
+    ) -> None:
+        """Log chart outcomes for Level 8 decisions even without a fill."""
+        try:
+            columns = [
+                "ts", "dt_mst", "decision_id", "product_id", "review_minutes",
+                "decision_action", "decision_bucket", "decision_strategy",
+                "final_buy_score", "buy_threshold", "truth_score",
+                "recommended_position_pct", "entry_price", "review_price",
+                "move_bps", "would_have_won", "missed_big_move", "reason",
+            ]
+            write_header = (
+                not os.path.exists(COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH)
+                or os.path.getsize(COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH) == 0
+            )
+            ts_val = now_ts()
+            dt_mst = (
+                datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                .astimezone(TZ)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+            with open(
+                COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH,
+                "a",
+                newline="",
+                encoding="utf-8",
+            ) as file:
+                writer = csv.writer(file)
+                if write_header:
+                    writer.writerow(columns)
+                writer.writerow([
+                    f"{ts_val:.6f}", dt_mst, decision_row.get("decision_id", ""),
+                    decision_row.get("product_id", ""), int(review_minutes),
+                    decision_row.get("action", ""), decision_row.get("bucket", ""),
+                    decision_row.get("strategy", ""),
+                    f"{float(decision_row.get('final_buy_score', 0.0) or 0.0):.6f}",
+                    f"{float(decision_row.get('buy_threshold', 0.0) or 0.0):.6f}",
+                    f"{float(decision_row.get('truth_score', 0.0) or 0.0):.6f}",
+                    f"{float(decision_row.get('recommended_position_pct', 0.0) or 0.0):.6f}",
+                    f"{float(entry_price):.12f}", f"{float(review_price):.12f}",
+                    f"{float(move_bps):.6f}", int(float(move_bps) > 0),
+                    int(float(move_bps) >= float(LEVEL8_MISSED_BIG_MOVE_BPS)),
+                    (
+                        f"observation_outcome;move_bps={float(move_bps):.2f};"
+                        f"review_minutes={int(review_minutes)}"
+                    ),
+                ])
+        except Exception as exc:
+            log(f"[level8-learning] observation outcome append failed: {exc}")
+
+    def _review_level8_missed_opportunities(self) -> None:
+        """Review recent council decisions against subsequent chart movement."""
+        if not ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
+            return
+        nowv = now_ts()
+        if (
+            nowv - float(self.last_level8_missed_opportunity_review_ts)
+            < float(LEVEL8_MISSED_REVIEW_EVERY_SEC)
+        ):
+            return
+        self.last_level8_missed_opportunity_review_ts = nowv
+        try:
+            if not os.path.exists(LEVEL8_COUNCIL_DECISIONS_CSV_PATH):
+                return
+            decisions = pd.read_csv(LEVEL8_COUNCIL_DECISIONS_CSV_PATH)
+            required = {
+                "ts", "decision_id", "product_id", "action", "bucket",
+                "final_buy_score", "buy_threshold", "truth_score",
+                "recommended_position_pct",
+            }
+            if decisions.empty or not required.issubset(decisions.columns):
+                return
+            decisions["ts"] = pd.to_numeric(decisions["ts"], errors="coerce")
+            decisions = decisions.dropna(subset=["ts"])
+
+            already_reviewed = set()
+            if os.path.exists(COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH):
+                try:
+                    existing = pd.read_csv(COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH)
+                    for _, row in existing.iterrows():
+                        minutes = pd.to_numeric(
+                            row.get("review_minutes", ""), errors="coerce"
+                        )
+                        if pd.notna(minutes):
+                            already_reviewed.add(
+                                f"{row.get('decision_id', '')}|{int(minutes)}"
+                            )
+                except Exception:
+                    already_reviewed = set()
+
+            min_window = min(LEVEL8_OBSERVATION_REVIEW_WINDOWS_MIN)
+            max_window = max(LEVEL8_OBSERVATION_REVIEW_WINDOWS_MIN)
+            reviewable = decisions[
+                (decisions["ts"] <= nowv - min_window * 60.0)
+                & (decisions["ts"] >= nowv - (max_window + 30) * 60.0)
+            ]
+            for _, decision in reviewable.tail(800).iterrows():
+                product_id = str(decision.get("product_id", ""))
+                decision_id = str(decision.get("decision_id", ""))
+                if not product_id or not decision_id:
+                    continue
+                entry_ts = float(decision["ts"])
+                entry_price = self._market_price_near_ts(
+                    product_id=product_id, target_ts=entry_ts, max_age_sec=120.0
+                )
+                if entry_price is None:
+                    continue
+                decision_dict = decision.to_dict()
+                for review_minutes in LEVEL8_OBSERVATION_REVIEW_WINDOWS_MIN:
+                    key = f"{decision_id}|{int(review_minutes)}"
+                    review_ts = entry_ts + float(review_minutes) * 60.0
+                    if key in already_reviewed or review_ts > nowv - 10.0:
+                        continue
+                    review_price = self._market_price_near_ts(
+                        product_id=product_id,
+                        target_ts=review_ts,
+                        max_age_sec=120.0,
+                    )
+                    if review_price is None:
+                        continue
+                    move_bps = ((review_price / entry_price) - 1.0) * 10000.0
+                    self._append_council_observation_outcome(
+                        decision_row=decision_dict,
+                        review_minutes=int(review_minutes),
+                        entry_price=entry_price,
+                        review_price=review_price,
+                        move_bps=move_bps,
+                    )
+                    already_reviewed.add(key)
+                    if (
+                        str(decision.get("action", "")).upper() in {"WAIT", "SHADOW"}
+                        and move_bps >= float(LEVEL8_MISSED_BIG_MOVE_BPS)
+                    ):
+                        missed_type = (
+                            "huge_missed_jump"
+                            if move_bps >= float(LEVEL8_MISSED_HUGE_MOVE_BPS)
+                            else "missed_big_jump"
+                        )
+                        self._append_missed_opportunity_row(
+                            decision_row=decision_dict,
+                            review_minutes=int(review_minutes),
+                            entry_price=entry_price,
+                            review_price=review_price,
+                            move_bps=move_bps,
+                            missed_type=missed_type,
+                        )
+        except Exception as exc:
+            log(f"[level8-learning] missed opportunity review failed: {exc}")
+
     def _append_agent_performance_from_outcomes(self) -> None:
         """
-        Connect council votes to 30-minute trade outcomes for agent learning.
+        Connect council votes to trade and chart-only outcomes for learning.
         """
         try:
             votes_path = os.path.join(BASE_DIR, "council_votes.csv")
-            outcomes_path = TRADE_OUTCOMES_CSV_PATH
+            trade_outcomes_path = TRADE_OUTCOMES_CSV_PATH
+            observation_outcomes_path = COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH
             out_path = AGENT_PERFORMANCE_CSV_PATH
 
-            if not os.path.exists(votes_path) or not os.path.exists(outcomes_path):
+            if not os.path.exists(votes_path):
+                return
+            if (
+                not os.path.exists(trade_outcomes_path)
+                and not os.path.exists(observation_outcomes_path)
+            ):
                 return
 
             votes = pd.read_csv(votes_path)
-            outcomes = pd.read_csv(outcomes_path)
+            frames = []
+            if os.path.exists(trade_outcomes_path):
+                trade_outcomes = pd.read_csv(trade_outcomes_path)
+                if not trade_outcomes.empty:
+                    trade_outcomes["source"] = "trade_outcome"
+                    frames.append(trade_outcomes)
+            if os.path.exists(observation_outcomes_path):
+                observation_outcomes = pd.read_csv(observation_outcomes_path)
+                if not observation_outcomes.empty:
+                    observation_outcomes["source"] = "observation_outcome"
+                    frames.append(observation_outcomes)
+            if not frames:
+                return
+            outcomes = pd.concat(frames, ignore_index=True, sort=False)
             required_vote_cols = {"decision_id", "ts", "product_id", "agent"}
             required_outcome_cols = {"ts", "product_id", "move_bps"}
             if (
@@ -10384,7 +10667,9 @@ class TradingBot:
                 outcomes["review_minutes"] = pd.to_numeric(
                     outcomes["review_minutes"], errors="coerce"
                 )
-                outcomes = outcomes[outcomes["review_minutes"] == 30].copy()
+                outcomes = outcomes[
+                    outcomes["review_minutes"].isin([15, 30, 60])
+                ].copy()
 
             outcomes = outcomes.dropna(subset=["ts"])
             if outcomes.empty:
@@ -10418,9 +10703,17 @@ class TradingBot:
                     if not product_id or not math.isfinite(vote_ts) or vote_ts <= 0 or not agent:
                         continue
 
+                    decision_id = str(vote.get("decision_id", ""))
                     product_outcomes = outcomes[
                         outcomes["product_id"].astype(str) == product_id
                     ].copy()
+                    if decision_id and "decision_id" in product_outcomes.columns:
+                        decision_matches = product_outcomes[
+                            product_outcomes["decision_id"].astype(str)
+                            == decision_id
+                        ].copy()
+                        if not decision_matches.empty:
+                            product_outcomes = decision_matches
                     product_outcomes = product_outcomes[
                         product_outcomes["ts"] >= vote_ts
                     ].copy()
@@ -10430,7 +10723,18 @@ class TradingBot:
                     product_outcomes["time_delta"] = product_outcomes["ts"] - vote_ts
                     outcome = product_outcomes.sort_values("time_delta").iloc[0]
                     move_bps = float(outcome.get("move_bps", 0.0))
-                    success = 1 if move_bps > 0 else 0
+                    decision_action = str(
+                        outcome.get("decision_action", outcome.get("action", ""))
+                    ).upper()
+                    if (
+                        decision_action in {"WAIT", "SHADOW"}
+                        and move_bps >= float(LEVEL8_MISSED_BIG_MOVE_BPS)
+                    ):
+                        success = 0
+                    elif move_bps > 0:
+                        success = 1
+                    else:
+                        success = 0
                     perf_key = (
                         f"{str(vote.get('decision_id', ''))}|"
                         f"{product_id}|{agent}|"
@@ -10464,6 +10768,8 @@ class TradingBot:
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
+            if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
+                self._review_level8_missed_opportunities()
             if (
                 ENABLE_LEVEL8_COUNCIL
                 and ts_now - float(self.last_agent_performance_update_ts) >= 60.0
@@ -11811,12 +12117,35 @@ class TradingBot:
                 min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
 
                 if entry_notional < min_order:
-                    log(
-                        f"[buy-skip] {product_id} below_min_order "
-                        f"entry_notional={entry_notional:.2f} min_order={min_order:.2f} "
-                        f"cash={cash_usd:.2f} equity={equity_usd:.2f}"
+                    reserve_cash_required = (
+                        float(equity_usd) * float(LEVEL8_RESERVE_CASH_PCT)
+                        if ENABLE_LEVEL8_COUNCIL
+                        else float(RESERVE_USD)
                     )
-                    continue
+                    spendable_cash = max(
+                        0.0, float(cash_usd) - reserve_cash_required
+                    )
+                    if (
+                        ENABLE_LEVEL8_COUNCIL
+                        and str(candidate.get("level8_action", "")).upper()
+                        == "ALLOW_BUY"
+                        and spendable_cash >= min_order
+                        and remaining_eval_budget >= min_order
+                    ):
+                        log(
+                            f"[level8] {product_id} raising ALLOW_BUY notional "
+                            f"to min live order old={entry_notional:.2f} "
+                            f"new={min_order:.2f}"
+                        )
+                        entry_notional = min_order
+                    else:
+                        log(
+                            f"[buy-skip] {product_id} below_min_order "
+                            f"entry_notional={entry_notional:.2f} "
+                            f"min_order={min_order:.2f} cash={cash_usd:.2f} "
+                            f"equity={equity_usd:.2f}"
+                        )
+                        continue
 
                 bid, ask = candidate["bid"], candidate["ask"]
 

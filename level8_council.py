@@ -9,6 +9,7 @@ import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADES_CSV = os.path.join(BASE_DIR, "trades.csv")
+MISSED_OPPORTUNITIES_CSV = os.path.join(BASE_DIR, "missed_opportunities.csv")
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -68,6 +69,30 @@ class Level8Council:
         self.core_bucket_pct = 0.70
 
         self.last_summary: Dict[str, Any] = {}
+
+    def _missed_opportunity_relief(self, product_id: str) -> float:
+        """Reduce strictness after repeated WAIT/SHADOW decisions missed jumps."""
+        try:
+            if not os.path.exists(MISSED_OPPORTUNITIES_CSV):
+                return 0.0
+            frame = pd.read_csv(MISSED_OPPORTUNITIES_CSV)
+            if frame.empty or "product_id" not in frame.columns:
+                return 0.0
+            frame = frame[
+                frame["product_id"].astype(str) == str(product_id)
+            ].copy()
+            if frame.empty:
+                return 0.0
+            frame["move_bps"] = pd.to_numeric(
+                frame["move_bps"], errors="coerce"
+            ).fillna(0.0)
+            recent = frame.tail(20)
+            big_misses = int((recent["move_bps"] >= 120.0).sum())
+            huge_misses = int((recent["move_bps"] >= 250.0).sum())
+            relief = big_misses * 0.008 + huge_misses * 0.014
+            return clamp(relief, 0.0, 0.12)
+        except Exception:
+            return 0.0
 
     def _recent_trades(self, lookback_rows: int = 80) -> pd.DataFrame:
         """Return recent trades, tolerating absent or malformed history."""
@@ -373,6 +398,8 @@ class Level8Council:
         elif strategy == "STAND_ASIDE":
             buy += 0.18
 
+        missed_relief = self._missed_opportunity_relief(product_id)
+        buy -= missed_relief
         buy = clamp(buy, self.min_buy_threshold, self.max_buy_threshold)
         sell = clamp(sell, self.min_sell_threshold, self.max_sell_threshold)
         return {
@@ -380,6 +407,7 @@ class Level8Council:
             "sell_threshold": sell,
             "risk_mode": risk_mode_u,
             "product_stats": product_stats,
+            "missed_opportunity_relief": missed_relief,
         }
 
     def decide_buy(

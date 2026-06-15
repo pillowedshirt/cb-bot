@@ -1600,9 +1600,13 @@ def age_seconds(ts_value: Any) -> float:
 def status_for_age(age: float) -> str:
     if pd.isna(age):
         return "unknown"
-    if age <= 8:
+
+    # The bot now uses REST fallback to refresh stale quotes.
+    # Keep the visual state calmer so the viewer does not flicker delayed/stale
+    # during normal Streamlit refresh cycles.
+    if age <= 20:
         return "live"
-    if age <= 30:
+    if age <= 60:
         return "delayed"
     return "stale"
 

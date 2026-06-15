@@ -238,6 +238,36 @@ LEVEL8_MIN_TEST_TRADE_USD: float = MIN_LIVE_ORDER_USD
 LEVEL8_SUPERSEDES_LEVEL5: bool = True
 
 # ============================================================
+# LEVEL 8 AGGRESSIVE LEARNING MODE
+# ============================================================
+#
+# This mode deliberately feeds Level 8 more imperfect candidates so the bot can
+# learn from real buys and missed opportunities.
+#
+# It does NOT disable mechanical protections:
+# - valid bid/ask
+# - fresh quote
+# - available cash
+# - Coinbase minimum order
+# - 20% reserve
+
+ENABLE_LEVEL8_LEARNING_MODE: bool = True
+
+# Let moderately imperfect market states reach Level 8.
+LEVEL8_LEARNING_MIN_SCORE: float = 22.0
+LEVEL8_LEARNING_MIN_PROB: float = 0.22
+LEVEL8_LEARNING_MIN_EV_BPS: float = -180.0
+
+# Do not buy truly absurd spread conditions, but make this much looser.
+LEVEL8_LEARNING_MAX_SPREAD_BPS: float = 80.0
+
+# How many watch candidates can be sent into the real buy pipeline.
+LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES: int = 15
+
+# Let the bot buy more than one learning candidate per evaluation if cash allows.
+LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL: int = 5
+
+# ============================================================
 # LEVEL 8 CHART-ONLY OPPORTUNITY LEARNING
 # ============================================================
 
@@ -249,18 +279,16 @@ LEVEL8_MISSED_REVIEW_EVERY_SEC: float = 60.0
 LEVEL8_MISSED_MOVE_THRESHOLD_RELIEF: float = 0.04
 LEVEL8_MISSED_MOVE_MAX_RELIEF: float = 0.12
 
-# Max total exposure per product can reach 50% of total equity through scale-ins.
-MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.50
+# Max total exposure per product can reach 80% of total equity through scale-ins.
+MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.80
 
-# Probability mapping:
-# estimated probability below 52% gets no size.
-# estimated probability at 52% gets minimum size; 78% gets maximum size.
-PROB_FOR_MIN_SIZE: float = 0.52
-PROB_FOR_MAX_SIZE: float = 0.78
+# Probability mapping for aggressive Level 8 learning-mode sizing.
+PROB_FOR_MIN_SIZE: float = 0.25
+PROB_FOR_MAX_SIZE: float = 0.70
 
-# Cash reserve.
-# The bot will not intentionally spend this final amount.
-RESERVE_USD: float = 2.00
+# Dollar reserve is no longer the primary guardrail.
+# Level 8's 20% reserve is the real reserve model.
+RESERVE_USD: float = 0.00
 
 # Capital rotation:
 # If available cash is insufficient for a stronger setup, the bot may sell weaker
@@ -300,12 +328,19 @@ MIN_STARTUP_LIQUIDATION_USD: float = 0.01
 # Websocket can be slow or sparse for some products. Use REST fallback quotes
 # so the bot can monitor all configured coins.
 ENABLE_REST_TOP_OF_BOOK_FALLBACK: bool = True
-TOP_OF_BOOK_READY_MIN_PRODUCTS_PCT: float = 0.80
-TOP_OF_BOOK_WAIT_SEC: float = 45.0
-TOP_OF_BOOK_REST_FALLBACK_EVERY_SEC: float = 3.0
-TOP_OF_BOOK_MAX_STALE_SEC: float = 15.0
 
-# If a product has no fresh quote, do not buy it.
+# Require nearly all configured products to have quotes before startup proceeds.
+TOP_OF_BOOK_READY_MIN_PRODUCTS_PCT: float = 0.95
+TOP_OF_BOOK_WAIT_SEC: float = 90.0
+
+# Backfill quotes faster so the viewer does not bounce live → delayed → stale.
+TOP_OF_BOOK_REST_FALLBACK_EVERY_SEC: float = 1.25
+
+# Treat a quote as stale quickly enough that REST refreshes before the viewer
+# spends a long time showing delayed/stale.
+TOP_OF_BOOK_MAX_STALE_SEC: float = 6.0
+
+# Still do not buy with stale or missing bid/ask.
 REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY: bool = True
 
 # ============================================================
@@ -521,52 +556,45 @@ HIGH_EDGE_MIN_PROJECTED_NET_BPS: float = 120.0
 # For launch reliability, do not use maker-only entries.
 MAKER_ENTRY_TIMEOUT_SEC: float = 4.0
 
-# Entry timing confirmation.
-# The three core requirements identify a coin worth watching.
-# This layer waits for the actual turn upward before entering.
+# Keep entry timing enabled, but make it permissive.
+# This aims for "moderately bad learning buys," not catastrophic falling-knife buys.
 REQUIRE_ENTRY_TIMING_CONFIRMATION: bool = True
 
-# Do not buy into an active live slide.
-BLOCK_BUY_WHILE_MICROTREND_DOWN: bool = True
+# Do not hard-block every micro downtrend. Level 8 needs learning room.
+BLOCK_BUY_WHILE_MICROTREND_DOWN: bool = False
+REQUIRE_MICRO_UPTURN_FOR_BUY: bool = False
+REQUIRE_PRICE_ABOVE_MICRO_VWAP_FOR_BUY: bool = False
 
-# Require at least one short-term upturn signal.
-REQUIRE_MICRO_UPTURN_FOR_BUY: bool = True
-
-# Stronger entry timing confirmation.
-# Score/probability/EV identify products worth watching; these requirements
-# decide whether the live turn is strong enough to enter now.
-REQUIRE_PRICE_ABOVE_MICRO_VWAP_FOR_BUY: bool = True
+# Keep a very loose higher-low / green-candle preference.
 REQUIRE_HIGHER_LOW_OR_GREEN_SEQUENCE_FOR_BUY: bool = True
-REQUIRE_NO_LOWER_LOW_SEQUENCE_FOR_BUY: bool = True
+REQUIRE_NO_LOWER_LOW_SEQUENCE_FOR_BUY: bool = False
 
-# Minimum live momentum stack in basis points.
-MIN_ENTRY_MOMENTUM_1_BPS: float = 0.0
-MIN_ENTRY_MOMENTUM_3_BPS: float = 3.0
-MIN_ENTRY_MOMENTUM_5_BPS: float = 5.0
-MIN_ENTRY_MOMENTUM_15_BPS: float = -8.0
+# Very permissive momentum stack.
+MIN_ENTRY_MOMENTUM_1_BPS: float = -8.0
+MIN_ENTRY_MOMENTUM_3_BPS: float = -14.0
+MIN_ENTRY_MOMENTUM_5_BPS: float = -20.0
+MIN_ENTRY_MOMENTUM_15_BPS: float = -45.0
+
 ENTRY_GREEN_CANDLE_LOOKBACK: int = 5
-ENTRY_MIN_GREEN_CANDLES: int = 3
-ENTRY_TIMING_FAIL_COOLDOWN_SEC: float = 45.0
+ENTRY_MIN_GREEN_CANDLES: int = 1
+ENTRY_TIMING_FAIL_COOLDOWN_SEC: float = 8.0
 
-# Candidate selectivity: core calibrated gates mean watch, not buy immediately.
-ENABLE_RELATIVE_CANDIDATE_SELECTIVITY: bool = True
-MAX_BUYABLE_RANKED_CANDIDATES: int = 3
-MIN_RANK_ADVANTAGE_OVER_MEDIAN: float = 15.0
-MIN_CANDIDATE_RANK_SCORE_TO_BUY: float = 95.0
-MIN_LIVE_EV_BPS_FOR_ACTUAL_BUY: float = 55.0
-LOW_CONFIDENCE_EV_BONUS_REQUIREMENT_BPS: float = 35.0
-MAX_SIMULTANEOUS_BUY_READY_WITHOUT_RANK_EDGE: int = 5
+# Level 8 is now the main determinant.
+# Do not let the old selectivity layer starve Level 8 of learning candidates.
+ENABLE_RELATIVE_CANDIDATE_SELECTIVITY: bool = False
+MAX_BUYABLE_RANKED_CANDIDATES: int = 15
+MIN_RANK_ADVANTAGE_OVER_MEDIAN: float = -999.0
+MIN_CANDIDATE_RANK_SCORE_TO_BUY: float = 0.0
+MIN_LIVE_EV_BPS_FOR_ACTUAL_BUY: float = -180.0
+LOW_CONFIDENCE_EV_BONUS_REQUIREMENT_BPS: float = 0.0
+MAX_SIMULTANEOUS_BUY_READY_WITHOUT_RANK_EDGE: int = 15
 
-# Spread/friction filters and rank penalties.
-ENABLE_HARD_SPREAD_FILTER_FOR_BUYS: bool = True
-HARD_MAX_BUY_SPREAD_BPS: float = 14.0
-PRODUCT_MAX_BUY_SPREAD_BPS: Dict[str, float] = {
-    "SHIB-USD": 10.0,
-    "ADA-USD": 12.0,
-    "AVAX-USD": 12.0,
-    "DOT-USD": 12.0,
-}
-SPREAD_RANK_PENALTY_MULT: float = 2.0
+# Spread still affects EV/cost math, but it should not prevent Level 8 from
+# learning unless the spread is truly unreasonable.
+ENABLE_HARD_SPREAD_FILTER_FOR_BUYS: bool = False
+HARD_MAX_BUY_SPREAD_BPS: float = 80.0
+PRODUCT_MAX_BUY_SPREAD_BPS: Dict[str, float] = {}
+SPREAD_RANK_PENALTY_MULT: float = 0.35
 
 # Post-buy outcome research windows.
 POST_BUY_REVIEW_WINDOWS_MINUTES: List[int] = [5, 15, 30, 60, 120]
@@ -11645,6 +11673,72 @@ class TradingBot:
                     watch_candidates=council_watch_candidates,
                 )
 
+            if ENABLE_LEVEL8_LEARNING_MODE and council_watch_candidates:
+                existing_products = {
+                    str(candidate.get("product_id", ""))
+                    for candidate in candidates
+                }
+
+                learning_candidates: List[Dict[str, Any]] = []
+
+                for watch_candidate in council_watch_candidates:
+                    product_id_lrn = str(watch_candidate.get("product_id", ""))
+
+                    if not product_id_lrn or product_id_lrn in existing_products:
+                        continue
+
+                    score_lrn = float(watch_candidate.get("score", 0.0))
+                    prob_lrn = float(watch_candidate.get("estimated_prob_up", 0.0))
+                    ev_lrn = float(watch_candidate.get("expected_net_edge_bps", 0.0))
+                    spread_lrn = float(watch_candidate.get("spread_bps", 999.0))
+
+                    # Mechanical quote sanity remains required.
+                    if spread_lrn > float(LEVEL8_LEARNING_MAX_SPREAD_BPS):
+                        continue
+
+                    # Learning mode allows imperfect candidates, but not total noise.
+                    if score_lrn < float(LEVEL8_LEARNING_MIN_SCORE):
+                        continue
+
+                    if prob_lrn < float(LEVEL8_LEARNING_MIN_PROB):
+                        continue
+
+                    if ev_lrn < float(LEVEL8_LEARNING_MIN_EV_BPS):
+                        continue
+
+                    c = dict(watch_candidate)
+                    c["manager_strategy"] = "LEVEL8_LEARNING_MODE"
+                    c["entry_reason"] = (
+                        f"level8_learning_mode;"
+                        f"score={score_lrn:.2f};"
+                        f"prob={prob_lrn:.3f};"
+                        f"ev={ev_lrn:.2f};"
+                        f"spread={spread_lrn:.2f}"
+                    )
+                    c["heartbeat_only"] = False
+                    c["learning_candidate"] = True
+                    c["rank_score"] = (
+                        score_lrn
+                        + ev_lrn * 0.05
+                        + prob_lrn * 25.0
+                    )
+
+                    learning_candidates.append(c)
+
+                learning_candidates.sort(
+                    key=lambda c: float(c.get("rank_score", 0.0)),
+                    reverse=True,
+                )
+
+                extra = learning_candidates[: int(LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES)]
+
+                if extra:
+                    candidates.extend(extra)
+                    log(
+                        f"[level8-learning] added {len(extra)} learning candidates "
+                        f"products={','.join(str(c.get('product_id', '')) for c in extra)}"
+                    )
+
             for candidate in candidates:
                 candidate["rank_score"] = candidate_rank_score(candidate)
             candidates.sort(key=lambda c: float(c.get("rank_score", 0.0)), reverse=True)
@@ -11958,6 +12052,9 @@ class TradingBot:
             for candidate in timed_candidates:
                 product_id_for_ai = str(candidate.get("product_id", ""))
                 ai_ok, ai_reason = self._ai_allows_candidate(candidate=candidate)
+                if ENABLE_LEVEL8_LEARNING_MODE:
+                    ai_ok = True
+                    ai_reason = f"learning_mode_ai_non_blocking;{ai_reason}"
                 candidate["ai_ok"] = bool(ai_ok)
                 candidate["ai_reason"] = str(ai_reason)
                 try:
@@ -11983,11 +12080,16 @@ class TradingBot:
                     continue
                 ai_filtered_candidates.append(candidate)
 
-            candidate_slice = (
-                ai_filtered_candidates[:MAX_NEW_ENTRIES_PER_EVAL]
-                if ENABLE_MULTI_CANDIDATE_BUYS
-                else ai_filtered_candidates[:1]
-            )
+            if ENABLE_LEVEL8_LEARNING_MODE:
+                candidate_slice = ai_filtered_candidates[
+                    : int(LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL)
+                ]
+            else:
+                candidate_slice = (
+                    ai_filtered_candidates[:MAX_NEW_ENTRIES_PER_EVAL]
+                    if ENABLE_MULTI_CANDIDATE_BUYS
+                    else ai_filtered_candidates[:1]
+                )
 
             if ENABLE_INVERTED_STOPLOSS_CYCLE:
                 for candidate in ai_filtered_candidates:

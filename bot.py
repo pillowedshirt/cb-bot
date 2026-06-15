@@ -215,6 +215,30 @@ LEVEL5_MAX_POSITION_PCT: float = 1.0
 
 ENABLE_LEVEL8_COUNCIL: bool = True
 
+# ============================================================
+# LEVEL 8 INTELLIGENCE / CREDIT ASSIGNMENT
+# ============================================================
+
+ENABLE_LEVEL8_AGENT_CREDIT_ASSIGNMENT: bool = True
+
+# The bot should start risky so it learns quickly.
+# This means exploration has a high weight early, then decays as real evidence grows.
+LEVEL8_EXPLORATION_START_WEIGHT: float = 0.38
+LEVEL8_EXPLORATION_MIN_WEIGHT: float = 0.08
+LEVEL8_EXPLORATION_DECAY_SAMPLE_SIZE: int = 120
+
+# Price-move labels for agent credit.
+LEVEL8_FLAT_MOVE_BPS: float = 18.0
+LEVEL8_GOOD_UP_MOVE_BPS: float = 60.0
+LEVEL8_BIG_UP_MOVE_BPS: float = 120.0
+LEVEL8_BAD_DOWN_MOVE_BPS: float = -60.0
+LEVEL8_BIG_DOWN_MOVE_BPS: float = -120.0
+
+# Credit assignment strength.
+LEVEL8_AGENT_CREDIT_CONFIDENCE_MULT: float = 0.65
+LEVEL8_AGENT_CREDIT_MIN_SCORE: float = 0.0
+LEVEL8_AGENT_CREDIT_MAX_SCORE: float = 1.0
+
 # Always-on council commentary.
 # This makes the Level 8 council evaluate current market conditions even when
 # nothing passes the normal buy gate, so the viewer always has council dialogue.
@@ -7621,6 +7645,99 @@ class TradingBot:
             "mom15": self._recent_momentum_bps_for_product(product_id, 15),
         }
 
+    def _level8_market_context(
+        self,
+        *,
+        product_id: str,
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Create first-class setup, regime, execution, and learning labels."""
+        try:
+            moms = self._entry_momentum_snapshot(product_id)
+        except Exception:
+            moms = {"mom1": 0.0, "mom3": 0.0, "mom5": 0.0, "mom15": 0.0}
+
+        mom1 = float(moms.get("mom1", 0.0))
+        mom3 = float(moms.get("mom3", 0.0))
+        mom5 = float(moms.get("mom5", 0.0))
+        mom15 = float(moms.get("mom15", 0.0))
+        spread_bps = float(candidate.get("spread_bps", 0.0) or 0.0)
+        ev_bps = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
+        projected_forward = float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0)
+        probability = clamp_float(float(candidate.get("estimated_prob_up", 0.5) or 0.5), 0.0, 1.0)
+        score = clamp_float(float(candidate.get("score", 0.0) or 0.0) / 100.0, 0.0, 1.0)
+        volatility_proxy = abs(mom1) * 0.25 + abs(mom3) * 0.25 + abs(mom5) * 0.30 + abs(mom15) * 0.20
+
+        if mom15 > 70 and mom5 > 10:
+            market_regime = "strong_uptrend"
+        elif mom15 > 25 and mom5 > -15:
+            market_regime = "weak_uptrend"
+        elif mom15 < -70 and mom5 < -10:
+            market_regime = "strong_downtrend"
+        elif mom15 < -25 and mom5 < 15:
+            market_regime = "weak_downtrend"
+        elif volatility_proxy > 90:
+            market_regime = "volatility_expansion"
+        elif abs(mom15) < 18 and abs(mom5) < 14:
+            market_regime = "range_chop"
+        else:
+            market_regime = "mixed"
+
+        if mom15 > 20 and mom5 < 0 and mom1 >= -8:
+            setup_tag = "upper_low"
+        elif mom5 < -25 and mom1 > -5:
+            setup_tag = "dip_bounce_watch"
+        elif mom3 > 15 and mom5 > 25:
+            setup_tag = "breakout_attempt"
+        elif mom5 < -40 and mom1 < -8:
+            setup_tag = "falling_knife"
+        elif mom15 > 30 and -20 <= mom5 <= 15:
+            setup_tag = "pullback_continuation"
+        elif abs(mom15) < 20 and abs(mom5) < 15:
+            setup_tag = "range_chop"
+        elif mom15 < -30 and mom5 > 0:
+            setup_tag = "possible_reversal"
+        else:
+            setup_tag = "mixed_structure"
+
+        if spread_bps > 120:
+            execution_state = "spread_extreme"
+        elif spread_bps > 60:
+            execution_state = "spread_wide"
+        elif spread_bps > 20:
+            execution_state = "spread_moderate"
+        else:
+            execution_state = "spread_clean"
+
+        structure_learning = {
+            "upper_low": 0.82, "dip_bounce_watch": 0.78,
+            "breakout_attempt": 0.74, "pullback_continuation": 0.76,
+            "possible_reversal": 0.70, "range_chop": 0.42,
+            "falling_knife": 0.32, "mixed_structure": 0.50,
+        }.get(setup_tag, 0.50)
+        regime_learning = {
+            "strong_uptrend": 0.80, "weak_uptrend": 0.72,
+            "volatility_expansion": 0.72, "mixed": 0.56,
+            "range_chop": 0.42, "weak_downtrend": 0.38,
+            "strong_downtrend": 0.30,
+        }.get(market_regime, 0.50)
+        uncertainty_value = clamp_float(abs(probability - score) * 0.70, 0.0, 0.25)
+        edge_value = clamp_float(0.50 + ev_bps / 400.0, 0.0, 1.0)
+        forward_value = clamp_float(0.50 + projected_forward / 450.0, 0.0, 1.0)
+        spread_penalty = clamp_float(spread_bps / 200.0, 0.0, 0.35)
+        learning_score = clamp_float(
+            structure_learning * 0.35 + regime_learning * 0.25
+            + edge_value * 0.15 + forward_value * 0.15
+            + uncertainty_value - spread_penalty,
+            0.0, 1.0,
+        )
+        return {
+            "mom1": mom1, "mom3": mom3, "mom5": mom5, "mom15": mom15,
+            "volatility_proxy": volatility_proxy, "market_regime": market_regime,
+            "setup_tag": setup_tag, "execution_state": execution_state,
+            "learning_score": learning_score,
+        }
+
     def _max_buy_spread_for_product(self, product_id: str) -> float:
         normalized = str(product_id).upper().strip()
         return float(PRODUCT_MAX_BUY_SPREAD_BPS.get(normalized, HARD_MAX_BUY_SPREAD_BPS))
@@ -7638,122 +7755,83 @@ class TradingBot:
         *,
         candidate: Dict[str, Any],
     ) -> Tuple[bool, Dict[str, Any]]:
+        """Build a context-aware multi-agent Level 8 council vote."""
         product_id = str(candidate.get("product_id", ""))
         fallback = {
-            "action": "WAIT",
-            "strategy": candidate.get("manager_strategy", "LEVEL8_UNAVAILABLE"),
-            "bucket": "BLOCKED",
-            "risk_mode": "NORMAL",
-            "recommended_position_pct": 0.0,
-            "decision_id": "",
-            "truth_score": 0.0,
-            "final_buy_score": 0.0,
-            "buy_threshold": 0.0,
-            "confidence": 0.0,
+            "action": "WAIT", "strategy": candidate.get("manager_strategy", "LEVEL8_UNAVAILABLE"),
+            "bucket": "BLOCKED", "risk_mode": "NORMAL", "recommended_position_pct": 0.0,
+            "decision_id": "", "truth_score": 0.0, "final_buy_score": 0.0,
+            "buy_threshold": 0.0, "confidence": 0.0, "learning_score": 0.0,
+            "setup_tag": "unknown", "market_regime": "unknown",
             "reason": "level8_unavailable_fail_closed",
         }
         if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
             return False, fallback
 
         try:
-            try:
-                decision = self.level8_council.decide_buy(
-                    product_id=product_id,
-                    candidate=candidate,
-                )
-            except TypeError:
-                probability = clamp_float(float(candidate.get("estimated_prob_up", 0.5)), 0.0, 1.0)
-                score = clamp_float(float(candidate.get("score", 0.0)) / 100.0, 0.0, 1.0)
-                expected_edge = float(candidate.get("expected_net_edge_bps", 0.0))
-                edge_score = clamp_float(0.5 + expected_edge / 240.0, 0.0, 1.0)
-                spread_bps = float(candidate.get("spread_bps", 0.0))
-                spread_quality = clamp_float(1.0 - max(0.0, spread_bps) / 100.0, 0.0, 1.0)
-                projected_forward = float(candidate.get("projected_forward_gain_bps", 0.0))
-                forward_score = clamp_float(0.5 + projected_forward / 320.0, 0.0, 1.0)
-                cost_bps = float(candidate.get("cost_bps", 0.0))
-                cost_score = clamp_float(1.0 - max(0.0, cost_bps) / 400.0, 0.0, 1.0)
-
-                moms = self._entry_momentum_snapshot(product_id)
-                mom1 = float(moms.get("mom1", 0.0))
-                mom3 = float(moms.get("mom3", 0.0))
-                mom5 = float(moms.get("mom5", 0.0))
-                mom15 = float(moms.get("mom15", 0.0))
-                trend_score = clamp_float(0.50 + mom5 / 180.0 + mom15 / 300.0, 0.0, 1.0)
-                mean_reversion_score = clamp_float(0.45 + max(0.0, -mom5) / 180.0 + max(0.0, mom1) / 160.0, 0.0, 1.0)
-                breakout_score = clamp_float(0.45 + max(0.0, mom3) / 150.0 + max(0.0, mom5) / 220.0, 0.0, 1.0)
-                risk_vote = self.level8_council.risk_agent()
-                votes = [
-                    {"agent": "trend", "buy": trend_score, "sell": clamp_float(1.0-trend_score,0.0,1.0), "hold": clamp_float(0.40+trend_score*0.30,0.0,1.0), "wait": clamp_float(0.60-trend_score*0.35,0.0,1.0), "confidence": clamp_float(0.35+abs(mom5)/180.0,0.20,0.90)},
-                    {"agent": "mean_reversion", "buy": mean_reversion_score, "sell": clamp_float(1.0-mean_reversion_score,0.0,1.0), "hold": 0.45, "wait": clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), "confidence": clamp_float(0.35+abs(mom5)/220.0,0.20,0.85)},
-                    {"agent": "breakout", "buy": breakout_score, "sell": clamp_float(1.0-breakout_score,0.0,1.0), "hold": clamp_float(0.40+breakout_score*0.20,0.0,1.0), "wait": clamp_float(0.65-breakout_score*0.30,0.0,1.0), "confidence": clamp_float(0.30+max(0.0,mom3)/160.0,0.20,0.85)},
-                    {"agent": "ai_outcome", "buy": probability, "sell": clamp_float(1.0-probability,0.0,1.0), "hold": clamp_float(0.35+probability*0.35,0.0,1.0), "wait": clamp_float(0.70-probability*0.40,0.0,1.0), "confidence": clamp_float(0.25+abs(probability-0.5)*1.20,0.20,0.85)},
-                    {"agent": "execution", "buy": clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), "sell": clamp_float(1.0-spread_quality*0.60,0.0,1.0), "hold": 0.45, "wait": clamp_float(1.0-spread_quality,0.0,1.0), "confidence": clamp_float(0.30+spread_quality*0.55,0.20,0.95)},
-                    {"agent": "product_health", "buy": clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), "sell": clamp_float(1.0-forward_score,0.0,1.0), "hold": clamp_float(0.40+forward_score*0.30,0.0,1.0), "wait": clamp_float(0.65-forward_score*0.35,0.0,1.0), "confidence": clamp_float(0.30+score*0.50,0.20,0.85)},
-                    {"agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50))},
-                ]
-                truth_buy = clamp_float(spread_quality*0.25+cost_score*0.15+probability*0.25+score*0.20+forward_score*0.15,0.0,1.0)
-                truth_vote = {"agent":"truth", "buy":truth_buy, "sell":clamp_float(1.0-truth_buy,0.0,1.0), "hold":clamp_float(0.35+truth_buy*0.30,0.0,1.0), "wait":clamp_float(0.80-truth_buy*0.55,0.0,1.0), "confidence":clamp_float(0.30+truth_buy*0.55,0.20,0.90)}
-                strategy = str(candidate.get("manager_strategy", "LEVEL8_DIRECT"))
-                decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
+            context = self._level8_market_context(product_id=product_id, candidate=candidate)
+            probability = clamp_float(float(candidate.get("estimated_prob_up", 0.5) or 0.5), 0.0, 1.0)
+            score = clamp_float(float(candidate.get("score", 0.0) or 0.0) / 100.0, 0.0, 1.0)
+            expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
+            projected_forward = float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0)
+            cost_bps = float(candidate.get("cost_bps", 0.0) or 0.0)
+            spread_bps = float(candidate.get("spread_bps", 0.0) or 0.0)
+            edge_score = clamp_float(0.5 + expected_edge / 240.0, 0.0, 1.0)
+            forward_score = clamp_float(0.5 + projected_forward / 320.0, 0.0, 1.0)
+            cost_score = clamp_float(1.0 - max(0.0, cost_bps) / 400.0, 0.0, 1.0)
+            spread_quality = clamp_float(1.0 - max(0.0, spread_bps) / 100.0, 0.0, 1.0)
+            mom1, mom3 = float(context["mom1"]), float(context["mom3"])
+            mom5, mom15 = float(context["mom5"]), float(context["mom15"])
+            setup_tag, market_regime = str(context["setup_tag"]), str(context["market_regime"])
+            execution_state, learning_score = str(context["execution_state"]), float(context["learning_score"])
+            trend_score = clamp_float(0.50 + mom5 / 180.0 + mom15 / 300.0, 0.0, 1.0)
+            mean_reversion_score = clamp_float(0.45 + max(0.0, -mom5) / 180.0 + max(0.0, mom1) / 160.0, 0.0, 1.0)
+            breakout_score = clamp_float(0.45 + max(0.0, mom3) / 150.0 + max(0.0, mom5) / 220.0, 0.0, 1.0)
+            trend_score = clamp_float(trend_score + (0.10 if setup_tag == "pullback_continuation" else 0.0) - (0.06 if setup_tag == "falling_knife" else 0.0), 0.0, 1.0)
+            mean_reversion_score = clamp_float(mean_reversion_score + (0.12 if setup_tag == "upper_low" else 0.0), 0.0, 1.0)
+            breakout_score = clamp_float(breakout_score - (0.12 if setup_tag == "falling_knife" else 0.0), 0.0, 1.0)
+            risk_vote = self.level8_council.risk_agent()
+            common = {"setup_tag": setup_tag, "market_regime": market_regime, "execution_state": execution_state, "learning_score": learning_score}
+            def vote(agent: str, buy: float, hold: float, wait: float, confidence: float, reason: str) -> Dict[str, Any]:
+                return {**common, "agent": agent, "buy": buy, "sell": clamp_float(1.0-buy, 0.0, 1.0), "hold": hold, "wait": wait, "confidence": confidence, "reason": reason}
+            votes = [
+                vote("trend", trend_score, clamp_float(0.40+trend_score*0.30,0.0,1.0), clamp_float(0.60-trend_score*0.35,0.0,1.0), clamp_float(0.35+abs(mom5)/180.0,0.20,0.90), f"trend mom5={mom5:.2f};mom15={mom15:.2f};regime={market_regime}"),
+                vote("mean_reversion", mean_reversion_score, 0.45, clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), clamp_float(0.35+abs(mom5)/220.0,0.20,0.85), f"mean_reversion setup={setup_tag};mom1={mom1:.2f};mom5={mom5:.2f}"),
+                vote("breakout", breakout_score, clamp_float(0.40+breakout_score*0.20,0.0,1.0), clamp_float(0.65-breakout_score*0.30,0.0,1.0), clamp_float(0.30+max(0.0,mom3)/160.0,0.20,0.85), f"breakout mom3={mom3:.2f};mom5={mom5:.2f};setup={setup_tag}"),
+                vote("ai_outcome", probability, clamp_float(0.35+probability*0.35,0.0,1.0), clamp_float(0.70-probability*0.40,0.0,1.0), clamp_float(0.25+abs(probability-0.5)*1.20,0.20,0.85), f"probability={probability:.3f};score={score:.3f}"),
+                vote("execution", clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), 0.45, clamp_float(1.0-spread_quality,0.0,1.0), clamp_float(0.30+spread_quality*0.55,0.20,0.95), f"execution spread={spread_bps:.2f};cost={cost_bps:.2f};state={execution_state}"),
+                vote("product_health", clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), clamp_float(0.40+forward_score*0.30,0.0,1.0), clamp_float(0.65-forward_score*0.35,0.0,1.0), clamp_float(0.30+score*0.50,0.20,0.85), f"product score={score:.3f};edge={expected_edge:.2f};forward={projected_forward:.2f}"),
+                {**common, "agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
+                vote("exploration", learning_score, 0.35, clamp_float(0.70-learning_score*0.45,0.0,1.0), clamp_float(0.30+learning_score*0.55,0.20,0.85), f"learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"),
+            ]
+            truth_buy = clamp_float(spread_quality*0.20 + cost_score*0.10 + probability*0.20 + score*0.15 + forward_score*0.15 + learning_score*0.20, 0.0, 1.0)
+            truth_vote = vote("truth", truth_buy, clamp_float(0.35+truth_buy*0.30,0.0,1.0), clamp_float(0.80-truth_buy*0.55,0.0,1.0), clamp_float(0.30+truth_buy*0.55,0.20,0.90), f"truth evidence={truth_buy:.3f};setup={setup_tag};regime={market_regime}")
+            strategy = f"LEVEL8_DIRECT|regime={market_regime}|setup={setup_tag}|execution={execution_state}"
+            decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
         except Exception as exc:
             log(f"[level8] decision failed for {product_id}: {exc}")
             return False, {**fallback, "reason": f"level8_decision_failed_fail_closed:{exc}"}
 
-        if isinstance(decision, dict):
-            action = decision.get("action", "WAIT")
-            strategy = candidate.get("manager_strategy", "LEGACY")
-            bucket = decision.get("bucket", "SHADOW")
-            risk_mode = decision.get("risk_mode", "NORMAL")
-            recommended_position_pct = decision.get("position_pct", 0.0)
-            decision_id = decision.get("decision_id", str(uuid.uuid4()))
-            truth_score = decision.get("truth_score", 0.0)
-            final_buy_score = decision.get("final_buy", 0.0)
-            buy_threshold = decision.get("buy_threshold", 0.0)
-            confidence = decision.get("confidence", truth_score)
-            reason = decision.get("sizing_reason", decision.get("reason", ""))
-        else:
-            action = decision.action
-            strategy = decision.strategy
-            bucket = decision.bucket
-            risk_mode = decision.risk_mode
-            recommended_position_pct = decision.recommended_position_pct
-            decision_id = decision.decision_id
-            truth_score = decision.truth_score
-            final_buy_score = decision.final_buy_score
-            buy_threshold = decision.buy_threshold
-            confidence = decision.confidence
-            reason = decision.reason
-
-        info = {
-            "action": action,
-            "strategy": strategy,
-            "bucket": bucket,
-            "risk_mode": risk_mode,
-            "recommended_position_pct": float(recommended_position_pct),
-            "decision_id": decision_id,
-            "truth_score": float(truth_score),
-            "final_buy_score": float(final_buy_score),
-            "buy_threshold": float(buy_threshold),
-            "confidence": float(confidence),
-            "reason": reason,
-        }
         try:
-            if isinstance(decision, dict):
-                self._append_level8_vote_snapshots(
-                    product_id=product_id,
-                    decision_id=str(info.get("decision_id", "")),
-                    strategy=str(info.get("strategy", candidate.get("manager_strategy", "LEVEL8_DIRECT"))),
-                    votes=decision.get("votes", []),
-                    truth_vote=decision.get("truth_vote", {}),
-                    reason=str(info.get("reason", "")),
-                )
+            action = str(decision.get("action", "WAIT"))
+            strategy = str(decision.get("strategy", strategy))
+            info = {
+                "action": action, "strategy": strategy, "bucket": str(decision.get("bucket", "SHADOW")),
+                "risk_mode": str(decision.get("risk_mode", "NORMAL")), "recommended_position_pct": float(decision.get("position_pct", 0.0) or 0.0),
+                "decision_id": str(decision.get("decision_id", str(uuid.uuid4()))), "truth_score": float(decision.get("truth_score", 0.0) or 0.0),
+                "final_buy_score": float(decision.get("final_buy", 0.0) or 0.0), "buy_threshold": float(decision.get("buy_threshold", 0.0) or 0.0),
+                "confidence": float(decision.get("confidence", decision.get("truth_score", 0.0)) or 0.0),
+                "learning_score": float(decision.get("learning_score", context["learning_score"]) or 0.0),
+                "setup_tag": context["setup_tag"], "market_regime": context["market_regime"],
+            }
+            base_reason = str(decision.get("sizing_reason", decision.get("reason", "")))
+            info["reason"] = f"{base_reason};setup={context['setup_tag']};regime={context['market_regime']};learning_score={info['learning_score']:.3f}"
         except Exception as exc:
-            log(f"[level8] vote snapshot write failed {product_id}: {exc}")
+            log(f"[level8] malformed decision for {product_id}: {exc}")
+            return False, {**fallback, "reason": f"level8_malformed_decision_fail_closed:{exc}"}
+        self._append_level8_vote_snapshots(product_id=product_id, decision_id=info["decision_id"], strategy=strategy, votes=votes, truth_vote=truth_vote, reason=info["reason"])
+        return action.upper() == "ALLOW_BUY" and action.upper() != "SHADOW", info
 
-        allow = str(action).upper() == "ALLOW_BUY"
-        if str(action).upper() == "SHADOW":
-            allow = False
-        return bool(allow), info
 
     def _run_level8_council_heartbeat(
         self,
@@ -7915,10 +7993,10 @@ class TradingBot:
         self, *, product_id: str, decision_id: str, strategy: str,
         votes: List[Dict[str, Any]], truth_vote: Dict[str, Any], reason: str,
     ) -> None:
-        """Write council votes so each member can be graded against outcomes."""
+        """Write rich council votes so each member can be graded later."""
         try:
             path = os.path.join(BASE_DIR, "council_votes.csv")
-            columns = ["ts", "dt_mst", "decision_id", "product_id", "agent", "strategy", "raw_buy_score", "raw_sell_score", "raw_hold_score", "raw_wait_score", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reliability", "product_adjustment", "strategy_adjustment", "recent_performance_adjustment", "weight", "reason"]
+            columns = ["ts", "dt_mst", "decision_id", "product_id", "agent", "strategy", "setup_tag", "market_regime", "execution_state", "learning_score", "raw_buy_score", "raw_sell_score", "raw_hold_score", "raw_wait_score", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reliability", "product_adjustment", "strategy_adjustment", "recent_performance_adjustment", "weight", "reason"]
             write_header = not os.path.exists(path) or os.path.getsize(path) == 0
             ts_val = now_ts()
             dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -7932,9 +8010,9 @@ class TradingBot:
                 for vote in rows:
                     confidence = float(vote.get("confidence", 0.0) or 0.0)
                     reliability = float(vote.get("reliability", 1.0) or 1.0)
-                    writer.writerow([f"{ts_val:.6f}", dt_mst, decision_id, product_id, str(vote.get("agent", "unknown")), strategy,
-                        f"{float(vote.get('buy', vote.get('raw_buy_score', 0.0)) or 0.0):.6f}", f"{float(vote.get('sell', vote.get('raw_sell_score', 0.0)) or 0.0):.6f}", f"{float(vote.get('hold', vote.get('raw_hold_score', 0.0)) or 0.0):.6f}", f"{float(vote.get('wait', vote.get('raw_wait_score', 0.0)) or 0.0):.6f}",
-                        f"{float(vote.get('adjusted_buy_score', vote.get('buy', 0.0)) or 0.0):.6f}", f"{float(vote.get('adjusted_sell_score', vote.get('sell', 0.0)) or 0.0):.6f}", f"{float(vote.get('adjusted_hold_score', vote.get('hold', 0.0)) or 0.0):.6f}", f"{float(vote.get('adjusted_wait_score', vote.get('wait', 0.0)) or 0.0):.6f}", f"{confidence:.6f}", f"{reliability:.6f}", "0.000000", "0.000000", "0.000000", f"{max(0.0, confidence * reliability):.6f}", reason])
+                    raw = [float(vote.get(k, vote.get(f"raw_{k}_score", 0.0)) or 0.0) for k in ("buy", "sell", "hold", "wait")]
+                    adjusted = [float(vote.get(f"adjusted_{k}_score", value) or value) for k, value in zip(("buy", "sell", "hold", "wait"), raw)]
+                    writer.writerow([f"{ts_val:.6f}", dt_mst, decision_id, product_id, str(vote.get("agent", "unknown")), strategy, str(vote.get("setup_tag", "")), str(vote.get("market_regime", "")), str(vote.get("execution_state", "")), f"{float(vote.get('learning_score', 0.0) or 0.0):.6f}", *[f"{v:.6f}" for v in raw], *[f"{v:.6f}" for v in adjusted], f"{confidence:.6f}", f"{reliability:.6f}", f"{float(vote.get('product_adjustment', 0.0) or 0.0):.6f}", f"{float(vote.get('strategy_adjustment', 0.0) or 0.0):.6f}", f"{float(vote.get('recent_performance_adjustment', 0.0) or 0.0):.6f}", f"{max(0.0, confidence * reliability):.6f}", str(vote.get("reason", reason))])
         except Exception as exc:
             log(f"[level8] vote snapshot append failed: {exc}")
 

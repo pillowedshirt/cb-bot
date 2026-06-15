@@ -33,7 +33,6 @@ SIGNAL_EVENTS_CSV = os.path.join(BASE_DIR, "signal_events.csv")
 TRADE_OUTCOMES_CSV = os.path.join(BASE_DIR, "trade_outcomes.csv")
 RECONCILIATION_CSV = os.path.join(BASE_DIR, "reconciliation.csv")
 AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
-MANAGER_STATUS_CSV = os.path.join(BASE_DIR, "manager_status.csv")
 COUNCIL_VOTES_CSV = os.path.join(BASE_DIR, "council_votes.csv")
 COUNCIL_DECISIONS_CSV = os.path.join(BASE_DIR, "council_decisions.csv")
 AGENT_PERFORMANCE_CSV = os.path.join(BASE_DIR, "agent_performance.csv")
@@ -1942,7 +1941,6 @@ def render_live_dashboard() -> None:
     trade_outcomes = load_csv(TRADE_OUTCOMES_CSV)
     reconciliation = load_csv(RECONCILIATION_CSV)
     ai_predictions = load_csv(AI_PREDICTIONS_CSV)
-    manager_status = load_csv(MANAGER_STATUS_CSV)
     council_votes = load_csv(COUNCIL_VOTES_CSV)
     council_decisions = load_csv(COUNCIL_DECISIONS_CSV)
     agent_performance = load_csv(AGENT_PERFORMANCE_CSV)
@@ -1972,9 +1970,6 @@ def render_live_dashboard() -> None:
         "expected_adverse_bps", "score", "probability", "ev_bps",
         "spread_bps", "momentum_1_bps", "momentum_3_bps",
         "momentum_5_bps", "momentum_15_bps",
-    ])
-    manager_status = numeric(manager_status, [
-        "ts", "session_net", "loss_streak", "closed_count",
     ])
     council_votes = numeric(council_votes, [
         "ts", "raw_buy_score", "raw_sell_score", "raw_hold_score", "raw_wait_score",
@@ -2283,34 +2278,6 @@ def render_live_dashboard() -> None:
     """,
         unsafe_allow_html=True,
     )
-
-    st.markdown(
-        '<div class="cb-section">Level 5 manager</div>',
-        unsafe_allow_html=True,
-    )
-    if manager_status.empty:
-        st.info("No manager_status.csv rows yet.")
-    else:
-        manager_row = manager_status.sort_values("ts").iloc[-1]
-        manager_col_1, manager_col_2, manager_col_3 = st.columns(3)
-        with manager_col_1:
-            mini_card(
-                "Risk mode",
-                str(manager_row.get("risk_mode", "—")),
-                str(manager_row.get("reason", "")),
-            )
-        with manager_col_2:
-            mini_card(
-                "Session net",
-                fmt_money(manager_row.get("session_net", np.nan), 4),
-                "recent logged P/L",
-            )
-        with manager_col_3:
-            mini_card(
-                "Loss streak",
-                fmt_num(manager_row.get("loss_streak", np.nan), 0),
-                "closed sell streak",
-            )
 
     st.markdown(
         '<div class="cb-section">Level 8 evidence council</div>',

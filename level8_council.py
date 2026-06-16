@@ -1170,21 +1170,37 @@ class Level8Council:
         unrealized_bps = float(context.get("unrealized_bps", 0.0) or 0.0)
         spread_bps = float(context.get("spread_bps", 0.0) or 0.0)
         cost_bps = float(context.get("cost_bps", 0.0) or 0.0)
+        hold_seconds = float(context.get("hold_seconds", 0.0) or 0.0)
+        min_hold_elapsed = bool(context.get("min_hold_elapsed", False))
+        target_hold_elapsed = bool(context.get("target_hold_elapsed", False))
+        max_hold_elapsed = bool(context.get("max_hold_elapsed", False))
+        hard_stop_hit = bool(context.get("hard_stop_hit", False))
+        early_profit_ok = bool(context.get("early_profit_ok", False))
+        net_after_exit_bps = float(context.get("net_after_exit_bps", 0.0) or 0.0)
 
+        # Profit capture only becomes strong when the exit is actually net-profitable.
         profit_capture = clamp(
-            0.35 + max(0.0, unrealized_bps) / 220.0,
+            0.20 + max(0.0, net_after_exit_bps) / 180.0,
             0.0,
             1.0,
         )
 
+        # Loss exits should not churn at tiny losses. They become strong only at hard-stop.
         loss_exit = clamp(
-            0.30 + max(0.0, -unrealized_bps) / 260.0,
+            (0.85 if hard_stop_hit else 0.15)
+            + max(0.0, -unrealized_bps - 220.0) / 420.0,
             0.0,
             1.0,
         )
 
+        # Hold pressure is high until the position has had time to work.
         continuation_hold = clamp(
-            0.55 + max(0.0, unrealized_bps) / 400.0 - max(0.0, -unrealized_bps) / 300.0,
+            0.78
+            + (0.12 if not min_hold_elapsed else 0.0)
+            + (0.10 if not target_hold_elapsed else 0.0)
+            + max(0.0, net_after_exit_bps) / 600.0
+            - (0.45 if hard_stop_hit else 0.0)
+            - (0.18 if max_hold_elapsed and net_after_exit_bps < 0 else 0.0),
             0.0,
             1.0,
         )
@@ -1195,8 +1211,9 @@ class Level8Council:
             1.0,
         )
 
+        # Fee recovery should HOLD when fees are not recovered, not SELL.
         fee_recovery = clamp(
-            0.40 + (unrealized_bps - cost_bps) / 280.0,
+            0.25 + max(0.0, net_after_exit_bps) / 220.0,
             0.0,
             1.0,
         )
@@ -1238,7 +1255,7 @@ class Level8Council:
                 "agent": "fee_recovery",
                 "buy": 0.0,
                 "sell": fee_recovery,
-                "hold": 1.0 - fee_recovery * 0.50,
+                "hold": clamp(0.85 - fee_recovery * 0.35, 0.0, 1.0),
                 "wait": 0.30,
                 "confidence": 0.65,
             },
@@ -1294,9 +1311,11 @@ class Level8Council:
         thresholds = self.adaptive_thresholds(product_id, "EXIT_REVIEW")
         sell_threshold = float(thresholds["sell_threshold"])
 
-        if final_sell >= sell_threshold:
+        if hard_stop_hit:
             action = "ALLOW_SELL"
-        elif abs(unrealized_bps) >= 90.0 and final_sell >= sell_threshold - 0.08:
+        elif early_profit_ok and final_sell >= sell_threshold:
+            action = "ALLOW_SELL"
+        elif max_hold_elapsed and final_sell >= sell_threshold and net_after_exit_bps >= 0.0:
             action = "ALLOW_SELL"
         else:
             action = "HOLD"
@@ -1316,7 +1335,13 @@ class Level8Council:
                 f"exit_council;unrealized_bps={unrealized_bps:.2f};"
                 f"spread_bps={spread_bps:.2f};cost_bps={cost_bps:.2f};"
                 f"final_sell={final_sell:.3f};threshold={sell_threshold:.3f};"
-                f"truth={truth_score:.3f}"
+                f"truth={truth_score:.3f};"
+                f"hold_seconds={hold_seconds:.1f};"
+                f"min_hold_elapsed={min_hold_elapsed};"
+                f"target_hold_elapsed={target_hold_elapsed};"
+                f"max_hold_elapsed={max_hold_elapsed};"
+                f"net_after_exit_bps={net_after_exit_bps:.2f};"
+                f"hard_stop_hit={hard_stop_hit}"
             ),
         }
 

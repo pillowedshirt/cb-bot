@@ -1163,170 +1163,116 @@ class Level8Council:
         """
         Level 8 sell council.
 
-        This is separate from buy logic because selling answers a different question:
-        should we capture profit, hold for continuation, or exit a failing position?
+        Selling answers three questions:
+        1. Should we sell now?
+        2. If yes, should we sell part or all of the position?
+        3. Are we capturing profit near a wave peak, or should we hold for continuation?
         """
         decision_id = f"l8exit-{product_id}-{int(utc_ts())}-{uuid.uuid4().hex[:8]}"
+
         unrealized_bps = float(context.get("unrealized_bps", 0.0) or 0.0)
         spread_bps = float(context.get("spread_bps", 0.0) or 0.0)
         cost_bps = float(context.get("cost_bps", 0.0) or 0.0)
         hold_seconds = float(context.get("hold_seconds", 0.0) or 0.0)
+
         min_hold_elapsed = bool(context.get("min_hold_elapsed", False))
         target_hold_elapsed = bool(context.get("target_hold_elapsed", False))
         max_hold_elapsed = bool(context.get("max_hold_elapsed", False))
         hard_stop_hit = bool(context.get("hard_stop_hit", False))
         early_profit_ok = bool(context.get("early_profit_ok", False))
+
         net_after_exit_bps = float(context.get("net_after_exit_bps", 0.0) or 0.0)
-        min_net_after_exit_bps = float(
-            context.get("min_net_after_exit_bps", 0.0) or 0.0
-        )
+        min_net_after_exit_bps = float(context.get("min_net_after_exit_bps", 0.0) or 0.0)
 
-        # Profit capture only becomes strong when the exit is actually net-profitable.
-        profit_capture = clamp(
-            0.20 + max(0.0, net_after_exit_bps) / 180.0,
-            0.0,
-            1.0,
-        )
+        peak_unrealized_bps = float(context.get("peak_unrealized_bps", unrealized_bps) or unrealized_bps)
+        pullback_from_peak_bps = float(context.get("pullback_from_peak_bps", 0.0) or 0.0)
 
-        # Loss exits should not churn at tiny losses. They become strong only at hard-stop.
-        loss_exit = clamp(
-            (0.85 if hard_stop_hit else 0.15)
-            + max(0.0, -unrealized_bps - 220.0) / 420.0,
-            0.0,
-            1.0,
-        )
+        momentum_1_bps = float(context.get("momentum_1_bps", 0.0) or 0.0)
+        momentum_3_bps = float(context.get("momentum_3_bps", 0.0) or 0.0)
+        momentum_5_bps = float(context.get("momentum_5_bps", 0.0) or 0.0)
+        green_candles = int(float(context.get("green_candles", 0) or 0))
 
-        # Hold pressure is high until the position has had time to work.
-        continuation_hold = clamp(
-            0.78
-            + (0.12 if not min_hold_elapsed else 0.0)
-            + (0.10 if not target_hold_elapsed else 0.0)
-            + max(0.0, net_after_exit_bps) / 600.0
-            - (0.45 if hard_stop_hit else 0.0)
-            - (0.18 if max_hold_elapsed and net_after_exit_bps < 0 else 0.0),
-            0.0,
-            1.0,
-        )
+        min_partial_fraction = float(context.get("min_partial_sell_fraction", 0.25) or 0.25)
+        max_partial_fraction = float(context.get("max_partial_sell_fraction", 1.0) or 1.0)
+        peak_capture_trigger_bps = float(context.get("peak_capture_trigger_bps", 45.0) or 45.0)
+        strong_pullback_bps = float(context.get("peak_capture_strong_pullback_bps", 120.0) or 120.0)
+        full_exit_pullback_bps = float(context.get("peak_capture_full_exit_pullback_bps", 240.0) or 240.0)
+        strong_continuation_mom3_bps = float(context.get("strong_continuation_mom3_bps", 10.0) or 10.0)
+        strong_continuation_pullback_max_bps = float(context.get("strong_continuation_pullback_max_bps", 35.0) or 35.0)
 
-        execution_sell_quality = clamp(
-            1.0 - max(0.0, spread_bps) / 120.0,
-            0.0,
-            1.0,
+        profit_capture = clamp(0.18 + max(0.0, net_after_exit_bps) / 190.0, 0.0, 1.0)
+        loss_exit = clamp((0.90 if hard_stop_hit else 0.10) + max(0.0, -unrealized_bps - 220.0) / 420.0, 0.0, 1.0)
+        continuation_quality = clamp(
+            0.48 + max(-80.0, min(120.0, momentum_3_bps)) / 180.0 + max(-120.0, min(180.0, momentum_5_bps)) / 320.0
+            + min(3, max(0, green_candles)) * 0.035 + max(0.0, net_after_exit_bps) / 850.0 - pullback_from_peak_bps / 150.0
+            - (0.60 if hard_stop_hit else 0.0),
+            0.0, 1.0,
         )
-
-        # Fee recovery should HOLD when fees are not recovered, not SELL.
-        fee_recovery = clamp(
-            0.25 + max(0.0, net_after_exit_bps) / 220.0,
-            0.0,
-            1.0,
-        )
+        continuation_hold = clamp(continuation_quality + (0.12 if not min_hold_elapsed else 0.0) + (0.08 if not target_hold_elapsed else 0.0) - (0.18 if max_hold_elapsed else 0.0), 0.0, 1.0)
+        peak_capture = clamp(0.12 + max(0.0, peak_unrealized_bps - min_net_after_exit_bps) / 500.0 + max(0.0, pullback_from_peak_bps - peak_capture_trigger_bps) / 150.0 - max(0.0, momentum_3_bps) / 260.0, 0.0, 1.0)
+        momentum_fade_sell = clamp(0.18 + max(0.0, -momentum_1_bps) / 120.0 + max(0.0, -momentum_3_bps) / 180.0 + max(0.0, pullback_from_peak_bps - peak_capture_trigger_bps) / 180.0, 0.0, 1.0)
+        execution_sell_quality = clamp(1.0 - max(0.0, spread_bps) / 120.0, 0.0, 1.0)
+        fee_recovery = clamp(0.20 + max(0.0, net_after_exit_bps) / 230.0, 0.0, 1.0)
+        harvest_pressure = clamp(profit_capture * 0.30 + peak_capture * 0.30 + momentum_fade_sell * 0.20 + loss_exit * 0.20, 0.0, 1.0)
 
         votes = [
-            {
-                "agent": "profit_capture",
-                "buy": 0.0,
-                "sell": profit_capture,
-                "hold": 1.0 - profit_capture * 0.55,
-                "wait": 0.20,
-                "confidence": 0.70,
-            },
-            {
-                "agent": "drawdown_exit",
-                "buy": 0.0,
-                "sell": loss_exit,
-                "hold": 1.0 - loss_exit * 0.70,
-                "wait": 0.25,
-                "confidence": 0.70,
-            },
-            {
-                "agent": "continuation_hold",
-                "buy": 0.0,
-                "sell": 1.0 - continuation_hold,
-                "hold": continuation_hold,
-                "wait": 0.20,
-                "confidence": 0.60,
-            },
-            {
-                "agent": "execution",
-                "buy": 0.0,
-                "sell": execution_sell_quality,
-                "hold": 0.40,
-                "wait": 1.0 - execution_sell_quality,
-                "confidence": 0.65,
-            },
-            {
-                "agent": "fee_recovery",
-                "buy": 0.0,
-                "sell": fee_recovery,
-                "hold": clamp(0.85 - fee_recovery * 0.35, 0.0, 1.0),
-                "wait": 0.30,
-                "confidence": 0.65,
-            },
+            {"agent": "profit_capture", "buy": 0.0, "sell": profit_capture, "hold": 1.0 - profit_capture * 0.55, "wait": 0.20, "confidence": 0.70, "reason": "sell when net profit is actually available"},
+            {"agent": "drawdown_exit", "buy": 0.0, "sell": loss_exit, "hold": 1.0 - loss_exit * 0.70, "wait": 0.25, "confidence": 0.72, "reason": "sell hard stops but avoid tiny fee-loss churn"},
+            {"agent": "continuation_hold", "buy": 0.0, "sell": 1.0 - continuation_hold, "hold": continuation_hold, "wait": 0.20, "confidence": 0.68, "reason": "hold if the wave still appears to be continuing"},
+            {"agent": "peak_capture", "buy": 0.0, "sell": peak_capture, "hold": 1.0 - peak_capture * 0.70, "wait": 0.25, "confidence": 0.72, "reason": "sell when price pulls back from a profitable local peak"},
+            {"agent": "momentum_fade", "buy": 0.0, "sell": momentum_fade_sell, "hold": 1.0 - momentum_fade_sell * 0.65, "wait": 0.30, "confidence": 0.66, "reason": "sell more when short-term momentum fades"},
+            {"agent": "execution", "buy": 0.0, "sell": execution_sell_quality, "hold": 0.40, "wait": 1.0 - execution_sell_quality, "confidence": 0.65, "reason": "avoid selling into poor spread conditions unless necessary"},
+            {"agent": "fee_recovery", "buy": 0.0, "sell": fee_recovery, "hold": clamp(0.85 - fee_recovery * 0.35, 0.0, 1.0), "wait": 0.30, "confidence": 0.67, "reason": "protect all-in fee-adjusted breakeven"},
+            {"agent": "harvest_sizing", "buy": 0.0, "sell": harvest_pressure, "hold": 1.0 - harvest_pressure * 0.55, "wait": 0.25, "confidence": 0.64, "reason": "choose partial vs full sell pressure"},
         ]
 
-        truth_vote = {
-            "agent": "exit_truth",
-            "buy": 0.0,
-            "sell": clamp(
-                profit_capture * 0.28
-                + loss_exit * 0.24
-                + execution_sell_quality * 0.18
-                + fee_recovery * 0.20
-                + (1.0 - continuation_hold) * 0.10,
-                0.0,
-                1.0,
-            ),
-            "hold": continuation_hold,
-            "wait": 1.0 - execution_sell_quality,
-            "confidence": 0.70,
-        }
+        truth_vote = {"agent": "exit_truth", "buy": 0.0, "sell": clamp(profit_capture * 0.18 + loss_exit * 0.18 + peak_capture * 0.20 + momentum_fade_sell * 0.14 + execution_sell_quality * 0.10 + fee_recovery * 0.12 + harvest_pressure * 0.08, 0.0, 1.0), "hold": continuation_hold, "wait": 1.0 - execution_sell_quality, "confidence": 0.72, "reason": "exit truth weighs profit, peak capture, continuation, cost, and execution"}
 
         adjusted = [self._adjust_vote(vote, product_id, "EXIT_REVIEW") for vote in votes]
         adjusted_truth = self._adjust_vote(truth_vote, product_id, "EXIT_REVIEW")
-
-        weighted = [
-            (vote, max(0.0, vote.confidence * vote.reliability))
-            for vote in adjusted
-        ]
-
+        weighted = [(vote, max(0.0, vote.confidence * vote.reliability)) for vote in adjusted]
         weight_total = sum(weight for _, weight in weighted) or 1.0
-
-        final_sell = clamp(
-            sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total,
-            0.0,
-            1.0,
-        )
-
-        final_hold = clamp(
-            sum(v.adjusted_hold_score * w for v, w in weighted) / weight_total,
-            0.0,
-            1.0,
-        )
-
-        truth_score = clamp(
-            adjusted_truth.adjusted_sell_score * 0.55
-            + adjusted_truth.confidence * 0.25
-            + adjusted_truth.reliability * 0.20,
-            0.0,
-            1.0,
-        )
+        final_sell = clamp(sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total, 0.0, 1.0)
+        final_hold = clamp(sum(v.adjusted_hold_score * w for v, w in weighted) / weight_total, 0.0, 1.0)
+        truth_score = clamp(adjusted_truth.adjusted_sell_score * 0.55 + adjusted_truth.confidence * 0.25 + adjusted_truth.reliability * 0.20, 0.0, 1.0)
 
         thresholds = self.adaptive_thresholds(product_id, "EXIT_REVIEW")
         sell_threshold = float(thresholds["sell_threshold"])
+        strong_continuation = bool(continuation_quality >= 0.68 and momentum_3_bps >= strong_continuation_mom3_bps and pullback_from_peak_bps <= strong_continuation_pullback_max_bps and not max_hold_elapsed and not hard_stop_hit)
+
+        if hard_stop_hit:
+            recommended_sell_fraction = 1.0
+            sell_fraction_reason = "hard_stop_full_exit"
+        elif net_after_exit_bps < min_net_after_exit_bps:
+            recommended_sell_fraction = 0.0
+            sell_fraction_reason = f"not_net_profitable_enough;net_after_exit_bps={net_after_exit_bps:.2f};min={min_net_after_exit_bps:.2f}"
+        elif strong_continuation:
+            recommended_sell_fraction = 0.0
+            sell_fraction_reason = f"strong_continuation_hold;mom3={momentum_3_bps:.2f};pullback={pullback_from_peak_bps:.2f};continuation_quality={continuation_quality:.3f}"
+        else:
+            fraction = min_partial_fraction
+            fraction += clamp((net_after_exit_bps - min_net_after_exit_bps) / 260.0, 0.0, 0.25)
+            fraction += clamp((pullback_from_peak_bps - peak_capture_trigger_bps) / 170.0, 0.0, 0.25)
+            fraction += clamp((final_sell - sell_threshold) / 0.35, 0.0, 0.20)
+            fraction += clamp((harvest_pressure - 0.50) / 1.50, 0.0, 0.15)
+            if continuation_quality >= 0.64 and momentum_3_bps > 0 and pullback_from_peak_bps < strong_pullback_bps:
+                fraction -= 0.18
+            if max_hold_elapsed:
+                fraction = max(fraction, 0.50)
+            if pullback_from_peak_bps >= strong_pullback_bps and peak_unrealized_bps > min_net_after_exit_bps:
+                fraction = max(fraction, 0.65)
+            if pullback_from_peak_bps >= full_exit_pullback_bps:
+                fraction = 1.0
+            recommended_sell_fraction = clamp(fraction, min_partial_fraction, max_partial_fraction)
+            sell_fraction_reason = f"fraction_from_profit_peak_momentum;net_after_exit_bps={net_after_exit_bps:.2f};peak_unrealized_bps={peak_unrealized_bps:.2f};pullback_from_peak_bps={pullback_from_peak_bps:.2f};mom1={momentum_1_bps:.2f};mom3={momentum_3_bps:.2f};mom5={momentum_5_bps:.2f};harvest_pressure={harvest_pressure:.3f};continuation_quality={continuation_quality:.3f}"
 
         if hard_stop_hit:
             action = "ALLOW_SELL"
-        elif (
-            early_profit_ok
-            and final_sell >= sell_threshold
-            and net_after_exit_bps >= min_net_after_exit_bps
-        ):
+        elif strong_continuation:
+            action = "HOLD"
+        elif early_profit_ok and final_sell >= sell_threshold and net_after_exit_bps >= min_net_after_exit_bps and recommended_sell_fraction > 0.0:
             action = "ALLOW_SELL"
-        elif (
-            max_hold_elapsed
-            and final_sell >= sell_threshold
-            and net_after_exit_bps >= min_net_after_exit_bps
-        ):
+        elif max_hold_elapsed and final_sell >= sell_threshold and net_after_exit_bps >= min_net_after_exit_bps and recommended_sell_fraction > 0.0:
             action = "ALLOW_SELL"
         else:
             action = "HOLD"
@@ -1340,20 +1286,18 @@ class Level8Council:
             "sell_threshold": sell_threshold,
             "buy_threshold": thresholds["buy_threshold"],
             "risk_mode": thresholds["risk_mode"],
+            "recommended_sell_fraction": float(recommended_sell_fraction),
+            "sell_fraction_reason": sell_fraction_reason,
             "votes": [asdict(vote) for vote in adjusted],
             "truth_vote": asdict(adjusted_truth),
             "reason": (
-                f"exit_council;unrealized_bps={unrealized_bps:.2f};"
-                f"spread_bps={spread_bps:.2f};cost_bps={cost_bps:.2f};"
-                f"final_sell={final_sell:.3f};threshold={sell_threshold:.3f};"
-                f"truth={truth_score:.3f};"
-                f"hold_seconds={hold_seconds:.1f};"
-                f"min_hold_elapsed={min_hold_elapsed};"
-                f"target_hold_elapsed={target_hold_elapsed};"
-                f"max_hold_elapsed={max_hold_elapsed};"
-                f"net_after_exit_bps={net_after_exit_bps:.2f};"
-                f"min_net_after_exit_bps={min_net_after_exit_bps:.2f};"
-                f"hard_stop_hit={hard_stop_hit}"
+                f"exit_council;unrealized_bps={unrealized_bps:.2f};spread_bps={spread_bps:.2f};cost_bps={cost_bps:.2f};"
+                f"final_sell={final_sell:.3f};final_hold={final_hold:.3f};threshold={sell_threshold:.3f};truth={truth_score:.3f};"
+                f"hold_seconds={hold_seconds:.1f};min_hold_elapsed={min_hold_elapsed};target_hold_elapsed={target_hold_elapsed};max_hold_elapsed={max_hold_elapsed};"
+                f"net_after_exit_bps={net_after_exit_bps:.2f};min_net_after_exit_bps={min_net_after_exit_bps:.2f};peak_unrealized_bps={peak_unrealized_bps:.2f};"
+                f"pullback_from_peak_bps={pullback_from_peak_bps:.2f};mom1={momentum_1_bps:.2f};mom3={momentum_3_bps:.2f};mom5={momentum_5_bps:.2f};"
+                f"green={green_candles};strong_continuation={strong_continuation};recommended_sell_fraction={recommended_sell_fraction:.3f};"
+                f"sell_fraction_reason={sell_fraction_reason};hard_stop_hit={hard_stop_hit}"
             ),
         }
 

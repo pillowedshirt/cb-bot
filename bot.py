@@ -381,6 +381,28 @@ LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL: float = 45.0
 LEVEL8_ALLOW_EARLY_PROFIT_CAPTURE: bool = True
 LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS: bool = True
 
+# Level 8 sell sizing / wave-riding behavior.
+# The council decides when to sell. These settings let it sell part of a position
+# when profit exists but continuation is still possible.
+LEVEL8_ENABLE_PARTIAL_SELLS: bool = True
+LEVEL8_MIN_PARTIAL_SELL_FRACTION: float = 0.25
+LEVEL8_MAX_PARTIAL_SELL_FRACTION: float = 1.00
+LEVEL8_FULL_SELL_FRACTION: float = 1.00
+
+# Peak-capture behavior.
+# The bot should try to ride the wave, but should also harvest profit when the
+# move starts pulling back from its local peak.
+LEVEL8_PEAK_CAPTURE_TRIGGER_BPS: float = 45.0
+LEVEL8_PEAK_CAPTURE_STRONG_PULLBACK_BPS: float = 120.0
+LEVEL8_PEAK_CAPTURE_FULL_EXIT_PULLBACK_BPS: float = 240.0
+LEVEL8_STRONG_CONTINUATION_MOM3_BPS: float = 10.0
+LEVEL8_STRONG_CONTINUATION_PULLBACK_MAX_BPS: float = 35.0
+
+# Small-account protection:
+# If a partial sell is below Coinbase's minimum order value, bot.py raises the
+# fraction enough to create a valid sell order, or sells the whole position if needed.
+LEVEL8_MIN_SELL_NOTIONAL_USD: float = MIN_LIVE_ORDER_USD
+
 # Only hard spending ceiling: max 80% deployed, 20% reserve.
 LEVEL8_RESERVE_CASH_PCT: float = 0.20
 LEVEL8_MAX_SINGLE_TRADE_PCT: float = 0.80
@@ -8800,8 +8822,18 @@ class TradingBot:
         product_id: str,
         lots: List[PositionLot],
         unrealized_bps: float,
+        entry_price: Optional[float] = None,
+        current_price: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Determine whether the position has been held long enough for a discretionary sell."""
+        """
+        Determine whether the position has been held long enough for a discretionary sell.
+
+        Extended Level 8 sell context:
+        - tracks local peak bid after entry,
+        - measures pullback from that peak,
+        - includes short-term momentum,
+        - gives the sell council enough context to choose HOLD, partial sell, or full sell.
+        """
         now_value = now_ts()
         entry_ts_values = []
         hold_until_values = []
@@ -8812,26 +8844,84 @@ class TradingBot:
             meta = lot.meta if isinstance(lot.meta, dict) else {}
             entry_ts = float(meta.get("entry_ts", 0.0) or 0.0)
             if entry_ts <= 0:
-                entry_ts = float(self.position_start_ts.get(product_id, 0.0) or self.last_buy_ts.get(product_id, 0.0) or now_value)
+                entry_ts = float(
+                    self.position_start_ts.get(product_id, 0.0)
+                    or self.last_buy_ts.get(product_id, 0.0)
+                    or now_value
+                )
 
             entry_ts_values.append(entry_ts)
-            hold_until_values.append(float(meta.get("hold_until_ts", entry_ts + float(LEVEL8_MIN_HOLD_SEC)) or (entry_ts + float(LEVEL8_MIN_HOLD_SEC))))
-            target_until_values.append(float(meta.get("target_hold_until_ts", entry_ts + float(LEVEL8_TARGET_HOLD_SEC)) or (entry_ts + float(LEVEL8_TARGET_HOLD_SEC))))
-            max_until_values.append(float(meta.get("max_hold_until_ts", entry_ts + float(LEVEL8_MAX_HOLD_SEC)) or (entry_ts + float(LEVEL8_MAX_HOLD_SEC))))
+            hold_until_values.append(
+                float(
+                    meta.get("hold_until_ts", entry_ts + float(LEVEL8_MIN_HOLD_SEC))
+                    or (entry_ts + float(LEVEL8_MIN_HOLD_SEC))
+                )
+            )
+            target_until_values.append(
+                float(
+                    meta.get("target_hold_until_ts", entry_ts + float(LEVEL8_TARGET_HOLD_SEC))
+                    or (entry_ts + float(LEVEL8_TARGET_HOLD_SEC))
+                )
+            )
+            max_until_values.append(
+                float(
+                    meta.get("max_hold_until_ts", entry_ts + float(LEVEL8_MAX_HOLD_SEC))
+                    or (entry_ts + float(LEVEL8_MAX_HOLD_SEC))
+                )
+            )
 
         entry_ts_min = min(entry_ts_values) if entry_ts_values else now_value
         hold_until_ts = max(hold_until_values) if hold_until_values else now_value + float(LEVEL8_MIN_HOLD_SEC)
         target_hold_until_ts = max(target_until_values) if target_until_values else now_value + float(LEVEL8_TARGET_HOLD_SEC)
         max_hold_until_ts = max(max_until_values) if max_until_values else now_value + float(LEVEL8_MAX_HOLD_SEC)
 
-        exit_cost_bps = float(self._exit_fee_bps_for_mode()) + float(EST_SLIPPAGE_BPS) + float(EST_ADVERSE_FILL_BPS)
+        exit_cost_bps = (
+            float(self._exit_fee_bps_for_mode())
+            + float(EST_SLIPPAGE_BPS)
+            + float(EST_ADVERSE_FILL_BPS)
+        )
         net_after_exit_bps = float(unrealized_bps) - float(exit_cost_bps)
 
         hard_stop_hit = float(unrealized_bps) <= float(LEVEL8_HARD_STOP_UNREALIZED_BPS)
         min_hold_elapsed = now_value >= hold_until_ts
         target_hold_elapsed = now_value >= target_hold_until_ts
         max_hold_elapsed = now_value >= max_hold_until_ts
-        early_profit_ok = bool(LEVEL8_ALLOW_EARLY_PROFIT_CAPTURE) and net_after_exit_bps >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL)
+        early_profit_ok = (
+            bool(LEVEL8_ALLOW_EARLY_PROFIT_CAPTURE)
+            and net_after_exit_bps >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL)
+        )
+
+        current_px = float(current_price or 0.0)
+        entry_px = float(entry_price or 0.0)
+
+        previous_peak = self.peak_bid.get(product_id)
+        previous_peak_val = float(previous_peak) if previous_peak else 0.0
+
+        if current_px > 0:
+            peak_price = max(previous_peak_val, current_px)
+            self.peak_bid[product_id] = float(peak_price)
+        else:
+            peak_price = previous_peak_val
+
+        if entry_px > 0 and peak_price > 0:
+            peak_unrealized_bps = ((float(peak_price) / float(entry_px)) - 1.0) * 10000.0
+        else:
+            peak_unrealized_bps = max(0.0, float(unrealized_bps))
+
+        pullback_from_peak_bps = max(
+            0.0,
+            float(peak_unrealized_bps) - float(unrealized_bps),
+        )
+
+        try:
+            momentum_snapshot = self._entry_momentum_snapshot(product_id)
+        except Exception:
+            momentum_snapshot = {"mom1": 0.0, "mom3": 0.0, "mom5": 0.0, "mom15": 0.0}
+
+        try:
+            green_count = int(self._recent_green_candle_count(product_id, ENTRY_GREEN_CANDLE_LOOKBACK))
+        except Exception:
+            green_count = 0
 
         return {
             "now_ts": now_value,
@@ -8847,6 +8937,14 @@ class TradingBot:
             "early_profit_ok": early_profit_ok,
             "exit_cost_bps": exit_cost_bps,
             "net_after_exit_bps": net_after_exit_bps,
+            "peak_price": float(peak_price),
+            "peak_unrealized_bps": float(peak_unrealized_bps),
+            "pullback_from_peak_bps": float(pullback_from_peak_bps),
+            "momentum_1_bps": float(momentum_snapshot.get("mom1", 0.0) or 0.0),
+            "momentum_3_bps": float(momentum_snapshot.get("mom3", 0.0) or 0.0),
+            "momentum_5_bps": float(momentum_snapshot.get("mom5", 0.0) or 0.0),
+            "momentum_15_bps": float(momentum_snapshot.get("mom15", 0.0) or 0.0),
+            "green_candles": int(green_count),
         }
 
     def _level8_should_hold_or_exit(
@@ -8861,7 +8959,7 @@ class TradingBot:
         default_exit_reason: str,
         hard_exit: bool = False,
         hold_state: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, Dict[str, Any]]:
         hold_state = dict(hold_state or {})
         net_after_exit_for_hard_check = float(
             hold_state.get("net_after_exit_bps", 0.0) or 0.0
@@ -8873,24 +8971,24 @@ class TradingBot:
 
         if hard_exit:
             if hard_stop_for_hard_check:
-                return True, f"level8_hard_stop_exit;{default_exit_reason}"
+                return True, f"level8_hard_stop_exit;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "hard_stop_full_exit"}
 
             if net_after_exit_for_hard_check >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):
-                return True, f"level8_hard_exit_net_profitable;{default_exit_reason}"
+                return True, f"level8_hard_exit_net_profitable;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "hard_exit_net_profitable"}
 
             return False, (
                 f"level8_blocked_non_hard_loss_exit "
                 f"net_after_exit_bps={net_after_exit_for_hard_check:.2f};"
                 f"hard_stop_hit={hard_stop_for_hard_check};"
                 f"{default_exit_reason}"
-            )
+            ), {}
 
         if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
             if net_after_exit_for_hard_check >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):
-                return True, f"level8_disabled_but_net_profitable;{default_exit_reason}"
+                return True, f"level8_disabled_but_net_profitable;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "level8_disabled_full_exit"}
             if hard_stop_for_hard_check:
-                return True, f"level8_disabled_but_hard_stop;{default_exit_reason}"
-            return False, f"level8_disabled_hold_not_net_profitable;{default_exit_reason}"
+                return True, f"level8_disabled_but_hard_stop;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "level8_disabled_hard_stop"}
+            return False, f"level8_disabled_hold_not_net_profitable;{default_exit_reason}", {}
 
         try:
             context = {
@@ -8910,6 +9008,21 @@ class TradingBot:
                 "net_after_exit_bps": float(hold_state.get("net_after_exit_bps", 0.0) or 0.0),
                 "exit_cost_bps": float(hold_state.get("exit_cost_bps", 0.0) or 0.0),
                 "min_net_after_exit_bps": float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL),
+                "peak_price": float(hold_state.get("peak_price", 0.0) or 0.0),
+                "peak_unrealized_bps": float(hold_state.get("peak_unrealized_bps", 0.0) or 0.0),
+                "pullback_from_peak_bps": float(hold_state.get("pullback_from_peak_bps", 0.0) or 0.0),
+                "momentum_1_bps": float(hold_state.get("momentum_1_bps", 0.0) or 0.0),
+                "momentum_3_bps": float(hold_state.get("momentum_3_bps", 0.0) or 0.0),
+                "momentum_5_bps": float(hold_state.get("momentum_5_bps", 0.0) or 0.0),
+                "momentum_15_bps": float(hold_state.get("momentum_15_bps", 0.0) or 0.0),
+                "green_candles": int(hold_state.get("green_candles", 0) or 0),
+                "min_partial_sell_fraction": float(LEVEL8_MIN_PARTIAL_SELL_FRACTION),
+                "max_partial_sell_fraction": float(LEVEL8_MAX_PARTIAL_SELL_FRACTION),
+                "peak_capture_trigger_bps": float(LEVEL8_PEAK_CAPTURE_TRIGGER_BPS),
+                "peak_capture_strong_pullback_bps": float(LEVEL8_PEAK_CAPTURE_STRONG_PULLBACK_BPS),
+                "peak_capture_full_exit_pullback_bps": float(LEVEL8_PEAK_CAPTURE_FULL_EXIT_PULLBACK_BPS),
+                "strong_continuation_mom3_bps": float(LEVEL8_STRONG_CONTINUATION_MOM3_BPS),
+                "strong_continuation_pullback_max_bps": float(LEVEL8_STRONG_CONTINUATION_PULLBACK_MAX_BPS),
             }
             if hasattr(self.level8_council, "decide_exit"):
                 decision = self.level8_council.decide_exit(
@@ -8941,7 +9054,7 @@ class TradingBot:
                 )
         except Exception as exc:
             log(f"[level8] exit decision failed {product_id}: {exc}")
-            return False, f"level8_exit_failed_fail_closed;{default_exit_reason}"
+            return False, f"level8_exit_failed_fail_closed;{default_exit_reason}", {}
 
         if isinstance(decision, dict):
             final_sell_score = float(decision.get("final_sell", 0.0))
@@ -9004,7 +9117,7 @@ class TradingBot:
                     f"net_after_exit_bps={net_after_exit_bps:.2f};"
                     f"min_required={float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):.2f};"
                     f"{reason};{default_exit_reason}"
-                )
+                ), decision
 
             if not hard_stop_hit and net_after_exit_bps < 0.0:
                 return False, (
@@ -9013,7 +9126,7 @@ class TradingBot:
                     f"hard_stop_hit={hard_stop_hit};"
                     f"hold_seconds={hold_seconds:.1f};"
                     f"{reason};{default_exit_reason}"
-                )
+                ), decision
 
             if (
                 not hard_stop_hit
@@ -9027,20 +9140,20 @@ class TradingBot:
                     f"hold_seconds={hold_seconds:.1f};"
                     f"max_hold_elapsed={max_hold_elapsed};"
                     f"{reason};{default_exit_reason}"
-                )
+                ), decision
 
             return True, (
                 f"level8_sell_allowed final_sell={final_sell_score:.3f};"
                 f"threshold={sell_threshold:.3f};"
                 f"truth={truth_score:.3f};"
                 f"{reason};{default_exit_reason}"
-            )
+            ), decision
         return False, (
             f"level8_hold final_sell={final_sell_score:.3f};"
             f"threshold={sell_threshold:.3f};"
             f"truth={truth_score:.3f};"
             f"{reason};{default_exit_reason}"
-        )
+        ), decision
 
     def _entry_timing_confirmation(
         self,
@@ -12645,8 +12758,10 @@ class TradingBot:
                                 product_id=product_id,
                                 lots=lots,
                                 unrealized_bps=float(unrealized_bps),
+                                entry_price=float(avg_entry_price),
+                                current_price=float(bid),
                             )
-                            should_exit_l8, level8_exit_reason = self._level8_should_hold_or_exit(
+                            should_exit_l8, level8_exit_reason, level8_exit_decision = self._level8_should_hold_or_exit(
                                 product_id=product_id,
                                 entry_price=float(avg_entry_price),
                                 current_price=float(bid),
@@ -12666,7 +12781,25 @@ class TradingBot:
                                 hold_state=hold_state,
                             )
                             if should_exit_l8:
-                                sell_qty, exit_reason, exit_role = position_qty, level8_exit_reason, "level8_direct_exit"
+                                sell_fraction = float(level8_exit_decision.get("recommended_sell_fraction", LEVEL8_FULL_SELL_FRACTION) or 0.0)
+                                if not bool(LEVEL8_ENABLE_PARTIAL_SELLS) or bool(hold_state.get("hard_stop_hit", False)):
+                                    sell_fraction = float(LEVEL8_FULL_SELL_FRACTION)
+                                sell_fraction = clamp_float(
+                                    sell_fraction,
+                                    0.0,
+                                    float(LEVEL8_MAX_PARTIAL_SELL_FRACTION),
+                                )
+                                sell_qty = position_qty * sell_fraction
+                                min_sell_notional = float(LEVEL8_MIN_SELL_NOTIONAL_USD)
+                                if 0.0 < sell_qty * float(bid) < min_sell_notional:
+                                    min_fraction = min(1.0, min_sell_notional / max(1e-12, position_qty * float(bid)))
+                                    sell_fraction = max(sell_fraction, min_fraction)
+                                    sell_qty = position_qty * sell_fraction
+                                if sell_qty >= position_qty * 0.999:
+                                    sell_qty = position_qty
+                                    sell_fraction = float(LEVEL8_FULL_SELL_FRACTION)
+                                exit_reason = f"{level8_exit_reason};sell_fraction={sell_fraction:.4f};sell_fraction_reason={level8_exit_decision.get('sell_fraction_reason', '')}"
+                                exit_role = "level8_direct_exit"
                             else:
                                 log(f"[level8] hold {product_id}: {level8_exit_reason}")
                         except Exception as exc:

@@ -8959,7 +8959,18 @@ class TradingBot:
         default_exit_reason: str,
         hard_exit: bool = False,
         hold_state: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, str, Dict[str, Any]]:
+    ) -> Tuple[bool, str, float]:
+        """
+        Ask Level 8 whether to hold or exit.
+
+        Return:
+        - should_sell
+        - reason
+        - recommended_sell_fraction
+
+        The sell council remains the strategy authority.
+        bot.py only applies mechanical safety checks after the council decides.
+        """
         hold_state = dict(hold_state or {})
         net_after_exit_for_hard_check = float(
             hold_state.get("net_after_exit_bps", 0.0) or 0.0
@@ -8971,24 +8982,24 @@ class TradingBot:
 
         if hard_exit:
             if hard_stop_for_hard_check:
-                return True, f"level8_hard_stop_exit;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "hard_stop_full_exit"}
+                return True, f"level8_hard_stop_exit;{default_exit_reason}", 1.0
 
             if net_after_exit_for_hard_check >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):
-                return True, f"level8_hard_exit_net_profitable;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "hard_exit_net_profitable"}
+                return True, f"level8_hard_exit_net_profitable;{default_exit_reason}", 1.0
 
             return False, (
                 f"level8_blocked_non_hard_loss_exit "
                 f"net_after_exit_bps={net_after_exit_for_hard_check:.2f};"
                 f"hard_stop_hit={hard_stop_for_hard_check};"
                 f"{default_exit_reason}"
-            ), {}
+            ), 0.0
 
         if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
             if net_after_exit_for_hard_check >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):
-                return True, f"level8_disabled_but_net_profitable;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "level8_disabled_full_exit"}
+                return True, f"level8_disabled_but_net_profitable;{default_exit_reason}", 1.0
             if hard_stop_for_hard_check:
-                return True, f"level8_disabled_but_hard_stop;{default_exit_reason}", {"recommended_sell_fraction": LEVEL8_FULL_SELL_FRACTION, "sell_fraction_reason": "level8_disabled_hard_stop"}
-            return False, f"level8_disabled_hold_not_net_profitable;{default_exit_reason}", {}
+                return True, f"level8_disabled_but_hard_stop;{default_exit_reason}", 1.0
+            return False, f"level8_disabled_hold_not_net_profitable;{default_exit_reason}", 0.0
 
         try:
             context = {
@@ -9008,7 +9019,6 @@ class TradingBot:
                 "net_after_exit_bps": float(hold_state.get("net_after_exit_bps", 0.0) or 0.0),
                 "exit_cost_bps": float(hold_state.get("exit_cost_bps", 0.0) or 0.0),
                 "min_net_after_exit_bps": float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL),
-                "peak_price": float(hold_state.get("peak_price", 0.0) or 0.0),
                 "peak_unrealized_bps": float(hold_state.get("peak_unrealized_bps", 0.0) or 0.0),
                 "pullback_from_peak_bps": float(hold_state.get("pullback_from_peak_bps", 0.0) or 0.0),
                 "momentum_1_bps": float(hold_state.get("momentum_1_bps", 0.0) or 0.0),
@@ -9024,6 +9034,7 @@ class TradingBot:
                 "strong_continuation_mom3_bps": float(LEVEL8_STRONG_CONTINUATION_MOM3_BPS),
                 "strong_continuation_pullback_max_bps": float(LEVEL8_STRONG_CONTINUATION_PULLBACK_MAX_BPS),
             }
+
             if hasattr(self.level8_council, "decide_exit"):
                 decision = self.level8_council.decide_exit(
                     product_id=product_id,
@@ -9052,16 +9063,32 @@ class TradingBot:
                     votes=[vote],
                     truth_vote={**vote, "agent": "exit_truth"},
                 )
+
         except Exception as exc:
             log(f"[level8] exit decision failed {product_id}: {exc}")
-            return False, f"level8_exit_failed_fail_closed;{default_exit_reason}", {}
+            return False, f"level8_exit_failed_fail_closed;{default_exit_reason}", 0.0
+
+        recommended_sell_fraction = 0.0
+        sell_fraction_reason = ""
 
         if isinstance(decision, dict):
             final_sell_score = float(decision.get("final_sell", 0.0))
             sell_threshold = float(decision.get("sell_threshold", 0.0))
             truth_score = float(decision.get("truth_score", 0.0))
             reason = str(decision.get("reason", "legacy_council_exit_review"))
-            sell_decision_id = str(decision.get("decision_id", f"l8exit-{product_id}-{int(now_ts())}-{uuid.uuid4().hex[:8]}"))
+            sell_decision_id = str(
+                decision.get(
+                    "decision_id",
+                    f"l8exit-{product_id}-{int(now_ts())}-{uuid.uuid4().hex[:8]}",
+                )
+            )
+
+            recommended_sell_fraction = clamp_float(
+                float(decision.get("recommended_sell_fraction", 0.0) or 0.0),
+                0.0,
+                1.0,
+            )
+            sell_fraction_reason = str(decision.get("sell_fraction_reason", ""))
 
             try:
                 self._append_level8_vote_snapshots(
@@ -9095,20 +9122,42 @@ class TradingBot:
             action = str(decision.get("action", "HOLD")).upper().strip()
             if action not in {"ALLOW_SELL", "HOLD"}:
                 action = "HOLD"
+
         else:
             final_sell_score = float(decision.final_sell_score)
             sell_threshold = float(decision.sell_threshold)
             truth_score = float(decision.truth_score)
             reason = str(decision.reason)
             action = str(decision.action).upper()
+            recommended_sell_fraction = 1.0 if action == "ALLOW_SELL" else 0.0
+            sell_fraction_reason = "legacy_exit_decision_no_fraction"
 
         if action == "ALLOW_SELL":
             hard_stop_hit = bool(hold_state.get("hard_stop_hit", False))
             early_profit_ok = bool(hold_state.get("early_profit_ok", False))
             min_hold_elapsed = bool(hold_state.get("min_hold_elapsed", False))
-            max_hold_elapsed = bool(hold_state.get("max_hold_elapsed", False))
             net_after_exit_bps = float(hold_state.get("net_after_exit_bps", 0.0) or 0.0)
             hold_seconds = float(hold_state.get("hold_seconds", 0.0) or 0.0)
+
+            if hard_stop_hit:
+                recommended_sell_fraction = 1.0
+                sell_fraction_reason = f"{sell_fraction_reason};hard_stop_forces_full_exit"
+
+            if not bool(LEVEL8_ENABLE_PARTIAL_SELLS):
+                recommended_sell_fraction = 1.0
+                sell_fraction_reason = f"{sell_fraction_reason};partial_sells_disabled"
+
+            recommended_sell_fraction = clamp_float(
+                float(recommended_sell_fraction),
+                0.0,
+                float(LEVEL8_MAX_PARTIAL_SELL_FRACTION),
+            )
+
+            if not hard_stop_hit and recommended_sell_fraction > 0:
+                recommended_sell_fraction = max(
+                    float(LEVEL8_MIN_PARTIAL_SELL_FRACTION),
+                    float(recommended_sell_fraction),
+                )
 
             if not hard_stop_hit and not early_profit_ok and not min_hold_elapsed:
                 return False, (
@@ -9116,8 +9165,9 @@ class TradingBot:
                     f"hold_seconds={hold_seconds:.1f};"
                     f"net_after_exit_bps={net_after_exit_bps:.2f};"
                     f"min_required={float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):.2f};"
+                    f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
                     f"{reason};{default_exit_reason}"
-                ), decision
+                ), 0.0
 
             if not hard_stop_hit and net_after_exit_bps < 0.0:
                 return False, (
@@ -9125,8 +9175,9 @@ class TradingBot:
                     f"net_after_exit_bps={net_after_exit_bps:.2f};"
                     f"hard_stop_hit={hard_stop_hit};"
                     f"hold_seconds={hold_seconds:.1f};"
+                    f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
                     f"{reason};{default_exit_reason}"
-                ), decision
+                ), 0.0
 
             if (
                 not hard_stop_hit
@@ -9138,22 +9189,35 @@ class TradingBot:
                     f"net_after_exit_bps={net_after_exit_bps:.2f};"
                     f"min_required={float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):.2f};"
                     f"hold_seconds={hold_seconds:.1f};"
-                    f"max_hold_elapsed={max_hold_elapsed};"
+                    f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
                     f"{reason};{default_exit_reason}"
-                ), decision
+                ), 0.0
+
+            if recommended_sell_fraction <= 0.0:
+                return False, (
+                    f"level8_hold:no_positive_sell_fraction "
+                    f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
+                    f"sell_fraction_reason={sell_fraction_reason};"
+                    f"{reason};{default_exit_reason}"
+                ), 0.0
 
             return True, (
                 f"level8_sell_allowed final_sell={final_sell_score:.3f};"
                 f"threshold={sell_threshold:.3f};"
                 f"truth={truth_score:.3f};"
+                f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
+                f"sell_fraction_reason={sell_fraction_reason};"
                 f"{reason};{default_exit_reason}"
-            ), decision
+            ), float(recommended_sell_fraction)
+
         return False, (
             f"level8_hold final_sell={final_sell_score:.3f};"
             f"threshold={sell_threshold:.3f};"
             f"truth={truth_score:.3f};"
+            f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
+            f"sell_fraction_reason={sell_fraction_reason};"
             f"{reason};{default_exit_reason}"
-        ), decision
+        ), 0.0
 
     def _entry_timing_confirmation(
         self,
@@ -12067,6 +12131,57 @@ class TradingBot:
             log(f"[level8-learning] missed opportunity review failed: {exc}")
 
 
+    def _nearest_sell_trade_after_decision(
+        self,
+        *,
+        product_id: str,
+        decision_ts: float,
+        decision_id: str,
+        max_after_sec: float = 240.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find the nearest executed SELL trade after a Level 8 exit decision.
+
+        This connects sell council decisions to realized earnings.
+        """
+        try:
+            if not os.path.exists(TRADES_CSV_PATH):
+                return None
+
+            trades = pd.read_csv(TRADES_CSV_PATH)
+            if trades.empty or "product_id" not in trades.columns:
+                return None
+
+            trades["ts"] = pd.to_numeric(trades.get("ts"), errors="coerce")
+            trades = trades.dropna(subset=["ts"])
+
+            sells = trades[
+                trades["product_id"].astype(str).eq(str(product_id))
+                & trades["event"].astype(str).str.upper().eq("SELL")
+                & trades["side"].astype(str).str.upper().eq("SELL")
+                & (trades["ts"] >= float(decision_ts) - 5.0)
+                & (trades["ts"] <= float(decision_ts) + float(max_after_sec))
+            ].copy()
+
+            if sells.empty:
+                return None
+
+            if decision_id and "note" in sells.columns:
+                id_matches = sells[
+                    sells["note"].astype(str).str.contains(str(decision_id), regex=False, na=False)
+                ].copy()
+                if not id_matches.empty:
+                    sells = id_matches
+
+            sells["decision_delta"] = (sells["ts"] - float(decision_ts)).abs()
+            row = sells.sort_values("decision_delta").iloc[0].to_dict()
+            return row
+
+        except Exception as exc:
+            log(f"[level8] nearest sell trade lookup failed {product_id}: {exc}")
+            return None
+
+
     def _classify_level8_sell_outcomes(self) -> None:
         """
         Review Level 8 sell decisions after the fact and classify sell quality.
@@ -12102,7 +12217,9 @@ class TradingBot:
                 "ts", "dt_mst", "outcome_key", "decision_id", "product_id",
                 "decision_action", "review_minutes", "sell_price",
                 "review_price", "move_after_sell_bps", "sell_outcome_kind",
-                "reason",
+                "realized_net_pnl_usd", "realized_gross_pnl_usd",
+                "realized_net_pnl_bps", "sold_qty", "executed_sell_fraction",
+                "earnings_quality_score", "reason",
             ]
             write_header = not os.path.exists(out_path) or os.path.getsize(out_path) == 0
             with open(out_path, "a", newline="", encoding="utf-8") as f:
@@ -12117,9 +12234,71 @@ class TradingBot:
                     action = str(row.get("action", "")).upper()
                     if not product_id or not decision_id or decision_ts <= 0:
                         continue
-                    sell_price = self._market_price_near_ts(product_id=product_id, target_ts=decision_ts, max_age_sec=120.0)
+                    sell_price = self._market_price_near_ts(
+                        product_id=product_id,
+                        target_ts=decision_ts,
+                        max_age_sec=120.0,
+                    )
                     if not sell_price:
                         continue
+
+                    matched_sell_trade = self._nearest_sell_trade_after_decision(
+                        product_id=product_id,
+                        decision_ts=decision_ts,
+                        decision_id=decision_id,
+                        max_after_sec=240.0,
+                    )
+
+                    realized_net_pnl_usd = 0.0
+                    realized_gross_pnl_usd = 0.0
+                    realized_net_pnl_bps = 0.0
+                    sold_qty = 0.0
+                    executed_sell_fraction = 0.0
+
+                    if matched_sell_trade:
+                        realized_net_pnl_usd = safe_float(
+                            matched_sell_trade.get("net_pnl_usd"),
+                            0.0,
+                        )
+                        realized_gross_pnl_usd = safe_float(
+                            matched_sell_trade.get("gross_pnl_usd"),
+                            0.0,
+                        )
+                        sold_qty = safe_float(
+                            matched_sell_trade.get("qty"),
+                            0.0,
+                        )
+
+                        entry_px = safe_float(
+                            matched_sell_trade.get("entry_price"),
+                            0.0,
+                        )
+                        exit_px = safe_float(
+                            matched_sell_trade.get("exit_price"),
+                            safe_float(matched_sell_trade.get("price"), 0.0),
+                        )
+
+                        if entry_px > 0 and exit_px > 0:
+                            realized_net_pnl_bps = ((exit_px / entry_px) - 1.0) * 10000.0
+
+                        note_text = str(matched_sell_trade.get("note", ""))
+                        try:
+                            marker = "executed_sell_fraction="
+                            if marker in note_text:
+                                executed_sell_fraction = float(
+                                    note_text.split(marker, 1)[1].split()[0]
+                                )
+                        except Exception:
+                            executed_sell_fraction = 0.0
+
+                    earnings_quality_score = clamp_float(
+                        0.50
+                        + max(-1.00, min(1.00, realized_net_pnl_usd / 1.00)) * 0.20
+                        + max(-250.0, min(350.0, realized_net_pnl_bps)) / 2500.0,
+                        0.0,
+                        1.0,
+                    )
+
                     for review_minutes in LEVEL8_SELL_REVIEW_MINUTES:
                         review_ts = decision_ts + float(review_minutes) * 60.0
                         if review_ts > now_value - 10.0:
@@ -12154,10 +12333,32 @@ class TradingBot:
                         ts_value = now_ts()
                         dt_mst = datetime.fromtimestamp(ts_value, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
                         writer.writerow([
-                            f"{ts_value:.6f}", dt_mst, key, decision_id, product_id, action,
-                            int(review_minutes), f"{float(sell_price):.12f}",
-                            f"{float(review_price):.12f}", f"{float(move_after_sell_bps):.6f}",
-                            kind, f"sell_outcome_review;action={action};move_after_sell={move_after_sell_bps:.2f};kind={kind}",
+                            f"{ts_value:.6f}",
+                            dt_mst,
+                            key,
+                            decision_id,
+                            product_id,
+                            action,
+                            int(review_minutes),
+                            f"{float(sell_price):.12f}",
+                            f"{float(review_price):.12f}",
+                            f"{float(move_after_sell_bps):.6f}",
+                            kind,
+                            f"{float(realized_net_pnl_usd):.10f}",
+                            f"{float(realized_gross_pnl_usd):.10f}",
+                            f"{float(realized_net_pnl_bps):.6f}",
+                            f"{float(sold_qty):.12f}",
+                            f"{float(executed_sell_fraction):.6f}",
+                            f"{float(earnings_quality_score):.6f}",
+                            (
+                                f"sell_outcome_review;action={action};"
+                                f"move_after_sell={move_after_sell_bps:.2f};"
+                                f"kind={kind};"
+                                f"realized_net_pnl_usd={realized_net_pnl_usd:.8f};"
+                                f"realized_net_pnl_bps={realized_net_pnl_bps:.2f};"
+                                f"executed_sell_fraction={executed_sell_fraction:.3f};"
+                                f"earnings_quality_score={earnings_quality_score:.3f}"
+                            ),
                         ])
                         existing_keys.add(key)
         except Exception as exc:
@@ -12308,6 +12509,22 @@ class TradingBot:
                     move_bps = float(outcome.get("move_bps", 0.0) or 0.0)
                     review_minutes = int(float(outcome.get("review_minutes", 0.0) or 0.0))
                     outcome_source = str(outcome.get("source", "unknown"))
+
+                    realized_net_pnl_usd = safe_float(
+                        outcome.get("realized_net_pnl_usd"),
+                        0.0,
+                    )
+                    realized_net_pnl_bps = safe_float(
+                        outcome.get("realized_net_pnl_bps"),
+                        0.0,
+                    )
+                    earnings_quality_score = safe_float(
+                        outcome.get("earnings_quality_score"),
+                        0.5,
+                    )
+                    decision_action_for_outcome = str(
+                        outcome.get("decision_action", "")
+                    ).upper()
                     if outcome_source in {"trade_outcome", "real_trade", "sell_outcome"}:
                         outcome_weight = 1.00
                     elif outcome_source in {"observation_outcome", "level8_observation"}:
@@ -12364,6 +12581,37 @@ class TradingBot:
                         else:
                             correct_pressure = sell_score + wait_score * 0.35
                             wrong_pressure = buy_score + hold_score * 0.20
+
+                    strategy_name = str(vote.get("strategy", "")).upper()
+
+                    if strategy_name == "EXIT_REVIEW" and outcome_source == "sell_outcome":
+                        # Earnings-aware agent competition:
+                        # Agents that pushed SELL on profitable exits get extra credit.
+                        # Agents that pushed HOLD can still get credit if the chart kept rising after the sell,
+                        # because that means the sell may have been too early.
+                        profit_bonus = clamp_float(
+                            (earnings_quality_score - 0.50) * 0.80
+                            + max(-1.0, min(1.0, realized_net_pnl_usd / 1.00)) * 0.20
+                            + max(-250.0, min(350.0, realized_net_pnl_bps)) / 2500.0,
+                            -0.25,
+                            0.35,
+                        )
+
+                        if decision_action_for_outcome == "ALLOW_SELL":
+                            if sell_score >= max(buy_score, hold_score, wait_score):
+                                correct_pressure += max(0.0, profit_bonus)
+                                wrong_pressure += max(0.0, -profit_bonus) * 0.50
+
+                            if hold_score > sell_score and move_bps >= float(LEVEL8_SELL_GOOD_EXIT_BPS):
+                                correct_pressure += 0.15
+                            elif hold_score > sell_score and realized_net_pnl_usd > 0 and move_bps <= -float(LEVEL8_SELL_GOOD_EXIT_BPS):
+                                wrong_pressure += 0.10
+
+                        elif decision_action_for_outcome == "HOLD":
+                            if hold_score >= max(buy_score, sell_score, wait_score) and move_bps > 0:
+                                correct_pressure += clamp_float(move_bps / 350.0, 0.0, 0.25)
+                            elif sell_score > hold_score and move_bps < 0:
+                                correct_pressure += clamp_float(abs(move_bps) / 350.0, 0.0, 0.25)
 
                     confidence_mult = clamp_float(
                         confidence * float(LEVEL8_AGENT_CREDIT_CONFIDENCE_MULT),
@@ -12436,7 +12684,12 @@ class TradingBot:
                         (
                             f"agent_credit;agent={agent};direction={agent_direction};"
                             f"move_bps={move_bps:.2f};kind={outcome_kind};"
-                            f"credit={agent_credit_score:.3f};weighted_credit={weighted_agent_credit_score:.3f};source={outcome_source};weight={outcome_weight:.2f}"
+                            f"realized_net_pnl_usd={realized_net_pnl_usd:.8f};"
+                            f"realized_net_pnl_bps={realized_net_pnl_bps:.2f};"
+                            f"earnings_quality_score={earnings_quality_score:.3f};"
+                            f"credit={agent_credit_score:.3f};"
+                            f"weighted_credit={weighted_agent_credit_score:.3f};"
+                            f"source={outcome_source};weight={outcome_weight:.2f}"
                         ),
                     ])
         except Exception as exc:
@@ -12761,7 +13014,7 @@ class TradingBot:
                                 entry_price=float(avg_entry_price),
                                 current_price=float(bid),
                             )
-                            should_exit_l8, level8_exit_reason, level8_exit_decision = self._level8_should_hold_or_exit(
+                            should_exit_l8, level8_exit_reason, level8_sell_fraction = self._level8_should_hold_or_exit(
                                 product_id=product_id,
                                 entry_price=float(avg_entry_price),
                                 current_price=float(bid),
@@ -12781,25 +13034,41 @@ class TradingBot:
                                 hold_state=hold_state,
                             )
                             if should_exit_l8:
-                                sell_fraction = float(level8_exit_decision.get("recommended_sell_fraction", LEVEL8_FULL_SELL_FRACTION) or 0.0)
-                                if not bool(LEVEL8_ENABLE_PARTIAL_SELLS) or bool(hold_state.get("hard_stop_hit", False)):
-                                    sell_fraction = float(LEVEL8_FULL_SELL_FRACTION)
                                 sell_fraction = clamp_float(
-                                    sell_fraction,
+                                    float(level8_sell_fraction),
                                     0.0,
-                                    float(LEVEL8_MAX_PARTIAL_SELL_FRACTION),
+                                    1.0,
                                 )
-                                sell_qty = position_qty * sell_fraction
-                                min_sell_notional = float(LEVEL8_MIN_SELL_NOTIONAL_USD)
-                                if 0.0 < sell_qty * float(bid) < min_sell_notional:
-                                    min_fraction = min(1.0, min_sell_notional / max(1e-12, position_qty * float(bid)))
-                                    sell_fraction = max(sell_fraction, min_fraction)
-                                    sell_qty = position_qty * sell_fraction
-                                if sell_qty >= position_qty * 0.999:
-                                    sell_qty = position_qty
-                                    sell_fraction = float(LEVEL8_FULL_SELL_FRACTION)
-                                exit_reason = f"{level8_exit_reason};sell_fraction={sell_fraction:.4f};sell_fraction_reason={level8_exit_decision.get('sell_fraction_reason', '')}"
-                                exit_role = "level8_direct_exit"
+
+                                position_notional = float(position_qty) * float(bid)
+
+                                if position_notional > 0 and sell_fraction > 0:
+                                    min_order_fraction = min(
+                                        1.0,
+                                        float(LEVEL8_MIN_SELL_NOTIONAL_USD) / max(position_notional, 1e-9),
+                                    )
+
+                                    if sell_fraction < min_order_fraction:
+                                        sell_fraction = min_order_fraction
+                                        level8_exit_reason = (
+                                            f"{level8_exit_reason};"
+                                            f"sell_fraction_raised_to_min_order="
+                                            f"{sell_fraction:.3f};"
+                                            f"position_notional={position_notional:.4f};"
+                                            f"min_sell_notional={float(LEVEL8_MIN_SELL_NOTIONAL_USD):.4f}"
+                                        )
+
+                                sell_qty = float(position_qty) * float(sell_fraction)
+                                exit_reason = (
+                                    f"{level8_exit_reason};"
+                                    f"executed_sell_fraction={sell_fraction:.3f};"
+                                    f"position_qty_before_sell={float(position_qty):.12f}"
+                                )
+                                exit_role = (
+                                    "level8_partial_exit"
+                                    if sell_fraction < 0.999
+                                    else "level8_full_exit"
+                                )
                             else:
                                 log(f"[level8] hold {product_id}: {level8_exit_reason}")
                         except Exception as exc:
@@ -12810,13 +13079,35 @@ class TradingBot:
                             log(f"[sell-skip] {product_id} recent sell failure cooldown")
                             continue
                         sell_trade_id = next((str(l.meta.get("trade_id")) for l in lots if isinstance(l.meta, dict) and l.meta.get("trade_id")), "")
-                        self.signal_events_log.log_event(event_type="sell_attempt", trade_id=sell_trade_id, product_id=product_id, action="attempt_sell", reason=str(exit_reason or "level8_direct_exit"))
-                        log(f"[sell-attempt] {product_id} qty={sell_qty:.12f} reason={exit_reason} role={exit_role} bid={bid:.8f} ask={ask:.8f} avg_entry={avg_entry_price:.8f}")
+                        self.signal_events_log.log_event(
+                            event_type="sell_attempt",
+                            trade_id=sell_trade_id,
+                            product_id=product_id,
+                            action="attempt_sell",
+                            reason=str(exit_reason or "level8_direct_exit"),
+                        )
+                        log(
+                            f"[sell-attempt] {product_id} "
+                            f"qty={sell_qty:.12f} "
+                            f"fraction={(sell_qty / max(position_qty, 1e-12)):.3f} "
+                            f"reason={exit_reason} role={exit_role} "
+                            f"bid={bid:.8f} ask={ask:.8f} avg_entry={avg_entry_price:.8f}"
+                        )
                         notional_usd, exec_price, fee, filled_notional = sell_qty * bid, bid, 0.0, None
                         fill = await self._execute_live_sell(product_id=product_id, base_qty=sell_qty, bid=bid, ask=ask, reason=exit_reason or "level8_direct_exit")
                         if fill is not None:
                             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
-                            self.signal_events_log.log_event(event_type="sell_fill", trade_id=sell_trade_id, product_id=product_id, action="sell_filled", reason=f"exit_role={exit_role};exit_reason={exit_reason}")
+                            self.signal_events_log.log_event(
+                                event_type="sell_fill",
+                                trade_id=sell_trade_id,
+                                product_id=product_id,
+                                action="sell_filled",
+                                reason=(
+                                    f"exit_role={exit_role};"
+                                    f"executed_sell_fraction={(sell_qty / max(position_qty, 1e-12)):.3f};"
+                                    f"exit_reason={exit_reason}"
+                                ),
+                            )
                             sell_qty, exec_price, fee = min(float(sell_qty), float(filled_qty)), float(avg_px), float(fee_val)
                             notional_usd = float(filled_notional) if filled_notional is not None else sell_qty * exec_price
                         else:
@@ -12825,7 +13116,29 @@ class TradingBot:
                         if sell_qty > 0:
                             fifo_cost, fifo_avg_entry = self._fifo_cost_basis(list(lots), sell_qty)
                             pnl_gross = float(notional_usd) - float(fifo_cost)
-                            self.tlog.log_trade(event="SELL", product_id=product_id, side="SELL", qty=sell_qty, price=exec_price, fee_usd_val=fee, gross_pnl_usd=pnl_gross, net_pnl_usd=pnl_gross-fee, entry_price=fifo_avg_entry if fifo_avg_entry is not None else avg_entry_price, exit_price=exec_price, weekly_bias=weekly_bias, note=exit_reason or "level8_direct_exit", filled_notional_usd=float(filled_notional) if filled_notional is not None else None, exit_role=exit_role)
+                            executed_sell_fraction = sell_qty / max(position_qty, 1e-12)
+                            self.tlog.log_trade(
+                                event="SELL",
+                                product_id=product_id,
+                                side="SELL",
+                                qty=sell_qty,
+                                price=exec_price,
+                                fee_usd_val=fee,
+                                gross_pnl_usd=pnl_gross,
+                                net_pnl_usd=pnl_gross - fee,
+                                entry_price=fifo_avg_entry if fifo_avg_entry is not None else avg_entry_price,
+                                exit_price=exec_price,
+                                weekly_bias=weekly_bias,
+                                note=(
+                                    f"{exit_reason or 'level8_direct_exit'} "
+                                    f"executed_sell_fraction={executed_sell_fraction:.6f} "
+                                    f"position_qty_before_sell={float(position_qty):.12f} "
+                                    f"gross_pnl_usd={float(pnl_gross):.8f} "
+                                    f"net_pnl_usd={float(pnl_gross - fee):.8f}"
+                                ),
+                                filled_notional_usd=float(filled_notional) if filled_notional is not None else None,
+                                exit_role=exit_role,
+                            )
                             self._record_trade_timestamp(product_id)
                             self._record_realized_trade_result(pnl_gross - fee)
                             self._fifo_reduce_lots(product_id, sell_qty)

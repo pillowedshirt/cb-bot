@@ -1745,6 +1745,82 @@ def clean_trades(t: pd.DataFrame) -> pd.DataFrame:
     return t
 
 
+def chart_trades_for_product(
+    trades: pd.DataFrame,
+    *,
+    product: str,
+    cutoff: float,
+    chart_frame: pd.DataFrame,
+    has_open_position: bool,
+) -> pd.DataFrame:
+    """
+    Return chart trade markers for one product.
+
+    Normal behavior:
+    - Show trades inside the selected chart window.
+
+    Added behavior:
+    - If the bot still has an open position and the latest BUY is older than
+      the selected chart window, pin that BUY marker to the left edge of the chart.
+    - This is visual only. It does not modify trades.csv.
+    """
+    if trades is None or trades.empty or "product_id" not in trades.columns:
+        return pd.DataFrame()
+
+    product_trades = trades[trades["product_id"].astype(str).eq(str(product))].copy()
+    if product_trades.empty:
+        return pd.DataFrame()
+
+    product_trades["ts"] = pd.to_numeric(product_trades.get("ts"), errors="coerce")
+    product_trades = product_trades.dropna(subset=["ts"]).copy()
+    if product_trades.empty:
+        return pd.DataFrame()
+
+    in_window = product_trades[product_trades["ts"] >= float(cutoff)].copy()
+    if "dt" not in in_window.columns and not in_window.empty:
+        in_window["dt"] = to_dt_mst(in_window["ts"])
+
+    if not bool(has_open_position):
+        return in_window
+
+    if chart_frame is None or chart_frame.empty or "ts" not in chart_frame.columns:
+        return in_window
+
+    has_visible_buy = False
+    if not in_window.empty and {"event", "side"}.issubset(in_window.columns):
+        has_visible_buy = bool((in_window["event"].astype(str).str.upper().eq("BUY") & in_window["side"].astype(str).str.upper().eq("BUY")).any())
+    if has_visible_buy:
+        return in_window
+
+    if not {"event", "side"}.issubset(product_trades.columns):
+        return in_window
+
+    all_buys = product_trades[product_trades["event"].astype(str).str.upper().eq("BUY") & product_trades["side"].astype(str).str.upper().eq("BUY")].copy()
+    if all_buys.empty:
+        return in_window
+
+    older_buys = all_buys[all_buys["ts"] < float(cutoff)].copy()
+    if older_buys.empty:
+        return in_window
+
+    latest_old_buy = older_buys.sort_values("ts").iloc[-1].copy()
+    chart_ts = pd.to_numeric(chart_frame["ts"], errors="coerce").dropna()
+    if chart_ts.empty:
+        return in_window
+
+    left_edge_ts = float(chart_ts.min())
+    original_ts = float(latest_old_buy.get("ts"))
+    latest_old_buy["original_ts"] = original_ts
+    latest_old_buy["ts"] = left_edge_ts
+    latest_old_buy["dt"] = to_dt_mst(pd.Series([left_edge_ts])).iloc[0]
+    latest_old_buy["note"] = (
+        f"{str(latest_old_buy.get('note', ''))} "
+        f"viewer_pinned_old_buy_marker original_ts={original_ts:.6f}"
+    ).strip()
+
+    return pd.concat([pd.DataFrame([latest_old_buy]), in_window], ignore_index=True).sort_values("ts").copy()
+
+
 def plot_price(ax, d: pd.DataFrame, *, title: str, show_bid_ask: bool, trades: pd.DataFrame):
     ax.set_facecolor("#09111F")
     ax.plot(d["dt"], d["mid"], linewidth=1.7, label="mid", color="#93C5FD", zorder=2)
@@ -1862,6 +1938,22 @@ def plot_price_plotly(
             sells = trades[trades["side"] == "SELL"]
 
         if not buys.empty:
+            buy_hover = []
+            for _, r in buys.iterrows():
+                original_ts = r.get("original_ts", "")
+                pinned_note = ""
+                if str(original_ts).strip() not in ("", "nan", "NaN", "None"):
+                    try:
+                        original_dt = to_dt_mst(pd.Series([float(original_ts)])).iloc[0]
+                        pinned_note = f"<br>pinned from original buy time {original_dt}"
+                    except Exception:
+                        pinned_note = "<br>pinned from older buy"
+                buy_hover.append(
+                    f"BUY<br>price={safe_float(r.get('price'), np.nan):.8f}"
+                    f"<br>qty={safe_float(r.get('qty'), np.nan):.8f}"
+                    f"{pinned_note}"
+                )
+
             fig.add_trace(go.Scatter(
                 x=buys["dt"],
                 y=buys["price"],
@@ -1870,7 +1962,8 @@ def plot_price_plotly(
                 text=["BUY"] * len(buys),
                 textposition="top center",
                 marker=dict(symbol="triangle-up", size=12, line=dict(width=1)),
-                hovertemplate="BUY<br>price=%{y}<br>%{x}<extra></extra>",
+                hovertext=buy_hover,
+                hovertemplate="%{hovertext}<br>%{x}<extra></extra>",
             ))
 
         if not sells.empty:
@@ -2185,7 +2278,7 @@ def render_live_dashboard() -> None:
     if m.empty:
         st.info(
             "Waiting for a valid market.csv. Start bot.py and let it write telemetry. "
-            "If bot.py is already running, delete/rename the old market.csv and restart bot.py."
+            "Old CSV files are allowed; the viewer will use old rows until bot.py appends fresh rows."
         )
         st.stop()
 
@@ -2789,9 +2882,19 @@ def render_live_dashboard() -> None:
         selected_status = status_for_age(selected_age)
         st.caption(f"{product} status: {selected_status} · age {fmt_num(selected_age, 0, 's')} · rows in chart {len(m_prod)}")
 
-    t_prod = pd.DataFrame()
-    if not t.empty and "product_id" in t.columns:
-        t_prod = t[(t["product_id"] == product) & (t["ts"] >= cutoff)].copy()
+    has_open_position_for_chart = False
+    try:
+        has_open_position_for_chart = safe_float(latest_row.get("position_qty"), 0.0) > 1e-12
+    except Exception:
+        has_open_position_for_chart = False
+
+    t_prod = chart_trades_for_product(
+        t,
+        product=product,
+        cutoff=float(cutoff),
+        chart_frame=m_prod,
+        has_open_position=has_open_position_for_chart,
+    )
 
 
     # =============================================================================

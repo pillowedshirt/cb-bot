@@ -318,6 +318,20 @@ LEVEL8_MAX_SINGLE_TRADE_PCT: float = 0.80
 LEVEL8_MAX_PRODUCT_EXPOSURE_PCT: float = 0.80
 LEVEL8_MAX_TOTAL_EXPOSURE_PCT: float = 0.80
 
+# Graduated live sizing:
+# Level 8 may recommend large allocations, but bot.py caps live size until
+# completed SELL outcomes prove the product and the whole bot have enough history.
+LEVEL8_GRADUATED_LIVE_SIZING: bool = True
+LEVEL8_PRODUCT_YOUNG_HISTORY_SELLS: int = 3
+LEVEL8_PRODUCT_MODERATE_HISTORY_SELLS: int = 10
+LEVEL8_GLOBAL_EARLY_HISTORY_SELLS: int = 10
+LEVEL8_GLOBAL_MODERATE_HISTORY_SELLS: int = 30
+LEVEL8_YOUNG_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.06
+LEVEL8_MODERATE_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.12
+LEVEL8_PROVEN_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.20
+LEVEL8_GLOBAL_EARLY_LIVE_SIZE_CAP_PCT: float = 0.08
+LEVEL8_GLOBAL_MODERATE_LIVE_SIZE_CAP_PCT: float = 0.16
+
 LEVEL8_MIN_TEST_TRADE_USD: float = MIN_LIVE_ORDER_USD
 LEVEL8_SUPERSEDES_LEVEL5: bool = True
 
@@ -1001,35 +1015,64 @@ def lerp_float(a: float, b: float, t: float) -> float:
 
 
 def candidate_rank_score(candidate: Dict[str, Any]) -> float:
-    """Rank passing candidates by net opportunity, timing, and friction."""
-    probability = float(candidate.get("estimated_prob_up", 0.0))
-    expected_edge_bps = float(candidate.get("expected_net_edge_bps", 0.0))
-    score = float(candidate.get("score", 0.0))
-    spread_bps = float(candidate.get("spread_bps", 0.0))
-    projected_bps = float(candidate.get("projected_forward_gain_bps", 0.0))
-    cost_bps = float(candidate.get("cost_bps", 0.0))
-    timing_reason = str(candidate.get("entry_timing_reason", ""))
+    """
+    Rank Level 8-approved candidates by live-money quality.
 
+    Highest priority:
+    - margin above Level 8 buy threshold,
+    - truth score,
+    - final buy score,
+    - projected net after cost,
+    - expected edge,
+    - lower spread,
+    - recommended position percentage,
+    - raw probability and raw score.
+    """
+    def f(key: str, default: float = 0.0) -> float:
+        try:
+            return float(candidate.get(key, default) or default)
+        except Exception:
+            return float(default)
+
+    final_buy = f("level8_final_buy_score")
+    threshold = f("level8_buy_threshold")
+    margin = final_buy - threshold
+    truth = f("level8_truth_score")
+    recommended_pct = f("level8_recommended_position_pct", f("position_pct"))
+    raw_prob = f("estimated_prob_up")
+    raw_score = f("score")
+    expected_edge_bps = f("expected_net_edge_bps")
+    spread_bps = f("spread_bps")
+    projected_bps = f("projected_forward_gain_bps")
+    cost_bps = f("cost_bps")
+    projected_net_after_cost = projected_bps - cost_bps
+
+    timing_reason = str(candidate.get("entry_timing_reason", ""))
     timing_bonus = 0.0
     if "entry_confirmed" in timing_reason:
-        timing_bonus += 35.0
+        timing_bonus += 20.0
+    if "realtime_upturn_ok=True" in timing_reason:
+        timing_bonus += 18.0
     if "hl=True" in timing_reason:
-        timing_bonus += 10.0
+        timing_bonus += 8.0
     if "vwap=True" in timing_reason:
-        timing_bonus += 8.0
+        timing_bonus += 6.0
     if "lower_low_seq=False" in timing_reason:
-        timing_bonus += 8.0
+        timing_bonus += 6.0
 
-    return (
-        expected_edge_bps
-        + probability * 80.0
-        + score * 0.45
-        + max(0.0, projected_bps - cost_bps) * 0.20
+    return float(
+        margin * 500.0
+        + truth * 140.0
+        + final_buy * 120.0
+        + max(0.0, projected_net_after_cost) * 0.35
+        + expected_edge_bps * 0.30
+        + raw_prob * 80.0
+        + raw_score * 0.35
+        + recommended_pct * 45.0
         + timing_bonus
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
-
 
 def fee_usd(notional_usd: float, fee_bps: float) -> float:
     """Return fee in USD for a given notional and fee rate."""
@@ -8855,7 +8898,9 @@ class TradingBot:
             except Exception as exc:
                 log(f"[level8] sell council snapshot write failed {product_id}: {exc}")
 
-            action = str(decision.get("action", "HOLD")).upper()
+            action = str(decision.get("action", "HOLD")).upper().strip()
+            if action not in {"ALLOW_SELL", "HOLD"}:
+                action = "HOLD"
         else:
             final_sell_score = float(decision.final_sell_score)
             sell_threshold = float(decision.sell_threshold)
@@ -8994,18 +9039,44 @@ class TradingBot:
     def _adopt_live_position_after_uncertain_buy(
         self, *, product_id: str, qty: float, entry_price: float, pending: Dict[str, Any],
     ) -> None:
-        """Adopt only the reconciled balance delta as a managed position lot."""
+        """
+        Adopt only the reconciled balance delta as a managed position lot.
+
+        Delayed Coinbase balance deltas are treated conservatively:
+        - raw_fill_price is the estimated market fill price,
+        - entry_price is the fee-adjusted all-in basis used for profitability,
+        - estimated_buy_fee_usd is included before sell decisions evaluate net profit.
+        """
         qty = float(qty)
-        entry_price = float(entry_price)
-        if qty <= 0 or entry_price <= 0:
+        all_in_entry_price = float(entry_price)
+        if qty <= 0 or all_in_entry_price <= 0:
             return
+
         adopted_ts = now_ts()
-        trade_id = f"adopted-{product_id}-{int(adopted_ts)}-{uuid.uuid4().hex[:8]}"
+        trade_id = str(
+            pending.get("trade_id")
+            or f"adopted-{product_id}-{int(adopted_ts)}-{uuid.uuid4().hex[:8]}"
+        )
         candidate = dict(pending.get("candidate") or {})
+
+        raw_fill_price = float(
+            pending.get("raw_fill_price", all_in_entry_price) or all_in_entry_price
+        )
+        raw_notional = float(
+            pending.get("raw_notional_usd", raw_fill_price * qty) or (raw_fill_price * qty)
+        )
+        estimated_buy_fee = float(
+            pending.get("estimated_buy_fee_usd", 0.0) or 0.0
+        )
+        requested_quote = float(
+            pending.get("requested_quote_usd", 0.0) or 0.0
+        )
+
         hold_plan = self._level8_build_hold_plan(
             candidate=candidate,
             entry_ts=adopted_ts,
         )
+
         lot_meta = {
             "trade_id": trade_id,
             "entry_ts": adopted_ts,
@@ -9018,31 +9089,99 @@ class TradingBot:
             "entry_reason": "adopted_after_uncertain_buy",
             "source": "coinbase_balance_reconciliation",
             "pending_reason": pending.get("reason", ""),
+            "requested_quote_usd": float(requested_quote),
+            "raw_fill_price": float(raw_fill_price),
+            "raw_notional_usd": float(raw_notional),
+            "estimated_buy_fee_usd": float(estimated_buy_fee),
+            "all_in_entry_price": float(all_in_entry_price),
             "estimated_prob_up": float(candidate.get("estimated_prob_up", 0.0)),
             "position_pct": float(candidate.get("position_pct", 0.0)),
             "target_bps": float(candidate.get("target_bps", 0.0)),
             "cost_bps": float(candidate.get("cost_bps", 0.0)),
-            "scalp_done": False, "core_done": False,
-            "scalp_armed": False, "core_armed": False,
+            "scalp_done": False,
+            "core_done": False,
+            "scalp_armed": False,
+            "core_armed": False,
             "profit_lock_armed": False,
         }
+
+        try:
+            lot_meta["min_profitable_exit_price"] = float(
+                required_exit_price_for_net_gain(
+                    effective_entry_price=float(all_in_entry_price),
+                    exit_fee_bps=self._exit_fee_bps_for_mode(),
+                    est_slippage_bps=EST_SLIPPAGE_BPS,
+                    est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                    min_net_gain_bps=max(
+                        MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                        MIN_NET_GAIN_AFTER_FEES_BPS,
+                    ),
+                )
+            )
+        except Exception:
+            lot_meta["min_profitable_exit_price"] = None
+
         self.positions.setdefault(product_id, []).append(PositionLot(
-            qty=qty, price=entry_price, tier=int(candidate.get("tier", TIER_LOW)),
-            score=float(candidate.get("score", 0.0)), meta=lot_meta,
+            qty=qty,
+            price=all_in_entry_price,
+            tier=int(candidate.get("tier", TIER_LOW)),
+            score=float(candidate.get("score", 0.0)),
+            meta=lot_meta,
         ))
+
         self.lot_tags.setdefault(product_id, []).append("RECONCILED")
         self.position_start_ts[product_id] = self.position_start_ts.get(product_id) or adopted_ts
-        self.position_entry_price[product_id] = entry_price
+        self.position_entry_price[product_id] = all_in_entry_price
         self.last_buy_ts[product_id] = adopted_ts
-        self.last_buy_price[product_id] = entry_price
+        self.last_buy_price[product_id] = all_in_entry_price
         self.anchor_ts[product_id] = adopted_ts
+
         self._queue_post_buy_reviews(
-            trade_id=trade_id, product_id=product_id, entry_ts=adopted_ts,
-            entry_price=entry_price, candidate=candidate,
+            trade_id=trade_id,
+            product_id=product_id,
+            entry_ts=adopted_ts,
+            entry_price=all_in_entry_price,
+            candidate=candidate,
         )
+
+        try:
+            self.tlog.log_trade(
+                event="BUY",
+                product_id=product_id,
+                side="BUY",
+                qty=qty,
+                price=raw_fill_price,
+                fee_usd_val=estimated_buy_fee,
+                gross_pnl_usd=0.0,
+                net_pnl_usd=-estimated_buy_fee,
+                entry_price=raw_fill_price,
+                exit_price=None,
+                weekly_bias=None,
+                note=(
+                    f"adopted_after_uncertain_buy "
+                    f"requested_quote_usd={requested_quote:.6f} "
+                    f"raw_fill_price={raw_fill_price:.8f} "
+                    f"all_in_entry_price={all_in_entry_price:.8f} "
+                    f"estimated_buy_fee_usd={estimated_buy_fee:.6f} "
+                    f"adopted_qty={qty:.12f} "
+                    f"pending_reason={pending.get('reason', '')}"
+                ),
+                filled_notional_usd=raw_notional,
+                entry_score=float(candidate.get("score", 0.0)),
+                entry_tier=int(candidate.get("tier", TIER_LOW)),
+                expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
+            )
+        except Exception as exc:
+            log(f"[reconcile] adopted BUY trade log failed for {product_id}: {exc}")
+
         log(
-            f"[reconcile] adopted uncertain buy {product_id} qty={qty:.12f} "
-            f"entry={entry_price:.8f} trade_id={trade_id}"
+            f"[reconcile] adopted uncertain buy {product_id} "
+            f"requested_quote_usd={requested_quote:.6f} "
+            f"qty={qty:.12f} "
+            f"raw_fill_price={raw_fill_price:.8f} "
+            f"all_in_entry_price={all_in_entry_price:.8f} "
+            f"estimated_buy_fee_usd={estimated_buy_fee:.6f} "
+            f"trade_id={trade_id}"
         )
 
     def _risk_pause_active(self) -> bool:
@@ -9098,6 +9237,94 @@ class TradingBot:
         if product_id not in self.product_trade_timestamps:
             self.product_trade_timestamps[product_id] = deque(maxlen=200)
         self.product_trade_timestamps[product_id].append(t)
+
+    def _completed_sell_history_counts(self, product_id: str) -> Tuple[int, int]:
+        """
+        Return completed SELL counts for this product and globally.
+
+        Only normal SELL rows count as completed trading outcomes.
+        STARTUP_LIQUIDATION rows do not count as earned strategy history.
+        """
+        try:
+            if not os.path.exists(TRADES_CSV_PATH) or os.path.getsize(TRADES_CSV_PATH) == 0:
+                return 0, 0
+
+            trades = pd.read_csv(TRADES_CSV_PATH)
+            if trades.empty or "event" not in trades.columns:
+                return 0, 0
+
+            sells = trades[
+                trades["event"].astype(str).str.upper().eq("SELL")
+            ].copy()
+
+            if sells.empty:
+                return 0, 0
+
+            global_sells = int(len(sells))
+
+            if "product_id" not in sells.columns:
+                return 0, global_sells
+
+            product_sells = int(
+                len(sells[sells["product_id"].astype(str).eq(str(product_id))])
+            )
+
+            return product_sells, global_sells
+
+        except Exception as exc:
+            log(f"[sizing-history] failed to read completed SELL history: {exc}")
+            return 0, 0
+
+    def _level8_graduated_live_size_pct(
+        self,
+        *,
+        product_id: str,
+        requested_pct: float,
+    ) -> Tuple[float, str]:
+        """
+        Cap Level 8 live size until completed outcomes justify larger allocations.
+        """
+        requested_pct = clamp_float(float(requested_pct), 0.0, float(LEVEL8_MAX_SINGLE_TRADE_PCT))
+
+        if not bool(LEVEL8_GRADUATED_LIVE_SIZING):
+            return requested_pct, "graduated_sizing_disabled"
+
+        product_sells, global_sells = self._completed_sell_history_counts(product_id)
+
+        if product_sells < int(LEVEL8_PRODUCT_YOUNG_HISTORY_SELLS):
+            product_cap = float(LEVEL8_YOUNG_PRODUCT_LIVE_SIZE_CAP_PCT)
+            product_stage = "young_product_history"
+        elif product_sells < int(LEVEL8_PRODUCT_MODERATE_HISTORY_SELLS):
+            product_cap = float(LEVEL8_MODERATE_PRODUCT_LIVE_SIZE_CAP_PCT)
+            product_stage = "moderate_product_history"
+        else:
+            product_cap = float(LEVEL8_PROVEN_PRODUCT_LIVE_SIZE_CAP_PCT)
+            product_stage = "proven_product_history"
+
+        if global_sells < int(LEVEL8_GLOBAL_EARLY_HISTORY_SELLS):
+            global_cap = float(LEVEL8_GLOBAL_EARLY_LIVE_SIZE_CAP_PCT)
+            global_stage = "early_global_history"
+        elif global_sells < int(LEVEL8_GLOBAL_MODERATE_HISTORY_SELLS):
+            global_cap = float(LEVEL8_GLOBAL_MODERATE_LIVE_SIZE_CAP_PCT)
+            global_stage = "moderate_global_history"
+        else:
+            global_cap = float(LEVEL8_MAX_SINGLE_TRADE_PCT)
+            global_stage = "proven_global_history"
+
+        final_cap = min(
+            float(product_cap),
+            float(global_cap),
+            float(LEVEL8_MAX_SINGLE_TRADE_PCT),
+        )
+        final_pct = min(float(requested_pct), float(final_cap))
+
+        return final_pct, (
+            f"graduated_sizing requested_pct={requested_pct:.3f};"
+            f"final_pct={final_pct:.3f};"
+            f"product_sells={product_sells};global_sells={global_sells};"
+            f"product_stage={product_stage};global_stage={global_stage};"
+            f"product_cap={product_cap:.3f};global_cap={global_cap:.3f}"
+        )
 
     def _entry_gate_bottoming(
         self,
@@ -11916,16 +12143,59 @@ class TradingBot:
                         snapshot = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
                         base_asset = product_base_asset(product_id_r)
                         qty_now = self.portfolio.get_total_asset(base_asset, snapshot=snapshot or {})
+                        cash_now = self.portfolio.get_tradable_usd(snapshot=snapshot or {})
                         before_base = float(pending.get("before_base", 0.0))
+                        before_cash = float(pending.get("before_cash", 0.0))
+                        requested_quote = float(pending.get("requested_quote_usd", 0.0) or 0.0)
+
                         actual_delta = max(0.0, float(qty_now) - before_base)
+                        cash_delta = max(0.0, float(before_cash) - float(cash_now))
+
                         if actual_delta > 1e-12:
                             tob = self.tob.get(product_id_r)
                             fallback_ask = float(pending.get("ask", 0.0))
                             mid = float(tob.mid) if tob and tob.mid > 0 else fallback_ask
-                            entry_price = max(fallback_ask, mid)
+
+                            if cash_delta > 0.0 and requested_quote > 0.0:
+                                raw_notional = min(float(cash_delta), float(requested_quote))
+                            elif requested_quote > 0.0:
+                                raw_notional = float(requested_quote)
+                            else:
+                                raw_notional = float(actual_delta) * max(float(fallback_ask), float(mid))
+
+                            raw_fill_price = (
+                                float(raw_notional) / float(actual_delta)
+                                if actual_delta > 0 and raw_notional > 0
+                                else max(float(fallback_ask), float(mid))
+                            )
+
+                            fee_from_cash_delta = max(0.0, float(cash_delta) - float(raw_notional))
+                            try:
+                                estimated_buy_fee = max(
+                                    fee_from_cash_delta,
+                                    fee_usd(float(raw_notional), self._entry_fee_bps_for_mode("MARKET")),
+                                )
+                            except Exception:
+                                estimated_buy_fee = fee_from_cash_delta
+
+                            all_in_entry_price = (
+                                (float(raw_notional) + float(estimated_buy_fee)) / float(actual_delta)
+                                if actual_delta > 0 and raw_notional > 0
+                                else float(raw_fill_price)
+                            )
+
+                            pending["raw_notional_usd"] = float(raw_notional)
+                            pending["raw_fill_price"] = float(raw_fill_price)
+                            pending["estimated_buy_fee_usd"] = float(estimated_buy_fee)
+                            pending["all_in_entry_price"] = float(all_in_entry_price)
+                            pending["after_cash"] = float(cash_now)
+                            pending["cash_delta"] = float(cash_delta)
+
                             self._adopt_live_position_after_uncertain_buy(
-                                product_id=product_id_r, qty=actual_delta,
-                                entry_price=entry_price, pending=pending,
+                                product_id=product_id_r,
+                                qty=actual_delta,
+                                entry_price=all_in_entry_price,
+                                pending=pending,
                             )
                             self.reconciliation_log.log_reconciliation(
                                 event_type="delayed_buy_adopted", product_id=product_id_r, side="BUY",
@@ -12057,6 +12327,28 @@ class TradingBot:
                 continue
 
             skip_new_buys_this_loop = False
+
+            warmup_remaining_sec = max(
+                0.0,
+                float(FIRST_BUY_DELAY_SEC) - (float(ts_now) - float(self.bot_start_ts)),
+            )
+
+            if not warmup_done:
+                skip_new_buys_this_loop = True
+                if int(ts_now) % 15 < max(1, int(EVAL_TICK_SEC)):
+                    log(
+                        f"[startup-warmup] live buys blocked for "
+                        f"{warmup_remaining_sec:.1f}s more; "
+                        f"telemetry, Level 8 heartbeat, SHADOW, and observation learning remain active"
+                    )
+
+            if bool(LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS) and self._risk_pause_active():
+                skip_new_buys_this_loop = True
+                log(
+                    f"[risk-pause] live buys blocked; "
+                    f"paused_until={float(self.paused_until_ts):.3f}; "
+                    f"telemetry and shadow learning remain active"
+                )
 
             candidates = []
             council_watch_candidates: List[Dict[str, Any]] = []
@@ -12322,7 +12614,10 @@ class TradingBot:
                 )
 
             if skip_new_buys_this_loop:
-                candidates = []
+                log(
+                    "[buy-loop] live-buy pause active; keeping candidates available "
+                    "for Level 8 review / SHADOW learning, but execution will be blocked"
+                )
 
             if ENABLE_LEVEL8_COUNCIL and candidates:
                 level8_filtered_candidates: List[Dict[str, Any]] = []
@@ -12433,6 +12728,10 @@ class TradingBot:
 
                 candidates = level8_filtered_candidates
 
+                candidates.sort(key=candidate_rank_score, reverse=True)
+                for c in candidates:
+                    c["rank_score"] = candidate_rank_score(c)
+
                 for c in candidates:
                     c["buy_ready_count"] = pre_level8_candidate_count
 
@@ -12495,15 +12794,50 @@ class TradingBot:
                     pass
                 ai_filtered_candidates.append(candidate)
 
-            if ENABLE_LEVEL8_LEARNING_MODE:
-                candidate_slice = ai_filtered_candidates[
+            ai_filtered_candidates.sort(key=candidate_rank_score, reverse=True)
+            for c in ai_filtered_candidates:
+                c["rank_score"] = candidate_rank_score(c)
+
+            live_buy_pool: List[Dict[str, Any]] = []
+            for candidate in ai_filtered_candidates:
+                product_for_rate = str(candidate.get("product_id", ""))
+                if not product_for_rate:
+                    continue
+
+                if not self._trade_rate_ok(product_for_rate):
+                    log(
+                        f"[buy-skip] {product_for_rate} trade_rate_limited "
+                        f"before candidate slicing"
+                    )
+                    try:
+                        self.signal_events_log.log_event(
+                            event_type="trade_rate_filter",
+                            product_id=product_for_rate,
+                            rank_score=f"{float(candidate.get('rank_score', 0.0)):.6f}",
+                            score=f"{float(candidate.get('score', 0.0)):.6f}",
+                            probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
+                            ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                            spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
+                            action="reject",
+                            reason="trade_rate_limited_before_live_slice",
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                live_buy_pool.append(candidate)
+
+            if skip_new_buys_this_loop:
+                candidate_slice = []
+            elif ENABLE_LEVEL8_LEARNING_MODE:
+                candidate_slice = live_buy_pool[
                     : int(LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL)
                 ]
             else:
                 candidate_slice = (
-                    ai_filtered_candidates[:MAX_NEW_ENTRIES_PER_EVAL]
+                    live_buy_pool[:MAX_NEW_ENTRIES_PER_EVAL]
                     if ENABLE_MULTI_CANDIDATE_BUYS
-                    else ai_filtered_candidates[:1]
+                    else live_buy_pool[:1]
                 )
 
             log(
@@ -12512,7 +12846,7 @@ class TradingBot:
                 f"timed={len(timed_candidates)}"
             )
 
-            if bool(LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS) and self._risk_pause_active():
+            if candidate_slice and bool(LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS) and self._risk_pause_active():
                 log(
                     f"[buy-loop] skipping new live buys because risk pause is active "
                     f"paused_until={float(self.paused_until_ts):.3f}"
@@ -12584,18 +12918,29 @@ class TradingBot:
                         break
 
                 if ENABLE_LEVEL8_COUNCIL:
-                    l8_pct = clamp_float(
+                    raw_l8_pct = clamp_float(
                         float(candidate.get("level8_recommended_position_pct", 0.0) or 0.0),
                         0.0,
                         float(LEVEL8_MAX_SINGLE_TRADE_PCT),
                     )
+
+                    l8_pct, graduated_sizing_reason = self._level8_graduated_live_size_pct(
+                        product_id=product_id,
+                        requested_pct=raw_l8_pct,
+                    )
+
+                    candidate["level8_raw_recommended_position_pct"] = float(raw_l8_pct)
+                    candidate["level8_recommended_position_pct"] = float(l8_pct)
+                    candidate["level8_graduated_sizing_reason"] = graduated_sizing_reason
 
                     entry_notional = float(equity_usd) * l8_pct
 
                     if l8_pct <= 0.0:
                         log(
                             f"[level8] {product_id} no positive Level 8 size; "
-                            f"pct={l8_pct:.6f} action={candidate.get('level8_action', '')}"
+                            f"raw_pct={raw_l8_pct:.6f} final_pct={l8_pct:.6f} "
+                            f"action={candidate.get('level8_action', '')} "
+                            f"{graduated_sizing_reason}"
                         )
                         continue
 
@@ -12766,6 +13111,7 @@ class TradingBot:
                     f"level8_truth={float(candidate.get('level8_truth_score', 0.0)):.3f} "
                     f"level8_buy_score={float(candidate.get('level8_final_buy_score', 0.0)):.3f} "
                     f"level8_threshold={float(candidate.get('level8_buy_threshold', 0.0)):.3f} "
+                    f"level8_size_reason={candidate.get('level8_graduated_sizing_reason', '')} "
                     f"bid={bid:.8f} ask={ask:.8f}"
                 )
                 fill = await self._execute_live_buy(
@@ -12841,9 +13187,16 @@ class TradingBot:
                 actual_deployment = float(filled_notional or entry_notional)
                 deployed_this_eval += actual_deployment
                 cash_usd = max(0.0, float(cash_usd) - actual_deployment - float(fee_val))
+                estimated_all_in_entry = (
+                    float((float(filled_notional or 0.0) + float(fee_val)) / float(filled_qty))
+                    if float(filled_qty) > 0 and filled_notional is not None
+                    else float(avg_px)
+                )
                 log(
                     f"[buy-success] {product_id} "
-                    f"qty={float(filled_qty):.12f} avg_px={float(avg_px):.8f} "
+                    f"qty={float(filled_qty):.12f} "
+                    f"raw_fill_price={float(avg_px):.8f} "
+                    f"estimated_all_in_entry={estimated_all_in_entry:.8f} "
                     f"fee={float(fee_val):.6f} "
                     f"filled_notional={float(filled_notional or 0.0):.6f} "
                     f"order_id={_order_id}"

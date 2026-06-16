@@ -167,15 +167,15 @@ REENTRY_REARM_BPS: float = 15.0
 # ============================================================
 
 # Warm-up / cadence
-FIRST_BUY_DELAY_SEC: float = 0.0
-BUY_COOLDOWN_SEC: float = 20.0
-POST_EXIT_COOLDOWN_SEC: float = 120.0
-MAX_NEW_ENTRIES_PER_EVAL: int = 3
-EVAL_TICK_SEC: float = 2.0
+FIRST_BUY_DELAY_SEC: float = 60.0
+BUY_COOLDOWN_SEC: float = 300.0
+POST_EXIT_COOLDOWN_SEC: float = 600.0
+MAX_NEW_ENTRIES_PER_EVAL: int = 1
+EVAL_TICK_SEC: float = 5.0
 
 # Bound aggregate deployment when several candidates pass in the same cycle.
 MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY: float = 0.40
-ENABLE_MULTI_CANDIDATE_BUYS: bool = True
+ENABLE_MULTI_CANDIDATE_BUYS: bool = False
 
 # Allocation / exposure
 MAX_OPEN_POSITIONS: int = 20
@@ -265,6 +265,37 @@ LEVEL8_MODE: str = "FILTER_AND_SIZE"
 LEVEL8_ALLOW_TEST_BUCKET_LIVE_TRADES: bool = True
 LEVEL8_ALLOW_CORE_BUCKET_LIVE_TRADES: bool = True
 
+# ============================================================
+# LEVEL 8 LIVE EXECUTION QUALITY GATE
+# ============================================================
+# Level 8 can still learn from weak ideas, but weak ideas become SHADOW.
+# Live buys require stronger evidence because real Coinbase fees are expensive.
+LEVEL8_ENABLE_LIVE_BUY_QUALITY_GATE: bool = True
+LEVEL8_MIN_LIVE_BUY_MARGIN: float = 0.10
+LEVEL8_MIN_LIVE_BUY_TRUTH: float = 0.55
+LEVEL8_MIN_LIVE_BUY_FINAL_SCORE: float = 0.44
+LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS: float = 85.0
+LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE: float = 80.0
+LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY: float = 0.36
+LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY: float = 22.0
+LEVEL8_BLOCK_LIVE_BUY_WHILE_MOMENTUM_FALLING: bool = True
+LEVEL8_MIN_MOM1_FOR_LIVE_BUY_BPS: float = -8.0
+LEVEL8_MIN_MOM3_FOR_LIVE_BUY_BPS: float = -18.0
+LEVEL8_MIN_MOM5_FOR_LIVE_BUY_BPS: float = -30.0
+
+# ============================================================
+# LEVEL 8 HOLD PLAN / FEE-AWARE SELLING
+# ============================================================
+# The run showed fee churn: buy, then sell too soon.
+# These settings force the bot to give positions enough time unless there is a real hard-stop.
+LEVEL8_MIN_HOLD_SEC: float = 10 * 60
+LEVEL8_TARGET_HOLD_SEC: float = 30 * 60
+LEVEL8_MAX_HOLD_SEC: float = 90 * 60
+LEVEL8_HARD_STOP_UNREALIZED_BPS: float = -420.0
+LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL: float = 45.0
+LEVEL8_ALLOW_EARLY_PROFIT_CAPTURE: bool = True
+LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS: bool = True
+
 # Only hard spending ceiling: max 80% deployed, 20% reserve.
 LEVEL8_RESERVE_CASH_PCT: float = 0.20
 LEVEL8_MAX_SINGLE_TRADE_PCT: float = 0.80
@@ -302,7 +333,7 @@ LEVEL8_LEARNING_MAX_SPREAD_BPS: float = 80.0
 LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES: int = 15
 
 # Let the bot buy more than one learning candidate per evaluation if cash allows.
-LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL: int = 5
+LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL: int = 1
 
 # ============================================================
 # LEVEL 8 CHART-ONLY OPPORTUNITY LEARNING
@@ -576,7 +607,7 @@ REQUIRE_VALID_LIVE_RECALIBRATION_PROFILE: bool = True
 LIVE_RECALIBRATION_PROJECTED_GROSS_MIN_BPS: float = 1.0
 
 # Edge-aware entry execution.
-USE_EDGE_AWARE_ENTRY_EXECUTION: bool = True
+USE_EDGE_AWARE_ENTRY_EXECUTION: bool = False
 
 # If the bot has decided to buy live, prioritize reliable execution.
 # MARKET removes maker-no-fill failures.
@@ -839,7 +870,7 @@ INVALIDATION_BUFFER_BPS: float = 10.0
 MAX_DAILY_LOSS_USD: float = 1.50
 MAX_CONSECUTIVE_LOSSES: int = 2
 COOLDOWN_AFTER_LOSS_SEC: float = 15 * 60
-MAX_TRADES_PER_HOUR: int = 4
+MAX_TRADES_PER_HOUR: int = 3
 MAX_TRADES_PER_PRODUCT_PER_HOUR: int = 1
 PAUSE_AFTER_DAILY_LOSS_SEC: float = 6 * 60 * 60
 
@@ -7849,6 +7880,70 @@ class TradingBot:
             return False, f"spread_too_high spread={float(spread_bps):.3f} max={max_spread:.3f}"
         return True, f"spread_ok spread={float(spread_bps):.3f} max={max_spread:.3f}"
 
+    def _level8_live_buy_quality_ok(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        level8_info: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Convert marginal Level 8 ALLOW_BUY decisions into SHADOW instead of live orders.
+
+        This keeps learning active while preventing weak/expensive setups from becoming
+        immediate real-money fee churn.
+        """
+        try:
+            product_id = str(candidate.get("product_id", ""))
+
+            final_buy = float(level8_info.get("final_buy_score", 0.0) or 0.0)
+            threshold = float(level8_info.get("buy_threshold", 0.0) or 0.0)
+            truth = float(level8_info.get("truth_score", 0.0) or 0.0)
+            margin = final_buy - threshold
+
+            raw_prob = float(candidate.get("estimated_prob_up", 0.0) or 0.0)
+            raw_score = float(candidate.get("score", 0.0) or 0.0)
+            projected_forward = float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0)
+            cost_bps = float(candidate.get("cost_bps", 0.0) or 0.0)
+            expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
+
+            projected_net_after_cost = projected_forward - cost_bps
+
+            if final_buy < float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):
+                return False, f"live_buy_shadowed:final_buy_too_low final={final_buy:.3f} min={float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):.3f}"
+            if margin < float(LEVEL8_MIN_LIVE_BUY_MARGIN):
+                return False, f"live_buy_shadowed:margin_too_small margin={margin:.3f} min={float(LEVEL8_MIN_LIVE_BUY_MARGIN):.3f}"
+            if truth < float(LEVEL8_MIN_LIVE_BUY_TRUTH):
+                return False, f"live_buy_shadowed:truth_too_low truth={truth:.3f} min={float(LEVEL8_MIN_LIVE_BUY_TRUTH):.3f}"
+            if projected_net_after_cost < float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS):
+                return False, (
+                    f"live_buy_shadowed:projected_net_after_cost_too_low "
+                    f"projected_forward={projected_forward:.2f} cost={cost_bps:.2f} "
+                    f"net_after_cost={projected_net_after_cost:.2f} "
+                    f"min={float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS):.2f}"
+                )
+            if expected_edge < float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):
+                return False, f"live_buy_shadowed:expected_edge_too_low edge={expected_edge:.2f} min={float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):.2f}"
+            if raw_prob < float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY):
+                return False, f"live_buy_shadowed:raw_prob_too_low prob={raw_prob:.3f} min={float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY):.3f}"
+            if raw_score < float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY):
+                return False, f"live_buy_shadowed:raw_score_too_low score={raw_score:.2f} min={float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY):.2f}"
+
+            if bool(LEVEL8_BLOCK_LIVE_BUY_WHILE_MOMENTUM_FALLING):
+                moms = self._entry_momentum_snapshot(product_id)
+                mom1 = float(moms.get("mom1", 0.0))
+                mom3 = float(moms.get("mom3", 0.0))
+                mom5 = float(moms.get("mom5", 0.0))
+                if (
+                    mom1 < float(LEVEL8_MIN_MOM1_FOR_LIVE_BUY_BPS)
+                    and mom3 < float(LEVEL8_MIN_MOM3_FOR_LIVE_BUY_BPS)
+                    and mom5 < float(LEVEL8_MIN_MOM5_FOR_LIVE_BUY_BPS)
+                ):
+                    return False, f"live_buy_shadowed:momentum_falling mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+
+            return True, f"live_buy_quality_ok margin={margin:.3f};truth={truth:.3f};net_after_cost={projected_net_after_cost:.2f};edge={expected_edge:.2f}"
+        except Exception as exc:
+            return False, f"live_buy_shadowed:quality_gate_exception:{exc}"
+
     def _level8_decision_for_candidate(
         self,
         *,
@@ -7991,7 +8086,32 @@ class TradingBot:
             truth_vote=decision.get("truth_vote", truth_vote) if isinstance(decision, dict) else truth_vote,
             reason=info["reason"],
         )
-        return action.upper() == "ALLOW_BUY" and action.upper() != "SHADOW", info
+        if (
+            ENABLE_LEVEL8_COUNCIL
+            and bool(LEVEL8_ENABLE_LIVE_BUY_QUALITY_GATE)
+            and str(action).upper() == "ALLOW_BUY"
+        ):
+            live_quality_ok, live_quality_reason = self._level8_live_buy_quality_ok(
+                candidate=candidate,
+                level8_info=info,
+            )
+            info["live_quality_ok"] = bool(live_quality_ok)
+            info["live_quality_reason"] = str(live_quality_reason)
+
+            if not live_quality_ok:
+                action = "SHADOW"
+                info["action"] = "SHADOW"
+                info["bucket"] = "SHADOW"
+                info["recommended_position_pct"] = 0.0
+                info["reason"] = f"{info.get('reason', '')};{live_quality_reason}"
+                log(f"[level8-live-gate] shadowed {product_id}: {live_quality_reason}")
+            else:
+                info["reason"] = f"{info.get('reason', '')};{live_quality_reason}"
+
+        allow = str(action).upper() == "ALLOW_BUY"
+        if str(action).upper() == "SHADOW":
+            allow = False
+        return bool(allow), info
 
 
     def _run_level8_council_heartbeat(
@@ -8322,6 +8442,115 @@ class TradingBot:
         except Exception as exc:
             log(f"[level8] decision snapshot write failed: {exc}")
 
+    def _level8_build_hold_plan(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        entry_ts: float,
+    ) -> Dict[str, float]:
+        """
+        Build a hold plan from calibration when available.
+
+        The bot lost money by buying and selling too quickly.
+        This gives each position time to reach fee-covered profit unless hard-stop is hit.
+        """
+        try:
+            calibrated_minutes = float(candidate.get("calibrated_time_to_min_profit_minutes", 0.0) or 0.0)
+            breathing_minutes = float(candidate.get("calibrated_post_profit_breathing_minutes", 0.0) or 0.0)
+
+            if calibrated_minutes <= 0:
+                calibrated_minutes = float(LEVEL8_TARGET_HOLD_SEC) / 60.0
+            if breathing_minutes <= 0:
+                breathing_minutes = 5.0
+
+            min_hold_sec = max(
+                float(LEVEL8_MIN_HOLD_SEC),
+                min(float(LEVEL8_TARGET_HOLD_SEC), calibrated_minutes * 60.0 * 0.50),
+            )
+            target_hold_sec = max(
+                min_hold_sec,
+                min(float(LEVEL8_MAX_HOLD_SEC), (calibrated_minutes + breathing_minutes) * 60.0),
+            )
+            max_hold_sec = max(
+                target_hold_sec,
+                min(float(LEVEL8_MAX_HOLD_SEC), target_hold_sec + 20.0 * 60.0),
+            )
+            return {
+                "entry_ts": float(entry_ts),
+                "hold_until_ts": float(entry_ts) + float(min_hold_sec),
+                "target_hold_until_ts": float(entry_ts) + float(target_hold_sec),
+                "max_hold_until_ts": float(entry_ts) + float(max_hold_sec),
+                "min_hold_sec": float(min_hold_sec),
+                "target_hold_sec": float(target_hold_sec),
+                "max_hold_sec": float(max_hold_sec),
+            }
+        except Exception:
+            entry_ts = float(entry_ts)
+            return {
+                "entry_ts": entry_ts,
+                "hold_until_ts": entry_ts + float(LEVEL8_MIN_HOLD_SEC),
+                "target_hold_until_ts": entry_ts + float(LEVEL8_TARGET_HOLD_SEC),
+                "max_hold_until_ts": entry_ts + float(LEVEL8_MAX_HOLD_SEC),
+                "min_hold_sec": float(LEVEL8_MIN_HOLD_SEC),
+                "target_hold_sec": float(LEVEL8_TARGET_HOLD_SEC),
+                "max_hold_sec": float(LEVEL8_MAX_HOLD_SEC),
+            }
+
+    def _level8_position_hold_state(
+        self,
+        *,
+        product_id: str,
+        lots: List[PositionLot],
+        unrealized_bps: float,
+    ) -> Dict[str, Any]:
+        """Determine whether the position has been held long enough for a discretionary sell."""
+        now_value = now_ts()
+        entry_ts_values = []
+        hold_until_values = []
+        target_until_values = []
+        max_until_values = []
+
+        for lot in lots:
+            meta = lot.meta if isinstance(lot.meta, dict) else {}
+            entry_ts = float(meta.get("entry_ts", 0.0) or 0.0)
+            if entry_ts <= 0:
+                entry_ts = float(self.position_start_ts.get(product_id, 0.0) or self.last_buy_ts.get(product_id, 0.0) or now_value)
+
+            entry_ts_values.append(entry_ts)
+            hold_until_values.append(float(meta.get("hold_until_ts", entry_ts + float(LEVEL8_MIN_HOLD_SEC)) or (entry_ts + float(LEVEL8_MIN_HOLD_SEC))))
+            target_until_values.append(float(meta.get("target_hold_until_ts", entry_ts + float(LEVEL8_TARGET_HOLD_SEC)) or (entry_ts + float(LEVEL8_TARGET_HOLD_SEC))))
+            max_until_values.append(float(meta.get("max_hold_until_ts", entry_ts + float(LEVEL8_MAX_HOLD_SEC)) or (entry_ts + float(LEVEL8_MAX_HOLD_SEC))))
+
+        entry_ts_min = min(entry_ts_values) if entry_ts_values else now_value
+        hold_until_ts = max(hold_until_values) if hold_until_values else now_value + float(LEVEL8_MIN_HOLD_SEC)
+        target_hold_until_ts = max(target_until_values) if target_until_values else now_value + float(LEVEL8_TARGET_HOLD_SEC)
+        max_hold_until_ts = max(max_until_values) if max_until_values else now_value + float(LEVEL8_MAX_HOLD_SEC)
+
+        exit_cost_bps = float(self._exit_fee_bps_for_mode()) + float(EST_SLIPPAGE_BPS) + float(EST_ADVERSE_FILL_BPS)
+        net_after_exit_bps = float(unrealized_bps) - float(exit_cost_bps)
+
+        hard_stop_hit = float(unrealized_bps) <= float(LEVEL8_HARD_STOP_UNREALIZED_BPS)
+        min_hold_elapsed = now_value >= hold_until_ts
+        target_hold_elapsed = now_value >= target_hold_until_ts
+        max_hold_elapsed = now_value >= max_hold_until_ts
+        early_profit_ok = bool(LEVEL8_ALLOW_EARLY_PROFIT_CAPTURE) and net_after_exit_bps >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL)
+
+        return {
+            "now_ts": now_value,
+            "entry_ts": entry_ts_min,
+            "hold_seconds": max(0.0, now_value - entry_ts_min),
+            "hold_until_ts": hold_until_ts,
+            "target_hold_until_ts": target_hold_until_ts,
+            "max_hold_until_ts": max_hold_until_ts,
+            "min_hold_elapsed": min_hold_elapsed,
+            "target_hold_elapsed": target_hold_elapsed,
+            "max_hold_elapsed": max_hold_elapsed,
+            "hard_stop_hit": hard_stop_hit,
+            "early_profit_ok": early_profit_ok,
+            "exit_cost_bps": exit_cost_bps,
+            "net_after_exit_bps": net_after_exit_bps,
+        }
+
     def _level8_should_hold_or_exit(
         self,
         *,
@@ -8333,6 +8562,7 @@ class TradingBot:
         cost_bps: float,
         default_exit_reason: str,
         hard_exit: bool = False,
+        hold_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
         if hard_exit:
             return True, f"level8_hard_exit_bypass;{default_exit_reason}"
@@ -8340,6 +8570,7 @@ class TradingBot:
             return True, f"level8_disabled;{default_exit_reason}"
 
         try:
+            hold_state = dict(hold_state or {})
             context = {
                 "entry_price": float(entry_price),
                 "current_price": float(current_price),
@@ -8348,6 +8579,14 @@ class TradingBot:
                 "cost_bps": float(cost_bps),
                 "hard_exit": bool(hard_exit),
                 "strategy": "EXIT_REVIEW",
+                "hold_seconds": float(hold_state.get("hold_seconds", 0.0) or 0.0),
+                "min_hold_elapsed": bool(hold_state.get("min_hold_elapsed", False)),
+                "target_hold_elapsed": bool(hold_state.get("target_hold_elapsed", False)),
+                "max_hold_elapsed": bool(hold_state.get("max_hold_elapsed", False)),
+                "hard_stop_hit": bool(hold_state.get("hard_stop_hit", False)),
+                "early_profit_ok": bool(hold_state.get("early_profit_ok", False)),
+                "net_after_exit_bps": float(hold_state.get("net_after_exit_bps", 0.0) or 0.0),
+                "exit_cost_bps": float(hold_state.get("exit_cost_bps", 0.0) or 0.0),
             }
             if hasattr(self.level8_council, "decide_exit"):
                 decision = self.level8_council.decide_exit(
@@ -8431,6 +8670,36 @@ class TradingBot:
             action = str(decision.action).upper()
 
         if action == "ALLOW_SELL":
+            hard_stop_hit = bool(hold_state.get("hard_stop_hit", False))
+            early_profit_ok = bool(hold_state.get("early_profit_ok", False))
+            min_hold_elapsed = bool(hold_state.get("min_hold_elapsed", False))
+            max_hold_elapsed = bool(hold_state.get("max_hold_elapsed", False))
+            net_after_exit_bps = float(hold_state.get("net_after_exit_bps", 0.0) or 0.0)
+            hold_seconds = float(hold_state.get("hold_seconds", 0.0) or 0.0)
+
+            if not hard_stop_hit and not early_profit_ok and not min_hold_elapsed:
+                return False, (
+                    f"level8_hold:min_hold_not_elapsed "
+                    f"hold_seconds={hold_seconds:.1f};"
+                    f"net_after_exit_bps={net_after_exit_bps:.2f};"
+                    f"min_required={float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):.2f};"
+                    f"{reason};{default_exit_reason}"
+                )
+
+            if (
+                not hard_stop_hit
+                and not early_profit_ok
+                and not max_hold_elapsed
+                and net_after_exit_bps < float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL)
+            ):
+                return False, (
+                    f"level8_hold:not_net_profitable_after_exit "
+                    f"net_after_exit_bps={net_after_exit_bps:.2f};"
+                    f"min_required={float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):.2f};"
+                    f"hold_seconds={hold_seconds:.1f};"
+                    f"{reason};{default_exit_reason}"
+                )
+
             return True, (
                 f"level8_sell_allowed final_sell={final_sell_score:.3f};"
                 f"threshold={sell_threshold:.3f};"
@@ -8530,9 +8799,19 @@ class TradingBot:
         adopted_ts = now_ts()
         trade_id = f"adopted-{product_id}-{int(adopted_ts)}-{uuid.uuid4().hex[:8]}"
         candidate = dict(pending.get("candidate") or {})
+        hold_plan = self._level8_build_hold_plan(
+            candidate=candidate,
+            entry_ts=adopted_ts,
+        )
         lot_meta = {
             "trade_id": trade_id,
             "entry_ts": adopted_ts,
+            "hold_until_ts": float(hold_plan["hold_until_ts"]),
+            "target_hold_until_ts": float(hold_plan["target_hold_until_ts"]),
+            "max_hold_until_ts": float(hold_plan["max_hold_until_ts"]),
+            "min_hold_sec": float(hold_plan["min_hold_sec"]),
+            "target_hold_sec": float(hold_plan["target_hold_sec"]),
+            "max_hold_sec": float(hold_plan["max_hold_sec"]),
             "entry_reason": "adopted_after_uncertain_buy",
             "source": "coinbase_balance_reconciliation",
             "pending_reason": pending.get("reason", ""),
@@ -8707,7 +8986,8 @@ class TradingBot:
         execution_mode: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
         """Execute a live buy and return only a Coinbase-confirmed fill."""
-        mode = str(execution_mode or ENTRY_EXECUTION_MODE).upper().strip()
+        # Force all live buys to MARKET. The council decides timing; Coinbase executes immediately.
+        mode = "MARKET"
         result = None
 
         try:
@@ -8793,7 +9073,8 @@ class TradingBot:
         mode_override: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
         """Execute a live sell and return only a Coinbase-confirmed fill."""
-        mode = str(mode_override or EXIT_EXECUTION_MODE).upper().strip()
+        # Force all live sells to MARKET. The council decides timing; Coinbase executes immediately.
+        mode = "MARKET"
         result = None
         log(
             f"[sell-attempt] {product_id} mode={mode} "
@@ -11641,12 +11922,29 @@ class TradingBot:
                     unrealized_bps = ((float(bid) / float(avg_entry_price)) - 1.0) * 10000.0
                     if position_qty > 1e-12 and bid > 0 and ask > 0:
                         try:
+                            hold_state = self._level8_position_hold_state(
+                                product_id=product_id,
+                                lots=lots,
+                                unrealized_bps=float(unrealized_bps),
+                            )
                             should_exit_l8, level8_exit_reason = self._level8_should_hold_or_exit(
-                                product_id=product_id, entry_price=float(avg_entry_price),
-                                current_price=float(bid), unrealized_bps=float(unrealized_bps),
+                                product_id=product_id,
+                                entry_price=float(avg_entry_price),
+                                current_price=float(bid),
+                                unrealized_bps=float(unrealized_bps),
                                 spread_bps=float(tob.spread_bps if tob else 0.0),
                                 cost_bps=float(self._round_trip_cost_bps(spread_bps=spread_bps)),
-                                default_exit_reason="level8_direct_exit_review", hard_exit=False,
+                                default_exit_reason=(
+                                    "level8_direct_exit_review;"
+                                    f"hold_seconds={float(hold_state.get('hold_seconds', 0.0)):.1f};"
+                                    f"net_after_exit_bps={float(hold_state.get('net_after_exit_bps', 0.0)):.2f};"
+                                    f"min_hold_elapsed={bool(hold_state.get('min_hold_elapsed', False))};"
+                                    f"target_hold_elapsed={bool(hold_state.get('target_hold_elapsed', False))};"
+                                    f"max_hold_elapsed={bool(hold_state.get('max_hold_elapsed', False))};"
+                                    f"hard_stop_hit={bool(hold_state.get('hard_stop_hit', False))}"
+                                ),
+                                hard_exit=False,
+                                hold_state=hold_state,
                             )
                             if should_exit_l8:
                                 sell_qty, exit_reason, exit_role = position_qty, level8_exit_reason, "level8_direct_exit"
@@ -12015,6 +12313,13 @@ class TradingBot:
                 f"timed={len(timed_candidates)}"
             )
 
+            if bool(LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS) and self._risk_pause_active():
+                log(
+                    f"[buy-loop] skipping new live buys because risk pause is active "
+                    f"paused_until={float(self.paused_until_ts):.3f}"
+                )
+                candidate_slice = []
+
             if ENABLE_INVERTED_STOPLOSS_CYCLE:
                 for candidate in ai_filtered_candidates:
                     product_id_for_marker = str(candidate.get("product_id", ""))
@@ -12035,6 +12340,9 @@ class TradingBot:
 
             for candidate in candidate_slice:
                 product_id = candidate["product_id"]
+                if not self._trade_rate_ok(product_id):
+                    log(f"[buy-skip] {product_id} trade_rate_limited")
+                    continue
                 if product_id in self.pending_buy_reconciliations:
                     log(f"[buy-skip] {product_id} pending delayed buy reconciliation")
                     continue
@@ -12361,9 +12669,19 @@ class TradingBot:
                 eff_price1 = float((filled_notional + fee1) / qty1) if qty1 > 0 and filled_notional is not None else buy_px1
 
                 if qty1 > 0:
+                    hold_plan = self._level8_build_hold_plan(
+                        candidate=candidate,
+                        entry_ts=entry_ts,
+                    )
                     lot_meta = {
                         "trade_id": trade_id,
                         "entry_ts": entry_ts,
+                        "hold_until_ts": float(hold_plan["hold_until_ts"]),
+                        "target_hold_until_ts": float(hold_plan["target_hold_until_ts"]),
+                        "max_hold_until_ts": float(hold_plan["max_hold_until_ts"]),
+                        "min_hold_sec": float(hold_plan["min_hold_sec"]),
+                        "target_hold_sec": float(hold_plan["target_hold_sec"]),
+                        "max_hold_sec": float(hold_plan["max_hold_sec"]),
                         "scalp_done": False,
                         "core_done": False,
 
@@ -12440,7 +12758,10 @@ class TradingBot:
                         note=(
                             f"{candidate.get('entry_reason', 'score_entry')} "
                             f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f} "
-                            f"pos_pct={float(candidate.get('position_pct', 0.0)):.3f}"
+                            f"raw_fill_price={float(buy_px1):.8f} "
+                            f"all_in_entry_price={float(eff_price1):.8f} "
+                            f"buy_fee_usd={float(fee1):.6f} "
+                            f"pos_pct={float(candidate.get('level8_recommended_position_pct', candidate.get('position_pct', 0.0))):.3f}"
                         ),
                         filled_notional_usd=(float(filled_notional) if filled_notional is not None else None),
                         entry_score=float(candidate["score"]), entry_tier=int(candidate["tier"]),

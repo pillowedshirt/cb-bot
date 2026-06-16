@@ -1669,7 +1669,7 @@ def age_seconds(ts_value: Any) -> float:
 
 def status_for_age(age: float) -> str:
     if pd.isna(age):
-        return "unknown"
+        return "waiting"
 
     # The bot now uses REST fallback to refresh stale quotes.
     # Keep the visual state calmer so the viewer does not flicker delayed/stale
@@ -1684,7 +1684,7 @@ def status_for_age(age: float) -> str:
 def status_class(status: str) -> str:
     if status == "live":
         return "cb-status-ok"
-    if status == "delayed":
+    if status in ("delayed", "waiting"):
         return "cb-status-warn"
     return "cb-status-bad"
 
@@ -2207,6 +2207,24 @@ def render_live_dashboard() -> None:
     m_telemetry = m[m["source"].astype(str).str.lower() == "telemetry"].copy() if "source" in m.columns else m.copy()
     m_chart = m.copy()
 
+    # The bot currently writes live market rows as source="telemetry".
+    # Older viewer logic expected source="eval", which caused overview/cards to show UNKNOWN
+    # even when market.csv had current rows.
+    if not m_eval.empty:
+        m_live_latest_source = m_eval.copy()
+    elif not m_telemetry.empty:
+        m_live_latest_source = m_telemetry.copy()
+    else:
+        m_live_latest_source = m.copy()
+
+    m_live_source_label = (
+        "eval"
+        if not m_eval.empty
+        else "telemetry"
+        if not m_telemetry.empty
+        else "all_market"
+    )
+
     cal = numeric(cal, [
         "ts", "min_score", "min_probability", "min_expected_value_bps",
         "scalp_pullback_pct", "core_pullback_pct",
@@ -2277,7 +2295,7 @@ def render_live_dashboard() -> None:
     # Overview data
     # =============================================================================
 
-    latest_all = latest_by_product(m_eval)
+    latest_all = latest_by_product(m_live_latest_source)
 
     # Build the overview from configured products, not only products with eval rows.
     eval_products = (
@@ -2421,6 +2439,7 @@ def render_live_dashboard() -> None:
         · data age {fmt_num(global_age, 0, 's')}
         · bot runtime {fmt_num(bot_runtime_sec / 60.0 if pd.notna(bot_runtime_sec) else np.nan, 1, ' min')}
         · viewer runtime {fmt_num(viewer_runtime_sec / 60.0, 1, ' min')}
+        · market source {m_live_source_label}
         · update {refresh_status}
         · mode {refresh_mode}
         · interval {refresh_sec}s
@@ -2735,7 +2754,10 @@ def render_live_dashboard() -> None:
     else:
         cutoff = pd.Timestamp.utcnow().timestamp() - float(window_minutes) * 60.0
 
-    m_prod_live = m_chart[(m_chart["product_id"] == product) & (m["ts"] >= cutoff)].dropna(subset=["ts", "mid"]).copy()
+    m_prod_live = m_chart[
+        (m_chart["product_id"].astype(str) == str(product))
+        & (pd.to_numeric(m_chart["ts"], errors="coerce") >= float(cutoff))
+    ].dropna(subset=["ts", "mid"]).copy()
     hist_prod = pd.DataFrame()
     if not hist.empty and "product_id" in hist.columns:
         hist_prod = hist[(hist["product_id"] == product) & (hist["ts"] >= cutoff)].copy()
@@ -2755,13 +2777,13 @@ def render_live_dashboard() -> None:
         st.stop()
 
     m_prod["dt"] = to_dt_mst(m_prod["ts"])
-    latest_eval_rows = latest_by_product(m_eval)
+    latest_eval_rows = latest_by_product(m_live_latest_source)
     selected_eval_rows = latest_eval_rows[latest_eval_rows["product_id"] == product] if not latest_eval_rows.empty else pd.DataFrame()
     if not selected_eval_rows.empty:
         latest_row = selected_eval_rows.iloc[-1]
     else:
         latest_row = m_prod.iloc[-1]
-        st.warning(f"No eval row is available for {product} yet; buy requirements are waiting for the evaluation loop.")
+        st.warning(f"No live market row is available for {product} yet; waiting for bot telemetry.")
     with top_b:
         selected_age = age_seconds(latest_row.get("ts"))
         selected_status = status_for_age(selected_age)

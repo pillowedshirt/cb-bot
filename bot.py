@@ -3881,6 +3881,60 @@ class LivePortfolio:
 
         return last
 
+    def _sanitize_buy_fill_units(
+        self,
+        *,
+        product_id: str,
+        requested_quote_usd: float,
+        qty_f: float,
+        avg_px_f: Optional[float],
+        notional_f: Optional[float],
+    ) -> Tuple[float, Optional[float], Optional[float], str]:
+        """
+        Coinbase/SDK responses can expose quote-sized values in fields that look like base size.
+        For BUY orders, local filled_qty must always be BASE units.
+
+        If requested quote is $34, qty must not become 34 BTC/ETH/SOL/etc.
+        """
+        reason = "unchanged"
+
+        try:
+            requested_quote = float(requested_quote_usd or 0.0)
+            qty = float(qty_f or 0.0)
+            avg_px = float(avg_px_f) if avg_px_f is not None else None
+            notional = float(notional_f) if notional_f is not None else None
+
+            if requested_quote <= 0:
+                return qty, avg_px, notional, "no_requested_quote"
+
+            if avg_px is None or avg_px <= 0:
+                return qty, avg_px, notional, "no_avg_price"
+
+            implied_notional = qty * avg_px if qty > 0 else 0.0
+
+            # Case 1: qty is actually quote amount, e.g. qty=34 and avg_px=66263.
+            if qty > 0 and implied_notional > requested_quote * 1.25:
+                if qty <= requested_quote * 1.25:
+                    notional = min(qty, requested_quote)
+                    qty = notional / avg_px
+                    reason = "qty_was_quote_amount_repaired_to_base"
+                else:
+                    notional = requested_quote
+                    qty = requested_quote / avg_px
+                    reason = "impossible_qty_repaired_from_requested_quote"
+
+            # Case 2: filled_notional is impossible but price is plausible.
+            if notional is None or notional <= 0 or notional > requested_quote * 1.25:
+                notional = requested_quote
+                qty = requested_quote / avg_px
+                reason = "notional_repaired_from_requested_quote"
+
+            return float(qty), float(avg_px), float(notional), reason
+
+        except Exception as exc:
+            log(f"[fill-sanitize] BUY sanitize failed for {product_id}: {exc}")
+            return float(qty_f or 0.0), avg_px_f, notional_f, "sanitize_exception"
+
     def _parse_order_fill_fields(self, order_d: dict) -> Tuple[float, Optional[float], float, Optional[float]]:
         """
         Parse order fields into (filled_qty_base, avg_price, fee_usd, filled_notional_usd).
@@ -4150,28 +4204,38 @@ class LivePortfolio:
         # This prevents "qty looks like USD" bugs that create impossible positions/logs.
         # -------------------------------
         try:
-            side_u2 = side_u  # BUY or SELL
             q = float(qty_f) if qty_f is not None else 0.0
             px = float(avg_px_f) if avg_px_f is not None else None
             notion = float(notional_f) if notional_f is not None else None
 
-            if px is not None and px > 0 and notion is not None and notion > 0:
-                expected_base = notion / px
+            if side_u == "BUY":
+                qty_f, avg_px_f, notional_f, sanitize_reason = self._sanitize_buy_fill_units(
+                    product_id=product_id,
+                    requested_quote_usd=float(quote_usd or 0.0),
+                    qty_f=q,
+                    avg_px_f=px,
+                    notional_f=notion,
+                )
+                if sanitize_reason != "unchanged":
+                    log(
+                        f"[fill-sanitize] {product_id} BUY {sanitize_reason} "
+                        f"requested_quote={float(quote_usd or 0.0):.6f} "
+                        f"qty={float(qty_f):.12f} "
+                        f"avg_px={0.0 if avg_px_f is None else float(avg_px_f):.8f} "
+                        f"notional={0.0 if notional_f is None else float(notional_f):.6f}"
+                    )
 
-                if side_u2 == "BUY":
-                    qty_f = float(expected_base)
-                # If qty is wildly inconsistent, replace qty with expected_base.
-                # (Most common failure: BUY returns qty field in QUOTE units by mistake.)
-                elif q <= 0 or (abs(q - expected_base) / max(expected_base, 1e-12)) > 0.10:
-                    # prefer expected_base, but preserve the idea of "some fill happened"
-                    qty_f = float(expected_base)
+            else:
+                if px is not None and px > 0 and notion is not None and notion > 0:
+                    expected_base = notion / px
+                    if q <= 0 or (abs(q - expected_base) / max(expected_base, 1e-12)) > 0.10:
+                        qty_f = float(expected_base)
 
-            # If we still don't have a usable avg_px but have notional and qty, derive it.
-            if (avg_px_f is None or float(avg_px_f) <= 0) and notion is not None and float(qty_f) > 0:
-                avg_px_f = float(notion) / float(qty_f)
+                if (avg_px_f is None or float(avg_px_f) <= 0) and notion is not None and float(qty_f) > 0:
+                    avg_px_f = float(notion) / float(qty_f)
 
-        except Exception:
-            pass
+        except Exception as exc:
+            log(f"[fill-reconcile] fill unit reconciliation failed for {product_id}: {exc}")
 
         # Determine outcome
         if qty_f <= 1e-12:
@@ -4268,6 +4332,28 @@ class LivePortfolio:
                 ok_final = False
                 err = err or "buy_sanity_check_failed"
                 log(f"[fill-reconcile] BUY sanity check failed for {product_id}: {exc}")
+
+        # Final BUY output sanitation for logs/reconciliation.
+        # Even if ok_final is False because balance delta is delayed, the returned fill fields
+        # should not show impossible quantities/notionals.
+        if side_u == "BUY":
+            try:
+                qty_f, avg_px_f, notional_f, final_sanitize_reason = self._sanitize_buy_fill_units(
+                    product_id=product_id,
+                    requested_quote_usd=float(quote_usd or 0.0),
+                    qty_f=float(qty_f or 0.0),
+                    avg_px_f=(None if avg_px_f is None else float(avg_px_f)),
+                    notional_f=(None if notional_f is None else float(notional_f)),
+                )
+                if final_sanitize_reason != "unchanged":
+                    log(
+                        f"[fill-sanitize] {product_id} final BUY output {final_sanitize_reason} "
+                        f"qty={float(qty_f):.12f} "
+                        f"avg_px={0.0 if avg_px_f is None else float(avg_px_f):.8f} "
+                        f"notional={0.0 if notional_f is None else float(notional_f):.6f}"
+                    )
+            except Exception as exc:
+                log(f"[fill-sanitize] final BUY output sanitize failed for {product_id}: {exc}")
 
         return ExecutionResult(
             ok=ok_final,
@@ -11952,6 +12038,18 @@ class TradingBot:
                 if product_id in self.pending_buy_reconciliations:
                     log(f"[buy-skip] {product_id} pending delayed buy reconciliation")
                     continue
+                # Refresh live cash/equity before every buy attempt.
+                # This prevents stale local cash from causing multiple same-cycle buy attempts
+                # after Coinbase has already reserved/spent funds on a prior order.
+                try:
+                    if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+                        live_snapshot_for_buy = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                        live_cash_for_buy = self.portfolio.get_tradable_usd(snapshot=live_snapshot_for_buy or {})
+                        if live_cash_for_buy >= 0:
+                            cash_usd = float(live_cash_for_buy)
+                            equity_usd = float(self._equity_usd())
+                except Exception as exc:
+                    log(f"[buy-loop] live cash refresh failed before {product_id}: {exc}")
                 existing_qty = sum(l.qty for l in self.positions.get(product_id, []))
                 if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
                     try:
@@ -11962,6 +12060,21 @@ class TradingBot:
                 product_exposure = self._current_product_exposure_usd(product_id)
                 total_exposure = self._current_total_exposure_usd()
                 open_count = self._open_position_count()
+
+                if ENABLE_LEVEL8_COUNCIL:
+                    total_exposure_cap_usd = float(equity_usd) * float(LEVEL8_MAX_TOTAL_EXPOSURE_PCT)
+                    total_exposure_room_usd = max(0.0, total_exposure_cap_usd - float(total_exposure))
+                    min_live_order_usd = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
+
+                    if total_exposure_room_usd < min_live_order_usd:
+                        log(
+                            f"[buy-skip] total_exposure_room_below_min_order "
+                            f"room={total_exposure_room_usd:.2f} "
+                            f"min_order={min_live_order_usd:.2f} "
+                            f"total_exposure={float(total_exposure):.2f} "
+                            f"equity={float(equity_usd):.2f}"
+                        )
+                        break
 
                 if ENABLE_LEVEL8_COUNCIL:
                     l8_pct = clamp_float(
@@ -12160,29 +12273,57 @@ class TradingBot:
                 if fill is None:
                     result = dict(self.last_buy_execution_result.get(product_id) or {})
                     error_text = str(result.get("error") or result.get("status") or "")
+
                     uncertain = any(token in error_text.lower() for token in (
-                        "buy_no_base_balance_delta", "balance_snapshot",
-                        "ambiguous_fill", "balance_delta_reconcile",
+                        "buy_no_base_balance_delta",
+                        "buy_balance_snapshot_unavailable",
+                        "balance_snapshot",
+                        "ambiguous_fill",
+                        "balance_delta_reconcile",
+                        "filled_balance_delta",
                     ))
+
                     if uncertain:
                         self.pending_buy_reconciliations[product_id] = {
-                            "ts": now_ts(), "product_id": product_id,
+                            "ts": now_ts(),
+                            "product_id": product_id,
                             "requested_quote_usd": float(entry_notional),
-                            "candidate": dict(candidate), "bid": bid, "ask": ask,
+                            "candidate": dict(candidate),
+                            "bid": bid,
+                            "ask": ask,
                             "before_base": float(before_buy_base),
                             "before_cash": float(before_buy_cash),
-                            "trade_id": trade_id, "reason": error_text,
+                            "trade_id": trade_id,
+                            "reason": error_text,
                         }
+
                         self.reconciliation_log.log_reconciliation(
-                            event_type="pending_buy_reconciliation", product_id=product_id, side="BUY",
+                            event_type="pending_buy_reconciliation",
+                            product_id=product_id,
+                            side="BUY",
                             client_order_id=result.get("client_order_id", ""),
                             order_id=result.get("order_id", ""),
                             requested_quote_usd=f"{float(entry_notional):.6f}",
                             before_base=f"{float(before_buy_base):.12f}",
                             before_cash=f"{float(before_buy_cash):.6f}",
-                            status="pending", error=error_text,
+                            status="pending",
+                            error=error_text,
                             action_taken="queued_for_delayed_reconcile",
                         )
+
+                        log(
+                            f"[buy-pending] {product_id} uncertain Coinbase fill; "
+                            f"queued delayed reconciliation and stopping this buy cycle "
+                            f"to avoid stale-cash overspending. error={error_text}"
+                        )
+
+                        try:
+                            await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                        except Exception:
+                            pass
+
+                        break
+
                     log(
                         f"[buy-failed] {product_id} live buy returned no confirmed fill "
                         f"error={error_text}"
@@ -12306,6 +12447,23 @@ class TradingBot:
                         expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
                     )
                     self._record_trade_timestamp(product_id)
+                    # With small account sizes, one Level 8 buy can consume most of the allowed
+                    # deployment. Stop this buy cycle once exposure is near the cap so we do not
+                    # spam below-minimum or insufficient-balance attempts on the remaining candidates.
+                    try:
+                        if ENABLE_LEVEL8_COUNCIL:
+                            latest_total_exposure = self._current_total_exposure_usd()
+                            latest_equity = max(float(self._equity_usd()), 1e-9)
+                            exposure_ratio = float(latest_total_exposure) / latest_equity
+                            if exposure_ratio >= float(LEVEL8_MAX_TOTAL_EXPOSURE_PCT) - 0.02:
+                                log(
+                                    f"[buy-loop] stopping cycle after buy; exposure near cap "
+                                    f"exposure_ratio={exposure_ratio:.3f} "
+                                    f"cap={float(LEVEL8_MAX_TOTAL_EXPOSURE_PCT):.3f}"
+                                )
+                                break
+                    except Exception as exc:
+                        log(f"[buy-loop] post-buy exposure cap check failed: {exc}")
 
             log(f"[loop] sleeping {EVAL_TICK_SEC:.1f}s until next evaluation")
             await asyncio.sleep(EVAL_TICK_SEC)

@@ -199,6 +199,113 @@ LEVEL8_SELL_REVIEW_MINUTES: List[int] = [5, 15, 30]
 LEVEL8_SELL_TOO_EARLY_BPS: float = 80.0
 LEVEL8_SELL_GOOD_EXIT_BPS: float = 30.0
 
+SELL_OUTCOME_LEGACY_COLUMNS: List[str] = [
+    "ts", "dt_mst", "outcome_key", "decision_id", "product_id",
+    "decision_action", "review_minutes", "sell_price",
+    "review_price", "move_after_sell_bps", "sell_outcome_kind",
+    "reason",
+]
+
+SELL_OUTCOME_COLUMNS: List[str] = [
+    "ts", "dt_mst", "outcome_key", "decision_id", "product_id",
+    "decision_action", "review_minutes", "sell_price",
+    "review_price", "move_after_sell_bps", "sell_outcome_kind",
+    "realized_net_pnl_usd", "realized_gross_pnl_usd",
+    "realized_net_pnl_bps", "sold_qty", "executed_sell_fraction",
+    "earnings_quality_score", "reason",
+]
+
+
+def load_sell_outcomes_csv(path: str) -> pd.DataFrame:
+    """
+    Load sell_outcomes.csv even if it contains mixed old/new schemas.
+
+    Old schema:
+    - 12 columns
+
+    New schema:
+    - 18 columns
+
+    This prevents pandas tokenizing errors after a patch adds columns.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return pd.DataFrame(columns=SELL_OUTCOME_COLUMNS)
+
+    rows: List[List[str]] = []
+
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as file:
+            reader = csv.reader(file)
+            header = next(reader, None)
+
+            if not header:
+                return pd.DataFrame(columns=SELL_OUTCOME_COLUMNS)
+
+            for raw_row in reader:
+                if not raw_row or not any(str(cell).strip() for cell in raw_row):
+                    continue
+
+                if len(raw_row) == len(SELL_OUTCOME_LEGACY_COLUMNS):
+                    legacy = dict(zip(SELL_OUTCOME_LEGACY_COLUMNS, raw_row))
+                    rows.append([
+                        legacy.get("ts", ""),
+                        legacy.get("dt_mst", ""),
+                        legacy.get("outcome_key", ""),
+                        legacy.get("decision_id", ""),
+                        legacy.get("product_id", ""),
+                        legacy.get("decision_action", ""),
+                        legacy.get("review_minutes", ""),
+                        legacy.get("sell_price", ""),
+                        legacy.get("review_price", ""),
+                        legacy.get("move_after_sell_bps", ""),
+                        legacy.get("sell_outcome_kind", ""),
+                        "0.0000000000",
+                        "0.0000000000",
+                        "0.000000",
+                        "0.000000000000",
+                        "0.000000",
+                        "0.500000",
+                        legacy.get("reason", ""),
+                    ])
+                    continue
+
+                if len(raw_row) >= len(SELL_OUTCOME_COLUMNS):
+                    fixed = raw_row[:len(SELL_OUTCOME_COLUMNS)]
+                    if len(raw_row) > len(SELL_OUTCOME_COLUMNS):
+                        fixed[-1] = ",".join(raw_row[len(SELL_OUTCOME_COLUMNS) - 1:])
+                    rows.append(fixed)
+                    continue
+
+                padded = list(raw_row) + [""] * (len(SELL_OUTCOME_COLUMNS) - len(raw_row))
+                rows.append(padded[:len(SELL_OUTCOME_COLUMNS)])
+
+        return pd.DataFrame(rows, columns=SELL_OUTCOME_COLUMNS)
+
+    except Exception:
+        return pd.DataFrame(columns=SELL_OUTCOME_COLUMNS)
+
+
+def normalize_sell_outcomes_csv(path: str) -> None:
+    """
+    Rewrite sell_outcomes.csv to the current 18-column schema.
+
+    This is safe to run repeatedly.
+    """
+    try:
+        if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+            return
+
+        df = load_sell_outcomes_csv(path)
+        if df.empty:
+            return
+
+        tmp = path + ".schema.tmp"
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, path)
+
+    except Exception:
+        pass
+
 DEBUG_LOG_ENABLED: bool = True
 DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
@@ -1182,12 +1289,29 @@ def product_base_asset(product_id: str) -> str:
         return ""
 
 
-def safe_float(x: Any) -> Optional[float]:
-    """Convert to float if possible, else None."""
+def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    """
+    Convert to float if possible.
+
+    Existing one-argument behavior is preserved:
+    - safe_float(value) returns float(value) or None.
+
+    New two-argument behavior:
+    - safe_float(value, 0.0) returns float(value) or 0.0.
+    """
     try:
-        return float(x) if x is not None else None
+        if x is None:
+            return default
+
+        value = float(x)
+
+        if not math.isfinite(value):
+            return default
+
+        return value
+
     except Exception:
-        return None
+        return default
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -9975,6 +10099,169 @@ class TradingBot:
         except Exception:
             return None
 
+    def _recover_open_lots_from_state_csvs(
+        self,
+        *,
+        product_id: str,
+        coinbase_qty: float,
+        fallback_entry_price: float,
+        current_bid: float,
+    ) -> List[PositionLot]:
+        """
+        Recover an open Coinbase position from runtime state CSVs when trades.csv
+        is missing or incomplete.
+        """
+        coinbase_qty = float(coinbase_qty)
+        fallback_entry_price = float(fallback_entry_price)
+
+        if coinbase_qty <= 1e-12:
+            return []
+
+        best: Optional[Dict[str, Any]] = None
+
+        try:
+            if os.path.exists(MARKET_CSV_PATH) and os.path.getsize(MARKET_CSV_PATH) > 0:
+                m = pd.read_csv(MARKET_CSV_PATH)
+                if not m.empty and {"product_id", "position_qty", "avg_entry_price", "ts"}.issubset(m.columns):
+                    sub = m[m["product_id"].astype(str).eq(str(product_id))].copy()
+                    if not sub.empty:
+                        sub["ts"] = pd.to_numeric(sub["ts"], errors="coerce")
+                        sub["position_qty"] = pd.to_numeric(sub["position_qty"], errors="coerce")
+                        sub["avg_entry_price"] = pd.to_numeric(sub["avg_entry_price"], errors="coerce")
+                        if "bid" in sub.columns:
+                            sub["bid"] = pd.to_numeric(sub["bid"], errors="coerce")
+                        else:
+                            sub["bid"] = float(current_bid)
+
+                        sub = sub.dropna(subset=["ts", "position_qty", "avg_entry_price"]).copy()
+                        sub = sub[
+                            (sub["position_qty"] > 1e-12)
+                            & (sub["avg_entry_price"] > 0)
+                        ].sort_values("ts").copy()
+
+                        if not sub.empty:
+                            qty_tol = max(1e-9, abs(float(coinbase_qty)) * 0.03)
+                            exactish = sub[
+                                (sub["position_qty"] - float(coinbase_qty)).abs() <= qty_tol
+                            ].copy()
+
+                            if not exactish.empty:
+                                chosen = exactish.sort_values("ts").iloc[0]
+                            else:
+                                sub["qty_delta"] = (sub["position_qty"] - float(coinbase_qty)).abs()
+                                chosen = sub.sort_values(["qty_delta", "ts"]).iloc[0]
+
+                            best = {
+                                "source": "market.csv",
+                                "entry_ts": float(chosen.get("ts")),
+                                "entry_price": float(chosen.get("avg_entry_price")),
+                                "raw_price": float(chosen.get("avg_entry_price")),
+                                "state_qty": float(chosen.get("position_qty")),
+                                "state_bid": float(chosen.get("bid", current_bid) or current_bid),
+                            }
+
+        except Exception as exc:
+            log(f"[startup-adopt] {product_id} market.csv state recovery failed: {exc}")
+
+        if best is None:
+            try:
+                if os.path.exists(POSITION_TARGETS_CSV_PATH) and os.path.getsize(POSITION_TARGETS_CSV_PATH) > 0:
+                    pt = pd.read_csv(POSITION_TARGETS_CSV_PATH)
+                    if not pt.empty and {"product_id", "position_qty", "avg_entry_price"}.issubset(pt.columns):
+                        sub = pt[pt["product_id"].astype(str).eq(str(product_id))].copy()
+                        if not sub.empty:
+                            sub["position_qty"] = pd.to_numeric(sub["position_qty"], errors="coerce")
+                            sub["avg_entry_price"] = pd.to_numeric(sub["avg_entry_price"], errors="coerce")
+                            sub = sub.dropna(subset=["position_qty", "avg_entry_price"]).copy()
+                            sub = sub[
+                                (sub["position_qty"] > 1e-12)
+                                & (sub["avg_entry_price"] > 0)
+                            ].copy()
+
+                            if not sub.empty:
+                                chosen = sub.iloc[-1]
+                                best = {
+                                    "source": "position_targets.csv",
+                                    "entry_ts": float(now_ts()),
+                                    "entry_price": float(chosen.get("avg_entry_price")),
+                                    "raw_price": float(chosen.get("avg_entry_price")),
+                                    "state_qty": float(chosen.get("position_qty")),
+                                    "state_bid": float(current_bid),
+                                }
+
+            except Exception as exc:
+                log(f"[startup-adopt] {product_id} position_targets.csv recovery failed: {exc}")
+
+        if best is None:
+            return []
+
+        entry_ts = float(best.get("entry_ts", now_ts()) or now_ts())
+        entry_price = float(best.get("entry_price", fallback_entry_price) or fallback_entry_price)
+
+        if entry_price <= 0:
+            return []
+
+        hold_plan = self._level8_build_hold_plan(
+            candidate={},
+            entry_ts=entry_ts,
+        )
+
+        lot_meta = {
+            "coinbase_existing": True,
+            "recovered_from_trades_csv": False,
+            "recovered_from_runtime_state_csv": True,
+            "runtime_state_source": str(best.get("source", "")),
+            "entry_ts": float(entry_ts),
+            "hold_until_ts": float(hold_plan["hold_until_ts"]),
+            "target_hold_until_ts": float(hold_plan["target_hold_until_ts"]),
+            "max_hold_until_ts": float(hold_plan["max_hold_until_ts"]),
+            "min_hold_sec": float(hold_plan["min_hold_sec"]),
+            "target_hold_sec": float(hold_plan["target_hold_sec"]),
+            "max_hold_sec": float(hold_plan["max_hold_sec"]),
+            "raw_fill_price": float(best.get("raw_price", entry_price) or entry_price),
+            "all_in_entry_price": float(entry_price),
+            "state_qty": float(best.get("state_qty", 0.0) or 0.0),
+            "coinbase_qty": float(coinbase_qty),
+            "state_bid": float(best.get("state_bid", current_bid) or current_bid),
+            "scalp_done": False,
+            "core_done": False,
+            "scalp_armed": False,
+            "core_armed": False,
+            "profit_lock_armed": False,
+        }
+
+        try:
+            lot_meta["min_profitable_exit_price"] = float(
+                required_exit_price_for_net_gain(
+                    effective_entry_price=float(entry_price),
+                    exit_fee_bps=self._exit_fee_bps_for_mode(),
+                    est_slippage_bps=EST_SLIPPAGE_BPS,
+                    est_adverse_fill_bps=EST_ADVERSE_FILL_BPS,
+                    min_net_gain_bps=max(
+                        MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT,
+                        MIN_NET_GAIN_AFTER_FEES_BPS,
+                    ),
+                )
+            )
+        except Exception:
+            lot_meta["min_profitable_exit_price"] = None
+
+        log(
+            f"[startup-adopt] {product_id} recovered open lot from "
+            f"{best.get('source', '')} qty={float(coinbase_qty):.12f} "
+            f"entry={float(entry_price):.8f} state_qty={float(best.get('state_qty', 0.0) or 0.0):.12f}"
+        )
+
+        return [
+            PositionLot(
+                qty=float(coinbase_qty),
+                price=float(entry_price),
+                tier=TIER_LOW,
+                score=0.0,
+                meta=lot_meta,
+            )
+        ]
+
     def _recover_open_lots_from_trade_csv(
         self,
         *,
@@ -9999,9 +10286,50 @@ class TradingBot:
             return []
 
         def fallback_lot(reason: str) -> List[PositionLot]:
+            state_lots = self._recover_open_lots_from_state_csvs(
+                product_id=product_id,
+                coinbase_qty=float(coinbase_qty),
+                fallback_entry_price=float(fallback_entry_price),
+                current_bid=float(current_bid),
+            )
+
+            if state_lots:
+                return state_lots
+
             entry_ts = now_ts()
-            hold_plan = self._level8_build_hold_plan(candidate={}, entry_ts=entry_ts)
-            return [PositionLot(qty=float(coinbase_qty), price=float(fallback_entry_price), tier=TIER_LOW, score=0.0, meta={"coinbase_existing": True, "recovered_from_trades_csv": False, "recovery_reason": reason, "entry_ts": float(entry_ts), "hold_until_ts": float(hold_plan["hold_until_ts"]), "target_hold_until_ts": float(hold_plan["target_hold_until_ts"]), "max_hold_until_ts": float(hold_plan["max_hold_until_ts"]), "min_hold_sec": float(hold_plan["min_hold_sec"]), "target_hold_sec": float(hold_plan["target_hold_sec"]), "max_hold_sec": float(hold_plan["max_hold_sec"]), "raw_fill_price": float(fallback_entry_price), "all_in_entry_price": float(fallback_entry_price), "scalp_done": False, "core_done": False, "scalp_armed": False, "core_armed": False, "profit_lock_armed": False})]
+            hold_plan = self._level8_build_hold_plan(
+                candidate={},
+                entry_ts=entry_ts,
+            )
+
+            return [
+                PositionLot(
+                    qty=float(coinbase_qty),
+                    price=float(fallback_entry_price),
+                    tier=TIER_LOW,
+                    score=0.0,
+                    meta={
+                        "coinbase_existing": True,
+                        "recovered_from_trades_csv": False,
+                        "recovered_from_runtime_state_csv": False,
+                        "recovery_reason": reason,
+                        "entry_ts": float(entry_ts),
+                        "hold_until_ts": float(hold_plan["hold_until_ts"]),
+                        "target_hold_until_ts": float(hold_plan["target_hold_until_ts"]),
+                        "max_hold_until_ts": float(hold_plan["max_hold_until_ts"]),
+                        "min_hold_sec": float(hold_plan["min_hold_sec"]),
+                        "target_hold_sec": float(hold_plan["target_hold_sec"]),
+                        "max_hold_sec": float(hold_plan["max_hold_sec"]),
+                        "raw_fill_price": float(fallback_entry_price),
+                        "all_in_entry_price": float(fallback_entry_price),
+                        "scalp_done": False,
+                        "core_done": False,
+                        "scalp_armed": False,
+                        "core_armed": False,
+                        "profit_lock_armed": False,
+                    },
+                )
+            ]
 
         try:
             if not os.path.exists(TRADES_CSV_PATH) or os.path.getsize(TRADES_CSV_PATH) <= 0:
@@ -10083,6 +10411,52 @@ class TradingBot:
                 mids[p] = float(tob.mid)
         return mids
 
+
+    def _equity_usd(self) -> float:
+        """
+        Return the current best estimate of total account equity in USD.
+
+        Live mode:
+        - Coinbase balances are source of truth.
+        - Current top-of-book mids value open crypto balances.
+
+        Fallback:
+        - Use local position lots if Coinbase refresh is unavailable.
+        """
+        try:
+            if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
+                snap = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                return float(
+                    self.portfolio.compute_equity_usd(
+                        mid_by_product=self._live_mid_by_product(),
+                        snapshot=snap,
+                    )
+                )
+        except Exception as exc:
+            log(f"[equity] live equity refresh failed: {exc}")
+
+        try:
+            total = 0.0
+
+            if isinstance(self.portfolio, LivePortfolio):
+                total += float(self.portfolio.cash_usd)
+            else:
+                total += float(getattr(self.portfolio, "cash_usd", 0.0) or 0.0)
+
+            for product_id, lots in self.positions.items():
+                tob = self.tob.get(product_id)
+                mark = float(tob.mid) if tob and tob.mid > 0 else 0.0
+                if mark <= 0:
+                    continue
+
+                total += sum(float(lot.qty) * mark for lot in lots)
+
+            return float(max(0.0, total))
+
+        except Exception as exc:
+            log(f"[equity] local equity fallback failed: {exc}")
+            return 0.0
+
     async def _adopt_existing_coinbase_holdings(self) -> None:
         """
         Convert existing Coinbase balances into local PositionLot objects.
@@ -10133,8 +10507,29 @@ class TradingBot:
             self.last_buy_price[product_id] = float(weighted_entry)
             self.anchor_ts[product_id] = self.position_start_ts[product_id] or now_ts()
             self.peak_bid[product_id] = float(tob.bid)
-            recovered_from_csv = any(bool((lot.meta if isinstance(lot.meta, dict) else {}).get("recovered_from_trades_csv")) for lot in recovered_lots)
-            log(f"[startup-adopt] adopted {product_id} qty={float(qty):.12f} avg_entry={float(weighted_entry):.8f} recovered_from_trades_csv={recovered_from_csv} entry_ts={float(self.position_start_ts[product_id] or 0.0):.6f}")
+            recovered_from_trade_csv = any(
+                bool((lot.meta if isinstance(lot.meta, dict) else {}).get("recovered_from_trades_csv"))
+                for lot in recovered_lots
+            )
+            recovered_from_runtime_state_csv = any(
+                bool((lot.meta if isinstance(lot.meta, dict) else {}).get("recovered_from_runtime_state_csv"))
+                for lot in recovered_lots
+            )
+            recovery_sources = sorted(set(
+                str((lot.meta if isinstance(lot.meta, dict) else {}).get("runtime_state_source", ""))
+                for lot in recovered_lots
+                if str((lot.meta if isinstance(lot.meta, dict) else {}).get("runtime_state_source", "")).strip()
+            ))
+
+            log(
+                f"[startup-adopt] adopted {product_id} "
+                f"qty={float(qty):.12f} "
+                f"avg_entry={float(weighted_entry):.8f} "
+                f"recovered_from_trades_csv={recovered_from_trade_csv} "
+                f"recovered_from_runtime_state_csv={recovered_from_runtime_state_csv} "
+                f"runtime_sources={recovery_sources} "
+                f"entry_ts={float(self.position_start_ts[product_id] or 0.0):.6f}"
+            )
             adopted += 1
 
         log(f"[startup] adopted {adopted} existing Coinbase holdings as managed positions")
@@ -12205,22 +12600,18 @@ class TradingBot:
             if sell_decisions.empty:
                 return
             out_path = os.path.join(BASE_DIR, "sell_outcomes.csv")
+            normalize_sell_outcomes_csv(out_path)
+
             existing_keys = set()
             if os.path.exists(out_path):
                 try:
-                    existing = pd.read_csv(out_path)
+                    existing = load_sell_outcomes_csv(out_path)
                     if not existing.empty and "outcome_key" in existing.columns:
                         existing_keys = set(existing["outcome_key"].astype(str).tolist())
                 except Exception:
                     existing_keys = set()
-            columns = [
-                "ts", "dt_mst", "outcome_key", "decision_id", "product_id",
-                "decision_action", "review_minutes", "sell_price",
-                "review_price", "move_after_sell_bps", "sell_outcome_kind",
-                "realized_net_pnl_usd", "realized_gross_pnl_usd",
-                "realized_net_pnl_bps", "sold_qty", "executed_sell_fraction",
-                "earnings_quality_score", "reason",
-            ]
+
+            columns = SELL_OUTCOME_COLUMNS
             write_header = not os.path.exists(out_path) or os.path.getsize(out_path) == 0
             with open(out_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -12401,7 +12792,8 @@ class TradingBot:
                     observation_outcomes["source"] = "observation_outcome"
                     frames.append(observation_outcomes)
             if os.path.exists(sell_outcomes_path):
-                sell_outcomes = pd.read_csv(sell_outcomes_path)
+                normalize_sell_outcomes_csv(sell_outcomes_path)
+                sell_outcomes = load_sell_outcomes_csv(sell_outcomes_path)
                 if not sell_outcomes.empty:
                     sell_outcomes = sell_outcomes.rename(columns={
                         "move_after_sell_bps": "move_bps",

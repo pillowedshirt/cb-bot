@@ -125,6 +125,75 @@ COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH: str = os.path.join(
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
 
+# Startup CSV-state detection.
+# This must check for meaningful pre-existing data rows, not just file existence.
+# Several logger classes create header-only CSVs during bot startup, so header-only
+# files do not count as prior bot state.
+STARTUP_STATE_CSV_PATHS: List[str] = [
+    TRADES_CSV_PATH,
+    ORDERS_CSV_PATH,
+    MARKET_CSV_PATH,
+    MACRO_WEEK_CSV,
+    MACRO_DAY_CSV,
+    MACRO_LEVELS_CSV,
+    CALIBRATION_CSV_PATH,
+    MICRO_HISTORY_CSV_PATH,
+    POSITION_TARGETS_CSV_PATH,
+    CANDIDATE_REPLAY_CSV_PATH,
+    PRODUCTS_ACTIVE_CSV_PATH,
+    SIGNAL_EVENTS_CSV_PATH,
+    LEVEL8_COUNCIL_DECISIONS_CSV_PATH,
+    TRADE_OUTCOMES_CSV_PATH,
+    MISSED_OPPORTUNITIES_CSV_PATH,
+    COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH,
+    RECONCILIATION_CSV_PATH,
+    AGENT_PERFORMANCE_CSV_PATH,
+]
+
+
+def _csv_has_meaningful_data_rows(path: str, *, min_rows: int = 1) -> bool:
+    """
+    Return True only when a CSV exists and contains at least min_rows data rows.
+
+    Header-only CSVs do not count.
+    This lets a brand-new run still liquidate to cash even if logger constructors
+    create empty CSV files during startup.
+    """
+    try:
+        if not path or not os.path.exists(path):
+            return False
+        if os.path.getsize(path) <= 0:
+            return False
+
+        data_rows = 0
+        with open(path, "r", newline="", encoding="utf-8") as file:
+            reader = csv.reader(file)
+            header_seen = False
+            for row in reader:
+                if not row or not any(str(cell).strip() for cell in row):
+                    continue
+                if not header_seen:
+                    header_seen = True
+                    continue
+                data_rows += 1
+                if data_rows >= int(min_rows):
+                    return True
+
+        return False
+
+    except Exception:
+        return False
+
+
+def has_existing_runtime_csv_state() -> bool:
+    """
+    Detect whether this launch has meaningful old bot runtime state.
+
+    Important:
+    This should be called before logger constructors append/create current-run rows.
+    """
+    return any(_csv_has_meaningful_data_rows(path) for path in STARTUP_STATE_CSV_PATHS)
+
 # Sell outcome classification.
 LEVEL8_SELL_REVIEW_MINUTES: List[int] = [5, 15, 30]
 LEVEL8_SELL_TOO_EARLY_BPS: float = 80.0
@@ -409,10 +478,12 @@ SOURCE_OF_TRUTH_COINBASE: bool = True
 
 # Startup handling for existing Coinbase crypto balances in PRODUCTS.
 # Options:
-#   "LIQUIDATE_EXISTING" = sell existing available balances for configured products before new entries.
-#   "ADOPT_EXISTING"    = treat existing balances as bot-managed positions using current mid as approximate entry.
+#   "AUTO_CSV_AWARE"     = if meaningful old runtime CSV rows exist, adopt holdings;
+#                          if no meaningful old runtime CSV rows exist, liquidate to cash.
+#   "LIQUIDATE_EXISTING" = always sell existing available balances before new entries.
+#   "ADOPT_EXISTING"    = always treat existing balances as bot-managed positions.
 #   "IGNORE_EXISTING"   = leave existing balances alone, but still include them in equity/exposure calculations.
-LIVE_STARTUP_MODE: str = "LIQUIDATE_EXISTING"
+LIVE_STARTUP_MODE: str = "AUTO_CSV_AWARE"
 
 # Use market sells for startup liquidation.
 # This is more likely to exit than maker-only post-only sells, but may pay taker fees/slippage.
@@ -4647,6 +4718,11 @@ class TradingBot:
         self.rest = rest
         self.api_key = api_key
         self.pem_secret = pem_secret
+
+        # Capture pre-existing runtime state before logger constructors create
+        # header-only CSV files or current-run rows.
+        self.startup_had_existing_runtime_state: bool = has_existing_runtime_csv_state()
+
         self.fetcher = MacroFetcher(rest)
         self.macro = MacroManager()
         self.tlog = TradeLogger(TRADES_CSV_PATH)
@@ -4663,6 +4739,11 @@ class TradingBot:
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
         self.levels_writer = MacroLevelsCSVWriter(MACRO_LEVELS_CSV)
+
+        log(
+            f"[startup-state] existing_runtime_csv_state="
+            f"{self.startup_had_existing_runtime_state}"
+        )
         # top of book per product
         self.tob: Dict[str, Optional[TopOfBook]] = {p: None for p in PRODUCTS}
         # Rolling mid price series per product
@@ -9695,6 +9776,128 @@ class TradingBot:
             f"trading will skip products without fresh bid/ask"
         )
 
+    def _parse_trade_note_float(self, note: Any, key: str) -> Optional[float]:
+        """
+        Parse key=value float pairs from trades.csv note text.
+
+        Example:
+        all_in_entry_price=123.456
+        buy_fee_usd=0.02
+        """
+        try:
+            text = str(note or "")
+            marker = f"{key}="
+            if marker not in text:
+                return None
+            tail = text.split(marker, 1)[1].strip()
+            raw = tail.split()[0].strip().strip(";").strip(",")
+            value = float(raw)
+            if value > 0 and math.isfinite(value):
+                return value
+            return None
+        except Exception:
+            return None
+
+    def _recover_open_lots_from_trade_csv(
+        self,
+        *,
+        product_id: str,
+        coinbase_qty: float,
+        fallback_entry_price: float,
+        current_bid: float,
+    ) -> List[PositionLot]:
+        """
+        Rebuild a managed position from previous trades.csv rows when possible.
+
+        The goal is not tax-perfect accounting. Coinbase remains the source of truth.
+        The goal is operational continuity:
+        - restore approximate entry basis after reboot,
+        - preserve prior BUY timestamps for hold-plan logic,
+        - let the sell council evaluate the position instead of blindly liquidating it.
+        """
+        coinbase_qty = float(coinbase_qty)
+        fallback_entry_price = float(fallback_entry_price)
+
+        if coinbase_qty <= 1e-12:
+            return []
+
+        def fallback_lot(reason: str) -> List[PositionLot]:
+            entry_ts = now_ts()
+            hold_plan = self._level8_build_hold_plan(candidate={}, entry_ts=entry_ts)
+            return [PositionLot(qty=float(coinbase_qty), price=float(fallback_entry_price), tier=TIER_LOW, score=0.0, meta={"coinbase_existing": True, "recovered_from_trades_csv": False, "recovery_reason": reason, "entry_ts": float(entry_ts), "hold_until_ts": float(hold_plan["hold_until_ts"]), "target_hold_until_ts": float(hold_plan["target_hold_until_ts"]), "max_hold_until_ts": float(hold_plan["max_hold_until_ts"]), "min_hold_sec": float(hold_plan["min_hold_sec"]), "target_hold_sec": float(hold_plan["target_hold_sec"]), "max_hold_sec": float(hold_plan["max_hold_sec"]), "raw_fill_price": float(fallback_entry_price), "all_in_entry_price": float(fallback_entry_price), "scalp_done": False, "core_done": False, "scalp_armed": False, "core_armed": False, "profit_lock_armed": False})]
+
+        try:
+            if not os.path.exists(TRADES_CSV_PATH) or os.path.getsize(TRADES_CSV_PATH) <= 0:
+                return fallback_lot("trades_csv_missing")
+            trades = pd.read_csv(TRADES_CSV_PATH)
+            if trades.empty or "product_id" not in trades.columns:
+                return fallback_lot("trades_csv_empty_or_missing_product_id")
+            product_trades = trades[trades["product_id"].astype(str).eq(str(product_id))].copy()
+            if product_trades.empty:
+                return fallback_lot("no_product_rows_in_trades_csv")
+            product_trades["ts_num"] = pd.to_numeric(product_trades.get("ts"), errors="coerce")
+            product_trades = product_trades.dropna(subset=["ts_num"]).sort_values("ts_num")
+            open_lots: List[Dict[str, Any]] = []
+            for _, row in product_trades.iterrows():
+                event = str(row.get("event", "")).upper().strip()
+                side = str(row.get("side", "")).upper().strip()
+                qty = safe_float(row.get("qty"), 0.0)
+                if qty <= 1e-12:
+                    continue
+                if event == "BUY" and side == "BUY":
+                    raw_price = safe_float(row.get("price"), 0.0)
+                    entry_price_col = safe_float(row.get("entry_price"), 0.0)
+                    notional = safe_float(row.get("notional_usd"), 0.0)
+                    fee = safe_float(row.get("fee_usd"), 0.0)
+                    note = str(row.get("note", ""))
+                    all_in_from_note = self._parse_trade_note_float(note, "all_in_entry_price")
+                    if all_in_from_note is not None and all_in_from_note > 0:
+                        entry_price = float(all_in_from_note)
+                    elif notional > 0 and qty > 0:
+                        entry_price = float((notional + max(0.0, fee)) / qty)
+                    elif entry_price_col > 0:
+                        entry_price = float(entry_price_col)
+                    elif raw_price > 0:
+                        entry_price = float(raw_price)
+                    else:
+                        entry_price = float(fallback_entry_price)
+                    open_lots.append({"qty": float(qty), "price": float(entry_price), "raw_price": float(raw_price if raw_price > 0 else entry_price), "entry_ts": float(row.get("ts_num")), "score": safe_float(row.get("entry_score"), 0.0), "tier": int(safe_float(row.get("entry_tier"), TIER_LOW)), "note": note})
+                elif side == "SELL" or event in {"SELL", "STARTUP_LIQUIDATION"}:
+                    remaining_sell_qty = float(qty)
+                    while remaining_sell_qty > 1e-12 and open_lots:
+                        first = open_lots[0]
+                        first_qty = float(first.get("qty", 0.0))
+                        if first_qty <= remaining_sell_qty + 1e-12:
+                            remaining_sell_qty -= first_qty
+                            open_lots.pop(0)
+                        else:
+                            first["qty"] = first_qty - remaining_sell_qty
+                            remaining_sell_qty = 0.0
+            total_recovered_qty = sum(float(lot.get("qty", 0.0)) for lot in open_lots)
+            if total_recovered_qty <= 1e-12:
+                return fallback_lot("no_open_buy_lots_after_fifo_recovery")
+            qty_scale = float(coinbase_qty) / max(total_recovered_qty, 1e-12)
+            recovered_position_lots: List[PositionLot] = []
+            for lot in open_lots:
+                lot_qty = max(0.0, float(lot.get("qty", 0.0)) * qty_scale)
+                if lot_qty <= 1e-12:
+                    continue
+                entry_ts = float(lot.get("entry_ts", now_ts()) or now_ts())
+                entry_price = float(lot.get("price", fallback_entry_price) or fallback_entry_price)
+                hold_plan = self._level8_build_hold_plan(candidate={"score": float(lot.get("score", 0.0) or 0.0), "tier": int(lot.get("tier", TIER_LOW) or TIER_LOW)}, entry_ts=entry_ts)
+                lot_meta = {"coinbase_existing": True, "recovered_from_trades_csv": True, "entry_ts": float(entry_ts), "hold_until_ts": float(hold_plan["hold_until_ts"]), "target_hold_until_ts": float(hold_plan["target_hold_until_ts"]), "max_hold_until_ts": float(hold_plan["max_hold_until_ts"]), "min_hold_sec": float(hold_plan["min_hold_sec"]), "target_hold_sec": float(hold_plan["target_hold_sec"]), "max_hold_sec": float(hold_plan["max_hold_sec"]), "raw_fill_price": float(lot.get("raw_price", entry_price) or entry_price), "all_in_entry_price": float(entry_price), "original_trades_csv_note": str(lot.get("note", "")), "coinbase_qty_scale": float(qty_scale), "scalp_done": False, "core_done": False, "scalp_armed": False, "core_armed": False, "profit_lock_armed": False}
+                try:
+                    lot_meta["min_profitable_exit_price"] = float(required_exit_price_for_net_gain(effective_entry_price=float(entry_price), exit_fee_bps=self._exit_fee_bps_for_mode(), est_slippage_bps=EST_SLIPPAGE_BPS, est_adverse_fill_bps=EST_ADVERSE_FILL_BPS, min_net_gain_bps=max(MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT, MIN_NET_GAIN_AFTER_FEES_BPS)))
+                except Exception:
+                    lot_meta["min_profitable_exit_price"] = None
+                recovered_position_lots.append(PositionLot(qty=float(lot_qty), price=float(entry_price), tier=int(lot.get("tier", TIER_LOW) or TIER_LOW), score=float(lot.get("score", 0.0) or 0.0), meta=lot_meta))
+            if not recovered_position_lots:
+                return fallback_lot("recovered_lots_below_min_qty")
+            return recovered_position_lots
+        except Exception as exc:
+            log(f"[startup-adopt] {product_id} trade CSV recovery failed: {exc}")
+            return fallback_lot(f"recovery_exception:{exc}")
+
     def _live_mid_by_product(self) -> Dict[str, float]:
         mids: Dict[str, float] = {}
         for p in PRODUCTS:
@@ -9706,48 +9909,55 @@ class TradingBot:
     async def _adopt_existing_coinbase_holdings(self) -> None:
         """
         Convert existing Coinbase balances into local PositionLot objects.
-        This gives the bot the ability to manage/sell them.
 
-        Important:
-        - The entry price is approximated using current mid.
-        - This is not true historical cost basis.
-        - For accurate tax/P&L, Coinbase fills/history are still the authority.
+        CSV-aware startup behavior:
+        - If trades.csv contains prior BUY rows, recover approximate all-in entry basis.
+        - If no prior BUY rows exist for a product, use current mid as fallback.
+        - Once adopted, the normal Level 8 sell council decides whether to HOLD or SELL.
         """
         if not isinstance(self.portfolio, LivePortfolio):
             return
 
         snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
         if not snap:
+            log("[startup-adopt] no Coinbase snapshot available")
             return
 
         adopted = 0
         for product_id in PRODUCTS:
             tob = self.tob.get(product_id)
             if not tob or tob.mid <= 0:
+                log(f"[startup-adopt] skipping {product_id}: no mid quote available")
                 continue
 
             qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
             if qty <= 1e-12:
                 self.positions[product_id] = []
+                self.position_start_ts[product_id] = None
+                self.position_entry_price[product_id] = None
                 continue
 
             approx_entry = float(tob.mid)
-            self.positions[product_id] = [
-                PositionLot(
-                    qty=float(qty),
-                    price=approx_entry,
-                    tier=TIER_LOW,
-                    score=0.0,
-                    meta={
-                        "coinbase_existing": True,
-                        "scalp_done": False,
-                        "core_done": False,
-                    },
-                )
-            ]
-            self.position_start_ts[product_id] = now_ts()
-            self.position_entry_price[product_id] = approx_entry
+            recovered_lots = self._recover_open_lots_from_trade_csv(product_id=product_id, coinbase_qty=float(qty), fallback_entry_price=approx_entry, current_bid=float(tob.bid))
+            if not recovered_lots:
+                continue
+
+            self.positions[product_id] = recovered_lots
+            entry_ts_values = []
+            for lot in recovered_lots:
+                meta = lot.meta if isinstance(lot.meta, dict) else {}
+                entry_ts_values.append(float(meta.get("entry_ts", now_ts()) or now_ts()))
+
+            total_qty = sum(float(lot.qty) for lot in recovered_lots)
+            weighted_entry = (sum(float(lot.qty) * float(lot.price) for lot in recovered_lots) / total_qty if total_qty > 0 else approx_entry)
+            self.position_start_ts[product_id] = min(entry_ts_values) if entry_ts_values else now_ts()
+            self.position_entry_price[product_id] = float(weighted_entry)
+            self.last_buy_ts[product_id] = self.position_start_ts[product_id] or now_ts()
+            self.last_buy_price[product_id] = float(weighted_entry)
+            self.anchor_ts[product_id] = self.position_start_ts[product_id] or now_ts()
             self.peak_bid[product_id] = float(tob.bid)
+            recovered_from_csv = any(bool((lot.meta if isinstance(lot.meta, dict) else {}).get("recovered_from_trades_csv")) for lot in recovered_lots)
+            log(f"[startup-adopt] adopted {product_id} qty={float(qty):.12f} avg_entry={float(weighted_entry):.8f} recovered_from_trades_csv={recovered_from_csv} entry_ts={float(self.position_start_ts[product_id] or 0.0):.6f}")
             adopted += 1
 
         log(f"[startup] adopted {adopted} existing Coinbase holdings as managed positions")
@@ -9931,15 +10141,33 @@ class TradingBot:
 
         mode = str(LIVE_STARTUP_MODE).upper().strip()
 
-        if mode == "LIQUIDATE_EXISTING":
+        if mode == "AUTO_CSV_AWARE":
+            if bool(self.startup_had_existing_runtime_state):
+                log(
+                    "[startup] AUTO_CSV_AWARE found meaningful existing CSV state; "
+                    "adopting Coinbase holdings for Level 8 sell-council management"
+                )
+                await self._adopt_existing_coinbase_holdings()
+            else:
+                log(
+                    "[startup] AUTO_CSV_AWARE found no meaningful existing CSV state; "
+                    "liquidating existing Coinbase holdings to cash"
+                )
+                await self._liquidate_existing_coinbase_holdings()
+
+        elif mode == "LIQUIDATE_EXISTING":
             await self._liquidate_existing_coinbase_holdings()
+
         elif mode == "ADOPT_EXISTING":
             await self._adopt_existing_coinbase_holdings()
+
         elif mode == "IGNORE_EXISTING":
             log("[startup] ignoring existing holdings for management, but still using Coinbase for cash/equity")
+
         else:
             raise RuntimeError(
-                "Invalid LIVE_STARTUP_MODE. Use 'LIQUIDATE_EXISTING', 'ADOPT_EXISTING', or 'IGNORE_EXISTING'."
+                "Invalid LIVE_STARTUP_MODE. Use 'AUTO_CSV_AWARE', 'LIQUIDATE_EXISTING', "
+                "'ADOPT_EXISTING', or 'IGNORE_EXISTING'."
             )
 
     async def run(self) -> None:

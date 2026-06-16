@@ -271,17 +271,33 @@ LEVEL8_ALLOW_CORE_BUCKET_LIVE_TRADES: bool = True
 # Level 8 can still learn from weak ideas, but weak ideas become SHADOW.
 # Live buys require stronger evidence because real Coinbase fees are expensive.
 LEVEL8_ENABLE_LIVE_BUY_QUALITY_GATE: bool = True
+
+# Level 8 must approve by a meaningful margin before real money is used.
 LEVEL8_MIN_LIVE_BUY_MARGIN: float = 0.10
 LEVEL8_MIN_LIVE_BUY_TRUTH: float = 0.55
 LEVEL8_MIN_LIVE_BUY_FINAL_SCORE: float = 0.44
+
+# Projected movement must clear estimated round-trip fee/spread/slippage/adverse-fill cost.
 LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS: float = 85.0
+LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS: float = 25.0
 LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE: float = 80.0
+
+# Raw signal floors prevent Level 8 exploration from live-buying extremely weak setups.
 LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY: float = 0.36
 LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY: float = 22.0
+
+# Spread is still a learning input, but live money should not chase very wide books.
+LEVEL8_MAX_LIVE_BUY_SPREAD_BPS: float = 60.0
+
+# Live buys need stable or improving momentum plus a small real-time upturn.
 LEVEL8_BLOCK_LIVE_BUY_WHILE_MOMENTUM_FALLING: bool = True
 LEVEL8_MIN_MOM1_FOR_LIVE_BUY_BPS: float = -8.0
 LEVEL8_MIN_MOM3_FOR_LIVE_BUY_BPS: float = -18.0
 LEVEL8_MIN_MOM5_FOR_LIVE_BUY_BPS: float = -30.0
+LEVEL8_REQUIRE_REALTIME_UPTURN_CONFIRMATION: bool = True
+LEVEL8_MIN_REALTIME_UPTURN_MOM1_BPS: float = 0.0
+LEVEL8_MIN_REALTIME_UPTURN_MOM3_BPS: float = -4.0
+LEVEL8_MIN_REALTIME_UPTURN_GREEN_CANDLES: int = 1
 
 # ============================================================
 # LEVEL 8 HOLD PLAN / FEE-AWARE SELLING
@@ -7889,8 +7905,10 @@ class TradingBot:
         """
         Convert marginal Level 8 ALLOW_BUY decisions into SHADOW instead of live orders.
 
-        This keeps learning active while preventing weak/expensive setups from becoming
-        immediate real-money fee churn.
+        Live-money rule:
+        - Level 8 remains the strategy authority.
+        - bot.py applies mechanical and quality controls before risking real funds.
+        - Weak but interesting ideas continue through SHADOW and observation learning.
         """
         try:
             product_id = str(candidate.get("product_id", ""))
@@ -7905,42 +7923,133 @@ class TradingBot:
             projected_forward = float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0)
             cost_bps = float(candidate.get("cost_bps", 0.0) or 0.0)
             expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
+            spread_bps = float(candidate.get("spread_bps", 0.0) or 0.0)
 
             projected_net_after_cost = projected_forward - cost_bps
+            min_projected_net = max(
+                float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS),
+                float(LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS),
+            )
 
             if final_buy < float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):
-                return False, f"live_buy_shadowed:final_buy_too_low final={final_buy:.3f} min={float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):.3f}"
+                return False, (
+                    f"live_buy_shadowed:final_buy_too_low "
+                    f"final={final_buy:.3f} "
+                    f"min={float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):.3f}"
+                )
+
             if margin < float(LEVEL8_MIN_LIVE_BUY_MARGIN):
-                return False, f"live_buy_shadowed:margin_too_small margin={margin:.3f} min={float(LEVEL8_MIN_LIVE_BUY_MARGIN):.3f}"
+                return False, (
+                    f"live_buy_shadowed:margin_too_small "
+                    f"margin={margin:.3f} "
+                    f"min={float(LEVEL8_MIN_LIVE_BUY_MARGIN):.3f}"
+                )
+
             if truth < float(LEVEL8_MIN_LIVE_BUY_TRUTH):
-                return False, f"live_buy_shadowed:truth_too_low truth={truth:.3f} min={float(LEVEL8_MIN_LIVE_BUY_TRUTH):.3f}"
-            if projected_net_after_cost < float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS):
+                return False, (
+                    f"live_buy_shadowed:truth_too_low "
+                    f"truth={truth:.3f} "
+                    f"min={float(LEVEL8_MIN_LIVE_BUY_TRUTH):.3f}"
+                )
+
+            if spread_bps > float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):
+                return False, (
+                    f"live_buy_shadowed:spread_too_high "
+                    f"spread={spread_bps:.2f} "
+                    f"max={float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):.2f}"
+                )
+
+            if projected_net_after_cost < min_projected_net:
                 return False, (
                     f"live_buy_shadowed:projected_net_after_cost_too_low "
-                    f"projected_forward={projected_forward:.2f} cost={cost_bps:.2f} "
+                    f"projected_forward={projected_forward:.2f} "
+                    f"round_trip_cost={cost_bps:.2f} "
                     f"net_after_cost={projected_net_after_cost:.2f} "
-                    f"min={float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS):.2f}"
+                    f"min={min_projected_net:.2f}"
                 )
+
             if expected_edge < float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):
-                return False, f"live_buy_shadowed:expected_edge_too_low edge={expected_edge:.2f} min={float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):.2f}"
+                return False, (
+                    f"live_buy_shadowed:expected_edge_too_low "
+                    f"edge={expected_edge:.2f} "
+                    f"min={float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):.2f}"
+                )
+
             if raw_prob < float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY):
-                return False, f"live_buy_shadowed:raw_prob_too_low prob={raw_prob:.3f} min={float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY):.3f}"
+                return False, (
+                    f"live_buy_shadowed:raw_prob_too_low "
+                    f"prob={raw_prob:.3f} "
+                    f"min={float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY):.3f}"
+                )
+
             if raw_score < float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY):
-                return False, f"live_buy_shadowed:raw_score_too_low score={raw_score:.2f} min={float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY):.2f}"
+                return False, (
+                    f"live_buy_shadowed:raw_score_too_low "
+                    f"score={raw_score:.2f} "
+                    f"min={float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY):.2f}"
+                )
+
+            moms = self._entry_momentum_snapshot(product_id)
+            mom1 = float(moms.get("mom1", 0.0))
+            mom3 = float(moms.get("mom3", 0.0))
+            mom5 = float(moms.get("mom5", 0.0))
 
             if bool(LEVEL8_BLOCK_LIVE_BUY_WHILE_MOMENTUM_FALLING):
-                moms = self._entry_momentum_snapshot(product_id)
-                mom1 = float(moms.get("mom1", 0.0))
-                mom3 = float(moms.get("mom3", 0.0))
-                mom5 = float(moms.get("mom5", 0.0))
                 if (
                     mom1 < float(LEVEL8_MIN_MOM1_FOR_LIVE_BUY_BPS)
                     and mom3 < float(LEVEL8_MIN_MOM3_FOR_LIVE_BUY_BPS)
                     and mom5 < float(LEVEL8_MIN_MOM5_FOR_LIVE_BUY_BPS)
                 ):
-                    return False, f"live_buy_shadowed:momentum_falling mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+                    return False, (
+                        f"live_buy_shadowed:momentum_falling "
+                        f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+                    )
 
-            return True, f"live_buy_quality_ok margin={margin:.3f};truth={truth:.3f};net_after_cost={projected_net_after_cost:.2f};edge={expected_edge:.2f}"
+            if bool(LEVEL8_REQUIRE_REALTIME_UPTURN_CONFIRMATION):
+                timing_ok, timing_reason = self._entry_timing_confirmation(
+                    product_id=product_id,
+                    signal=candidate.get("signal"),
+                )
+                green_count = self._recent_green_candle_count(
+                    product_id,
+                    ENTRY_GREEN_CANDLE_LOOKBACK,
+                )
+                realtime_upturn_ok = bool(
+                    mom1 >= float(LEVEL8_MIN_REALTIME_UPTURN_MOM1_BPS)
+                    and (
+                        mom3 >= float(LEVEL8_MIN_REALTIME_UPTURN_MOM3_BPS)
+                        or green_count >= int(LEVEL8_MIN_REALTIME_UPTURN_GREEN_CANDLES)
+                    )
+                )
+
+                candidate["entry_timing_ok"] = bool(timing_ok and realtime_upturn_ok)
+                candidate["entry_timing_reason"] = (
+                    f"{timing_reason};"
+                    f"realtime_upturn_ok={realtime_upturn_ok};"
+                    f"green_count={green_count};"
+                    f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+                )
+
+                if not timing_ok or not realtime_upturn_ok:
+                    return False, (
+                        f"live_buy_shadowed:no_realtime_upturn "
+                        f"timing_ok={timing_ok};"
+                        f"realtime_upturn_ok={realtime_upturn_ok};"
+                        f"{candidate['entry_timing_reason']}"
+                    )
+
+            return True, (
+                f"live_buy_quality_ok "
+                f"margin={margin:.3f};"
+                f"truth={truth:.3f};"
+                f"final_buy={final_buy:.3f};"
+                f"threshold={threshold:.3f};"
+                f"projected_net_after_cost={projected_net_after_cost:.2f};"
+                f"edge={expected_edge:.2f};"
+                f"spread={spread_bps:.2f};"
+                f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+            )
+
         except Exception as exc:
             return False, f"live_buy_shadowed:quality_gate_exception:{exc}"
 
@@ -8104,6 +8213,13 @@ class TradingBot:
                 info["bucket"] = "SHADOW"
                 info["recommended_position_pct"] = 0.0
                 info["reason"] = f"{info.get('reason', '')};{live_quality_reason}"
+
+                self._append_level8_shadow_trade(
+                    candidate=candidate,
+                    level8_info=info,
+                    reason=live_quality_reason,
+                )
+
                 log(f"[level8-live-gate] shadowed {product_id}: {live_quality_reason}")
             else:
                 info["reason"] = f"{info.get('reason', '')};{live_quality_reason}"
@@ -8442,6 +8558,64 @@ class TradingBot:
         except Exception as exc:
             log(f"[level8] decision snapshot write failed: {exc}")
 
+    def _append_level8_shadow_trade(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        level8_info: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        """
+        Write bot-side SHADOW conversions to shadow_trades.csv.
+
+        Level8Council.decide_buy already logs native SHADOW actions.
+        This helper covers the second case: Level 8 said ALLOW_BUY, but bot.py's
+        stricter live-money quality gate converted it to SHADOW.
+        """
+        try:
+            path = os.path.join(BASE_DIR, "shadow_trades.csv")
+            columns = [
+                "ts",
+                "dt_utc",
+                "decision_id",
+                "product_id",
+                "strategy",
+                "shadow_action",
+                "council_buy_score",
+                "buy_threshold",
+                "truth_score",
+                "recommended_position_pct",
+                "reason",
+            ]
+
+            write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+            ts_val = now_ts()
+            dt_utc = datetime.fromtimestamp(ts_val, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+
+            with open(path, "a", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                if write_header:
+                    writer.writerow(columns)
+
+                writer.writerow([
+                    f"{ts_val:.6f}",
+                    dt_utc,
+                    str(level8_info.get("decision_id", "")),
+                    str(candidate.get("product_id", "")),
+                    str(level8_info.get("strategy", candidate.get("manager_strategy", ""))),
+                    "BUY",
+                    f"{float(level8_info.get('final_buy_score', 0.0) or 0.0):.6f}",
+                    f"{float(level8_info.get('buy_threshold', 0.0) or 0.0):.6f}",
+                    f"{float(level8_info.get('truth_score', 0.0) or 0.0):.6f}",
+                    f"{float(level8_info.get('recommended_position_pct', 0.0) or 0.0):.6f}",
+                    str(reason),
+                ])
+
+        except Exception as exc:
+            log(f"[level8-shadow] failed to append bot-side shadow trade: {exc}")
+
     def _level8_build_hold_plan(
         self,
         *,
@@ -8564,13 +8738,37 @@ class TradingBot:
         hard_exit: bool = False,
         hold_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
+        hold_state = dict(hold_state or {})
+        net_after_exit_for_hard_check = float(
+            hold_state.get("net_after_exit_bps", 0.0) or 0.0
+        )
+        hard_stop_for_hard_check = bool(
+            hold_state.get("hard_stop_hit", False)
+            or float(unrealized_bps) <= float(LEVEL8_HARD_STOP_UNREALIZED_BPS)
+        )
+
         if hard_exit:
-            return True, f"level8_hard_exit_bypass;{default_exit_reason}"
+            if hard_stop_for_hard_check:
+                return True, f"level8_hard_stop_exit;{default_exit_reason}"
+
+            if net_after_exit_for_hard_check >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):
+                return True, f"level8_hard_exit_net_profitable;{default_exit_reason}"
+
+            return False, (
+                f"level8_blocked_non_hard_loss_exit "
+                f"net_after_exit_bps={net_after_exit_for_hard_check:.2f};"
+                f"hard_stop_hit={hard_stop_for_hard_check};"
+                f"{default_exit_reason}"
+            )
+
         if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
-            return True, f"level8_disabled;{default_exit_reason}"
+            if net_after_exit_for_hard_check >= float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):
+                return True, f"level8_disabled_but_net_profitable;{default_exit_reason}"
+            if hard_stop_for_hard_check:
+                return True, f"level8_disabled_but_hard_stop;{default_exit_reason}"
+            return False, f"level8_disabled_hold_not_net_profitable;{default_exit_reason}"
 
         try:
-            hold_state = dict(hold_state or {})
             context = {
                 "entry_price": float(entry_price),
                 "current_price": float(current_price),
@@ -8587,6 +8785,7 @@ class TradingBot:
                 "early_profit_ok": bool(hold_state.get("early_profit_ok", False)),
                 "net_after_exit_bps": float(hold_state.get("net_after_exit_bps", 0.0) or 0.0),
                 "exit_cost_bps": float(hold_state.get("exit_cost_bps", 0.0) or 0.0),
+                "min_net_after_exit_bps": float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL),
             }
             if hasattr(self.level8_council, "decide_exit"):
                 decision = self.level8_council.decide_exit(
@@ -8656,12 +8855,7 @@ class TradingBot:
             except Exception as exc:
                 log(f"[level8] sell council snapshot write failed {product_id}: {exc}")
 
-            if final_sell_score >= sell_threshold:
-                action = "ALLOW_SELL"
-            elif abs(float(unrealized_bps)) >= 90.0 and final_sell_score >= sell_threshold - 0.08:
-                action = "ALLOW_SELL"
-            else:
-                action = "HOLD"
+            action = str(decision.get("action", "HOLD")).upper()
         else:
             final_sell_score = float(decision.final_sell_score)
             sell_threshold = float(decision.sell_threshold)
@@ -8686,10 +8880,18 @@ class TradingBot:
                     f"{reason};{default_exit_reason}"
                 )
 
+            if not hard_stop_hit and net_after_exit_bps < 0.0:
+                return False, (
+                    f"level8_hold:block_negative_net_exit_without_hard_stop "
+                    f"net_after_exit_bps={net_after_exit_bps:.2f};"
+                    f"hard_stop_hit={hard_stop_hit};"
+                    f"hold_seconds={hold_seconds:.1f};"
+                    f"{reason};{default_exit_reason}"
+                )
+
             if (
                 not hard_stop_hit
                 and not early_profit_ok
-                and not max_hold_elapsed
                 and net_after_exit_bps < float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL)
             ):
                 return False, (
@@ -8697,6 +8899,7 @@ class TradingBot:
                     f"net_after_exit_bps={net_after_exit_bps:.2f};"
                     f"min_required={float(LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL):.2f};"
                     f"hold_seconds={hold_seconds:.1f};"
+                    f"max_hold_elapsed={max_hold_elapsed};"
                     f"{reason};{default_exit_reason}"
                 )
 
@@ -8985,81 +9188,74 @@ class TradingBot:
         reason: str,
         execution_mode: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
-        """Execute a live buy and return only a Coinbase-confirmed fill."""
-        # Force all live buys to MARKET. The council decides timing; Coinbase executes immediately.
+        """
+        Execute a live MARKET buy and return only a Coinbase-confirmed fill.
+
+        Market-only rule:
+        - Level 8 decides whether the timing is good enough.
+        - This function only submits an immediate Coinbase MARKET buy.
+        - Logs must distinguish raw market fill price from all-in fee-adjusted entry basis.
+        """
         mode = "MARKET"
         result = None
 
         try:
-            if mode == "MARKET":
-                result = await self._live_buy_market(product_id=product_id, quote_usd=quote_usd)
-            elif mode == "MAKER":
-                result = await self._live_buy_maker(product_id=product_id, quote_usd=quote_usd, bid=bid)
-            elif mode == "LIMIT_THEN_MARKET":
-                result = await self._live_buy_maker(
-                    product_id=product_id,
-                    quote_usd=quote_usd,
-                    bid=bid,
-                )
+            result = await self._live_buy_market(
+                product_id=product_id,
+                quote_usd=float(quote_usd),
+            )
 
-                fill = self._require_live_fill(
-                    result, product_id=product_id, side="BUY"
-                )
+            self.last_buy_execution_result[product_id] = (
+                dict(result) if isinstance(result, dict) else {}
+            )
 
-                if LOG_ORDER_ATTEMPTS:
-                    self.olog.log_order(
-                        event="BUY_ATTEMPT",
-                        product_id=product_id,
-                        side="BUY",
-                        mode="MAKER_FIRST",
-                        requested_quote_usd=quote_usd,
-                        result=result,
-                        reason=reason,
-                    )
+            fill = self._require_live_fill(
+                result,
+                product_id=product_id,
+                side="BUY",
+            )
 
-                if fill is not None:
-                    self.last_buy_execution_result[product_id] = (
-                        dict(result) if isinstance(result, dict) else {}
-                    )
-                    return fill
-
-                maker_error = ""
-                try:
-                    if isinstance(result, dict):
-                        maker_error = str(
-                            result.get("error") or result.get("status") or ""
-                        )
-                except Exception:
-                    maker_error = ""
-
-                log(
-                    f"[buy-fallback] {product_id} maker did not fill; "
-                    f"maker_error={maker_error}; falling back to market"
-                )
-
-                result = await self._live_buy_market(
-                    product_id=product_id, quote_usd=quote_usd
-                )
-            else:
-                raise RuntimeError(f"Invalid live buy execution mode={mode}")
-
-            self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
-            fill = self._require_live_fill(result, product_id=product_id, side="BUY")
             if LOG_ORDER_ATTEMPTS:
                 self.olog.log_order(
-                    event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode,
-                    requested_quote_usd=quote_usd, result=result, reason=reason,
+                    event="BUY_ATTEMPT",
+                    product_id=product_id,
+                    side="BUY",
+                    mode=mode,
+                    requested_quote_usd=float(quote_usd),
+                    result=result,
+                    reason=(
+                        f"market_only_live_buy;"
+                        f"requested_quote_usd={float(quote_usd):.6f};"
+                        f"bid_snapshot={float(bid):.8f};"
+                        f"ask_snapshot={float(ask):.8f};"
+                        f"{reason}"
+                    ),
                 )
+
             return fill
 
         except Exception as e:
-            self.last_buy_execution_result[product_id] = {"error": str(e), "status": "EXCEPTION"}
+            self.last_buy_execution_result[product_id] = {
+                "error": str(e),
+                "status": "EXCEPTION",
+            }
+
             if LOG_ORDER_ATTEMPTS:
                 self.olog.log_order(
-                    event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode,
-                    requested_quote_usd=quote_usd, result=result, reason=reason, raw_error=str(e),
+                    event="BUY_ATTEMPT",
+                    product_id=product_id,
+                    side="BUY",
+                    mode=mode,
+                    requested_quote_usd=float(quote_usd),
+                    result=result,
+                    reason=reason,
+                    raw_error=str(e),
                 )
-            log(f"[buy-error] {product_id} mode={mode} quote=${quote_usd:.2f}: {e}")
+
+            log(
+                f"[buy-error] {product_id} mode={mode} "
+                f"quote=${float(quote_usd):.2f}: {e}"
+            )
             return None
 
     async def _execute_live_sell(
@@ -9072,69 +9268,72 @@ class TradingBot:
         reason: str,
         mode_override: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
-        """Execute a live sell and return only a Coinbase-confirmed fill."""
-        # Force all live sells to MARKET. The council decides timing; Coinbase executes immediately.
+        """
+        Execute a live MARKET sell and return only a Coinbase-confirmed fill.
+
+        Market-only rule:
+        - Level 8 decides whether selling is allowed.
+        - This function only submits an immediate Coinbase MARKET sell.
+        """
         mode = "MARKET"
         result = None
+
         log(
             f"[sell-attempt] {product_id} mode={mode} "
-            f"qty={base_qty:.12f} reason={reason}"
+            f"qty={float(base_qty):.12f} "
+            f"bid_snapshot={float(bid):.8f} "
+            f"ask_snapshot={float(ask):.8f} "
+            f"reason={reason}"
         )
 
         try:
-            if mode == "MARKET":
-                result = await self._live_sell_market(product_id=product_id, base_qty=base_qty)
-            elif mode == "MAKER":
-                result = await self._live_sell_maker(product_id=product_id, base_qty=base_qty, ask=ask)
-            elif mode == "LIMIT_THEN_MARKET":
-                result = await self._live_sell_maker(product_id=product_id, base_qty=base_qty, ask=ask)
-                fill = self._require_live_fill(result, product_id=product_id, side="SELL")
+            result = await self._live_sell_market(
+                product_id=product_id,
+                base_qty=float(base_qty),
+            )
 
-                if LOG_ORDER_ATTEMPTS:
-                    self.olog.log_order(
-                        event="SELL_ATTEMPT",
-                        product_id=product_id,
-                        side="SELL",
-                        mode="MAKER_FIRST",
-                        requested_base_qty=base_qty,
-                        result=result,
-                        reason=reason,
-                    )
+            fill = self._require_live_fill(
+                result,
+                product_id=product_id,
+                side="SELL",
+            )
 
-                if fill is not None:
-                    return fill
-
-                maker_error = ""
-                try:
-                    if isinstance(result, dict):
-                        maker_error = str(result.get("error") or result.get("status") or "")
-                except Exception:
-                    maker_error = ""
-
-                log(
-                    f"[sell-fallback] {product_id} maker did not fill; "
-                    f"maker_error={maker_error}; falling back to market"
-                )
-
-                result = await self._live_sell_market(product_id=product_id, base_qty=base_qty)
-            else:
-                raise RuntimeError(f"Invalid live sell execution mode={mode}")
-
-            fill = self._require_live_fill(result, product_id=product_id, side="SELL")
             if LOG_ORDER_ATTEMPTS:
                 self.olog.log_order(
-                    event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode,
-                    requested_base_qty=base_qty, result=result, reason=reason,
+                    event="SELL_ATTEMPT",
+                    product_id=product_id,
+                    side="SELL",
+                    mode=mode,
+                    requested_base_qty=float(base_qty),
+                    result=result,
+                    reason=(
+                        f"market_only_live_sell;"
+                        f"requested_base_qty={float(base_qty):.12f};"
+                        f"bid_snapshot={float(bid):.8f};"
+                        f"ask_snapshot={float(ask):.8f};"
+                        f"{reason}"
+                    ),
                 )
+
             return fill
 
         except Exception as e:
             if LOG_ORDER_ATTEMPTS:
                 self.olog.log_order(
-                    event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode,
-                    requested_base_qty=base_qty, result=result, reason=reason, raw_error=str(e),
+                    event="SELL_ATTEMPT",
+                    product_id=product_id,
+                    side="SELL",
+                    mode=mode,
+                    requested_base_qty=float(base_qty),
+                    result=result,
+                    reason=reason,
+                    raw_error=str(e),
                 )
-            log(f"[sell-error] {product_id} mode={mode} qty={base_qty:.12f}: {e}")
+
+            log(
+                f"[sell-error] {product_id} mode={mode} "
+                f"qty={float(base_qty):.12f}: {e}"
+            )
             return None
 
 

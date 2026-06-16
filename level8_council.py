@@ -1177,6 +1177,9 @@ class Level8Council:
         hard_stop_hit = bool(context.get("hard_stop_hit", False))
         early_profit_ok = bool(context.get("early_profit_ok", False))
         net_after_exit_bps = float(context.get("net_after_exit_bps", 0.0) or 0.0)
+        min_net_after_exit_bps = float(
+            context.get("min_net_after_exit_bps", 0.0) or 0.0
+        )
 
         # Profit capture only becomes strong when the exit is actually net-profitable.
         profit_capture = clamp(
@@ -1313,9 +1316,17 @@ class Level8Council:
 
         if hard_stop_hit:
             action = "ALLOW_SELL"
-        elif early_profit_ok and final_sell >= sell_threshold:
+        elif (
+            early_profit_ok
+            and final_sell >= sell_threshold
+            and net_after_exit_bps >= min_net_after_exit_bps
+        ):
             action = "ALLOW_SELL"
-        elif max_hold_elapsed and final_sell >= sell_threshold and net_after_exit_bps >= 0.0:
+        elif (
+            max_hold_elapsed
+            and final_sell >= sell_threshold
+            and net_after_exit_bps >= min_net_after_exit_bps
+        ):
             action = "ALLOW_SELL"
         else:
             action = "HOLD"
@@ -1341,6 +1352,7 @@ class Level8Council:
                 f"target_hold_elapsed={target_hold_elapsed};"
                 f"max_hold_elapsed={max_hold_elapsed};"
                 f"net_after_exit_bps={net_after_exit_bps:.2f};"
+                f"min_net_after_exit_bps={min_net_after_exit_bps:.2f};"
                 f"hard_stop_hit={hard_stop_hit}"
             ),
         }

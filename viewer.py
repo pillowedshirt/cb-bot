@@ -314,7 +314,7 @@ def render_confirmed_trades(trades: pd.DataFrame) -> None:
 
 def render_coin_analytics(coin: Dict[str, Any]) -> None:
     st.markdown('<div class="panel-card"><div class="section-title">Selected Coin Analytics</div></div>', unsafe_allow_html=True)
-    rows = [[("Truth Score", "truth_score", ".3f"), ("Final Buy Score", "final_buy_score", ".3f"), ("Buy Threshold", "buy_threshold", ".3f"), ("Sell Threshold", "sell_threshold", ".3f")], [("Expected Utility (bps)", "expected_utility_bps", ".2f"), ("Buy vs Wait (bps)", "buy_vs_wait_edge_bps", ".2f"), ("POC Distance (bps)", "poc_distance_bps", ".2f"), ("Peak Unrealized (bps)", "peak_unrealized_bps", ".2f")]]
+    rows = [[("Truth Score", "truth_score", ".3f"), ("Final Buy Score", "final_buy_score", ".3f"), ("Buy Threshold", "buy_threshold", ".3f"), ("Sell Threshold", "sell_threshold", ".3f")], [("Expected Utility (bps)", "expected_utility_bps", ".2f"), ("Buy vs Wait (bps)", "buy_vs_wait_edge_bps", ".2f"), ("POC Distance (bps)", "poc_distance_bps", ".2f"), ("Peak Unrealized (bps)", "peak_unrealized_bps", ".2f")], [("OB Imbalance", "order_book_imbalance", ".3f"), ("OB Top Depth ($)", "order_book_top_depth_usd", ".0f"), ("Spread Instability", "spread_instability_bps", ".2f"), ("Liquidity Risk", "liquidity_risk_score", ".3f")]]
     for row in rows:
         cols = st.columns(4)
         for col, (label, key, fmt) in zip(cols, row):
@@ -324,6 +324,7 @@ def render_coin_analytics(coin: Dict[str, Any]) -> None:
     cols[1].metric("Volume Node", str(coin.get("volume_node_state", "")) or "—")
     cols[2].metric("Low Volume Path Up (bps)", f"{_safe_float(coin.get('low_volume_path_up_bps')):.2f}")
     cols[3].metric("Low Volume Path Down (bps)", f"{_safe_float(coin.get('low_volume_path_down_bps')):.2f}")
+    st.caption(str(coin.get("order_book_reason", ""))[:260] or "Order-book context pending.")
 
 
 def render_agent_statements(votes_df: pd.DataFrame, selected_coin: str) -> None:

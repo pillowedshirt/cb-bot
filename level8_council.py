@@ -28,44 +28,114 @@ LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 # These are starting weights only. Live outcomes, sell outcomes, SHADOW outcomes,
 # and backtest priors still adapt these over time.
 INITIAL_AGENT_RELIABILITY_PRIORS = {
-    "truth": 1.25,
-    "setup_performance_agent": 1.22,
-    "product_health": 1.12,
-    "execution": 1.12,
-    "risk": 1.10,
-    "market_structure_agent": 1.14,
-    "validated_liquidity_agent": 1.12,
-    "candle_context_agent": 1.10,
-    "candle_sequence_agent": 1.08,
-    "volume_profile_agent": 1.12,
+    # Core truth / economic authorities.
+    "truth": 1.24,
+    "exit_truth": 1.24,
+    "utility_leader": 1.24,
+    "sell_utility_leader": 1.22,
+    "setup_performance_agent": 1.14,
+    # Execution / risk authorities.
+    "product_health": 1.10,
+    "execution": 1.10,
+    "risk": 1.12,
+    "fee_recovery": 1.16,
+    "drawdown_exit": 1.18,
+    # Primary market map.
     "volume_profile_leader": 1.35,
-    "volume_profile_leader_exit": 1.28,
-    "previous_session_volume_profile_agent": 1.24,
+    "volume_profile_leader_exit": 1.30,
+    "volume_profile_agent": 1.05,
+    "volume_profile_harvest": 1.06,
+    # Institutional/session memory.
+    "previous_session_volume_profile_agent": 1.22,
     "previous_session_profile_exit": 1.18,
-    "quant_boundary_agent": 1.12,
-    "quant_boundary_exit": 1.10,
-    "fair_value_gap_agent": 1.02,
-    "fresh_zone_retest_agent": 1.02,
-    "trend": 1.00,
-    "mean_reversion": 0.94,
-    "breakout": 0.94,
-    "ai_outcome": 0.92,
-    "smt_divergence_agent": 0.88,
     "previous_session_profile_agent": 1.08,
-    "exploration": 0.35,
-    "profit_capture": 1.16,
-    "peak_capture": 1.18,
+    # Quant/statistical reality check.
+    # Starts useful, but below volume until it proves live edge.
+    "quant_boundary_agent": 1.08,
+    "quant_boundary_exit": 1.08,
+    "ai_outcome": 0.92,
+    # Session / structure / liquidity confirmation.
+    "market_structure_agent": 1.10,
+    "validated_liquidity_agent": 1.08,
+    "candle_context_agent": 1.04,
+    "candle_sequence_agent": 0.98,
+    "candle_exhaustion_sell": 1.12,
+    "fresh_zone_retest_agent": 1.00,
+    "fair_value_gap_agent": 1.00,
+    "fvg_reclaim_rejection_exit": 1.04,
+    # Cross-asset context.
+    "smt_divergence_agent": 0.88,
+    "smt_divergence_exit": 0.92,
+    # Exit mechanics.
+    "profit_capture": 1.18,
+    "peak_capture": 1.20,
     "momentum_fade": 1.12,
     "continuation_hold": 1.10,
     "harvest_sizing": 1.12,
-    "fee_recovery": 1.16,
-    "drawdown_exit": 1.18,
-    "exit_truth": 1.22,
-    "candle_exhaustion_sell": 1.12,
-    "volume_profile_harvest": 1.08,
-    "fvg_reclaim_rejection_exit": 1.04,
-    "smt_divergence_exit": 0.92,
+    "spike_profit_protection": 1.22,
+    # Older generic modes remain low until proven.
+    "trend": 0.96,
+    "mean_reversion": 0.92,
+    "breakout": 0.92,
+    "exploration": 0.28,
 }
+
+# ============================================================
+# AGENT PRIORITY / REDUNDANCY POLICY
+# ============================================================
+AGENT_SHRINKAGE_TARGET_N: float = 80.0
+AGENT_STRONG_SAMPLE_N: float = 150.0
+AGENT_UNPROVEN_MAX_DIRECTIONAL_ADJ: float = 0.07
+AGENT_PROVEN_MAX_DIRECTIONAL_ADJ: float = 0.24
+
+BUY_REDUNDANCY_GROUP_CAPS = {
+    "economics": 0.30, "volume": 0.34, "previous_session": 0.18,
+    "quant": 0.16, "price_action": 0.20, "session_liquidity": 0.18,
+    "cross_asset": 0.10, "risk_execution": 0.22, "learning": 0.20,
+    "other": 0.16,
+}
+SELL_REDUNDANCY_GROUP_CAPS = {
+    "economics": 0.30, "volume": 0.30, "previous_session": 0.18,
+    "quant": 0.18, "price_action": 0.22, "session_liquidity": 0.16,
+    "cross_asset": 0.10, "risk_execution": 0.24, "profit_capture": 0.36,
+    "learning": 0.18, "other": 0.16,
+}
+
+
+def agent_redundancy_group(agent: str) -> str:
+    """Return the evidence family for redundancy control."""
+    text = str(agent or "").lower()
+    if text in {"truth", "exit_truth", "utility_leader", "sell_utility_leader"}:
+        return "economics"
+    if "volume_profile" in text or text in {"volume_profile_agent", "volume_profile_harvest"}:
+        return "volume"
+    if "previous_session" in text or "prior_session" in text:
+        return "previous_session"
+    if "quant" in text or "stationarity" in text or "forecast" in text:
+        return "quant"
+    if ("candle" in text or "structure" in text or "liquidity_agent" in text or "fresh_zone" in text or "fair_value_gap" in text or "fvg" in text):
+        return "price_action"
+    if "session" in text or "sweep" in text or "breakout_continuation" in text:
+        return "session_liquidity"
+    if "smt" in text or "peer" in text or "relative" in text:
+        return "cross_asset"
+    if text in {"risk", "execution", "product_health", "fee_recovery", "drawdown_exit"}:
+        return "risk_execution"
+    if text in {"profit_capture", "peak_capture", "momentum_fade", "continuation_hold", "harvest_sizing", "spike_profit_protection"}:
+        return "profit_capture"
+    if "setup_performance" in text or "ai" in text or "learning" in text:
+        return "learning"
+    return "other"
+
+
+def dominant_vote_direction(vote: Dict[str, Any]) -> str:
+    values = {
+        "buy": float(vote.get("buy", vote.get("raw_buy_score", 0.0)) or 0.0),
+        "sell": float(vote.get("sell", vote.get("raw_sell_score", 0.0)) or 0.0),
+        "hold": float(vote.get("hold", vote.get("raw_hold_score", 0.0)) or 0.0),
+        "wait": float(vote.get("wait", vote.get("raw_wait_score", 0.0)) or 0.0),
+    }
+    return max(values, key=values.get)
 
 
 def initial_agent_reliability_prior(agent: str) -> float:
@@ -891,7 +961,10 @@ class Level8Council:
             recent_win_rate = float((pnl > 0.0).mean())
 
         n = float(agent_stats.get("n", 0.0))
-        sample_factor = clamp(n / 12.0, 0.0, 1.0)
+        # Bayesian-style shrinkage: tiny samples barely adjust weights, while
+        # large samples can earn real authority.
+        sample_factor = clamp(n / float(AGENT_SHRINKAGE_TARGET_N), 0.0, 1.0)
+        strong_sample_factor = clamp(n / float(AGENT_STRONG_SAMPLE_N), 0.0, 1.0)
         agent_credit = float(agent_stats.get("weighted_credit", agent_stats.get("avg_credit", 0.5)))
         product_win_rate = float(product_stats.get("win_rate", 0.5))
         strategy_win_rate = float(strategy_stats.get("win_rate", 0.5))
@@ -904,12 +977,18 @@ class Level8Council:
         product_adj = clamp(product_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         strategy_adj = clamp(strategy_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         recent_adj = clamp(recent_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
-        directional = clamp(product_adj + strategy_adj + recent_adj + leader_bonus - leader_penalty, -self.max_agent_adjustment, self.max_agent_adjustment)
+        raw_directional = product_adj + strategy_adj + recent_adj + leader_bonus - leader_penalty
+        dynamic_directional_cap = (
+            float(AGENT_UNPROVEN_MAX_DIRECTIONAL_ADJ) * (1.0 - strong_sample_factor)
+            + float(AGENT_PROVEN_MAX_DIRECTIONAL_ADJ) * strong_sample_factor
+        )
+        directional = clamp(raw_directional, -dynamic_directional_cap, dynamic_directional_cap)
         initial_prior = initial_agent_reliability_prior(agent)
+        # Reliability starts near the prior, but outcome credit is shrunk toward
+        # neutral until the agent has enough samples.
         base_reliability = (
-            0.80
-            * float(initial_prior)
-            + (agent_credit - 0.5) * 1.35 * sample_factor
+            0.86 * float(initial_prior)
+            + (agent_credit - 0.5) * 1.05 * sample_factor
         )
         reliability = clamp(base_reliability + leader_bonus - leader_penalty, self.min_agent_reliability, self.max_agent_reliability)
 
@@ -946,7 +1025,10 @@ class Level8Council:
                     "leader_bonus": f"{leader_bonus:.6f}",
                     "leader_penalty": f"{leader_penalty:.6f}",
                     "reason": (
-                        f"agent={agent};competitive_goal=highest_weight;initial_prior={initial_prior:.3f};credit={agent_credit:.3f};"
+                        f"agent={agent};competitive_goal=profit_weighted_shrunk_reliability;"
+                        f"initial_prior={initial_prior:.3f};credit={agent_credit:.3f};"
+                        f"n={n:.0f};sample_factor={sample_factor:.3f};"
+                        f"directional_cap={dynamic_directional_cap:.3f};"
                         f"leader_rank={float(competition.get('leaderboard_rank', 999.0)):.0f};"
                         f"leader_score={float(competition.get('leaderboard_score', 0.5)):.3f};"
                         f"bonus={leader_bonus:.3f};penalty={leader_penalty:.3f}"
@@ -985,10 +1067,50 @@ class Level8Council:
         raw_hold = float(vote.get("hold", 0.0) or 0.0)
         raw_wait = float(vote.get("wait", 0.0) or 0.0)
 
-        buy = clamp(raw_buy + directional_adj, 0.0, 1.0)
-        sell = clamp(raw_sell + directional_adj, 0.0, 1.0)
-        hold = clamp(raw_hold + directional_adj * 0.25, 0.0, 1.0)
-        wait = clamp(raw_wait - directional_adj * 0.75, 0.0, 1.0)
+        # Direction-specific adjustment: boost the agent's dominant direction
+        # instead of raising buy and sell together.
+        dominant = dominant_vote_direction({
+            "buy": raw_buy, "sell": raw_sell, "hold": raw_hold, "wait": raw_wait,
+        })
+        buy = raw_buy
+        sell = raw_sell
+        hold = raw_hold
+        wait = raw_wait
+        if directional_adj >= 0:
+            if dominant == "buy":
+                buy += directional_adj
+                sell -= directional_adj * 0.35
+                wait -= directional_adj * 0.25
+            elif dominant == "sell":
+                sell += directional_adj
+                buy -= directional_adj * 0.35
+                hold -= directional_adj * 0.15
+            elif dominant == "hold":
+                hold += directional_adj * 0.70
+                sell -= directional_adj * 0.20
+                buy -= directional_adj * 0.10
+            else:
+                wait += directional_adj * 0.65
+                buy -= directional_adj * 0.20
+                sell -= directional_adj * 0.20
+        else:
+            penalty = abs(directional_adj)
+            if dominant == "buy":
+                buy -= penalty
+                wait += penalty * 0.45
+            elif dominant == "sell":
+                sell -= penalty
+                hold += penalty * 0.35
+                wait += penalty * 0.20
+            elif dominant == "hold":
+                hold -= penalty * 0.75
+                wait += penalty * 0.35
+            else:
+                wait -= penalty * 0.60
+        buy = clamp(buy, 0.0, 1.0)
+        sell = clamp(sell, 0.0, 1.0)
+        hold = clamp(hold, 0.0, 1.0)
+        wait = clamp(wait, 0.0, 1.0)
 
         confidence = clamp(float(vote.get("confidence", 0.5) or 0.5), 0.0, 1.0)
         reliability = float(adjustments["reliability"])
@@ -1113,6 +1235,34 @@ class Level8Council:
             "missed_opportunity_relief": missed_relief,
         }
 
+    def _weighted_vote_pairs(
+        self,
+        adjusted_votes: list[AgentVote],
+        *,
+        decision_side: str,
+    ) -> list[tuple[AgentVote, float]]:
+        """Return vote weights after redundancy-group caps."""
+        raw_pairs: list[tuple[AgentVote, float, str]] = []
+        for vote in adjusted_votes:
+            raw_weight = max(0.0, float(vote.confidence) * float(vote.reliability))
+            group = agent_redundancy_group(vote.agent)
+            raw_pairs.append((vote, raw_weight, group))
+
+        total_weight = sum(weight for _, weight, _ in raw_pairs) or 1.0
+        group_totals: Dict[str, float] = {}
+        for _, weight, group in raw_pairs:
+            group_totals[group] = group_totals.get(group, 0.0) + weight
+
+        caps = BUY_REDUNDANCY_GROUP_CAPS if str(decision_side).upper() == "BUY" else SELL_REDUNDANCY_GROUP_CAPS
+        final_pairs: list[tuple[AgentVote, float]] = []
+        for vote, weight, group in raw_pairs:
+            group_cap_fraction = float(caps.get(group, caps.get("other", 0.16)))
+            group_cap_abs = group_cap_fraction * total_weight
+            group_total = max(group_totals.get(group, 0.0), 1e-12)
+            scale = min(1.0, group_cap_abs / group_total)
+            final_pairs.append((vote, weight * scale))
+        return final_pairs
+
     def decide_buy(
         self,
         product_id: str,
@@ -1124,10 +1274,7 @@ class Level8Council:
         decision_id = f"l8buy-{product_id}-{int(utc_ts())}-{uuid.uuid4().hex[:8]}"
         adjusted = [self._adjust_vote(vote, product_id, strategy) for vote in votes]
         adjusted_truth = self._adjust_vote(truth_vote, product_id, strategy)
-        weighted = [
-            (vote, max(0.0, vote.confidence * vote.reliability))
-            for vote in adjusted
-        ]
+        weighted = self._weighted_vote_pairs(adjusted, decision_side="BUY")
         weight_total = sum(weight for _, weight in weighted) or 1.0
         combined = {
             "adj_buy": sum(v.adjusted_buy_score * w for v, w in weighted) / weight_total,
@@ -1564,7 +1711,7 @@ class Level8Council:
 
         adjusted = [self._adjust_vote(vote, product_id, "EXIT_REVIEW") for vote in votes]
         adjusted_truth = self._adjust_vote(truth_vote, product_id, "EXIT_REVIEW")
-        weighted = [(vote, max(0.0, vote.confidence * vote.reliability)) for vote in adjusted]
+        weighted = self._weighted_vote_pairs(adjusted, decision_side="SELL")
         weight_total = sum(weight for _, weight in weighted) or 1.0
         final_sell = clamp(sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total, 0.0, 1.0)
         final_hold = clamp(sum(v.adjusted_hold_score * w for v, w in weighted) / weight_total, 0.0, 1.0)

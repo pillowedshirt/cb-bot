@@ -135,6 +135,7 @@ TRADES_CSV_PATH: str = os.path.join(BASE_DIR, "trades.csv")
 ORDERS_CSV_PATH: str = os.path.join(BASE_DIR, "orders.csv")
 MARKET_CSV_PATH: str = os.path.join(BASE_DIR, "market.csv")
 VIEWER_SNAPSHOT_PATH: str = os.path.join(BASE_DIR, "viewer_snapshot.json")
+VIEWER_SNAPSHOT_JSON: str = VIEWER_SNAPSHOT_PATH
 VIEWER_SNAPSHOT_WRITE_EVERY_SEC: float = 2.0
 MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
@@ -1495,9 +1496,16 @@ def _viewer_safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None:
             return float(default)
-        return float(v)
+        out = float(v)
+        if not math.isfinite(out):
+            return float(default)
+        return out
     except Exception:
         return float(default)
+
+
+def _json_safe_float(value: Any, default: float = 0.0) -> float:
+    return _viewer_safe_float(value, default)
 
 
 def candidate_rank_score(candidate: Dict[str, Any]) -> float:
@@ -5455,6 +5463,7 @@ class TradingBot:
             f"{self.startup_had_existing_runtime_state}"
         )
         self._last_viewer_snapshot_write_ts: float = 0.0
+        self._latest_viewer_snapshot_rows: Dict[str, Dict[str, Any]] = {}
         # top of book per product
         self.tob: Dict[str, Optional[TopOfBook]] = {p: None for p in PRODUCTS}
         # Rolling mid price series per product
@@ -17001,6 +17010,46 @@ class TradingBot:
             "selected_target_stop_price": _viewer_safe_float(candidate.get("target_stop_price", 0.0)),
         }
 
+    def _build_viewer_snapshot_row(
+        self,
+        *,
+        product_id: str,
+        candidate: Optional[Dict[str, Any]] = None,
+        live_signal: Any = None,
+    ) -> Dict[str, Any]:
+        row = self._build_viewer_coin_snapshot(
+            product_id=product_id,
+            candidate=candidate,
+            live_signal=live_signal,
+        )
+        candidate = dict(candidate or {})
+        row.update({
+            "volume_profile_leader_buy_score": _json_safe_float(
+                candidate.get("volume_profile_leader_buy_score", row.get("leader_buy_score", 0.0))
+            ),
+            "volume_profile_leader_sell_score": _json_safe_float(
+                candidate.get("volume_profile_leader_sell_score", row.get("leader_sell_score", 0.0))
+            ),
+            "volume_profile_leader_hold_score": _json_safe_float(
+                candidate.get("volume_profile_leader_hold_score", row.get("leader_hold_score", 0.50))
+            ),
+            "volume_profile_leader_wait_score": _json_safe_float(
+                candidate.get("volume_profile_leader_wait_score", row.get("leader_wait_score", 0.50))
+            ),
+            "volume_profile_leader_confidence": _json_safe_float(
+                candidate.get("volume_profile_leader_confidence", row.get("leader_confidence", 0.10))
+            ),
+            "calibrated_p_win": _json_safe_float(candidate.get("calibrated_p_win", 0.50)),
+            "payoff_ratio": _json_safe_float(candidate.get("payoff_ratio", 0.0)),
+            "pullback_from_peak_bps": _json_safe_float(candidate.get("pullback_from_peak_bps", 0.0)),
+            "unfair_trade_score": _json_safe_float(candidate.get("unfair_trade_score", 0.0)),
+            "volume_profile_utility_adjust_bps": _json_safe_float(
+                candidate.get("volume_profile_utility_adjust_bps", 0.0)
+            ),
+            "volume_profile_utility_reason": str(candidate.get("volume_profile_utility_reason", "")),
+        })
+        return row
+
     def _write_viewer_snapshot(self, snapshot: Dict[str, Any]) -> None:
         try:
             tmp_path = VIEWER_SNAPSHOT_PATH + ".tmp"
@@ -17020,13 +17069,14 @@ class TradingBot:
                 product_id = str(candidate.get("product_id", "") or "")
                 if not product_id:
                     continue
-                coins[product_id] = self._build_viewer_coin_snapshot(product_id=product_id, candidate=candidate)
+                coins[product_id] = self._build_viewer_snapshot_row(product_id=product_id, candidate=candidate)
+            self._latest_viewer_snapshot_rows = dict(coins)
             ranked = sorted(
                 list(coins.values()),
                 key=lambda x: (
-                    _viewer_safe_float(x.get("leader_buy_score", 0.0)),
-                    _viewer_safe_float(x.get("truth_score", 0.0)),
                     _viewer_safe_float(x.get("expected_utility_bps", 0.0)),
+                    _viewer_safe_float(x.get("truth_score", 0.0)),
+                    _viewer_safe_float(x.get("volume_profile_leader_buy_score", 0.0)),
                 ),
                 reverse=True,
             )

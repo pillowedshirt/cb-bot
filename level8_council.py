@@ -1555,6 +1555,10 @@ class Level8Council:
         spike_suggested_fraction = float(spike_context.get("suggested_fraction", 0.0) or 0.0)
         spike_reason = str(spike_context.get("reason", "no_spike_profit_protection"))
 
+        sell_quality_context = dict(context.get("sell_quality_context", {}) or {})
+        sell_quality_penalty = float(sell_quality_context.get("sell_quality_penalty", 0.0) or 0.0)
+        sell_quality_reason = str(sell_quality_context.get("reason", ""))
+
         min_partial_fraction = float(context.get("min_partial_sell_fraction", 0.25) or 0.25)
         max_partial_fraction = float(context.get("max_partial_sell_fraction", 1.0) or 1.0)
         peak_capture_trigger_bps = float(context.get("peak_capture_trigger_bps", 45.0) or 45.0)
@@ -1769,7 +1773,12 @@ class Level8Council:
         adjusted_truth = self._adjust_vote(truth_vote, product_id, "EXIT_REVIEW")
         weighted = self._weighted_vote_pairs(adjusted, decision_side="SELL")
         weight_total = sum(weight for _, weight in weighted) or 1.0
-        final_sell = clamp(sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total, 0.0, 1.0)
+        final_sell = clamp(
+            sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total
+            - sell_quality_penalty,
+            0.0,
+            1.0,
+        )
         final_hold = clamp(sum(v.adjusted_hold_score * w for v, w in weighted) / weight_total, 0.0, 1.0)
         truth_score = clamp(adjusted_truth.adjusted_sell_score * 0.55 + adjusted_truth.confidence * 0.25 + adjusted_truth.reliability * 0.20, 0.0, 1.0)
 
@@ -1866,7 +1875,15 @@ class Level8Council:
 
         strong_profit_exception = bool(
             net_after_exit_bps >= min_net_after_exit_bps + 140.0
-            and final_sell >= sell_threshold + 0.08
+            and (
+                final_sell >= sell_threshold + 0.08
+                or spike_immediate_partial
+                or spike_allow_partial
+                or peak_capture >= 0.72
+                or volume_profile_leader_sell_score >= 0.70
+                or previous_session_reaction in {"rejected_prior_vah", "rejected_prior_poc"}
+                or quant_boundary_state == "above_upper_boundary_stretched"
+            )
             and recommended_sell_fraction > 0.0
         )
 
@@ -1927,6 +1944,8 @@ class Level8Council:
                 f"continuation_override_by_harvest={continuation_override_by_harvest};"
                 f"harvest_confirmation={harvest_confirmation};"
                 f"strong_profit_exception={strong_profit_exception};"
+                f"sell_quality_penalty={sell_quality_penalty:.3f};"
+                f"sell_quality_reason={sell_quality_reason};"
                 f"session_sell_score={session_sell_score:.3f};"
                 f"session_buy_score={session_buy_score:.3f};"
                 f"session_confidence={session_confidence:.3f};"

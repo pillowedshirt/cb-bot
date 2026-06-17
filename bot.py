@@ -9693,6 +9693,66 @@ class TradingBot:
             pass
         return out
 
+
+    def _portfolio_correlation_exposure_penalty(self, candidate_product_id: str) -> Dict[str, Any]:
+        """
+        Avoid making multiple highly correlated bets at the same time.
+        Uses recent return correlation from in-memory candles.
+        """
+        try:
+            candidate_returns = self._peer_returns_by_product(exclude_product_id="").get(candidate_product_id, [])
+            if len(candidate_returns) < 30:
+                return {"penalty_bps": 0.0, "reason": "correlation_insufficient_candidate_returns"}
+
+            held = []
+            for product_id in PRODUCTS:
+                if product_id == candidate_product_id:
+                    continue
+                try:
+                    if self._has_open_position(product_id):
+                        held.append(product_id)
+                except Exception:
+                    pass
+
+            if not held:
+                return {"penalty_bps": 0.0, "reason": "no_existing_positions"}
+
+            peers = self._peer_returns_by_product(exclude_product_id=candidate_product_id)
+            max_corr = 0.0
+            corr_product = ""
+            for held_product in held:
+                r = peers.get(held_product, [])
+                n = min(len(candidate_returns), len(r))
+                if n < 30:
+                    continue
+                a = np.array(candidate_returns[-n:], dtype=float)
+                b = np.array(r[-n:], dtype=float)
+                if np.std(a) <= 1e-12 or np.std(b) <= 1e-12:
+                    continue
+                corr = float(np.corrcoef(a, b)[0, 1])
+                if abs(corr) > abs(max_corr):
+                    max_corr = corr
+                    corr_product = held_product
+
+            penalty = 0.0
+            if abs(max_corr) >= 0.82:
+                penalty = 45.0
+            elif abs(max_corr) >= 0.70:
+                penalty = 25.0
+
+            return {
+                "penalty_bps": float(penalty),
+                "max_corr": float(max_corr),
+                "corr_product": corr_product,
+                "reason": (
+                    f"portfolio_corr;product={candidate_product_id};"
+                    f"held_corr_product={corr_product};max_corr={max_corr:.3f};"
+                    f"penalty={penalty:.2f}"
+                ),
+            }
+        except Exception as exc:
+            return {"penalty_bps": 0.0, "reason": f"portfolio_corr_error:{exc}"}
+
     def _previous_session_profile_for_product(
         self,
         *,
@@ -11238,6 +11298,9 @@ class TradingBot:
             walk_forward = self._walk_forward_penalty_for_product(str(candidate.get("product_id", "")))
             walk_forward_penalty_bps = float(walk_forward.get("penalty_bps", 0.0) or 0.0)
             walk_forward_reason = str(walk_forward.get("reason", ""))
+            portfolio_corr = self._portfolio_correlation_exposure_penalty(str(candidate.get("product_id", "")))
+            portfolio_corr_penalty_bps = float(portfolio_corr.get("penalty_bps", 0.0) or 0.0)
+            portfolio_corr_reason = str(portfolio_corr.get("reason", ""))
             maker_adjusted_expected_value_bps = (
                 float(maker_fill_probability) * float(expected_value_bps)
                 - (1.0 - float(maker_fill_probability)) * float(UTILITY_MAKER_NO_FILL_PENALTY_BPS)
@@ -11275,6 +11338,7 @@ class TradingBot:
                 + float(previous_session_profile_utility_adjust_bps)
                 + float(quant_context_utility_adjust_bps)
                 - float(walk_forward_penalty_bps)
+                - float(portfolio_corr_penalty_bps)
                 - float(contradiction_penalty_bps)
                 - max(0.0, float(wait_utility_bps) - 8.0) * 0.35
             )
@@ -11316,6 +11380,8 @@ class TradingBot:
                 f"{quant_context_utility_reason};"
                 f"walk_forward_penalty={walk_forward_penalty_bps:.2f};"
                 f"{walk_forward_reason};"
+                f"portfolio_corr_penalty={portfolio_corr_penalty_bps:.2f};"
+                f"{portfolio_corr_reason};"
                 f"wait_utility={wait_utility_bps:.2f};buy_vs_wait={buy_vs_wait_edge_bps:.2f};"
                 f"realized_vol_30m={realized_vol_bps:.2f};vol_size_mult={vol_mult:.3f};"
                 f"{vol_reason};{p_reason};{maker_reason}"
@@ -11339,6 +11405,8 @@ class TradingBot:
                 "quant_context_utility_reason": str(quant_context_utility_reason),
                 "walk_forward_penalty_bps": float(walk_forward_penalty_bps),
                 "walk_forward_reason": str(walk_forward_reason),
+                "portfolio_corr_penalty_bps": float(portfolio_corr_penalty_bps),
+                "portfolio_corr_reason": str(portfolio_corr_reason),
                 "utility_quality": float(utility_quality),
                 "utility_rank_bonus": float(utility_rank_bonus),
                 "utility_size_multiplier": float(utility_size_multiplier),
@@ -13712,6 +13780,43 @@ class TradingBot:
         except Exception as exc:
             log(f"[sell-quality] review failed: {exc}")
 
+
+    def _sell_quality_recent_context(self, product_id: str) -> Dict[str, Any]:
+        try:
+            if not os.path.exists(SELL_QUALITY_REVIEWS_CSV_PATH):
+                return {"sell_quality_penalty": 0.0, "reason": "sell_quality_unavailable"}
+            frame = pd.read_csv(SELL_QUALITY_REVIEWS_CSV_PATH)
+            if frame.empty or "product_id" not in frame.columns:
+                return {"sell_quality_penalty": 0.0, "reason": "sell_quality_empty"}
+            frame = frame[frame["product_id"].astype(str) == str(product_id)].copy()
+            if frame.empty:
+                return {"sell_quality_penalty": 0.0, "reason": "sell_quality_no_product"}
+            frame["capture_quality_score"] = pd.to_numeric(frame.get("capture_quality_score", 0.0), errors="coerce").fillna(0.0)
+            frame["move_after_sell_bps"] = pd.to_numeric(frame.get("move_after_sell_bps", 0.0), errors="coerce").fillna(0.0)
+            reviews = frame[frame.get("sell_quality_kind", "").astype(str) == "review"].tail(12)
+            if reviews.empty:
+                return {"sell_quality_penalty": 0.0, "reason": "sell_quality_no_reviews"}
+            avg_capture = float(reviews["capture_quality_score"].mean())
+            too_early_rate = float((reviews["move_after_sell_bps"] > 80.0).mean())
+            # Positive penalty means be less eager to sell tiny gains and require
+            # better confirmation unless spike protection is active.
+            penalty = 0.0
+            if avg_capture < 0.45:
+                penalty += (0.45 - avg_capture) * 0.20
+            if too_early_rate > 0.35:
+                penalty += (too_early_rate - 0.35) * 0.20
+            return {
+                "sell_quality_penalty": float(min(0.12, penalty)),
+                "avg_capture": avg_capture,
+                "too_early_rate": too_early_rate,
+                "reason": (
+                    f"sell_quality_context;avg_capture={avg_capture:.3f};"
+                    f"too_early_rate={too_early_rate:.3f};penalty={penalty:.3f}"
+                ),
+            }
+        except Exception as exc:
+            return {"sell_quality_penalty": 0.0, "reason": f"sell_quality_context_error:{exc}"}
+
     def _intraday_drawdown_pct(self) -> float:
         try:
             today = now_mst().strftime("%Y-%m-%d")
@@ -14098,6 +14203,7 @@ class TradingBot:
                     product_id=product_id,
                     hold_state=hold_state,
                 ),
+                "sell_quality_context": self._sell_quality_recent_context(product_id),
             }
 
             if hasattr(self.level8_council, "decide_exit"):

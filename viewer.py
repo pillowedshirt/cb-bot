@@ -22,6 +22,10 @@ POSITION_TARGETS_PATH = os.path.join(BASE_DIR, "position_targets.csv")
 COUNCIL_DECISIONS_PATH = os.path.join(BASE_DIR, "council_decisions.csv")
 COUNCIL_VOTES_CSV_PATH = os.path.join(BASE_DIR, "council_votes.csv")
 ORDERS_CSV_PATH = os.path.join(BASE_DIR, "orders.csv")
+WALK_FORWARD_VALIDATION_PATH = os.path.join(BASE_DIR, "walk_forward_validation.csv")
+AGENT_ABLATION_PATH = os.path.join(BASE_DIR, "agent_ablation.csv")
+AI_FEATURE_IMPORTANCE_PATH = os.path.join(BASE_DIR, "ai_feature_importance.csv")
+ORDER_BOOK_SNAPSHOTS_PATH = os.path.join(BASE_DIR, "order_book_snapshots.csv")
 
 FAST_REFRESH_MS = 3000
 FAST_TTL_SEC = 2
@@ -75,6 +79,21 @@ def load_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
     return pd.read_csv(path)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_walk_forward_validation_df() -> pd.DataFrame:
+    return load_csv(WALK_FORWARD_VALIDATION_PATH)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_agent_ablation_df() -> pd.DataFrame:
+    return load_csv(AGENT_ABLATION_PATH)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_ai_feature_importance_df() -> pd.DataFrame:
+    return load_csv(AI_FEATURE_IMPORTANCE_PATH)
 
 
 @st.cache_data(ttl=FAST_TTL_SEC, show_spinner=False)
@@ -447,6 +466,9 @@ def main() -> None:
     decisions_df = load_csv(COUNCIL_DECISIONS_PATH)
     council_votes_df = load_council_votes_df()
     orders_df = load_csv(ORDERS_CSV_PATH)
+    walk_forward_df = load_walk_forward_validation_df()
+    agent_ablation_df = load_agent_ablation_df()
+    ai_importance_df = load_ai_feature_importance_df()
     render_leader_and_council(snapshot, selected)
     st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
     render_agent_statements(council_votes_df, selected)
@@ -479,6 +501,26 @@ def main() -> None:
             st.info("No order attempts found.")
         else:
             st.dataframe(orders_df.tail(100), use_container_width=True, hide_index=True)
+    with st.expander("Validation / Overfitting Controls", expanded=False):
+        st.markdown("### Walk-Forward Validation")
+        if not walk_forward_df.empty:
+            st.dataframe(walk_forward_df.tail(50), use_container_width=True, hide_index=True)
+        else:
+            st.info("No walk-forward validation rows yet.")
+        st.markdown("### Agent Ablation")
+        if not agent_ablation_df.empty:
+            if "ablation_score" in agent_ablation_df.columns:
+                agent_ablation_view = agent_ablation_df.sort_values("ablation_score", ascending=False).tail(50)
+            else:
+                agent_ablation_view = agent_ablation_df.tail(50)
+            st.dataframe(agent_ablation_view, use_container_width=True, hide_index=True)
+        else:
+            st.info("No agent ablation rows yet.")
+    with st.expander("AI Feature Importance", expanded=False):
+        if not ai_importance_df.empty:
+            st.dataframe(ai_importance_df.head(40), use_container_width=True, hide_index=True)
+        else:
+            st.info("No AI feature importance report yet.")
 
 
 if __name__ == "__main__":

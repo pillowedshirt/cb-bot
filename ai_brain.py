@@ -452,6 +452,8 @@ class LocalAIBrain:
             )
 
         features = self._row_to_features(context)
+        feature_nonzero_count = int((features.abs() > 1e-12).sum(axis=1).iloc[0])
+        feature_coverage = feature_nonzero_count / max(float(len(FEATURE_COLUMNS)), 1.0)
         classifier = self.model_pack["classifier"]
         move_regressor = self.model_pack["move_regressor"]
         adverse_regressor = self.model_pack["adverse_regressor"]
@@ -463,7 +465,9 @@ class LocalAIBrain:
         expected_move = float(move_regressor.predict(features)[0])
         expected_adverse = max(0.0, float(adverse_regressor.predict(features)[0]))
 
-        if prob_up_30m >= 0.62 and expected_move > expected_adverse:
+        if feature_coverage < 0.35:
+            action = "WAIT"
+        elif prob_up_30m >= 0.62 and expected_move > expected_adverse:
             action = "ALLOW_BUY"
         elif (
             prob_up_30m <= 0.42
@@ -485,7 +489,9 @@ class LocalAIBrain:
             reason=(
                 f"prob_up_30m={prob_up_30m:.4f};"
                 f"expected_move_30m_bps={expected_move:.2f};"
-                f"expected_adverse_bps={expected_adverse:.2f}"
+                f"expected_adverse_bps={expected_adverse:.2f};"
+                f"feature_coverage={feature_coverage:.3f};"
+                f"nonzero_features={feature_nonzero_count};"
             ),
         )
         self.log_prediction(product_id, context, decision)

@@ -140,6 +140,17 @@ REM ------------------------------------------------------------
 REM Start bot in its own command window
 REM ------------------------------------------------------------
 
+echo [check] Compiling Python files before launch...
+"%PYTHON_EXE%" -m py_compile bot.py level8_council.py ai_brain.py backtest_intelligence.py viewer.py price_action_context.py previous_session_volume_profile.py quant_context.py session_liquidity.py
+
+if errorlevel 1 (
+    echo.
+    echo [error] Python compile check failed. Bot was not started.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo [run] Starting Level 8 live bot...
 start "LEVEL 8 COUNCIL BOT" cmd /k "cd /d "%~dp0" && "%PYTHON_EXE%" bot.py"
 

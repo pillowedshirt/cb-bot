@@ -134,6 +134,8 @@ PRODUCTS: List[str] = list(PRODUCTS_DEFAULT)
 TRADES_CSV_PATH: str = os.path.join(BASE_DIR, "trades.csv")
 ORDERS_CSV_PATH: str = os.path.join(BASE_DIR, "orders.csv")
 MARKET_CSV_PATH: str = os.path.join(BASE_DIR, "market.csv")
+VIEWER_SNAPSHOT_PATH: str = os.path.join(BASE_DIR, "viewer_snapshot.json")
+VIEWER_SNAPSHOT_WRITE_EVERY_SEC: float = 2.0
 MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
 MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
@@ -1487,6 +1489,15 @@ def clamp_float(x: float, lo: float, hi: float) -> float:
 
 def lerp_float(a: float, b: float, t: float) -> float:
     return float(float(a) + (float(b) - float(a)) * float(t))
+
+
+def _viewer_safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def candidate_rank_score(candidate: Dict[str, Any]) -> float:
@@ -5443,6 +5454,7 @@ class TradingBot:
             f"[startup-state] existing_runtime_csv_state="
             f"{self.startup_had_existing_runtime_state}"
         )
+        self._last_viewer_snapshot_write_ts: float = 0.0
         # top of book per product
         self.tob: Dict[str, Optional[TopOfBook]] = {p: None for p in PRODUCTS}
         # Rolling mid price series per product
@@ -16903,6 +16915,134 @@ class TradingBot:
         except Exception as exc:
             log(f"[level8] agent performance update failed: {exc}")
 
+    def _build_viewer_coin_snapshot(
+        self,
+        *,
+        product_id: str,
+        candidate: Optional[Dict[str, Any]] = None,
+        live_signal: object | None = None,
+    ) -> Dict[str, Any]:
+        candidate = dict(candidate or {})
+        price = 0.0
+        spread_bps = 0.0
+        if live_signal is not None:
+            price = _viewer_safe_float(getattr(live_signal, "price", 0.0))
+            spread_bps = _viewer_safe_float(getattr(live_signal, "spread_bps", 0.0))
+        if price <= 0:
+            price = _viewer_safe_float(
+                candidate.get("price", candidate.get("mid", candidate.get("current_price", 0.0)))
+            )
+        if spread_bps <= 0:
+            spread_bps = _viewer_safe_float(candidate.get("spread_bps", 0.0))
+
+        owns_position = bool(self._has_open_position(product_id)) if hasattr(self, "_has_open_position") else False
+        position_qty = 0.0
+        avg_entry = 0.0
+        net_after_exit_bps = 0.0
+        peak_unrealized_bps = 0.0
+
+        try:
+            lots = list(getattr(self, "open_lots", {}).get(product_id, []) or [])
+            total_qty = 0.0
+            weighted_cost = 0.0
+            for lot in lots:
+                q = _viewer_safe_float(lot.get("qty", 0.0) or lot.get("base_qty", 0.0))
+                e = _viewer_safe_float(lot.get("entry_price", 0.0) or lot.get("all_in_entry_price", 0.0))
+                if q > 0:
+                    total_qty += q
+                    weighted_cost += q * e
+            if total_qty > 0:
+                position_qty = total_qty
+                avg_entry = weighted_cost / total_qty
+        except Exception:
+            pass
+
+        try:
+            hold_state = self._build_hold_state_for_product(product_id) if hasattr(self, "_build_hold_state_for_product") else {}
+            hold_state = hold_state or {}
+            net_after_exit_bps = _viewer_safe_float(hold_state.get("net_after_exit_bps", 0.0))
+            peak_unrealized_bps = _viewer_safe_float(hold_state.get("peak_unrealized_bps", 0.0))
+        except Exception:
+            pass
+
+        return {
+            "product_id": str(product_id),
+            "updated_ts": time.time(),
+            "price": price,
+            "spread_bps": spread_bps,
+            "owns_position": owns_position,
+            "position_qty": position_qty,
+            "avg_entry": avg_entry,
+            "net_after_exit_bps": net_after_exit_bps,
+            "peak_unrealized_bps": peak_unrealized_bps,
+            "leader_buy_score": _viewer_safe_float(candidate.get("volume_profile_leader_buy_score", 0.0)),
+            "leader_sell_score": _viewer_safe_float(candidate.get("volume_profile_leader_sell_score", 0.0)),
+            "leader_hold_score": _viewer_safe_float(candidate.get("volume_profile_leader_hold_score", 0.0)),
+            "leader_wait_score": _viewer_safe_float(candidate.get("volume_profile_leader_wait_score", 0.0)),
+            "leader_confidence": _viewer_safe_float(candidate.get("volume_profile_leader_confidence", 0.0)),
+            "truth_score": _viewer_safe_float(candidate.get("level8_truth_score", candidate.get("truth_score", 0.0))),
+            "final_buy_score": _viewer_safe_float(candidate.get("level8_final_buy_score", candidate.get("final_buy_score", 0.0))),
+            "buy_threshold": _viewer_safe_float(candidate.get("level8_buy_threshold", candidate.get("buy_threshold", 0.0))),
+            "sell_threshold": _viewer_safe_float(candidate.get("sell_threshold", 0.0)),
+            "recommended_position_pct": _viewer_safe_float(candidate.get("level8_recommended_position_pct", candidate.get("recommended_position_pct", candidate.get("position_pct", 0.0)))),
+            "expected_utility_bps": _viewer_safe_float(candidate.get("expected_utility_bps", 0.0)),
+            "buy_vs_wait_edge_bps": _viewer_safe_float(candidate.get("buy_vs_wait_edge_bps", 0.0)),
+            "value_acceptance_state": str(candidate.get("value_acceptance_state", "")),
+            "volume_node_state": str(candidate.get("volume_node_state", "")),
+            "poc_distance_bps": _viewer_safe_float(candidate.get("poc_distance_bps", 0.0)),
+            "low_volume_path_up_bps": _viewer_safe_float(candidate.get("low_volume_path_up_bps", 0.0)),
+            "low_volume_path_down_bps": _viewer_safe_float(candidate.get("low_volume_path_down_bps", 0.0)),
+            "leader_reason": str(candidate.get("volume_profile_utility_reason", candidate.get("leader_reason", ""))),
+            "decision_action": str(candidate.get("level8_action", candidate.get("action", ""))),
+            "decision_reason": str(candidate.get("level8_reason", candidate.get("reason", ""))),
+            "council_mode": "POSITION_MANAGEMENT" if owns_position else "ENTRY",
+            "selected_target_buy_price": _viewer_safe_float(candidate.get("target_buy_price", 0.0)),
+            "selected_target_sell_price": _viewer_safe_float(candidate.get("target_sell_price", 0.0)),
+            "selected_target_stop_price": _viewer_safe_float(candidate.get("target_stop_price", 0.0)),
+        }
+
+    def _write_viewer_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        try:
+            tmp_path = VIEWER_SNAPSHOT_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2)
+            os.replace(tmp_path, VIEWER_SNAPSHOT_PATH)
+        except Exception as exc:
+            try:
+                self._log_debug(f"[viewer_snapshot] write failed: {exc}")
+            except Exception:
+                pass
+
+    def _refresh_viewer_snapshot_from_candidates(self, candidates: List[Dict[str, Any]]) -> None:
+        try:
+            coins: Dict[str, Dict[str, Any]] = {}
+            for candidate in candidates or []:
+                product_id = str(candidate.get("product_id", "") or "")
+                if not product_id:
+                    continue
+                coins[product_id] = self._build_viewer_coin_snapshot(product_id=product_id, candidate=candidate)
+            ranked = sorted(
+                list(coins.values()),
+                key=lambda x: (
+                    _viewer_safe_float(x.get("leader_buy_score", 0.0)),
+                    _viewer_safe_float(x.get("truth_score", 0.0)),
+                    _viewer_safe_float(x.get("expected_utility_bps", 0.0)),
+                ),
+                reverse=True,
+            )
+            snapshot = {
+                "updated_ts": time.time(),
+                "coins": coins,
+                "top_products": [r.get("product_id", "") for r in ranked[:8]],
+                "live_positions": [r.get("product_id", "") for r in ranked if bool(r.get("owns_position", False))],
+            }
+            now = time.time()
+            if now - float(getattr(self, "_last_viewer_snapshot_write_ts", 0.0)) >= float(VIEWER_SNAPSHOT_WRITE_EVERY_SEC):
+                self._write_viewer_snapshot(snapshot)
+                self._last_viewer_snapshot_write_ts = now
+        except Exception as exc:
+            log_exception("viewer snapshot refresh failed", exc)
+
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
@@ -17781,6 +17921,8 @@ class TradingBot:
                 f"[eval-loop] after Level 8 filter "
                 f"buy_ready={safe_buy_ready_count} selectable={len(candidates)}"
             )
+
+            self._refresh_viewer_snapshot_from_candidates(candidates or council_watch_candidates)
 
             strong_candidate_count = sum(1 for c in candidates if c["score"] >= MID_SCORE_UTIL_THRESHOLD)
             max_deploy_this_eval = (

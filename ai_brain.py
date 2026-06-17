@@ -57,6 +57,20 @@ FEATURE_COLUMNS = [
     "fresh_zone_buy_score",
     "fvg_buy_score",
     "smt_buy_score",
+    "previous_session_profile_buy_score",
+    "previous_session_profile_sell_score",
+    "previous_session_profile_hold_score",
+    "previous_session_profile_wait_score",
+    "previous_session_profile_confidence",
+    "quant_buy_score",
+    "quant_sell_score",
+    "quant_hold_score",
+    "quant_wait_score",
+    "quant_confidence",
+    "quant_stationarity_score",
+    "quant_forecast_return_bps",
+    "quant_conditional_volatility_bps",
+    "quant_peer_spread_z",
 ]
 
 

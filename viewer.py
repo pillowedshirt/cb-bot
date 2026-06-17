@@ -1,12 +1,20 @@
 import json
 import os
 import time
+import traceback
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+
+try:
+    import streamlit.components.v1 as components
+except Exception:
+    components = None
 
 try:
     from debug_tools import (
@@ -18,6 +26,7 @@ try:
         dataframe_debug_summary,
         viewer_snapshot_summary,
         csv_debug_summary,
+        csv_runtime_status,
     )
 except Exception:
     def module_debug(*args, **kwargs):
@@ -40,6 +49,8 @@ except Exception:
     def viewer_snapshot_summary(*args, **kwargs):
         return {}
     def csv_debug_summary(*args, **kwargs):
+        return {}
+    def csv_runtime_status(*args, **kwargs):
         return {}
 
 MODULE_NAME = "viewer"
@@ -83,6 +94,15 @@ WALK_FORWARD_VALIDATION_PATH = os.path.join(BASE_DIR, "walk_forward_validation.c
 AGENT_ABLATION_PATH = os.path.join(BASE_DIR, "agent_ablation.csv")
 AI_FEATURE_IMPORTANCE_PATH = os.path.join(BASE_DIR, "ai_feature_importance.csv")
 ORDER_BOOK_SNAPSHOTS_PATH = os.path.join(BASE_DIR, "order_book_snapshots.csv")
+MICRO_HISTORY_CSV_PATH = os.path.join(BASE_DIR, "micro_history.csv")
+MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
+MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
+SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
+
+SNAPSHOT_STALE_WARN_SEC = 20.0
+CHART_STALE_WARN_SEC_DAY = 180.0
+CHART_STALE_WARN_SEC_WEEK = 3600.0
+COUNCIL_STALE_WARN_SEC = 60.0
 
 FAST_REFRESH_MS = 3000
 FAST_TTL_SEC = 2
@@ -127,84 +147,74 @@ div[data-testid="stMetric"] { background: rgba(37,29,23,0.95); border: 1px solid
 def load_viewer_snapshot() -> Dict[str, Any]:
     try:
         if not os.path.exists(VIEWER_SNAPSHOT_CSV_SAFE_PATH):
-            debug_every(
+            module_debug(
                 MODULE_NAME,
                 "viewer_snapshot_missing",
-                10.0,
-                "viewer_snapshot_missing",
-                data={"path": VIEWER_SNAPSHOT_CSV_SAFE_PATH},
-                level="WARN",
-                also_overall=True,
+                data={"path": VIEWER_SNAPSHOT_CSV_SAFE_PATH, "startup_state": "waiting_for_first_bot_snapshot"},
+                level="INFO",
+                also_overall=False,
             )
             return {
                 "updated_ts": 0.0,
                 "coins": {},
                 "top_products": [],
                 "live_positions": [],
-                "_viewer_snapshot_error": "viewer_snapshot.json not found",
+                "readiness": {"startup_state": "waiting_for_first_bot_snapshot"},
+                "_viewer_snapshot_error": "viewer_snapshot.json not written yet",
+                "_startup_waiting": True,
             }
         with open(VIEWER_SNAPSHOT_CSV_SAFE_PATH, "r", encoding="utf-8") as f:
             snapshot = json.load(f)
-        debug_every(
-            MODULE_NAME,
-            "viewer_snapshot_loaded",
-            10.0,
-            "viewer_snapshot_loaded",
-            data=viewer_snapshot_summary(snapshot),
-            level="DEBUG",
-            also_overall=False,
-        )
+        summary = viewer_snapshot_summary(snapshot)
+        module_debug(MODULE_NAME, "viewer_snapshot_loaded", data=summary, level="INFO", also_overall=False)
+        module_debug(MODULE_NAME, "viewer_snapshot_coin_count", data={"coin_count": summary.get("coin_count", 0)}, level="INFO", also_overall=False)
         return snapshot
     except Exception as exc:
-        module_exception(
-            MODULE_NAME,
-            "load_viewer_snapshot failed",
-            exc,
-            data={"path": VIEWER_SNAPSHOT_CSV_SAFE_PATH},
-            also_overall=True,
-        )
-        return {
-            "updated_ts": 0.0,
-            "coins": {},
-            "top_products": [],
-            "live_positions": [],
-            "_viewer_snapshot_error": f"{type(exc).__name__}: {exc}",
-        }
+        module_exception(MODULE_NAME, "viewer_snapshot_corrupt", exc, data={"path": VIEWER_SNAPSHOT_CSV_SAFE_PATH, "traceback": traceback.format_exc()}, also_overall=True)
+        return {"updated_ts": 0.0, "coins": {}, "top_products": [], "live_positions": [], "readiness": {}, "_viewer_snapshot_error": f"{type(exc).__name__}: {exc}"}
+
+
+def csv_file_age_sec(path: str) -> float:
+    try:
+        if not os.path.exists(path):
+            return 999999.0
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except Exception:
+        return 999999.0
+
+
+def dataframe_latest_age_sec(frame: pd.DataFrame) -> float:
+    try:
+        if frame.empty or "ts" not in frame.columns:
+            return 999999.0
+        ts = pd.to_numeric(frame["ts"], errors="coerce").dropna()
+        if ts.empty:
+            return 999999.0
+        latest = float(ts.max())
+        return max(0.0, time.time() - latest)
+    except Exception:
+        return 999999.0
 
 
 @st.cache_data(ttl=SLOW_TTL_SEC, show_spinner=False)
 def load_csv(path: str) -> pd.DataFrame:
+    required_by_name = {
+        "micro_history.csv": ["ts", "product_id", "open", "high", "low", "close", "volume"],
+        "macro_day.csv": ["ts", "product_id", "open", "high", "low", "close", "volume"],
+        "macro_week.csv": ["ts", "product_id", "open", "high", "low", "close", "volume"],
+    }
+    name = os.path.basename(path)
+    required = required_by_name.get(name, [])
     try:
         if not os.path.exists(path):
-            debug_every(
-                MODULE_NAME,
-                f"csv_missing:{os.path.basename(path)}",
-                30.0,
-                "viewer_csv_missing",
-                data={"path": path},
-                level="DEBUG",
-                also_overall=False,
-            )
+            module_debug(MODULE_NAME, "viewer_csv_missing", data=csv_runtime_status(path, required_columns=required, name=name), level="INFO", also_overall=False)
             return pd.DataFrame()
         frame = pd.read_csv(path)
-        debug_every(
-            MODULE_NAME,
-            f"csv_loaded:{os.path.basename(path)}",
-            30.0,
-            "viewer_csv_loaded",
-            data=dataframe_debug_summary(frame, name=os.path.basename(path)),
-            level="DEBUG",
-            also_overall=False,
-        )
+        status = {**csv_runtime_status(path, required_columns=required, name=name), **dataframe_debug_summary(frame, required_columns=required, name=name)}
+        module_debug(MODULE_NAME, "viewer_csv_loaded", data=status, level="DEBUG", also_overall=False)
         return frame
     except Exception as exc:
-        module_exception(
-            MODULE_NAME,
-            "viewer_csv_load_failed",
-            exc,
-            data={"path": path},
-            also_overall=True,
-        )
+        module_exception(MODULE_NAME, "viewer_csv_load_failed", exc, data={"path": path, "traceback": traceback.format_exc(), **csv_runtime_status(path, required_columns=required, name=name)}, also_overall=True)
         return pd.DataFrame()
 
 
@@ -811,6 +821,258 @@ def main() -> None:
         else:
             st.info("No AI feature importance report yet.")
 
+
+
+def load_chart_history(product_id: str, timeframe: str) -> tuple[pd.DataFrame, dict]:
+    timeframe = str(timeframe or "day").lower()
+    if timeframe == "week":
+        source_path, source_name = MACRO_WEEK_CSV_PATH, "macro_week.csv"
+    else:
+        source_path, source_name = MICRO_HISTORY_CSV_PATH, "micro_history.csv"
+    required = ["ts", "product_id", "open", "high", "low", "close", "volume"]
+    frame = load_csv(source_path)
+    if timeframe == "day" and frame.empty:
+        source_path, source_name = MACRO_DAY_CSV_PATH, "macro_day.csv"
+        frame = load_csv(source_path)
+    meta = {"product_id": product_id, "timeframe": timeframe, "source": source_name, "path": source_path, "rows_before_filter": int(len(frame)) if hasattr(frame, "__len__") else 0, "rows": 0, "has_volume": False, "age_sec": 999999.0, "missing_columns": []}
+    if frame.empty:
+        module_debug(MODULE_NAME, "chart_history_empty", data=meta, level="WARN", also_overall=False)
+        return pd.DataFrame(), meta
+    missing = [c for c in required if c not in frame.columns]
+    meta["missing_columns"] = missing
+    if missing:
+        module_debug(MODULE_NAME, "chart_history_missing_columns", data=meta, level="WARN", also_overall=True)
+        return pd.DataFrame(), meta
+    out = frame[frame["product_id"].astype(str) == str(product_id)].copy()
+    for col in ["ts", "open", "high", "low", "close", "volume"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["ts", "open", "high", "low", "close"]).sort_values("ts")
+    out["dt"] = pd.to_datetime(out["ts"], unit="s", errors="coerce", utc=True)
+    out = out.tail(7 * 24 * 4 + 50 if timeframe == "week" else 24 * 60 + 200)
+    meta["rows"] = int(len(out)); meta["has_volume"] = bool("volume" in out.columns and pd.to_numeric(out["volume"], errors="coerce").fillna(0).sum() > 0); meta["age_sec"] = dataframe_latest_age_sec(out)
+    module_debug(MODULE_NAME, "chart_history_selected", data=meta, level="INFO", also_overall=False)
+    return out, meta
+
+
+def _first_price(*vals):
+    for v in vals:
+        f = _safe_float(v, 0.0)
+        if f > 0: return f
+    return 0.0
+
+
+def _nearest_close(chart_df: pd.DataFrame, ts_value: Any) -> float:
+    try:
+        t = pd.to_numeric(pd.Series([ts_value]), errors="coerce").iloc[0]
+        if pd.isna(t):
+            dt = pd.to_datetime(ts_value, errors="coerce", utc=True); t = dt.timestamp() if pd.notna(dt) else 0
+        idx = (pd.to_numeric(chart_df["ts"], errors="coerce") - float(t)).abs().idxmin()
+        return float(chart_df.loc[idx, "close"])
+    except Exception:
+        return 0.0
+
+
+def _marker_df(df: pd.DataFrame, product_id: str, chart_df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "product_id" not in df.columns or "ts" not in df.columns: return pd.DataFrame()
+    out = df[df["product_id"].astype(str) == str(product_id)].copy()
+    if out.empty: return out
+    out["dt"] = pd.to_datetime(pd.to_numeric(out["ts"], errors="coerce"), unit="s", errors="coerce", utc=True)
+    if "price" not in out.columns: out["price"] = 0.0
+    out["price"] = pd.to_numeric(out["price"], errors="coerce").fillna(0.0)
+    out.loc[out["price"] <= 0, "price"] = out.loc[out["price"] <= 0, "ts"].apply(lambda x: _nearest_close(chart_df, x))
+    return out[out["price"] > 0]
+
+
+def build_coin_chart(chart_df, chart_meta, coin_state, market_df, confirmed_trades_df, shadow_trades_df, decisions_df, target_state, overlay_toggles) -> go.Figure:
+    product_id = str(chart_meta.get("product_id") or coin_state.get("product_id") or "")
+    has_volume = bool(chart_meta.get("has_volume")) and bool(overlay_toggles.get("volume", True))
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.035, row_heights=[0.76, 0.24])
+    overlay_count = 0
+    if not chart_df.empty:
+        fig.add_trace(go.Candlestick(x=chart_df["dt"], open=chart_df["open"], high=chart_df["high"], low=chart_df["low"], close=chart_df["close"], name="OHLC"), row=1, col=1)
+        if has_volume:
+            fig.add_trace(go.Bar(x=chart_df["dt"], y=pd.to_numeric(chart_df["volume"], errors="coerce").fillna(0), name="Volume", marker_color="rgba(86,139,211,0.35)"), row=2, col=1); overlay_count += 1
+    def hline(label, y, color, dash="dash"):
+        nonlocal overlay_count
+        y=_safe_float(y)
+        if y>0:
+            fig.add_hline(y=y, line_width=1.2, line_color=color, line_dash=dash, annotation_text=label, annotation_position="right", row=1, col=1); overlay_count += 1
+    if overlay_toggles.get("profile", True):
+        hline("POC", _first_price(target_state.get("point_of_control"), coin_state.get("point_of_control")), "#ff9f5a"); hline("VAH", _first_price(target_state.get("value_area_high"), coin_state.get("value_area_high")), "#e8c16f", "dot"); hline("VAL", _first_price(target_state.get("value_area_low"), coin_state.get("value_area_low")), "#e8c16f", "dot")
+    if overlay_toggles.get("prior_profile", True):
+        hline("Prior POC", coin_state.get("previous_session_profile_poc"), "#facc15"); hline("Prior VAH", coin_state.get("previous_session_profile_vah"), "#fde68a", "dot"); hline("Prior VAL", coin_state.get("previous_session_profile_val"), "#fde68a", "dot")
+    if overlay_toggles.get("average_entry", True): hline("Avg Entry", _first_price(coin_state.get("avg_entry"), target_state.get("avg_entry_price")), "#a5dcff", "solid")
+    if overlay_toggles.get("targets", True):
+        hline("Target Buy", _first_price(target_state.get("target_buy_price"), coin_state.get("selected_target_buy_price")), "#78d6a8"); hline("Target Sell", _first_price(target_state.get("target_sell_price"), target_state.get("scalp_target_price"), target_state.get("core_target_price"), coin_state.get("selected_target_sell_price")), "#ff8e8e"); hline("Stop", _first_price(target_state.get("target_stop_price"), coin_state.get("selected_target_stop_price")), "#d46cff", "dot"); hline("Min Profitable Exit", _first_price(target_state.get("min_profitable_exit_price"), coin_state.get("min_profitable_exit_price")), "#facc15")
+    if overlay_toggles.get("structure", False):
+        for key in ["validated_high","validated_low","zone_low","zone_high","bullish_fvg_low","bullish_fvg_high","bearish_fvg_low","bearish_fvg_high"]: hline(key, coin_state.get(key), "rgba(255,255,255,0.35)", "dot")
+    if overlay_toggles.get("vwap", True) and not market_df.empty and "anchored_vwap" in market_df.columns and "product_id" in market_df.columns:
+        m=market_df[market_df["product_id"].astype(str)==product_id].copy()
+        if not m.empty and "ts" in m.columns:
+            m["dt"]=pd.to_datetime(pd.to_numeric(m["ts"],errors="coerce"),unit="s",errors="coerce",utc=True); m["anchored_vwap"]=pd.to_numeric(m["anchored_vwap"],errors="coerce"); m=m.dropna(subset=["dt","anchored_vwap"])
+            if not m.empty: fig.add_trace(go.Scatter(x=m["dt"], y=m["anchored_vwap"], mode="lines", name="Anchored VWAP", line=dict(color="#9b87f5", width=1.5)), row=1, col=1); overlay_count += 1
+    if overlay_toggles.get("confirmed_trades", True):
+        t=_marker_df(confirmed_trades_df, product_id, chart_df)
+        if not t.empty and "side" in t.columns:
+            buys=t[t["side"].astype(str).str.upper()=="BUY"]; sells=t[t["side"].astype(str).str.upper()=="SELL"]
+            if not buys.empty: fig.add_trace(go.Scatter(x=buys["dt"], y=buys["price"], mode="markers", name="Confirmed Buys", marker=dict(symbol="triangle-up", size=11, color="#78d6a8")), row=1, col=1); overlay_count += 1
+            if not sells.empty: fig.add_trace(go.Scatter(x=sells["dt"], y=sells["price"], mode="markers", name="Confirmed Sells", marker=dict(symbol="triangle-down", size=11, color="#ff8e8e")), row=1, col=1); overlay_count += 1
+    if overlay_toggles.get("shadow_trades", True):
+        sh=_marker_df(shadow_trades_df, product_id, chart_df)
+        if not sh.empty: fig.add_trace(go.Scatter(x=sh["dt"], y=sh["price"], mode="markers", name="Shadow Trades", marker=dict(symbol="circle", size=7, color="#ffd37c")), row=1, col=1); overlay_count += 1
+    latest_decision_id=""
+    if overlay_toggles.get("level8_markers", True):
+        d=_marker_df(decisions_df, product_id, chart_df)
+        if not d.empty:
+            latest_decision_id=str(d.iloc[-1].get("decision_id", "")); actions=d["action"] if "action" in d.columns else ["L8"]*len(d)
+            fig.add_trace(go.Scatter(x=d["dt"], y=d["price"], mode="markers+text", text=actions, textposition="top center", name="Level 8", marker=dict(symbol="diamond", size=9, color="#38bdf8")), row=1, col=1); overlay_count += 1
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#0b0f14", plot_bgcolor="#0b0f14", font=dict(color="#d7dde8"), legend=dict(orientation="h", y=1.02), margin=dict(l=15,r=15,t=45,b=15), height=760, xaxis_rangeslider_visible=False)
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)"); fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
+    module_debug(MODULE_NAME, "chart_debug", data={"selected_coin": product_id, "active_timeframe": chart_meta.get("timeframe"), "chart_source_file": chart_meta.get("source"), "selected_candle_rows": int(len(chart_df)), "selected_volume_rows": int(len(chart_df)) if has_volume else 0, "volume_available": bool(chart_meta.get("has_volume")), "overlay_toggles": overlay_toggles, "overlay_count": overlay_count, "trace_count": len(fig.data), "chart_data_age": chart_meta.get("age_sec"), "latest_decision_id": latest_decision_id}, level="INFO", also_overall=False)
+    return fig
+
+
+def latest_council_votes_for_coin(council_votes_df, decisions_df, product_id):
+    latest_decision_id, latest_row = "", {}
+    try:
+        d=decisions_df[decisions_df["product_id"].astype(str)==str(product_id)].copy() if not decisions_df.empty and "product_id" in decisions_df.columns else pd.DataFrame()
+        if not d.empty:
+            d["ts_num"]=pd.to_numeric(d.get("ts"), errors="coerce"); d=d.sort_values("ts_num"); latest_row=d.iloc[-1].to_dict(); latest_decision_id=str(latest_row.get("decision_id", ""))
+        v=council_votes_df[council_votes_df["product_id"].astype(str)==str(product_id)].copy() if not council_votes_df.empty and "product_id" in council_votes_df.columns else pd.DataFrame()
+        if not v.empty and latest_decision_id and "decision_id" in v.columns:
+            matched=v[v["decision_id"].astype(str)==latest_decision_id].copy(); v=matched if not matched.empty else v
+        if not v.empty and (not latest_decision_id) and "decision_id" in v.columns:
+            latest_decision_id=str(v.sort_values("ts").iloc[-1].get("decision_id", "")) if "ts" in v.columns else str(v.iloc[-1].get("decision_id", "")); v=v[v["decision_id"].astype(str)==latest_decision_id].copy()
+        sort_cols=[c for c in ["leaderboard_rank","agent"] if c in v.columns]
+        if sort_cols: v=v.sort_values(sort_cols)
+        return latest_decision_id, latest_row, v
+    except Exception as exc:
+        module_exception(MODULE_NAME, "latest_council_votes_for_coin_failed", exc, also_overall=True); return latest_decision_id, latest_row, pd.DataFrame()
+
+
+def vote_leaning(row):
+    scores={"BUY":_safe_float(row.get("adjusted_buy_score")),"SELL":_safe_float(row.get("adjusted_sell_score")),"HOLD":_safe_float(row.get("adjusted_hold_score")),"WAIT":_safe_float(row.get("adjusted_wait_score"))}
+    return max(scores, key=scores.get)
+
+def strongest_vote_score(row): return max(_safe_float(row.get(k)) for k in ["adjusted_buy_score","adjusted_sell_score","adjusted_hold_score","adjusted_wait_score"])
+
+def agent_title_icon(agent):
+    m={"volume_profile_leader":"♛ King / Volume Profile Leader","volume_profile_agent":"🏰 Value Cartographer","trend":"⚔ Trend Knight","mean_reversion":"🜁 Mean Reversion Oracle","breakout":"🐎 Breakout Cavalier","ai_outcome":"🧠 AI Seer","execution":"⚖ Execution Chancellor","order_book_liquidity_agent":"🛡 Order Book Guard","previous_session_volume_profile_agent":"📜 Prior Session Archivist","quant_boundary_agent":"🔭 Quant Astrologer","candle_context_agent":"🕯 Candle Scribe","candle_sequence_agent":"🔥 Sequence Herald","candle_exhaustion_agent":"💤 Exhaustion Watchman","market_structure_agent":"🏗 Structure Mason","validated_liquidity_agent":"💧 Liquidity Scout","fresh_zone_retest_agent":"🌿 Fresh Zone Ranger","fair_value_gap_agent":"🕳 Fair Value Gap Keeper","smt_divergence_agent":"🪞 SMT Mirror Mage","setup_performance_agent":"📊 Setup Historian","utility_leader":"💰 Utility Treasurer","risk":"🧯 Risk Warden","exploration":"🧪 Exploration Alchemist","truth":"⚜ Truth Arbiter"}
+    return m.get(str(agent), "🪑 Council Agent")
+
+def whimsical_blurb(reason):
+    r=str(reason or ""); low=r.lower(); blurb="The council keeps its counsel."
+    if "spread" in low or "cost" in low or "fee" in low: blurb="The chamber eyes the toll bridge before marching."
+    elif "poc" in low or "value" in low: blurb="The king sees price wandering near the value throne."
+    elif "prob" in low or "odds" in low: blurb="The oracle asks for stronger odds before blessing a trade."
+    elif "stale_market_data" in low or "stale" in low: blurb="The scouts demand fresher market scrolls."
+    return f"{blurb} — {r[:160]}"
+
+
+def render_leader_and_council(council_votes_df, decisions_df, selected_coin: str):
+    did, drow, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected_coin)
+    action = drow.get("action", drow.get("final_action", "—")) if isinstance(drow, dict) else "—"
+    module_debug(MODULE_NAME, "latest_council_votes", data={"product_id": selected_coin, "latest_decision_id": did, "vote_rows": int(len(votes))}, level="INFO", also_overall=False)
+    st.markdown(f'<div class="leader-card"><div class="section-title">🏰 Medieval Council Chamber — {selected_coin}</div><div class="muted">Latest Level 8 action: <b>{action}</b> · decision_id: <b>{did or "—"}</b></div></div>', unsafe_allow_html=True)
+    if votes.empty:
+        st.info("No council vote statements found for this selected coin yet."); return did, votes
+    king = votes[votes.get("agent", pd.Series(dtype=str)).astype(str)=="volume_profile_leader"] if "agent" in votes.columns else pd.DataFrame()
+    rest = votes.drop(king.index) if not king.empty else votes
+    if not king.empty:
+        row=king.iloc[-1].to_dict(); st.markdown(f'<div class="leader-card"><b>{agent_title_icon("volume_profile_leader")}</b><br>Leaning: <b>{vote_leaning(row)}</b> · Confidence: <b>{_safe_float(row.get("confidence")):.3f}</b> · Strongest score: <b>{strongest_vote_score(row):.3f}</b><br><span class="muted">{whimsical_blurb(row.get("reason", ""))}</span></div>', unsafe_allow_html=True)
+    cards=rest.to_dict("records")
+    for i in range(0,len(cards),4):
+        cols=st.columns(4)
+        for col,row in zip(cols,cards[i:i+4]):
+            agent=str(row.get("agent","unknown"))
+            col.markdown(f'<div class="metric-card"><div class="metric-label">{agent}</div><b>{agent_title_icon(agent)}</b><br><span class="muted">Leaning: <b>{vote_leaning(row)}</b><br>Confidence: <b>{_safe_float(row.get("confidence")):.3f}</b><br>Strongest: <b>{strongest_vote_score(row):.3f}</b><br>{whimsical_blurb(row.get("reason", ""))}</span></div>', unsafe_allow_html=True)
+    with st.expander("Raw council vote table", expanded=False): st.dataframe(votes, use_container_width=True, hide_index=True)
+    return did, votes
+
+
+def trigger_viewer_refresh(interval_ms: int) -> dict:
+    tick=0; method="none"
+    try:
+        if st_autorefresh is not None:
+            tick=st_autorefresh(interval=interval_ms, key="council_auto_refresh"); method="streamlit_autorefresh"
+        elif components is not None:
+            tick=int(st.session_state.get("_viewer_refresh_tick",0))+1; st.session_state["_viewer_refresh_tick"]=tick; components.html(f"<script>setTimeout(function(){{window.parent.location.reload();}}, {int(interval_ms)});</script>", height=0); method="components_js_reload"
+        else:
+            tick=int(st.session_state.get("_viewer_refresh_tick",0)); method="manual_refresh_only"
+        module_debug(MODULE_NAME, "viewer_refresh_tick", data={"tick":tick,"method":method,"interval_ms":interval_ms}, level="DEBUG", also_overall=False); return {"tick":tick,"method":method,"interval_ms":interval_ms}
+    except Exception as exc:
+        module_exception(MODULE_NAME, "viewer_refresh_failed", exc, also_overall=True); return {"tick":tick,"method":"refresh_failed","interval_ms":interval_ms}
+
+@contextmanager
+def render_section(name: str):
+    module_debug(MODULE_NAME, "render_section_start", data={"section": name}, level="DEBUG", also_overall=False)
+    try:
+        yield
+        module_debug(MODULE_NAME, "render_section_end", data={"section": name}, level="DEBUG", also_overall=False)
+    except Exception as exc:
+        module_exception(MODULE_NAME, f"render_section_failed:{name}", exc, also_overall=True); raise
+
+
+def _overlay_controls():
+    defaults={"volume":True,"confirmed_trades":True,"shadow_trades":True,"profile":True,"prior_profile":True,"average_entry":True,"targets":True,"vwap":True,"structure":False,"level8_markers":True}
+    labels={"volume":"Volume","confirmed_trades":"Confirmed buys/sells","shadow_trades":"Shadow trades","profile":"POC / VAH / VAL","prior_profile":"Prior-session POC/VAH/VAL","average_entry":"Average entry","targets":"Targets/sell plan","vwap":"VWAP / anchored VWAP","structure":"Trend / structure lines","level8_markers":"Level 8 action markers"}
+    with st.expander("Chart overlays", expanded=False):
+        return {k: st.checkbox(labels[k], value=v, key=f"overlay_{k}") for k,v in defaults.items()}
+
+
+def _render_freshness(snapshot, chart_meta, votes, refresh_info, timeframe):
+    now=time.time(); snap_ts=_safe_float(snapshot.get("updated_ts")); snap_age=max(0, now-snap_ts) if snap_ts>0 else 999999.0; council_age=dataframe_latest_age_sec(votes); chart_age=float(chart_meta.get("age_sec",999999.0));
+    cols=st.columns(7); cols[0].metric("Current time", datetime.now(timezone.utc).strftime("%H:%M:%S UTC")); cols[1].metric("Snapshot updated", format_age(snap_age)); cols[2].metric("Snapshot age", format_age(snap_age)); cols[3].metric("Chart age", format_age(chart_age)); cols[4].metric("Council age", format_age(council_age)); cols[5].metric("Refresh", refresh_info.get("method")); cols[6].metric("Tick", refresh_info.get("tick"))
+    if snap_age>SNAPSHOT_STALE_WARN_SEC: st.warning("Snapshot data is stale."); module_debug(MODULE_NAME,"stale_snapshot",data={"age_sec":snap_age},level="WARN",also_overall=False)
+    limit=CHART_STALE_WARN_SEC_WEEK if timeframe=="week" else CHART_STALE_WARN_SEC_DAY
+    if chart_age>limit: st.warning("Chart data is stale."); module_debug(MODULE_NAME,"stale_chart_data",data={"age_sec":chart_age,"timeframe":timeframe},level="WARN",also_overall=False)
+    if council_age>COUNCIL_STALE_WARN_SEC: st.warning("Council votes are stale."); module_debug(MODULE_NAME,"stale_council_votes",data={"age_sec":council_age},level="WARN",also_overall=False)
+
+
+def main() -> None:
+    inject_medieval_css()
+    with st.sidebar:
+        interval_label=st.selectbox("Refresh interval", ["2s","3s","5s","10s","15s","30s"], index=1); interval_ms=int(interval_label.rstrip("s"))*1000
+    refresh_info=trigger_viewer_refresh(interval_ms)
+    with render_section("header"): render_header()
+    with render_section("snapshot_load"):
+        snapshot=load_viewer_snapshot()
+        if snapshot.get("_startup_waiting"): st.info("Waiting for the first bot snapshot. This is normal during startup before the bot completes its first evaluation cycle.")
+    with render_section("held_positions"): render_held_positions(snapshot)
+    with render_section("selected_coin"):
+        selected=pick_selected_coin(snapshot)
+        if not selected: module_debug(MODULE_NAME,"missing_selected_coin",data={"snapshot_coin_count":len(snapshot.get("coins",{}) or {})},level="WARN",also_overall=False); st.warning("No coin data is available yet. Start the bot and wait for viewer_snapshot.json to update."); return
+        module_debug(MODULE_NAME,"selected_coin_present",data={"selected":selected},level="INFO",also_overall=False)
+        timeframe=st.radio("Chart mode", ["day","week"], horizontal=True, format_func=lambda x: x.title())
+        overlays=_overlay_controls()
+    market_df=load_csv(MARKET_CSV_PATH); trades_df=load_csv(TRADES_CSV_PATH); shadow_df=load_csv(SHADOW_TRADES_CSV_PATH); targets_df=load_csv(POSITION_TARGETS_PATH); decisions_df=load_csv(COUNCIL_DECISIONS_PATH); council_votes_df=load_council_votes_df(); orders_df=load_csv(ORDERS_CSV_PATH); walk_forward_df=load_walk_forward_validation_df(); agent_ablation_df=load_agent_ablation_df(); ai_importance_df=load_ai_feature_importance_df(); order_book_df=load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
+    coin=dict((snapshot.get("coins",{}) or {}).get(selected,{}) or {}); target=latest_targets_for_coin(targets_df, selected); chart_df, chart_meta=load_chart_history(selected, timeframe); confirmed=confirmed_trades_only(trades_df, selected)
+    with render_section("council_chamber"): latest_decision_id, latest_votes=render_leader_and_council(council_votes_df, decisions_df, selected)
+    _render_freshness(snapshot, chart_meta, latest_votes, refresh_info, timeframe)
+    with render_section("chart"):
+        st.markdown('<div class="panel-card"><div class="section-title">Coinbase-Style OHLCV Chart</div><div class="muted">Candles come from micro/macro OHLCV files; market.csv is telemetry only.</div></div>', unsafe_allow_html=True)
+        fig=build_coin_chart(chart_df, chart_meta, coin, market_df, confirmed, shadow_df, decisions_df, target, overlays); st.plotly_chart(fig, use_container_width=True)
+        if confirmed.empty: st.info("No confirmed trades yet.")
+    with render_section("context_panels"):
+        render_volume_context_note(coin); render_transcript_strategy_context(coin); render_order_book_context(coin)
+    with render_section("confirmed_trades"): render_confirmed_trades(confirmed)
+    with render_section("targets"): render_targets_panel(coin, target)
+    with render_section("analytics"): render_coin_analytics(coin)
+    viewer_health=viewer_runtime_audit(snapshot=snapshot, selected=selected, market_df=market_df, trades_df=trades_df, targets_df=targets_df, decisions_df=decisions_df, council_votes_df=council_votes_df, orders_df=orders_df, walk_forward_df=walk_forward_df, agent_ablation_df=agent_ablation_df, ai_importance_df=ai_importance_df)
+    viewer_health.update({"selected_candle_rows": int(len(chart_df)), "selected_volume_rows": int(len(chart_df)) if chart_meta.get("has_volume") else 0, "chart_trace_count": len(fig.data), "active_timeframe": timeframe, "chart_overlay_toggles": overlays, "latest_decision_id": latest_decision_id, "latest_agent_vote_row_count": int(len(latest_votes))})
+    with render_section("debug_health"):
+        with st.expander("Viewer Debug Health", expanded=False): st.json(viewer_health)
+    with render_section("validation"):
+        with st.expander("Validation / Overfitting Controls", expanded=False):
+            st.markdown("### Walk-Forward Validation"); st.info("Walk-forward validation is waiting for enough reviewed outcomes.") if walk_forward_df.empty else st.dataframe(walk_forward_df.tail(50), use_container_width=True, hide_index=True)
+            st.markdown("### Agent Ablation"); st.info("Agent ablation is waiting for enough reviewed outcomes.") if agent_ablation_df.empty else st.dataframe(agent_ablation_df.tail(50), use_container_width=True, hide_index=True)
+            st.markdown("### AI Feature Importance"); st.info("AI feature importance will appear after the AI brain has enough training rows.") if ai_importance_df.empty else st.dataframe(ai_importance_df.head(40), use_container_width=True, hide_index=True)
+    with render_section("raw_tables"):
+        with st.expander("Raw Tables", expanded=False):
+            for name,df in [("council_decisions",decisions_df),("council_votes",council_votes_df),("market",market_df),("order_book_snapshots",order_book_df),("shadow_trades",shadow_df)]:
+                st.markdown(f"### {name}"); st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
+    with render_section("backend_orders"):
+        with st.expander("Backend Order Attempts", expanded=False): st.info("No backend order attempts yet.") if orders_df.empty else st.dataframe(orders_df.tail(100), use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
     try:

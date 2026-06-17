@@ -293,3 +293,19 @@ def csv_debug_summary(
         }
     except Exception as exc:
         return {**file_status(path), "name": name or Path(path).name, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def csv_runtime_status(path: str | Path, required_columns: Optional[Iterable[str]] = None, name: Optional[str] = None) -> Dict[str, Any]:
+    status = csv_debug_summary(path, required_columns=required_columns, name=name)
+    try:
+        p = Path(path)
+        status["age_sec"] = max(0.0, time.time() - p.stat().st_mtime) if p.exists() else None
+    except Exception:
+        status["age_sec"] = None
+    return status
+
+
+def normal_early_state(module_name: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+    payload = dict(data or {})
+    payload["state"] = "normal_early_learning"
+    write_debug(module_name, message, level="INFO", data=payload, also_overall=False)

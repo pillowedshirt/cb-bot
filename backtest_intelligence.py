@@ -737,8 +737,10 @@ def _walk_forward_validation_rows(base_dir: str) -> List[List[Any]]:
     dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
     if frame.empty or "product_id" not in frame.columns:
+        module_debug(MODULE_NAME, "backtest_walk_forward_waiting_for_rows", data={"candidate_rows": int(len(frame)) if hasattr(frame, "__len__") else 0, "min_product_rows": 80, "reason": "not_enough_reviewed_outcomes_yet"}, level="INFO", also_overall=False)
         return rows
     if "ts" not in frame.columns:
+        module_debug(MODULE_NAME, "backtest_walk_forward_waiting_for_rows", data={"candidate_rows": int(len(frame)), "min_product_rows": 80, "reason": "not_enough_reviewed_outcomes_yet"}, level="INFO", also_overall=False)
         return rows
     frame = frame.copy()
     frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce")
@@ -752,6 +754,7 @@ def _walk_forward_validation_rows(base_dir: str) -> List[List[Any]]:
     for product_id, product_frame in frame.groupby("product_id"):
         product_frame = product_frame.sort_values("ts").reset_index(drop=True)
         if len(product_frame) < 80:
+            module_debug(MODULE_NAME, "backtest_walk_forward_waiting_for_rows", data={"candidate_rows": int(len(frame)), "product_id": str(product_id), "product_rows": int(len(product_frame)), "min_product_rows": 80, "reason": "not_enough_reviewed_outcomes_yet"}, level="INFO", also_overall=False)
             continue
         fold_count = 4
         fold_size = max(20, len(product_frame) // fold_count)
@@ -811,6 +814,7 @@ def _agent_ablation_rows(base_dir: str) -> List[List[Any]]:
         observations["outcome_bps"] = pd.to_numeric(observations["move_bps"], errors="coerce").fillna(0.0)
         outcome = observations[["decision_id", "outcome_bps"]].copy()
     if outcome.empty:
+        module_debug(MODULE_NAME, "backtest_agent_ablation_waiting_for_outcomes", data={"vote_rows": int(len(votes)) if hasattr(votes, "__len__") else 0, "audit_rows": int(len(audit)) if hasattr(audit, "__len__") else 0, "observation_rows": int(len(observations)) if hasattr(observations, "__len__") else 0, "reason": "not_enough_reviewed_outcomes_yet"}, level="INFO", also_overall=False)
         return rows
     votes = votes.copy()
     for col in ["adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "weight"]:
@@ -903,8 +907,8 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "sell_recommendation_rows", len(sell_rows), "product-level sell replay recommendations"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_prior_rows", len(agent_rows), "profit-weighted agent priors"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "setup_performance_rows", len(setup_rows), "product/session/setup-specific profit replay"],
-        [f"{ts_value:.6f}", _utc_dt(ts_value), "walk_forward_validation_rows", len(walk_forward_rows), "out-of-sample validation rows"],
-        [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_ablation_rows", len(ablation_rows), "agent marginal contribution report"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "walk_forward_validation_rows", len(walk_forward_rows), "out-of-sample validation rows" if walk_forward_rows else "not enough reviewed outcomes yet"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_ablation_rows", len(ablation_rows), "agent marginal contribution report" if ablation_rows else "not enough reviewed outcomes yet"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
     ]
     _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)

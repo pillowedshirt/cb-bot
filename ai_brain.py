@@ -406,9 +406,11 @@ class LocalAIBrain:
                 data={
                     "rows": int(len(frame)),
                     "required": int(self.min_training_rows),
+                    "state": "normal_early_learning",
+                    "message": "AI training starts after enough reviewed rows exist.",
                 },
-                level="WARN",
-                also_overall=True,
+                level="INFO",
+                also_overall=False,
             )
             return {
                 "ok": False,

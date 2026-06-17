@@ -152,6 +152,7 @@ BACKTEST_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_recomm
 BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_sell_recommendations.csv")
 BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
 BACKTEST_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_summary.csv")
+BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_setup_performance.csv")
 
 # Startup CSV-state detection.
 # This must check for meaningful pre-existing data rows, not just file existence.
@@ -179,6 +180,7 @@ STARTUP_STATE_CSV_PATHS: List[str] = [
     BACKTEST_RECOMMENDATIONS_CSV_PATH,
     BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH,
     BACKTEST_AGENT_PRIORS_CSV_PATH,
+    BACKTEST_SETUP_PERFORMANCE_CSV_PATH,
     BACKTEST_SUMMARY_CSV_PATH,
 ]
 
@@ -8336,6 +8338,138 @@ class TradingBot:
             return False
 
 
+    def _smt_divergence_context_for_product(
+        self,
+        *,
+        product_id: str,
+        lookback: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        Compare related crypto products for SMT/correlation divergence.
+
+        This is weighted evidence, not a hard trigger.
+
+        Bullish SMT:
+        - this product sweeps lower or makes a lower low while the paired product refuses.
+
+        Bearish SMT:
+        - this product sweeps higher or makes a higher high while the paired product refuses.
+        """
+        try:
+            pairs = [
+                ("BTC-USD", "ETH-USD"),
+                ("ETH-USD", "BTC-USD"),
+                ("SOL-USD", "AVAX-USD"),
+                ("AVAX-USD", "SOL-USD"),
+                ("DOGE-USD", "SHIB-USD"),
+                ("SHIB-USD", "DOGE-USD"),
+            ]
+
+            peer = ""
+            for a, b in pairs:
+                if product_id == a and b in self.minute_candles:
+                    peer = b
+                    break
+
+            if not peer:
+                # Fallback: compare altcoins to BTC when BTC is available.
+                if product_id != "BTC-USD" and "BTC-USD" in self.minute_candles:
+                    peer = "BTC-USD"
+
+            if not peer:
+                return {
+                    "agent": "smt_divergence_agent",
+                    "buy": 0.0,
+                    "sell": 0.0,
+                    "hold": 0.50,
+                    "wait": 0.50,
+                    "confidence": 0.10,
+                    "smt_state": "no_peer",
+                    "peer": "",
+                    "reason": "smt_no_peer_available",
+                }
+
+            own = list(self.minute_candles.get(product_id, []))[-int(lookback):]
+            other = list(self.minute_candles.get(peer, []))[-int(lookback):]
+
+            if len(own) < 4 or len(other) < 4:
+                return {
+                    "agent": "smt_divergence_agent",
+                    "buy": 0.0,
+                    "sell": 0.0,
+                    "hold": 0.50,
+                    "wait": 0.50,
+                    "confidence": 0.10,
+                    "smt_state": "insufficient_candles",
+                    "peer": peer,
+                    "reason": f"smt_insufficient_candles;peer={peer}",
+                }
+
+            def low(c):
+                return float(getattr(c, "low", 0.0) or 0.0)
+
+            def high(c):
+                return float(getattr(c, "high", 0.0) or 0.0)
+
+            def close(c):
+                return float(getattr(c, "close", 0.0) or 0.0)
+
+            own_prev_low = min(low(c) for c in own[:-2] if low(c) > 0)
+            own_recent_low = min(low(c) for c in own[-2:] if low(c) > 0)
+            peer_prev_low = min(low(c) for c in other[:-2] if low(c) > 0)
+            peer_recent_low = min(low(c) for c in other[-2:] if low(c) > 0)
+
+            own_prev_high = max(high(c) for c in own[:-2])
+            own_recent_high = max(high(c) for c in own[-2:])
+            peer_prev_high = max(high(c) for c in other[:-2])
+            peer_recent_high = max(high(c) for c in other[-2:])
+
+            own_swept_low = bool(own_recent_low < own_prev_low and close(own[-1]) > own_prev_low)
+            peer_refused_low = bool(peer_recent_low >= peer_prev_low)
+
+            own_swept_high = bool(own_recent_high > own_prev_high and close(own[-1]) < own_prev_high)
+            peer_refused_high = bool(peer_recent_high <= peer_prev_high)
+
+            bullish_smt = bool(own_swept_low and peer_refused_low)
+            bearish_smt = bool(own_swept_high and peer_refused_high)
+
+            buy_score = clamp_float(0.30 + (0.38 if bullish_smt else 0.0), 0.0, 1.0)
+            sell_score = clamp_float(0.28 + (0.38 if bearish_smt else 0.0), 0.0, 1.0)
+            hold_score = clamp_float(0.48 + buy_score * 0.18 - sell_score * 0.12, 0.0, 1.0)
+            confidence = clamp_float(0.22 + (0.42 if bullish_smt or bearish_smt else 0.0), 0.10, 0.85)
+
+            smt_state = "bullish_smt" if bullish_smt else "bearish_smt" if bearish_smt else "no_smt"
+
+            return {
+                "agent": "smt_divergence_agent",
+                "buy": float(buy_score),
+                "sell": float(sell_score),
+                "hold": float(hold_score),
+                "wait": clamp_float(0.60 - max(buy_score, sell_score) * 0.25, 0.0, 1.0),
+                "confidence": float(confidence),
+                "smt_state": smt_state,
+                "peer": peer,
+                "reason": (
+                    f"smt_state={smt_state};peer={peer};"
+                    f"own_swept_low={own_swept_low};peer_refused_low={peer_refused_low};"
+                    f"own_swept_high={own_swept_high};peer_refused_high={peer_refused_high}"
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "agent": "smt_divergence_agent",
+                "buy": 0.0,
+                "sell": 0.0,
+                "hold": 0.50,
+                "wait": 0.50,
+                "confidence": 0.10,
+                "smt_state": "smt_error",
+                "peer": "",
+                "reason": f"smt_error:{exc}",
+            }
+
+
     def _price_action_context_for_product(
         self,
         *,
@@ -8675,6 +8809,7 @@ class TradingBot:
             "learning_score": learning_score,
             "session_liquidity": session_liquidity,
             "price_action_context": price_action_context,
+            "smt_divergence": self._smt_divergence_context_for_product(product_id=product_id),
         }
 
     def _max_buy_spread_for_product(self, product_id: str) -> float:
@@ -9148,6 +9283,18 @@ class TradingBot:
                 common=common,
             )
 
+            smt_context = dict(context.get("smt_divergence", {}) or {})
+            smt_vote = {
+                **common,
+                "agent": "smt_divergence_agent",
+                "buy": clamp_float(float(smt_context.get("buy", 0.0) or 0.0), 0.0, 1.0),
+                "sell": clamp_float(float(smt_context.get("sell", 0.0) or 0.0), 0.0, 1.0),
+                "hold": clamp_float(float(smt_context.get("hold", 0.50) or 0.50), 0.0, 1.0),
+                "wait": clamp_float(float(smt_context.get("wait", 0.50) or 0.50), 0.0, 1.0),
+                "confidence": clamp_float(float(smt_context.get("confidence", 0.10) or 0.10), 0.10, 0.85),
+                "reason": str(smt_context.get("reason", "smt_no_reason")),
+            }
+
             votes = [
                 vote("trend", trend_score, clamp_float(0.40+trend_score*0.30,0.0,1.0), clamp_float(0.60-trend_score*0.35,0.0,1.0), clamp_float(0.35+abs(mom5)/180.0,0.20,0.90), f"trend mom5={mom5:.2f};mom15={mom15:.2f};regime={market_regime}"),
                 vote("mean_reversion", mean_reversion_score, 0.45, clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), clamp_float(0.35+abs(mom5)/220.0,0.20,0.85), f"mean_reversion setup={setup_tag};mom1={mom1:.2f};mom5={mom5:.2f}"),
@@ -9170,6 +9317,7 @@ class TradingBot:
                 vote("product_health", clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), clamp_float(0.40+forward_score*0.30,0.0,1.0), clamp_float(0.65-forward_score*0.35,0.0,1.0), clamp_float(0.30+score*0.50,0.20,0.85), f"product score={score:.3f};edge={expected_edge:.2f};forward={projected_forward:.2f}"),
                 session_liquidity_vote,
                 *price_action_votes,
+                smt_vote,
                 {**common, "agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
                 vote("exploration", learning_score, 0.35, clamp_float(0.70-learning_score*0.45,0.0,1.0), clamp_float(0.30+learning_score*0.55,0.20,0.85), f"learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"),
             ]
@@ -9210,6 +9358,8 @@ class TradingBot:
             value_area_for_strategy = str(pa_context_for_strategy.get("value_area_state", ""))
             fvg_state_for_strategy = str(pa_context_for_strategy.get("fvg_state", ""))
             structure_for_strategy = str(pa_context_for_strategy.get("structure_state", ""))
+            smt_for_strategy = dict(context.get("smt_divergence", {}) or {})
+            smt_state_for_strategy = str(smt_for_strategy.get("smt_state", ""))
 
             strategy = (
                 f"LEVEL8_DIRECT|regime={market_regime}|setup={setup_tag}|"
@@ -9218,6 +9368,7 @@ class TradingBot:
                 f"structure={structure_for_strategy}|"
                 f"value_area={value_area_for_strategy}|"
                 f"fvg={fvg_state_for_strategy}|"
+                f"smt={smt_state_for_strategy}|"
                 f"execution={execution_state}"
             )
             decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
@@ -9248,7 +9399,8 @@ class TradingBot:
                 f"session_agent={session_context.get('strongest_agent', '')};"
                 f"session_setup={session_context.get('strongest_setup', '')};"
                 f"session_reason={session_context.get('reason', '')};"
-                f"price_action_reason={price_context.get('reason', '')}"
+                f"price_action_reason={price_context.get('reason', '')};"
+                f"smt_reason={dict(context.get('smt_divergence', {}) or {}).get('reason', '')}"
             )
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")

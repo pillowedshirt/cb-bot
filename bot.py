@@ -30,9 +30,10 @@ from coinbase.rest import RESTClient
 from coinbase import jwt_generator
 
 try:
-    from ai_brain import LocalAIBrain
+    from ai_brain import LocalAIBrain, FEATURE_COLUMNS as AI_FEATURE_COLUMNS
 except Exception:
     LocalAIBrain = None
+    AI_FEATURE_COLUMNS = []
 
 try:
     from level8_council import Level8Council
@@ -188,6 +189,7 @@ DECISION_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "decision_audit.csv")
 SELL_QUALITY_REVIEWS_CSV_PATH: str = os.path.join(BASE_DIR, "sell_quality_reviews.csv")
 MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.csv")
 MAKER_MISS_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_miss_outcomes.csv")
+ORDER_BOOK_SNAPSHOTS_CSV_PATH: str = os.path.join(BASE_DIR, "order_book_snapshots.csv")
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
 
 # Startup CSV-state detection.
@@ -1220,6 +1222,15 @@ ENABLE_HARD_SPREAD_FILTER_FOR_BUYS: bool = False
 HARD_MAX_BUY_SPREAD_BPS: float = 80.0
 PRODUCT_MAX_BUY_SPREAD_BPS: Dict[str, float] = {}
 SPREAD_RANK_PENALTY_MULT: float = 0.35
+ENABLE_ORDER_BOOK_CONTEXT: bool = True
+ORDER_BOOK_LEVELS: int = 25
+ORDER_BOOK_REFRESH_EVERY_SEC: float = 3.0
+ORDER_BOOK_MIN_TOP_DEPTH_USD: float = 1500.0
+ORDER_BOOK_IMBALANCE_STRONG_BUY: float = 0.18
+ORDER_BOOK_IMBALANCE_STRONG_SELL: float = -0.18
+ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE: float = 0.72
+SPREAD_INSTABILITY_WINDOW: int = 12
+SPREAD_INSTABILITY_BLOCK_BPS: float = 18.0
 
 # Post-buy outcome research windows.
 POST_BUY_REVIEW_WINDOWS_MINUTES: List[int] = [5, 15, 30, 60, 120]
@@ -4460,6 +4471,46 @@ class LivePortfolio:
 
         return None, None
 
+    def get_order_book_snapshot(self, product_id: str, limit: int = 25) -> Dict[str, Any]:
+        """Best-effort Coinbase product book snapshot for liquidity context."""
+        product_id = str(product_id).strip().upper()
+        try:
+            fn = getattr(self.rest, "get_product_book", None)
+            if not callable(fn):
+                return {"ok": False, "reason": "get_product_book_unavailable"}
+            try:
+                resp = fn(product_id=product_id, limit=int(limit))
+            except TypeError:
+                resp = fn(product_id)
+            data = self._to_dict(resp)
+            pricebook = self._to_dict(data.get("pricebook"))
+            bids = data.get("bids") or pricebook.get("bids") or []
+            asks = data.get("asks") or pricebook.get("asks") or []
+
+            def parse_levels(levels: Any) -> List[Dict[str, float]]:
+                out: List[Dict[str, float]] = []
+                if not isinstance(levels, list):
+                    return out
+                for item in levels[: int(limit)]:
+                    d = self._to_dict(item)
+                    price = safe_float(d.get("price") or d.get("bid_price") or d.get("ask_price"))
+                    size = safe_float(d.get("size") or d.get("quantity") or d.get("base_size"))
+                    if price is not None and size is not None and price > 0 and size > 0:
+                        out.append({"price": float(price), "size": float(size), "notional_usd": float(price) * float(size)})
+                return out
+
+            bid_levels = parse_levels(bids)
+            ask_levels = parse_levels(asks)
+            return {
+                "ok": bool(bid_levels and ask_levels),
+                "product_id": product_id,
+                "bids": bid_levels,
+                "asks": ask_levels,
+                "reason": "ok" if bid_levels and ask_levels else "empty_book",
+            }
+        except Exception as exc:
+            return {"ok": False, "product_id": product_id, "reason": f"order_book_error:{exc}"}
+
     def get_product_meta(self, product_id: str) -> Dict[str, Any]:
         """Return Coinbase product metadata used to format order sizes."""
         product_id = str(product_id).strip().upper()
@@ -5673,6 +5724,9 @@ class TradingBot:
         self.ai_brain = None
         self.level8_council = None
         self.last_level8_council_heartbeat_ts: float = 0.0
+        self._last_order_book_context_ts: Dict[str, float] = {}
+        self._order_book_context_cache: Dict[str, Dict[str, Any]] = {}
+        self._spread_history_by_product: Dict[str, Deque[float]] = {}
         self.last_ai_train_ts: float = 0.0
         self._ai_training_running: bool = False
         self._backtest_reload_running: bool = False
@@ -12193,6 +12247,7 @@ class TradingBot:
         candidate: Dict[str, Any],
     ) -> Tuple[bool, Dict[str, Any]]:
         """Build a context-aware multi-agent Level 8 council vote."""
+        candidate = self._apply_order_book_context_to_candidate(candidate)
         product_id = str(candidate.get("product_id", ""))
         owns_position = self._has_open_position(product_id)
         if (
@@ -12443,6 +12498,22 @@ class TradingBot:
                 1.0,
             )
 
+            order_book_buy_score = float(candidate.get("order_book_buy_score", 0.50) or 0.50)
+            order_book_sell_score = float(candidate.get("order_book_sell_score", 0.50) or 0.50)
+            order_book_wait_score = float(candidate.get("order_book_wait_score", 0.20) or 0.20)
+            order_book_liquidity_risk = float(candidate.get("liquidity_risk_score", 0.0) or 0.0)
+            order_book_available = bool(candidate.get("order_book_available", False))
+            order_book_vote = {
+                **common,
+                "agent": "execution_order_book",
+                "buy": clamp_float(order_book_buy_score, 0.0, 1.0),
+                "sell": clamp_float(order_book_sell_score, 0.0, 1.0),
+                "hold": clamp_float(0.45 + max(0.0, 0.50 - order_book_liquidity_risk) * 0.25, 0.0, 1.0),
+                "wait": clamp_float(order_book_wait_score, 0.0, 1.0),
+                "confidence": clamp_float(0.12 + (0.44 if order_book_available else 0.0) + order_book_liquidity_risk * 0.10, 0.10, 0.66),
+                "reason": str(candidate.get("order_book_reason", "order_book_context_absent")),
+            }
+
             utility_leader_vote = {
                 **common,
                 "agent": "utility_leader",
@@ -12473,6 +12544,7 @@ class TradingBot:
                     ai_reason,
                 ),
                 vote("execution", clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), 0.45, clamp_float(1.0-spread_quality,0.0,1.0), clamp_float(0.30+spread_quality*0.55,0.20,0.95), f"execution spread={spread_bps:.2f};cost={cost_bps:.2f};state={execution_state}"),
+                order_book_vote,
                 vote("product_health", clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), clamp_float(0.40+forward_score*0.30,0.0,1.0), clamp_float(0.65-forward_score*0.35,0.0,1.0), clamp_float(0.30+score*0.50,0.20,0.85), f"product score={score:.3f};edge={expected_edge:.2f};forward={projected_forward:.2f}"),
                 session_liquidity_vote,
                 previous_session_profile_vote,
@@ -12555,7 +12627,9 @@ class TradingBot:
                 + utility_truth_component * 0.10
                 + volume_leader_truth_component * float(VOLUME_PROFILE_LEADER_TRUTH_WEIGHT)
                 + previous_session_truth_component * float(PREVIOUS_SESSION_PROFILE_TRUTH_WEIGHT)
-                + quant_truth_component * float(QUANT_CONTEXT_TRUTH_WEIGHT),
+                + quant_truth_component * float(QUANT_CONTEXT_TRUTH_WEIGHT)
+                + order_book_buy_score * (0.035 if order_book_available else 0.0)
+                - order_book_liquidity_risk * 0.025,
                 0.0,
                 1.0,
             )
@@ -12571,6 +12645,8 @@ class TradingBot:
                     f"volume_leader_component={volume_leader_truth_component:.3f};"
                     f"previous_session_component={previous_session_truth_component:.3f};"
                     f"quant_component={quant_truth_component:.3f};"
+                    f"order_book_buy={order_book_buy_score:.3f};"
+                    f"liquidity_risk={order_book_liquidity_risk:.3f};"
                     f"expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f};"
                     f"calibrated_p_win={float(candidate.get('calibrated_p_win', 0.50) or 0.50):.3f};"
                     f"payoff={float(candidate.get('payoff_ratio', 0.0) or 0.0):.3f};"
@@ -17116,42 +17192,130 @@ class TradingBot:
         except Exception as exc:
             log(f"[ai] training failed: {exc}")
 
-    def _ai_context_from_candidate(
-        self, candidate: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _order_book_context_for_product(self, product_id: str) -> Dict[str, Any]:
+        """Order-book depth and liquidity imbalance context."""
+        if not bool(ENABLE_ORDER_BOOK_CONTEXT):
+            return {"order_book_available": False, "order_book_reason": "order_book_disabled"}
+        ts_now = now_ts()
+        last_ts = float(self._last_order_book_context_ts.get(product_id, 0.0) or 0.0)
+        if product_id in self._order_book_context_cache and ts_now - last_ts < float(ORDER_BOOK_REFRESH_EVERY_SEC):
+            return dict(self._order_book_context_cache[product_id])
+        context: Dict[str, Any] = {
+            "order_book_available": False, "order_book_imbalance": 0.0,
+            "order_book_bid_depth_usd": 0.0, "order_book_ask_depth_usd": 0.0,
+            "order_book_top_depth_usd": 0.0, "spread_instability_bps": 0.0,
+            "liquidity_risk_score": 0.0, "order_book_reason": "unavailable",
+        }
+        try:
+            if not hasattr(self, "portfolio") or self.portfolio is None:
+                context["order_book_reason"] = "portfolio_unavailable"
+                return context
+            book = self.portfolio.get_order_book_snapshot(product_id, limit=int(ORDER_BOOK_LEVELS))
+            if not bool(book.get("ok", False)):
+                context["order_book_reason"] = str(book.get("reason", "book_not_ok"))
+                return context
+            bids = list(book.get("bids", []) or [])
+            asks = list(book.get("asks", []) or [])
+            bid_depth = sum(float(x.get("notional_usd", 0.0) or 0.0) for x in bids)
+            ask_depth = sum(float(x.get("notional_usd", 0.0) or 0.0) for x in asks)
+            top_depth = sum(float(x.get("notional_usd", 0.0) or 0.0) for x in bids[:3]) + sum(float(x.get("notional_usd", 0.0) or 0.0) for x in asks[:3])
+            total_depth = max(1e-9, bid_depth + ask_depth)
+            imbalance = (bid_depth - ask_depth) / total_depth
+            bid, ask = self.portfolio.get_best_bid_ask(product_id)
+            spread_bps = 0.0
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
+                mid = (float(bid) + float(ask)) / 2.0
+                spread_bps = ((float(ask) - float(bid)) / max(mid, 1e-9)) * 10000.0
+            hist = self._spread_history_by_product.setdefault(product_id, deque(maxlen=int(SPREAD_INSTABILITY_WINDOW)))
+            hist.append(float(spread_bps))
+            spread_instability = max(hist) - min(hist) if len(hist) >= 4 else 0.0
+            depth_risk = 1.0 - min(1.0, top_depth / max(float(ORDER_BOOK_MIN_TOP_DEPTH_USD), 1e-9))
+            imbalance_risk = max(0.0, abs(imbalance) - 0.45) / 0.55
+            spread_instability_risk = min(1.0, spread_instability / max(float(SPREAD_INSTABILITY_BLOCK_BPS), 1e-9))
+            liquidity_risk = clamp_float(depth_risk * 0.45 + imbalance_risk * 0.20 + spread_instability_risk * 0.35, 0.0, 1.0)
+            context = {
+                "order_book_available": True, "order_book_imbalance": float(imbalance),
+                "order_book_bid_depth_usd": float(bid_depth), "order_book_ask_depth_usd": float(ask_depth),
+                "order_book_top_depth_usd": float(top_depth), "spread_instability_bps": float(spread_instability),
+                "liquidity_risk_score": float(liquidity_risk),
+                "order_book_reason": (f"order_book_context;imbalance={imbalance:.4f};bid_depth={bid_depth:.2f};"
+                                      f"ask_depth={ask_depth:.2f};top_depth={top_depth:.2f};"
+                                      f"spread_instability={spread_instability:.2f};liquidity_risk={liquidity_risk:.3f}"),
+            }
+            self._last_order_book_context_ts[product_id] = ts_now
+            self._order_book_context_cache[product_id] = dict(context)
+            try:
+                self._append_csv_dict_row(
+                    path=ORDER_BOOK_SNAPSHOTS_CSV_PATH,
+                    columns=["ts", "dt_mst", "product_id", "bid_depth_usd", "ask_depth_usd", "top_depth_usd", "imbalance", "spread_instability_bps", "liquidity_risk_score", "reason"],
+                    row={"ts": f"{ts_now:.6f}", "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "bid_depth_usd": f"{bid_depth:.6f}", "ask_depth_usd": f"{ask_depth:.6f}", "top_depth_usd": f"{top_depth:.6f}", "imbalance": f"{imbalance:.6f}", "spread_instability_bps": f"{spread_instability:.6f}", "liquidity_risk_score": f"{liquidity_risk:.6f}", "reason": context["order_book_reason"]},
+                )
+            except Exception:
+                pass
+            return context
+        except Exception as exc:
+            context["order_book_reason"] = f"order_book_context_error:{exc}"
+            return context
+
+    def _apply_order_book_context_to_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        product_id = str(candidate.get("product_id", ""))
+        if not product_id:
+            return candidate
+        ctx = self._order_book_context_for_product(product_id)
+        candidate["order_book_available"] = bool(ctx.get("order_book_available", False))
+        for key in ("order_book_imbalance", "order_book_bid_depth_usd", "order_book_ask_depth_usd", "order_book_top_depth_usd", "spread_instability_bps", "liquidity_risk_score"):
+            candidate[key] = _json_safe_float(ctx.get(key, 0.0))
+        candidate["order_book_reason"] = str(ctx.get("order_book_reason", ""))
+        imb = float(candidate["order_book_imbalance"])
+        risk = float(candidate["liquidity_risk_score"])
+        candidate["order_book_buy_score"] = clamp_float(0.50 + imb * 0.80 - risk * 0.35, 0.0, 1.0)
+        candidate["order_book_sell_score"] = clamp_float(0.50 - imb * 0.80 + risk * 0.25, 0.0, 1.0)
+        candidate["order_book_wait_score"] = clamp_float(0.20 + risk * 0.70, 0.0, 1.0)
+        return candidate
+
+    def _ai_context_from_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Build live AI context with parity to ai_brain.FEATURE_COLUMNS."""
         product_id = str(candidate.get("product_id", ""))
         moms = {"mom1": 0.0, "mom3": 0.0, "mom5": 0.0, "mom15": 0.0}
         try:
             moms = self._entry_momentum_snapshot(product_id)
         except Exception:
             pass
-
         green = 0
         try:
-            green = self._recent_green_candle_count(
-                product_id, ENTRY_GREEN_CANDLE_LOOKBACK
-            )
+            green = self._recent_green_candle_count(product_id, ENTRY_GREEN_CANDLE_LOOKBACK)
         except Exception:
             pass
 
-        return {
-            "ts": now_ts(),
-            "score": float(candidate.get("score", 0.0)),
-            "probability": float(candidate.get("estimated_prob_up", 0.0)),
-            "ev_bps": float(candidate.get("expected_net_edge_bps", 0.0)),
-            "projected_forward_bps": float(
-                candidate.get("projected_forward_gain_bps", 0.0)
-            ),
-            "cost_bps": float(candidate.get("cost_bps", 0.0)),
-            "spread_bps": float(candidate.get("spread_bps", 0.0)),
-            "momentum_1_bps": float(moms.get("mom1", 0.0)),
-            "momentum_3_bps": float(moms.get("mom3", 0.0)),
-            "momentum_5_bps": float(moms.get("mom5", 0.0)),
-            "momentum_15_bps": float(moms.get("mom15", 0.0)),
-            "green_candles": float(green),
-            "rank_score": float(candidate.get("rank_score", 0.0)),
-            "buy_ready_count": float(candidate.get("buy_ready_count", 0.0)),
+        def f(*keys: str, default: float = 0.0) -> float:
+            for key in keys:
+                try:
+                    if key in candidate:
+                        return float(candidate.get(key, default) or default)
+                except Exception:
+                    pass
+            return float(default)
+
+        context: Dict[str, Any] = {
+            "ts": now_ts(), "score": f("score"), "probability": f("estimated_prob_up", "probability"),
+            "ev_bps": f("expected_net_edge_bps", "ev_bps"), "projected_forward_bps": f("projected_forward_gain_bps", "projected_forward_bps"),
+            "cost_bps": f("cost_bps"), "spread_bps": f("spread_bps"),
+            "momentum_1_bps": float(moms.get("mom1", 0.0)), "momentum_3_bps": float(moms.get("mom3", 0.0)),
+            "momentum_5_bps": float(moms.get("mom5", 0.0)), "momentum_15_bps": float(moms.get("mom15", 0.0)),
+            "green_candles": float(green), "rank_score": f("rank_score"), "buy_ready_count": f("buy_ready_count"),
         }
+        for column in list(AI_FEATURE_COLUMNS or []):
+            if column not in context:
+                context[column] = f(column)
+        context.update({
+            "expected_utility_bps": f("expected_utility_bps"), "buy_vs_wait_edge_bps": f("buy_vs_wait_edge_bps"),
+            "calibrated_p_win": f("calibrated_p_win", default=0.50), "payoff_ratio": f("payoff_ratio"),
+            "maker_adjusted_expected_value_bps": f("maker_adjusted_expected_value_bps"), "uncertainty_penalty_bps": f("uncertainty_penalty_bps"),
+            "order_book_imbalance": f("order_book_imbalance"), "order_book_bid_depth_usd": f("order_book_bid_depth_usd"),
+            "order_book_ask_depth_usd": f("order_book_ask_depth_usd"), "order_book_top_depth_usd": f("order_book_top_depth_usd"),
+            "spread_instability_bps": f("spread_instability_bps"), "liquidity_risk_score": f("liquidity_risk_score"),
+        })
+        return context
 
     def _ai_allows_candidate(
         self, *, candidate: Dict[str, Any]
@@ -18167,6 +18331,17 @@ class TradingBot:
             "quant_peer_spread_z": _json_safe_float(candidate.get("quant_peer_spread_z", 0.0)),
             "quant_reason": str(candidate.get("quant_reason", "")),
             "quant_context_utility_adjust_bps": _json_safe_float(candidate.get("quant_context_utility_adjust_bps", 0.0)),
+            "order_book_available": bool(candidate.get("order_book_available", False)),
+            "order_book_imbalance": _json_safe_float(candidate.get("order_book_imbalance", 0.0)),
+            "order_book_bid_depth_usd": _json_safe_float(candidate.get("order_book_bid_depth_usd", 0.0)),
+            "order_book_ask_depth_usd": _json_safe_float(candidate.get("order_book_ask_depth_usd", 0.0)),
+            "order_book_top_depth_usd": _json_safe_float(candidate.get("order_book_top_depth_usd", 0.0)),
+            "spread_instability_bps": _json_safe_float(candidate.get("spread_instability_bps", 0.0)),
+            "liquidity_risk_score": _json_safe_float(candidate.get("liquidity_risk_score", 0.0)),
+            "order_book_buy_score": _json_safe_float(candidate.get("order_book_buy_score", 0.0)),
+            "order_book_sell_score": _json_safe_float(candidate.get("order_book_sell_score", 0.0)),
+            "order_book_wait_score": _json_safe_float(candidate.get("order_book_wait_score", 0.0)),
+            "order_book_reason": str(candidate.get("order_book_reason", "")),
         })
         return row
 

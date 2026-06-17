@@ -19,6 +19,7 @@ DECISION_AUDIT_CSV = os.path.join(BASE_DIR, "decision_audit.csv")
 SELL_QUALITY_REVIEWS_CSV = os.path.join(BASE_DIR, "sell_quality_reviews.csv")
 AI_MODEL_PATH = os.path.join(BASE_DIR, "ai_brain.joblib")
 AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
+AI_FEATURE_IMPORTANCE_CSV = os.path.join(BASE_DIR, "ai_feature_importance.csv")
 
 FEATURE_COLUMNS = [
     "score",
@@ -78,6 +79,14 @@ FEATURE_COLUMNS = [
     "quant_conditional_volatility_bps",
     "quant_peer_spread_z",
     "quant_context_utility_adjust_bps",
+    "order_book_imbalance",
+    "order_book_bid_depth_usd",
+    "order_book_ask_depth_usd",
+    "order_book_top_depth_usd",
+    "spread_instability_bps",
+    "liquidity_risk_score",
+    "market_data_age_sec",
+    "viewer_snapshot_age_sec",
 ]
 
 
@@ -309,6 +318,43 @@ class LocalAIBrain:
 
         return frame
 
+    def _write_feature_importance_report(self, frame: pd.DataFrame) -> None:
+        """Write a lightweight feature-importance proxy for AI training inputs."""
+        try:
+            if frame.empty:
+                return
+            rows = []
+            y_move = pd.to_numeric(frame["y_move_30m_bps"], errors="coerce").fillna(0.0)
+            y_up = pd.to_numeric(frame["y_up_30m"], errors="coerce").fillna(0)
+            winners = frame[y_up == 1]
+            losers = frame[y_up == 0]
+            for column in FEATURE_COLUMNS:
+                x = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+                corr = 0.0
+                try:
+                    if x.std() > 0 and y_move.std() > 0:
+                        corr = float(x.corr(y_move))
+                except Exception:
+                    corr = 0.0
+                winner_mean = float(pd.to_numeric(winners[column], errors="coerce").fillna(0.0).mean()) if not winners.empty else 0.0
+                loser_mean = float(pd.to_numeric(losers[column], errors="coerce").fillna(0.0).mean()) if not losers.empty else 0.0
+                rows.append({
+                    "feature": column,
+                    "abs_corr_to_move": abs(float(corr or 0.0)),
+                    "corr_to_move": float(corr or 0.0),
+                    "winner_mean": winner_mean,
+                    "loser_mean": loser_mean,
+                    "winner_minus_loser": winner_mean - loser_mean,
+                    "sample_count": int(len(frame)),
+                })
+            out = pd.DataFrame(rows).sort_values(
+                ["abs_corr_to_move", "winner_minus_loser"],
+                ascending=[False, False],
+            )
+            out.to_csv(AI_FEATURE_IMPORTANCE_CSV, index=False)
+        except Exception:
+            pass
+
     def train(self) -> Dict[str, Any]:
         frame = self.build_training_frame()
         if len(frame) < self.min_training_rows:
@@ -325,6 +371,7 @@ class LocalAIBrain:
             }
 
         features = frame[FEATURE_COLUMNS].copy()
+        self._write_feature_importance_report(frame)
         classification_target = frame["y_up_30m"].astype(int)
         if classification_target.nunique() < 2:
             return {

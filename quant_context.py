@@ -175,6 +175,20 @@ def _peer_relative_context(*, product_id: str, returns: List[float], peer_return
 
 
 def build_quant_context_signal(*, product_id: str, candles: List[Any], peer_returns_by_product: Optional[Dict[str, List[float]]] = None, lookback: int = 240) -> QuantContextSignal:
+    debug_every(
+        MODULE_NAME,
+        f"quant_context_start:{product_id}",
+        30.0,
+        "quant_context_start",
+        data={
+            "product_id": product_id,
+            "candles_count": len(candles) if candles is not None else 0,
+            "peer_count": len(peer_returns_by_product or {}),
+            "lookback": lookback,
+        },
+        level="DEBUG",
+        also_overall=False,
+    )
     returns = _log_returns_from_closes(_closes(list(candles or [])[-int(lookback):]))
     if len(returns) < 30:
         return QuantContextSignal(product_id, 0.0, 0.0, 0.0, 0.0, 0.20, 0.50, 0.50, 0.0, 0.0, 0.0, 0.0, "insufficient_data", "no_boundary", 0.0, 0.0, 0.50, 0.75, 0.10, "", 0.0, "no_peer_context", "insufficient_returns", f"quant_context_unavailable;returns={len(returns)}")
@@ -206,6 +220,29 @@ def build_quant_context_signal(*, product_id: str, candles: List[Any], peer_retu
     hold_score = _clamp(0.40 + (0.20 if forecast > 0 and boundary_state != "above_upper_boundary_stretched" else 0.0) + (0.14 if vol_state == "normal_volatility" else 0.0) - (0.18 if sell_score >= 0.60 else 0.0))
     wait_score = _clamp(0.36 + (0.24 if stationarity_score < 0.42 else 0.0) + (0.18 if vol_state == "volatility_expansion_cluster" and abs(forecast) < 8 else 0.0) + (0.18 if boundary_state == "inside_quant_boundary" and abs(forecast) < 6 else 0.0))
     confidence = _clamp(0.28 + min(0.20, len(returns) / 400.0) + stationarity_score * 0.22 + min(0.16, abs(forecast) / 65.0) + (0.10 if peer_state not in {"no_peer_context", "insufficient_peer_data"} else 0.0))
+    debug_every(
+        MODULE_NAME,
+        f"quant_context_result:{product_id}",
+        30.0,
+        "quant_context_result",
+        data={
+            "product_id": product_id,
+            "boundary_state": boundary_state,
+            "volatility_cluster_state": vol_state,
+            "forecast_return_bps": forecast,
+            "stationarity_score": stationarity_score,
+            "peer_product": peer.get("peer_product", ""),
+            "peer_state": peer_state,
+            "peer_spread_z": peer.get("peer_spread_z", 0.0),
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "hold_score": hold_score,
+            "wait_score": wait_score,
+            "confidence": confidence,
+        },
+        level="DEBUG",
+        also_overall=False,
+    )
     return QuantContextSignal(product_id, float(mean_ret), float(std_ret), float(ac1), float(ac3), float(stationarity_score), float(stat["mean_drift_score"]), float(stat["variance_drift_score"]), float(forecast), float(upper), float(lower), float(ewma), vol_state, boundary_state, float(buy_score), float(sell_score), float(hold_score), float(wait_score), float(confidence), str(peer.get("peer_product", "")), float(peer.get("peer_spread_z", 0.0)), peer_state, str(peer.get("peer_reason", "")), f"quant_context;boundary={boundary_state};vol_state={vol_state};forecast={forecast:.2f};upper={upper:.2f};lower={lower:.2f};mean={mean_ret:.2f};std={std_ret:.2f};ewma_vol={ewma:.2f};ac1={ac1:.3f};ac3={ac3:.3f};stationarity={stationarity_score:.3f};{peer.get('peer_reason', '')}")
 
 

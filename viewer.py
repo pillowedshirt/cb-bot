@@ -53,6 +53,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 initialize_all_module_debug_logs(BASE_DIR)
 module_debug(
     MODULE_NAME,
+    "viewer_per_file_debug_logs_initialized",
+    data={
+        "debug_dir": os.path.join(BASE_DIR, "debug"),
+        "viewer_snapshot_path": VIEWER_SNAPSHOT_PATH if "VIEWER_SNAPSHOT_PATH" in globals() else "",
+    },
+    level="INFO",
+    also_overall=True,
+)
+module_debug(
+    MODULE_NAME,
     "viewer_module_loaded",
     data={
         "base_dir": BASE_DIR,
@@ -356,8 +366,11 @@ def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confi
             else:
                 fig.add_hline(y=y, line_width=1.5, line_color=color, line_dash=dash, annotation_text=label, annotation_position="right")
     if not confirmed_trades_df.empty and {"side", "price", "ts"}.issubset(confirmed_trades_df.columns):
-        buys = confirmed_trades_df[confirmed_trades_df["side"].astype(str).str.upper() == "BUY"]
-        sells = confirmed_trades_df[confirmed_trades_df["side"].astype(str).str.upper() == "SELL"]
+        trades_for_chart = confirmed_trades_df.copy()
+        trades_for_chart["price"] = pd.to_numeric(trades_for_chart["price"], errors="coerce")
+        trades_for_chart = trades_for_chart.dropna(subset=["price"])
+        buys = trades_for_chart[trades_for_chart["side"].astype(str).str.upper() == "BUY"]
+        sells = trades_for_chart[trades_for_chart["side"].astype(str).str.upper() == "SELL"]
         if not buys.empty:
             buy_trace = go.Scatter(x=buys["ts"], y=buys["price"], mode="markers", name="Confirmed Buys", marker=dict(symbol="triangle-up", size=10, color="#78d6a8"))
             fig.add_trace(buy_trace, row=1, col=1) if has_volume else fig.add_trace(buy_trace)

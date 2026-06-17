@@ -182,6 +182,20 @@ def _higher_timeframe_bias(candles: List[Any]) -> Tuple[str, float, str]:
 
 
 def build_previous_session_volume_profile_signal(*, product_id: str, candles: List[Any], current_price: float, session_key: str = "daily_utc", bins: int = 36) -> PreviousSessionVolumeProfileSignal:
+    debug_every(
+        MODULE_NAME,
+        f"previous_session_profile_start:{product_id}:{session_key}",
+        30.0,
+        "previous_session_profile_start",
+        data={
+            "product_id": product_id,
+            "session_key": session_key,
+            "candles_count": len(candles) if candles is not None else 0,
+            "current_price": current_price,
+        },
+        level="DEBUG",
+        also_overall=False,
+    )
     now = max([_get(c, "ts", 0.0) or _get(c, "minute_start_ts", 0.0) for c in candles] or [0.0])
     start_ts, end_ts = _session_bounds_for_hour(now, session_key)
     session_candles = _candles_in_bounds(candles, start_ts, end_ts)
@@ -228,6 +242,28 @@ def build_previous_session_volume_profile_signal(*, product_id: str, candles: Li
     hold_score = _clamp(0.36 + (0.32 if accepted_above_vah and bias != "bearish" else 0.0) + (0.20 if reclaimed_val and bias == "bullish" else 0.0) - (0.22 if rejected_vah or accepted_below_val else 0.0))
     wait_score = _clamp(0.35 + (0.32 if near_poc else 0.0) + (0.16 if reaction_state in {"near_prior_vah", "near_prior_val"} else 0.0) - (0.18 if accepted_above_vah or reclaimed_val else 0.0))
     confidence = _clamp(0.32 + min(0.20, len(session_candles) / 160.0) + (0.18 if reaction_state not in {"between_or_away_from_prior_levels", "unavailable"} else 0.0) + bias_conf * 0.20)
+    debug_every(
+        MODULE_NAME,
+        f"previous_session_profile_result:{product_id}:{session_key}",
+        30.0,
+        "previous_session_profile_result",
+        data={
+            "product_id": product_id,
+            "session_key": session_key,
+            "reaction_state": reaction_state,
+            "bias": bias,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "hold_score": hold_score,
+            "wait_score": wait_score,
+            "confidence": confidence,
+            "poc": poc,
+            "vah": vah,
+            "val": val,
+        },
+        level="DEBUG",
+        also_overall=False,
+    )
     return PreviousSessionVolumeProfileSignal(product_id, session_key, start_ts, end_ts, float(session_high), float(session_low), float(session_open), float(session_close), float(poc), float(vah), float(val), float(current_price), float(d_poc), float(d_vah), float(d_val), reaction_state, bias, float(bias_conf), float(buy_score), float(sell_score), float(hold_score), float(wait_score), float(confidence), f"previous_session_volume_profile;session={session_key};reaction={reaction_state};bias={bias};bias_conf={bias_conf:.3f};poc={poc:.10f};vah={vah:.10f};val={val:.10f};d_poc={d_poc:.2f};d_vah={d_vah:.2f};d_val={d_val:.2f};{vp_reason};{bias_reason}")
 
 

@@ -388,7 +388,28 @@ class LocalAIBrain:
 
     def train(self) -> Dict[str, Any]:
         frame = self.build_training_frame()
+        module_debug(
+            MODULE_NAME,
+            "ai_train_frame_built",
+            data={
+                "rows": int(len(frame)),
+                "columns": list(frame.columns)[:120] if not frame.empty else [],
+                "min_training_rows": int(self.min_training_rows),
+            },
+            level="INFO",
+            also_overall=False,
+        )
         if len(frame) < self.min_training_rows:
+            module_debug(
+                MODULE_NAME,
+                "ai_train_skipped_not_enough_rows",
+                data={
+                    "rows": int(len(frame)),
+                    "required": int(self.min_training_rows),
+                },
+                level="WARN",
+                also_overall=True,
+            )
             return {
                 "ok": False,
                 "sample_count": int(len(frame)),
@@ -456,7 +477,26 @@ class LocalAIBrain:
         }
         joblib.dump(pack, AI_MODEL_PATH)
         self.model_pack = pack
-        return {"ok": True, "sample_count": int(len(frame)), "feature_columns_used": list(FEATURE_COLUMNS), "auc_if_available": auc, "model_ready": True, "reason": "trained"}
+        module_debug(
+            MODULE_NAME,
+            "ai_train_success",
+            data={
+                "sample_count": int(len(frame)),
+                "auc_if_available": auc,
+                "feature_count": len(FEATURE_COLUMNS),
+                "model_path": AI_MODEL_PATH,
+            },
+            level="INFO",
+            also_overall=True,
+        )
+        return {
+            "ok": True,
+            "sample_count": int(len(frame)),
+            "feature_columns_used": list(FEATURE_COLUMNS),
+            "auc_if_available": auc,
+            "model_ready": True,
+            "reason": "trained",
+        }
 
     @staticmethod
     def _row_to_features(context: Dict[str, Any]) -> pd.DataFrame:
@@ -485,6 +525,20 @@ class LocalAIBrain:
         features = self._row_to_features(context)
         feature_nonzero_count = int((features.abs() > 1e-12).sum(axis=1).iloc[0])
         feature_coverage = feature_nonzero_count / max(float(len(FEATURE_COLUMNS)), 1.0)
+        debug_every(
+            MODULE_NAME,
+            f"ai_predict:{product_id}",
+            15.0,
+            "ai_predict_feature_coverage",
+            data={
+                "product_id": product_id,
+                "feature_nonzero_count": feature_nonzero_count,
+                "feature_count": len(FEATURE_COLUMNS),
+                "feature_coverage": feature_coverage,
+            },
+            level="DEBUG",
+            also_overall=False,
+        )
         classifier = self.model_pack["classifier"]
         move_regressor = self.model_pack["move_regressor"]
         adverse_regressor = self.model_pack["adverse_regressor"]

@@ -10137,6 +10137,7 @@ class TradingBot:
                     cost_bps=float(cost_bps),
                     projected_forward_gain_bps=0.0,
                 ),
+                "smt_divergence": self._smt_divergence_context_for_product(product_id=product_id),
             }
 
             if hasattr(self.level8_council, "decide_exit"):

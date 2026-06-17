@@ -14,6 +14,7 @@ except Exception:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIEWER_SNAPSHOT_PATH = os.path.join(BASE_DIR, "viewer_snapshot.json")
+VIEWER_SNAPSHOT_CSV_SAFE_PATH = VIEWER_SNAPSHOT_PATH
 MARKET_CSV_PATH = os.path.join(BASE_DIR, "market.csv")
 TRADES_CSV_PATH = os.path.join(BASE_DIR, "trades.csv")
 POSITION_TARGETS_PATH = os.path.join(BASE_DIR, "position_targets.csv")
@@ -61,9 +62,9 @@ div[data-testid="stMetric"] { background: rgba(37,29,23,0.95); border: 1px solid
 
 @st.cache_data(ttl=FAST_TTL_SEC, show_spinner=False)
 def load_viewer_snapshot() -> Dict[str, Any]:
-    if not os.path.exists(VIEWER_SNAPSHOT_PATH):
+    if not os.path.exists(VIEWER_SNAPSHOT_CSV_SAFE_PATH):
         return {"updated_ts": 0.0, "coins": {}, "top_products": [], "live_positions": []}
-    with open(VIEWER_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+    with open(VIEWER_SNAPSHOT_CSV_SAFE_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -93,7 +94,7 @@ def coin_market_history(df: pd.DataFrame, product_id: str) -> pd.DataFrame:
     return sub.tail(HISTORY_ROWS_PER_COIN)
 
 
-def confirmed_trades_for_coin(df: pd.DataFrame, product_id: str) -> pd.DataFrame:
+def confirmed_trades_only(df: pd.DataFrame, product_id: str) -> pd.DataFrame:
     if df.empty or "product_id" not in df.columns:
         return pd.DataFrame()
     sub = df[df["product_id"].astype(str) == str(product_id)].copy()
@@ -107,6 +108,9 @@ def confirmed_trades_for_coin(df: pd.DataFrame, product_id: str) -> pd.DataFrame
         sub = sub.sort_values("ts", ascending=False)
     return sub.head(20)
 
+
+def confirmed_trades_for_coin(df: pd.DataFrame, product_id: str) -> pd.DataFrame:
+    return confirmed_trades_only(df, product_id)
 
 def latest_targets_for_coin(df: pd.DataFrame, product_id: str) -> Dict[str, Any]:
     if df.empty or "product_id" not in df.columns:
@@ -137,6 +141,7 @@ def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confi
         ("POC", target_state.get("point_of_control", coin_state.get("point_of_control", 0.0)), "#ff9f5a", "dash"),
         ("Buy Target", target_state.get("target_buy_price", coin_state.get("selected_target_buy_price", 0.0)), "#78d6a8", "dash"),
         ("Sell Target", target_state.get("target_sell_price", coin_state.get("selected_target_sell_price", 0.0)), "#ff8e8e", "dash"),
+        ("Min Profitable Exit", target_state.get("min_profitable_exit_price", coin_state.get("min_profitable_exit_price", 0.0)), "#facc15", "dash"),
         ("Stop", target_state.get("target_stop_price", coin_state.get("selected_target_stop_price", 0.0)), "#d46cff", "dot"),
         ("Avg Entry", coin_state.get("avg_entry", 0.0), "#a5dcff", "solid"),
     ]
@@ -180,11 +185,11 @@ def render_leader_and_council(snapshot: Dict[str, Any], selected_coin: str) -> N
 <div class="leader-card"><div class="section-title">♛ The King of the Council — Volume Profile Leader</div>
 <div class="muted">Selected Coin: <b>{selected_coin}</b> &nbsp; | &nbsp; Freshness: <span class="{freshness_class(age)}">{format_age(age)}</span></div>
 <div style="margin-top:0.6rem;" class="metric-grid">
-<div class="metric-card"><div class="metric-label">Leader Buy Score</div><div class="metric-value">{_safe_float(coin.get('leader_buy_score')):.3f}</div></div>
-<div class="metric-card"><div class="metric-label">Leader Sell Score</div><div class="metric-value">{_safe_float(coin.get('leader_sell_score')):.3f}</div></div>
-<div class="metric-card"><div class="metric-label">Leader Hold Score</div><div class="metric-value">{_safe_float(coin.get('leader_hold_score')):.3f}</div></div>
+<div class="metric-card"><div class="metric-label">Leader Buy Score</div><div class="metric-value">{_safe_float(coin.get('volume_profile_leader_buy_score', coin.get('leader_buy_score'))):.3f}</div></div>
+<div class="metric-card"><div class="metric-label">Leader Sell Score</div><div class="metric-value">{_safe_float(coin.get('volume_profile_leader_sell_score', coin.get('leader_sell_score'))):.3f}</div></div>
+<div class="metric-card"><div class="metric-label">Leader Hold Score</div><div class="metric-value">{_safe_float(coin.get('volume_profile_leader_hold_score', coin.get('leader_hold_score'))):.3f}</div></div>
 <div class="metric-card"><div class="metric-label">Council Mode</div><div class="metric-value">{coin.get('council_mode', '')}</div></div>
-</div><div style="margin-top:0.75rem;" class="muted"><b>Decision:</b> {coin.get('decision_action', '')}<br/><b>Volume State:</b> {coin.get('value_acceptance_state', '')} / {coin.get('volume_node_state', '')}<br/><b>Leader Reason:</b> {str(coin.get('leader_reason', ''))[:400]}</div></div>
+</div><div style="margin-top:0.75rem;" class="muted"><b>Decision:</b> {coin.get('decision_action', '')}<br/><b>Volume State:</b> {coin.get('value_acceptance_state', '')} / {coin.get('volume_node_state', '')}<br/><b>Leader Reason:</b> {str(coin.get('volume_profile_utility_reason', coin.get('leader_reason', '')))[:500]}</div></div>
 """, unsafe_allow_html=True)
     cols = st.columns(4)
     for col, (label, key, desc) in zip(cols, [("Truth", "truth_score", "How strongly the chamber believes the setup."), ("Final Buy", "final_buy_score", "Final buy score for this specific coin."), ("Expected Utility", "expected_utility_bps", "Net expected value after costs."), ("Buy vs Wait", "buy_vs_wait_edge_bps", "Whether action beats waiting.")]):
@@ -243,6 +248,7 @@ def main() -> None:
     inject_medieval_css()
     if st_autorefresh is not None:
         st_autorefresh(interval=FAST_REFRESH_MS, key="council_auto_refresh")
+    st.markdown("<div style='height:1.25rem;'></div>", unsafe_allow_html=True)
     render_header()
     snapshot = load_viewer_snapshot()
     selected = pick_selected_coin(snapshot)
@@ -259,7 +265,7 @@ def main() -> None:
     orders_df = load_csv(ORDERS_CSV_PATH)
     coin = dict((snapshot.get("coins", {}) or {}).get(selected, {}) or {})
     history = coin_market_history(market_df, selected)
-    confirmed = confirmed_trades_for_coin(trades_df, selected)
+    confirmed = confirmed_trades_only(trades_df, selected)
     target = latest_targets_for_coin(targets_df, selected)
     st.markdown('<div class="panel-card"><div class="section-title">Primary Market Chart</div><div class="muted">This is the main chart the chamber should prioritize for buy and sell judgment.</div></div>', unsafe_allow_html=True)
     st.plotly_chart(build_coin_chart(history, coin, confirmed, target), use_container_width=True)
@@ -268,13 +274,15 @@ def main() -> None:
     render_coin_analytics(coin)
     with st.expander("Account / Exposure", expanded=False):
         st.json({"live_positions": snapshot.get("live_positions", []), "top_products": snapshot.get("top_products", [])})
-    with st.expander("Council Decision Log", expanded=False):
+    with st.expander("Live Readiness", expanded=False):
+        st.json(snapshot.get("readiness", {}))
+    with st.expander("Raw Council Tables", expanded=False):
         if decisions_df.empty:
             st.info("No council decision log found.")
         else:
             sub = decisions_df[decisions_df["product_id"].astype(str) == str(selected)] if "product_id" in decisions_df.columns else decisions_df
             st.dataframe(sub.tail(50), use_container_width=True, hide_index=True)
-    with st.expander("Raw Order Attempts / Backend Debug", expanded=False):
+    with st.expander("Backend Order Attempts", expanded=False):
         if orders_df.empty:
             st.info("No order attempts found.")
         else:

@@ -507,11 +507,15 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "session_liquidity_setup",
         "structure_state",
         "value_area_state",
+        "value_acceptance_state",
+        "volume_node_state",
         "fvg_state",
         "smt_state",
         "price_action_buy_score",
         "candle_exhaustion_score",
         "volume_profile_buy_score",
+        "volume_profile_leader_buy_score",
+        "unfair_trade_score",
         "validated_liquidity_buy_score",
         "fresh_zone_buy_score",
         "fvg_buy_score",
@@ -525,6 +529,8 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "price_action_buy_score",
         "candle_exhaustion_score",
         "volume_profile_buy_score",
+        "volume_profile_leader_buy_score",
+        "unfair_trade_score",
         "validated_liquidity_buy_score",
         "fresh_zone_buy_score",
         "fvg_buy_score",
@@ -549,11 +555,15 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         + "|session_setup=" + frame["session_liquidity_setup"].astype(str)
         + "|structure=" + frame["structure_state"].astype(str)
         + "|value=" + frame["value_area_state"].astype(str)
+        + "|acceptance=" + frame["value_acceptance_state"].astype(str)
+        + "|volume_node=" + frame["volume_node_state"].astype(str)
         + "|fvg=" + frame["fvg_state"].astype(str)
         + "|smt=" + frame["smt_state"].astype(str)
         + "|pa=" + frame["price_action_buy_score"].map(_bucket).astype(str)
         + "|exhaust=" + frame["candle_exhaustion_score"].map(_bucket).astype(str)
         + "|volume=" + frame["volume_profile_buy_score"].map(_bucket).astype(str)
+        + "|vp_leader=" + frame["volume_profile_leader_buy_score"].map(_bucket).astype(str)
+        + "|unfair=" + frame["unfair_trade_score"].map(_bucket).astype(str)
         + "|validated_liq=" + frame["validated_liquidity_buy_score"].map(_bucket).astype(str)
         + "|fresh_zone=" + frame["fresh_zone_buy_score"].map(_bucket).astype(str)
         + "|fvg_score=" + frame["fvg_buy_score"].map(_bucket).astype(str)

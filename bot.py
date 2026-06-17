@@ -2357,6 +2357,9 @@ class SignalEventsLogger(_ResearchCSVLogger):
         "regime_utility_adjust_bps",
         "volatility_size_multiplier",
         "portfolio_rank_bonus",
+        "value_acceptance_state",
+        "volume_node_state",
+        "volume_profile_utility_adjust_bps",
         "action",
         "reason",
     ]
@@ -9312,6 +9315,24 @@ class TradingBot:
             self._price_action_vote(common=common, agent="validated_liquidity_agent", buy=float(pa.get("validated_liquidity_buy_score", 0.0) or 0.0), sell=float(pa.get("validated_liquidity_sell_score", 0.0) or 0.0), hold=0.48, wait=0.42, confidence=liquidity_confidence, reason=f"validated_high={pa.get('validated_high', 0.0)};validated_low={pa.get('validated_low', 0.0)};{pa.get('reason', '')}"),
             self._price_action_vote(common=common, agent="fresh_zone_retest_agent", buy=float(pa.get("fresh_zone_buy_score", 0.0) or 0.0), sell=float(pa.get("fresh_zone_sell_score", 0.0) or 0.0), hold=0.48, wait=0.42, confidence=fresh_zone_confidence, reason=f"fresh_zone_state={pa.get('fresh_zone_state', '')};zone={pa.get('fresh_zone_low', 0.0)}-{pa.get('fresh_zone_high', 0.0)}"),
             self._price_action_vote(common=common, agent="fair_value_gap_agent", buy=float(pa.get("fvg_buy_score", 0.0) or 0.0), sell=float(pa.get("fvg_sell_score", 0.0) or 0.0), hold=0.48, wait=0.42, confidence=fvg_confidence, reason=f"fvg_state={pa.get('fvg_state', '')};bullish={pa.get('bullish_fvg_low', 0.0)}-{pa.get('bullish_fvg_high', 0.0)};bearish={pa.get('bearish_fvg_low', 0.0)}-{pa.get('bearish_fvg_high', 0.0)}"),
+            self._price_action_vote(
+                common=common,
+                agent="volume_profile_leader",
+                buy=float(pa.get("volume_profile_leader_buy_score", 0.0) or 0.0),
+                sell=float(pa.get("volume_profile_leader_sell_score", 0.0) or 0.0),
+                hold=float(pa.get("volume_profile_leader_hold_score", 0.50) or 0.50),
+                wait=float(pa.get("volume_profile_leader_wait_score", 0.50) or 0.50),
+                confidence=float(pa.get("volume_profile_leader_confidence", volume_confidence) or volume_confidence),
+                reason=(
+                    f"value_acceptance_state={pa.get('value_acceptance_state', '')};"
+                    f"volume_node_state={pa.get('volume_node_state', '')};"
+                    f"poc_distance_bps={pa.get('poc_distance_bps', 0.0)};"
+                    f"low_volume_path_up_bps={pa.get('low_volume_path_up_bps', 0.0)};"
+                    f"low_volume_path_down_bps={pa.get('low_volume_path_down_bps', 0.0)};"
+                    f"unfair_trade_score={pa.get('unfair_trade_score', 0.0)};"
+                    f"{pa.get('volume_profile_leader_reason', '')}"
+                ),
+            ),
             self._price_action_vote(common=common, agent="volume_profile_agent", buy=float(pa.get("volume_profile_buy_score", 0.0) or 0.0), sell=float(pa.get("volume_profile_sell_score", 0.0) or 0.0), hold=float(pa.get("volume_profile_hold_score", 0.50) or 0.50), wait=0.40, confidence=volume_confidence, reason=f"value_area_state={pa.get('value_area_state', '')};val={pa.get('value_area_low', 0.0)};vah={pa.get('value_area_high', 0.0)};poc={pa.get('point_of_control', 0.0)}"),
         ]
 
@@ -10992,6 +11013,11 @@ class TradingBot:
             maker_fill_probability = float(candidate.get("maker_fill_probability", 0.0) or 0.0)
             wait_utility_bps = float(candidate.get("wait_utility_bps", 0.0) or 0.0)
             buy_vs_wait_edge_bps = float(candidate.get("buy_vs_wait_edge_bps", 0.0) or 0.0)
+            value_acceptance_state = str(candidate.get("value_acceptance_state", "") or "").lower()
+            volume_node_state = str(candidate.get("volume_node_state", "") or "").lower()
+            poc_distance_bps = float(candidate.get("poc_distance_bps", 0.0) or 0.0)
+            volume_profile_leader_wait_score = float(candidate.get("volume_profile_leader_wait_score", 0.50) or 0.50)
+            volume_profile_utility_adjust_bps = float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0)
 
             regime_adj = self._regime_specific_adjustments(candidate)
             adaptive_adj = self._adaptive_guardrail_adjustments()
@@ -11095,6 +11121,57 @@ class TradingBot:
                         f"expected_utility={expected_utility_bps:.2f};"
                     )
 
+
+            if bool(ENABLE_VOLUME_PROFILE_LEADER):
+                inside_value_chop = bool(
+                    value_acceptance_state in {"inside_fair_value", "inside_value_near_poc"}
+                    or (
+                        volume_node_state == "high_volume_node"
+                        and volume_profile_leader_wait_score >= 0.62
+                    )
+                    or poc_distance_bps <= 20.0
+                )
+
+                strong_exception = bool(
+                    expected_utility_bps >= float(VOLUME_ALLOW_INSIDE_VALUE_IF_SETUP_STRONG_AND_UTILITY_BPS)
+                    and setup_perf_strong
+                    and truth >= effective_min_truth + 0.05
+                )
+
+                if (
+                    bool(VOLUME_BLOCK_BUY_INSIDE_VALUE_NEAR_POC)
+                    and inside_value_chop
+                    and not strong_exception
+                ):
+                    return False, (
+                        f"live_buy_shadowed:volume_profile_inside_fair_value_or_poc_chop "
+                        f"value_acceptance_state={value_acceptance_state};"
+                        f"volume_node_state={volume_node_state};"
+                        f"poc_distance_bps={poc_distance_bps:.2f};"
+                        f"wait_score={volume_profile_leader_wait_score:.3f};"
+                        f"expected_utility={expected_utility_bps:.2f};"
+                        f"strong_exception={strong_exception};"
+                    )
+
+                if (
+                    bool(VOLUME_BLOCK_BUY_ACCEPTED_BELOW_VALUE)
+                    and value_acceptance_state == "accepted_below_value"
+                ):
+                    return False, (
+                        f"live_buy_shadowed:volume_profile_accepted_lower_prices "
+                        f"value_acceptance_state={value_acceptance_state};"
+                        f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
+                    )
+
+                if (
+                    bool(VOLUME_BLOCK_BUY_REJECTED_ABOVE_VALUE)
+                    and value_acceptance_state == "rejected_above_value"
+                ):
+                    return False, (
+                        f"live_buy_shadowed:volume_profile_rejected_above_value "
+                        f"value_acceptance_state={value_acceptance_state};"
+                        f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
+                    )
             if margin < float(effective_min_margin):
                 return False, (
                     f"live_buy_shadowed:council_margin_too_small "
@@ -11187,6 +11264,9 @@ class TradingBot:
                 f"buy_vs_wait_edge={buy_vs_wait_edge_bps:.2f};"
                 f"regime_adjust={regime_utility_adjust_bps:.2f};"
                 f"adaptive_adjust={adaptive_utility_adjust_bps:.2f};"
+                f"value_acceptance_state={value_acceptance_state};"
+                f"volume_node_state={volume_node_state};"
+                f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
                 f"{backtest_reason}"
             )
 
@@ -11456,16 +11536,28 @@ class TradingBot:
                 1.0,
             )
 
+            volume_leader_truth_component = clamp_float(
+                0.50
+                + float(candidate.get("volume_profile_leader_buy_score", 0.0) or 0.0) * 0.34
+                - float(candidate.get("volume_profile_leader_sell_score", 0.0) or 0.0) * 0.34
+                - max(0.0, float(candidate.get("volume_profile_leader_wait_score", 0.50) or 0.50) - 0.55) * 0.24
+                + float(candidate.get("unfair_trade_score", 0.0) or 0.0) * 0.18
+                + float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0) / 240.0,
+                0.0,
+                1.0,
+            )
+
             truth_buy = clamp_float(
-                spread_quality * 0.12
-                + cost_score * 0.10
-                + probability * 0.13
-                + score * 0.11
-                + forward_score * 0.11
-                + learning_score * 0.12
-                + session_buy_score * session_confidence * 0.08
+                spread_quality * 0.09
+                + cost_score * 0.08
+                + probability * 0.10
+                + score * 0.08
+                + forward_score * 0.08
+                + learning_score * 0.09
+                + session_buy_score * session_confidence * 0.06
                 + price_action_buy_weighted * price_action_conf_weighted * 0.08
-                + utility_truth_component * 0.15,
+                + utility_truth_component * 0.10
+                + volume_leader_truth_component * float(VOLUME_PROFILE_LEADER_TRUTH_WEIGHT),
                 0.0,
                 1.0,
             )
@@ -11478,6 +11570,7 @@ class TradingBot:
                 (
                     f"truth evidence={truth_buy:.3f};"
                     f"utility_component={utility_truth_component:.3f};"
+                    f"volume_leader_component={volume_leader_truth_component:.3f};"
                     f"expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f};"
                     f"calibrated_p_win={float(candidate.get('calibrated_p_win', 0.50) or 0.50):.3f};"
                     f"payoff={float(candidate.get('payoff_ratio', 0.0) or 0.0):.3f};"
@@ -11488,6 +11581,8 @@ class TradingBot:
             session_setup_for_strategy = str(session_liquidity_vote.get("session_liquidity_setup", "none"))
             pa_context_for_strategy = dict(context.get("price_action_context", {}) or {})
             value_area_for_strategy = str(pa_context_for_strategy.get("value_area_state", ""))
+            value_acceptance_for_strategy = str(pa_context_for_strategy.get("value_acceptance_state", ""))
+            volume_node_for_strategy = str(pa_context_for_strategy.get("volume_node_state", ""))
             fvg_state_for_strategy = str(pa_context_for_strategy.get("fvg_state", ""))
             structure_for_strategy = str(pa_context_for_strategy.get("structure_state", ""))
             smt_for_strategy = dict(context.get("smt_divergence", {}) or {})
@@ -11505,6 +11600,8 @@ class TradingBot:
                 f"session_setup={session_setup_for_strategy}|"
                 f"structure={structure_for_strategy}|"
                 f"value_area={value_area_for_strategy}|"
+                f"value_acceptance={value_acceptance_for_strategy}|"
+                f"volume_node={volume_node_for_strategy}|"
                 f"fvg={fvg_state_for_strategy}|"
                 f"smt={smt_state_for_strategy}|"
                 f"utility={utility_state_for_strategy}|"
@@ -11560,6 +11657,10 @@ class TradingBot:
                 "volatility_size_multiplier": float(candidate.get("volatility_size_multiplier", 1.0) or 1.0),
                 "portfolio_rank_bonus": float(candidate.get("portfolio_rank_bonus", 0.0) or 0.0),
                 "utility_decision_reason": str(candidate.get("utility_decision_reason", "")),
+                "value_acceptance_state": str(candidate.get("value_acceptance_state", "")),
+                "volume_node_state": str(candidate.get("volume_node_state", "")),
+                "volume_profile_utility_adjust_bps": float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0),
+                "volume_profile_utility_reason": str(candidate.get("volume_profile_utility_reason", "")),
             }
             base_reason = str(decision.get("sizing_reason", decision.get("reason", "")))
             session_context = dict(context.get("session_liquidity", {}) or {})
@@ -11576,7 +11677,8 @@ class TradingBot:
                 f"smt_reason={dict(context.get('smt_divergence', {}) or {}).get('reason', '')};"
                 f"setup_performance={candidate.get('backtest_setup_reason', '')};"
                 f"utility_leader={candidate.get('utility_decision_reason', '')};"
-                f"portfolio={candidate.get('portfolio_reason', '')}"
+                f"portfolio={candidate.get('portfolio_reason', '')};"
+                f"volume_profile_leader={candidate.get('volume_profile_utility_reason', '')}"
             )
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")
@@ -11936,6 +12038,9 @@ class TradingBot:
         buy_vs_wait_edge_bps: float = 0.0,
         realized_volatility_bps_30m: float = 0.0,
         volatility_size_multiplier: float = 1.0,
+        value_acceptance_state: str = "",
+        volume_node_state: str = "",
+        volume_profile_utility_adjust_bps: float = 0.0,
     ) -> None:
         """
         Write a normalized Level 8 decision row for live and heartbeat decisions.
@@ -11971,6 +12076,9 @@ class TradingBot:
                 "buy_vs_wait_edge_bps",
                 "realized_volatility_bps_30m",
                 "volatility_size_multiplier",
+                "value_acceptance_state",
+                "volume_node_state",
+                "volume_profile_utility_adjust_bps",
                 "reason",
             ]
             write_header = not os.path.exists(
@@ -12041,6 +12149,9 @@ class TradingBot:
                     f"{float(buy_vs_wait_edge_bps):.6f}",
                     f"{float(realized_volatility_bps_30m):.6f}",
                     f"{float(volatility_size_multiplier):.6f}",
+                    str(value_acceptance_state),
+                    str(volume_node_state),
+                    f"{float(volume_profile_utility_adjust_bps):.6f}",
                     reason,
                 ])
         except Exception as exc:
@@ -12330,14 +12441,30 @@ class TradingBot:
             continuation = float(pa.get("candle_continuation_score", 0.0) or 0.0)
             exhaustion = float(pa.get("candle_exhaustion_score", 0.0) or 0.0)
             value_sell = float(pa.get("volume_profile_sell_score", 0.0) or 0.0)
+            volume_leader_sell = float(pa.get("volume_profile_leader_sell_score", value_sell) or value_sell)
+            volume_leader_hold = float(pa.get("volume_profile_leader_hold_score", 0.50) or 0.50)
+            value_acceptance_state = str(pa.get("value_acceptance_state", ""))
+            volume_node_state = str(pa.get("volume_node_state", ""))
             fvg_sell = float(pa.get("fvg_sell_score", 0.0) or 0.0)
 
-            additional_upside_bps = max(0.0, mom3 * 0.45 + mom5 * 0.25 + continuation * 80.0)
+            additional_upside_bps = max(
+                0.0,
+                mom3 * 0.45
+                + mom5 * 0.25
+                + continuation * 60.0
+                + volume_leader_hold * 70.0
+                + (45.0 if value_acceptance_state == "accepted_above_value" else 0.0)
+            )
+
             giveback_risk_bps = (
                 pullback_from_peak_bps * 0.45
                 + exhaustion * 90.0
-                + value_sell * 55.0
+                + value_sell * 35.0
+                + volume_leader_sell * 95.0
                 + fvg_sell * 45.0
+                + (75.0 if value_acceptance_state == "rejected_above_value" else 0.0)
+                + (80.0 if value_acceptance_state == "accepted_below_value" else 0.0)
+                + (28.0 if volume_node_state == "high_volume_node" else 0.0)
             )
 
             hold_utility_bps = additional_upside_bps - giveback_risk_bps
@@ -12361,6 +12488,10 @@ class TradingBot:
                     f"sell_utility hold={hold_utility_bps:.2f};sell={sell_utility_bps:.2f};"
                     f"sell_minus_hold={sell_minus_hold:.2f};add_upside={additional_upside_bps:.2f};"
                     f"giveback_risk={giveback_risk_bps:.2f};continuation={continuation:.3f};"
+                    f"volume_leader_sell={volume_leader_sell:.3f};"
+                    f"volume_leader_hold={volume_leader_hold:.3f};"
+                    f"value_acceptance_state={value_acceptance_state};"
+                    f"volume_node_state={volume_node_state};"
                     f"exhaustion={exhaustion:.3f};peak={peak_unrealized_bps:.2f};"
                     f"pullback={pullback_from_peak_bps:.2f}"
                 ),
@@ -17242,6 +17373,9 @@ class TradingBot:
                             buy_vs_wait_edge_bps=float(level8_info.get("buy_vs_wait_edge_bps", 0.0) or 0.0),
                             realized_volatility_bps_30m=float(level8_info.get("realized_volatility_bps_30m", 0.0) or 0.0),
                             volatility_size_multiplier=float(level8_info.get("volatility_size_multiplier", 1.0) or 1.0),
+                            value_acceptance_state=str(level8_info.get("value_acceptance_state", "")),
+                            volume_node_state=str(level8_info.get("volume_node_state", "")),
+                            volume_profile_utility_adjust_bps=float(level8_info.get("volume_profile_utility_adjust_bps", 0.0) or 0.0),
                         )
 
                         try:
@@ -17258,6 +17392,9 @@ class TradingBot:
                                 calibrated_p_win=f"{float(candidate.get('calibrated_p_win', 0.50)):.6f}",
                                 payoff_ratio=f"{float(candidate.get('payoff_ratio', 0.0)):.6f}",
                                 maker_adjusted_expected_value_bps=f"{float(candidate.get('maker_adjusted_expected_value_bps', 0.0)):.6f}",
+                                value_acceptance_state=str(candidate.get("value_acceptance_state", "")),
+                                volume_node_state=str(candidate.get("volume_node_state", "")),
+                                volume_profile_utility_adjust_bps=f"{float(candidate.get('volume_profile_utility_adjust_bps', 0.0)):.6f}",
                                 projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
                                 cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
                                 spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",

@@ -40,6 +40,10 @@ INITIAL_AGENT_RELIABILITY_PRIORS = {
     "volume_profile_agent": 1.12,
     "volume_profile_leader": 1.35,
     "volume_profile_leader_exit": 1.28,
+    "previous_session_volume_profile_agent": 1.24,
+    "previous_session_profile_exit": 1.18,
+    "quant_boundary_agent": 1.12,
+    "quant_boundary_exit": 1.10,
     "fair_value_gap_agent": 1.02,
     "fresh_zone_retest_agent": 1.02,
     "trend": 1.00,
@@ -48,7 +52,6 @@ INITIAL_AGENT_RELIABILITY_PRIORS = {
     "ai_outcome": 0.92,
     "smt_divergence_agent": 0.88,
     "previous_session_profile_agent": 1.08,
-    "quant_boundary_agent": 1.06,
     "exploration": 0.35,
     "profit_capture": 1.16,
     "peak_capture": 1.18,
@@ -1319,6 +1322,19 @@ class Level8Council:
 
         smt_context = dict(context.get("smt_divergence", {}) or {})
         smt_sell_score = float(smt_context.get("sell", 0.0) or 0.0)
+        previous_session_profile = dict(context.get("previous_session_profile", {}) or {})
+        previous_session_sell_score = float(previous_session_profile.get("sell_score", 0.0) or 0.0)
+        previous_session_hold_score = float(previous_session_profile.get("hold_score", 0.50) or 0.50)
+        previous_session_wait_score = float(previous_session_profile.get("wait_score", 0.50) or 0.50)
+        previous_session_reaction = str(previous_session_profile.get("reaction_state", ""))
+        previous_session_reason = str(previous_session_profile.get("reason", ""))
+        quant_context = dict(context.get("quant_context", {}) or {})
+        quant_sell_score = float(quant_context.get("quant_sell_score", 0.0) or 0.0)
+        quant_hold_score = float(quant_context.get("quant_hold_score", 0.50) or 0.50)
+        quant_wait_score = float(quant_context.get("quant_wait_score", 0.50) or 0.50)
+        quant_boundary_state = str(quant_context.get("boundary_state", ""))
+        quant_vol_state = str(quant_context.get("volatility_cluster_state", ""))
+        quant_reason = str(quant_context.get("reason", ""))
         smt_confidence = float(smt_context.get("confidence", 0.0) or 0.0)
         smt_reason = str(smt_context.get("reason", "no_smt_sell_context"))
 
@@ -1349,7 +1365,9 @@ class Level8Council:
         continuation_quality = clamp(
             0.48 + max(-80.0, min(120.0, momentum_3_bps)) / 180.0 + max(-120.0, min(180.0, momentum_5_bps)) / 320.0
             + min(3, max(0, green_candles)) * 0.035 + max(0.0, net_after_exit_bps) / 850.0 - pullback_from_peak_bps / 150.0
-            - (0.60 if hard_stop_hit else 0.0),
+            - (0.60 if hard_stop_hit else 0.0)
+            + previous_session_hold_score * 0.10
+            + quant_hold_score * 0.08,
             0.0, 1.0,
         )
         continuation_hold = clamp(continuation_quality + (0.12 if not min_hold_elapsed else 0.0) + (0.08 if not target_hold_elapsed else 0.0) - (0.18 if max_hold_elapsed else 0.0), 0.0, 1.0)
@@ -1363,7 +1381,9 @@ class Level8Council:
             + volume_profile_sell_score * 0.08
             + volume_profile_leader_sell_score * 0.24
             + fvg_sell_score * 0.12
-            + smt_sell_score * smt_confidence * 0.10,
+            + smt_sell_score * smt_confidence * 0.10
+            + previous_session_sell_score * 0.16
+            + quant_sell_score * 0.14,
             0.0,
             1.0,
         )
@@ -1436,6 +1456,24 @@ class Level8Council:
                     f"wait={volume_profile_leader_wait_score:.3f};"
                     f"{pa_reason}"
                 ),
+            },
+            {
+                "agent": "previous_session_profile_exit",
+                "buy": 0.0,
+                "sell": clamp(previous_session_sell_score, 0.0, 1.0),
+                "hold": clamp(previous_session_hold_score, 0.0, 1.0),
+                "wait": clamp(previous_session_wait_score, 0.0, 1.0),
+                "confidence": clamp(float(previous_session_profile.get("confidence", 0.10) or 0.10), 0.10, 0.90),
+                "reason": f"previous_session_profile_exit;reaction={previous_session_reaction};{previous_session_reason}",
+            },
+            {
+                "agent": "quant_boundary_exit",
+                "buy": 0.0,
+                "sell": clamp(quant_sell_score, 0.0, 1.0),
+                "hold": clamp(quant_hold_score, 0.0, 1.0),
+                "wait": clamp(quant_wait_score, 0.0, 1.0),
+                "confidence": clamp(float(quant_context.get("confidence", 0.10) or 0.10), 0.10, 0.90),
+                "reason": f"quant_boundary_exit;boundary={quant_boundary_state};vol={quant_vol_state};{quant_reason}",
             },
             {
                 "agent": "fvg_reclaim_rejection_exit",
@@ -1513,7 +1551,9 @@ class Level8Council:
                 continuation_hold * 0.70
                 + candle_continuation_score * pa_confidence * 0.18
                 + volume_profile_hold_score * 0.06
-                + volume_profile_leader_hold_score * 0.18,
+                + volume_profile_leader_hold_score * 0.18
+                + previous_session_hold_score * 0.10
+                + quant_hold_score * 0.08,
                 0.0,
                 1.0,
             ),
@@ -1612,6 +1652,8 @@ class Level8Council:
             or volume_profile_sell_score >= 0.58
             or volume_profile_leader_sell_score >= 0.58
             or value_acceptance_state in {"rejected_above_value", "accepted_below_value"}
+            or previous_session_reaction in {"rejected_prior_vah", "accepted_below_prior_val", "rejected_prior_poc"}
+            or quant_boundary_state == "above_upper_boundary_stretched"
             or fvg_sell_score >= 0.58
             or (smt_sell_score * smt_confidence) >= 0.38
             or sell_minus_hold_utility_bps >= 20.0
@@ -1694,6 +1736,10 @@ class Level8Council:
                 f"volume_node_state={volume_node_state};"
                 f"volume_profile_leader_sell={volume_profile_leader_sell_score:.3f};"
                 f"volume_profile_leader_hold={volume_profile_leader_hold_score:.3f};"
+                f"previous_session_reaction={previous_session_reaction};"
+                f"previous_session_sell={previous_session_sell_score:.3f};"
+                f"quant_boundary={quant_boundary_state};"
+                f"quant_sell={quant_sell_score:.3f};"
                 f"fvg_state={fvg_state};"
                 f"smt_reason={smt_reason};"
                 f"recommended_sell_fraction={recommended_sell_fraction:.3f};"

@@ -516,6 +516,8 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "volume_profile_buy_score",
         "volume_profile_leader_buy_score",
         "unfair_trade_score",
+        "expected_utility_bps",
+        "buy_vs_wait_edge_bps",
         "validated_liquidity_buy_score",
         "fresh_zone_buy_score",
         "fvg_buy_score",
@@ -531,6 +533,8 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "volume_profile_buy_score",
         "volume_profile_leader_buy_score",
         "unfair_trade_score",
+        "expected_utility_bps",
+        "buy_vs_wait_edge_bps",
         "validated_liquidity_buy_score",
         "fresh_zone_buy_score",
         "fvg_buy_score",
@@ -564,6 +568,8 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         + "|volume=" + frame["volume_profile_buy_score"].map(_bucket).astype(str)
         + "|vp_leader=" + frame["volume_profile_leader_buy_score"].map(_bucket).astype(str)
         + "|unfair=" + frame["unfair_trade_score"].map(_bucket).astype(str)
+        + "|utility=" + (frame["expected_utility_bps"] / 200.0).map(_bucket).astype(str)
+        + "|buy_vs_wait=" + (frame["buy_vs_wait_edge_bps"] / 200.0).map(_bucket).astype(str)
         + "|validated_liq=" + frame["validated_liquidity_buy_score"].map(_bucket).astype(str)
         + "|fresh_zone=" + frame["fresh_zone_buy_score"].map(_bucket).astype(str)
         + "|fvg_score=" + frame["fvg_buy_score"].map(_bucket).astype(str)

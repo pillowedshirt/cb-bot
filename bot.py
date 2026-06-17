@@ -165,6 +165,7 @@ BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_setu
 
 # Decision-engine completion logs.
 DECISION_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "decision_audit.csv")
+SELL_QUALITY_REVIEWS_CSV_PATH: str = os.path.join(BASE_DIR, "sell_quality_reviews.csv")
 MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.csv")
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
 
@@ -196,6 +197,7 @@ STARTUP_STATE_CSV_PATHS: List[str] = [
     BACKTEST_AGENT_PRIORS_CSV_PATH,
     BACKTEST_SETUP_PERFORMANCE_CSV_PATH,
     DECISION_AUDIT_CSV_PATH,
+    SELL_QUALITY_REVIEWS_CSV_PATH,
     MAKER_FILL_OUTCOMES_CSV_PATH,
     ADAPTIVE_GUARDRAILS_CSV_PATH,
     BACKTEST_SUMMARY_CSV_PATH,
@@ -633,9 +635,9 @@ LEVEL8_MIN_SELL_NOTIONAL_USD: float = MIN_LIVE_ORDER_USD
 
 # Only hard spending ceiling: max 80% deployed, 20% reserve.
 LEVEL8_RESERVE_CASH_PCT: float = 0.20
-LEVEL8_MAX_SINGLE_TRADE_PCT: float = 0.80
-LEVEL8_MAX_PRODUCT_EXPOSURE_PCT: float = 0.80
-LEVEL8_MAX_TOTAL_EXPOSURE_PCT: float = 0.80
+LEVEL8_MAX_SINGLE_TRADE_PCT: float = 0.20
+LEVEL8_MAX_PRODUCT_EXPOSURE_PCT: float = 0.35
+LEVEL8_MAX_TOTAL_EXPOSURE_PCT: float = 0.65
 
 # Graduated live sizing:
 # Level 8 may recommend large allocations, but bot.py caps live size until
@@ -673,13 +675,13 @@ ENABLE_LEVEL8_LEARNING_MODE: bool = True
 # Let moderately imperfect market states reach Level 8.
 LEVEL8_LEARNING_MIN_SCORE: float = 22.0
 LEVEL8_LEARNING_MIN_PROB: float = 0.22
-LEVEL8_LEARNING_MIN_EV_BPS: float = -180.0
+LEVEL8_LEARNING_MIN_EV_BPS: float = -60.0
 
 # Do not buy truly absurd spread conditions, but make this much looser.
 LEVEL8_LEARNING_MAX_SPREAD_BPS: float = 80.0
 
 # How many watch candidates can be sent into the real buy pipeline.
-LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES: int = 15
+LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES: int = 8
 
 # Let the bot buy more than one learning candidate per evaluation if cash allows.
 LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL: int = 1
@@ -1378,8 +1380,10 @@ INVALIDATION_BUFFER_BPS: float = 10.0
 MAX_DAILY_LOSS_USD: float = 1.50
 MAX_CONSECUTIVE_LOSSES: int = 2
 COOLDOWN_AFTER_LOSS_SEC: float = 15 * 60
-MAX_TRADES_PER_HOUR: int = 3
+MAX_TRADES_PER_HOUR: int = 2
 MAX_TRADES_PER_PRODUCT_PER_HOUR: int = 1
+MAX_INTRADAY_DRAWDOWN_PCT: float = 0.035
+ENABLE_GLOBAL_DRAWDOWN_BRAKE: bool = True
 PAUSE_AFTER_DAILY_LOSS_SEC: float = 6 * 60 * 60
 
 # Scaling
@@ -9751,6 +9755,24 @@ class TradingBot:
                     writer.writeheader()
                 writer.writerow({col: row.get(col, "") for col in columns})
 
+            if os.path.basename(path) in {
+                "council_decisions.csv",
+                "council_votes.csv",
+                "sell_outcomes.csv",
+                "sell_quality_reviews.csv",
+                "decision_audit.csv",
+                "maker_fill_outcomes.csv",
+            }:
+                try:
+                    from level8_council import append_sqlite_event
+                    append_sqlite_event(
+                        event_type=os.path.splitext(os.path.basename(path))[0],
+                        source_path=path,
+                        row={col: row.get(col, "") for col in columns},
+                    )
+                except Exception as exc:
+                    log(f"[sqlite] mirror failed path={path}: {exc}")
+
         except Exception as exc:
             log(f"[csv] append failed path={path}: {exc}")
 
@@ -10203,16 +10225,68 @@ class TradingBot:
                 return None, 0.0, "empty_maker_fill_history"
             product_id = str(candidate.get("product_id", "") or "")
             side_text = str(side).upper()
-            subset = frame[
+            if "spread_bps" not in frame.columns:
+                frame["spread_bps"] = 0.0
+            frame["spread_bps"] = pd.to_numeric(frame["spread_bps"], errors="coerce").fillna(0.0)
+
+            def _spread_bucket(value: float) -> str:
+                value = float(value)
+                if value <= 8.0:
+                    return "tight"
+                if value <= 25.0:
+                    return "normal"
+                if value <= 60.0:
+                    return "wide"
+                return "very_wide"
+
+            def _volatility_bucket(value: float) -> str:
+                value = abs(float(value))
+                if value <= 20.0:
+                    return "calm"
+                if value <= 65.0:
+                    return "active"
+                return "volatile"
+
+            spread_bucket = _spread_bucket(safe_float(candidate.get("spread_bps"), 0.0))
+            volatility_bucket = _volatility_bucket(safe_float(candidate.get("momentum_5_bps", candidate.get("volatility_bps", 0.0)), 0.0))
+            session_bucket = str(candidate.get("session_liquidity_setup", candidate.get("session_bucket", "unknown")) or "unknown")
+
+            frame["_spread_bucket"] = frame["spread_bps"].map(_spread_bucket)
+            if "volatility_bucket" not in frame.columns:
+                frame["volatility_bucket"] = ""
+            if "session_bucket" not in frame.columns:
+                frame["session_bucket"] = frame.get("session_liquidity_setup", pd.Series(["unknown"] * len(frame))).astype(str)
+
+            base = frame[
                 (frame.get("product_id", "").astype(str) == product_id)
                 & (frame.get("side", "").astype(str).str.upper() == side_text)
+            ].copy()
+            if base.empty:
+                return None, 0.0, "maker_fill_samples_too_low;n=0"
+
+            exact = base[
+                (base["_spread_bucket"].astype(str) == spread_bucket)
+                & (base["volatility_bucket"].astype(str).replace("", volatility_bucket) == volatility_bucket)
+                & (base["session_bucket"].astype(str).replace("", session_bucket) == session_bucket)
             ].tail(80)
-            if len(subset) < int(MAKER_FILL_LEARNING_MIN_SAMPLES):
-                return None, 0.0, f"maker_fill_samples_too_low;n={len(subset)}"
-            filled = subset.get("filled", pd.Series(dtype=str)).astype(str).str.lower().isin(["true", "1", "yes"])
-            fill_rate = float(filled.mean())
-            confidence = clamp_float(math.sqrt(len(subset) / 80.0), 0.0, 1.0)
-            return clamp_float(fill_rate, 0.02, 0.95), confidence, f"learned_maker_fill product={product_id};side={side_text};n={len(subset)};fill_rate={fill_rate:.3f};conf={confidence:.3f}"
+            spread_side = base[base["_spread_bucket"].astype(str) == spread_bucket].tail(80)
+            subsets = [(exact, 0.50, "exact"), (spread_side, 0.30, "spread"), (base.tail(80), 0.20, "product_side")]
+            weighted_rate = 0.0
+            weighted_conf = 0.0
+            used = []
+            for subset, weight, label in subsets:
+                if len(subset) < int(MAKER_FILL_LEARNING_MIN_SAMPLES):
+                    continue
+                filled = subset.get("filled", pd.Series(dtype=str)).astype(str).str.lower().isin(["true", "1", "yes"])
+                conf = clamp_float(math.sqrt(len(subset) / 80.0), 0.0, 1.0)
+                weighted_rate += float(filled.mean()) * weight * conf
+                weighted_conf += weight * conf
+                used.append(f"{label}:n={len(subset)}")
+            if weighted_conf <= 0.0:
+                return None, 0.0, f"maker_fill_samples_too_low;n={len(base)};spread_bucket={spread_bucket};volatility_bucket={volatility_bucket};session_bucket={session_bucket}"
+            fill_rate = weighted_rate / weighted_conf
+            confidence = clamp_float(weighted_conf, 0.0, 1.0)
+            return clamp_float(fill_rate, 0.02, 0.95), confidence, f"learned_maker_fill product={product_id};side={side_text};spread_bucket={spread_bucket};volatility_bucket={volatility_bucket};session_bucket={session_bucket};used={','.join(used)};fill_rate={fill_rate:.3f};conf={confidence:.3f}"
         except Exception as exc:
             return None, 0.0, f"maker_fill_learning_error:{exc}"
 
@@ -10519,6 +10593,8 @@ class TradingBot:
             + "|volume=" + self._setup_perf_bucket(safe_float(candidate.get("volume_profile_buy_score"), 0.0))
             + "|vp_leader=" + self._setup_perf_bucket(safe_float(candidate.get("volume_profile_leader_buy_score"), 0.0))
             + "|unfair=" + self._setup_perf_bucket(safe_float(candidate.get("unfair_trade_score"), 0.0))
+            + "|utility=" + self._setup_perf_bucket(safe_float(candidate.get("expected_utility_bps"), 0.0) / 200.0)
+            + "|buy_vs_wait=" + self._setup_perf_bucket(safe_float(candidate.get("buy_vs_wait_edge_bps"), 0.0) / 200.0)
             + "|validated_liq=" + self._setup_perf_bucket(safe_float(candidate.get("validated_liquidity_buy_score"), 0.0))
             + "|fresh_zone=" + self._setup_perf_bucket(safe_float(candidate.get("fresh_zone_buy_score"), 0.0))
             + "|fvg_score=" + self._setup_perf_bucket(safe_float(candidate.get("fvg_buy_score"), 0.0))
@@ -11027,6 +11103,13 @@ class TradingBot:
                 or candidate.get("current_price", 0.0)
                 or 0.0
             )
+
+            if bool(ENABLE_GLOBAL_DRAWDOWN_BRAKE):
+                try:
+                    if self._intraday_drawdown_pct() >= float(MAX_INTRADAY_DRAWDOWN_PCT):
+                        return False, "live_buy_blocked:global_drawdown_brake"
+                except Exception:
+                    pass
 
             seconds_since_last_buy = self._seconds_since_last_buy_for_product(product_id)
 
@@ -12568,6 +12651,139 @@ class TradingBot:
             "momentum_15_bps": float(momentum_snapshot.get("mom15", 0.0) or 0.0),
             "green_candles": int(green_count),
         }
+
+    def _sell_quality_columns(self) -> List[str]:
+        return [
+            "ts", "dt_mst", "product_id", "trade_id", "sell_price",
+            "review_price", "review_minutes", "move_after_sell_bps",
+            "peak_before_sell_bps", "net_after_exit_bps", "executed_sell_fraction",
+            "capture_quality_score", "sell_quality_kind", "reason",
+        ]
+
+    def _append_sell_quality_seed(self, *, product_id: str, trade_id: str, sell_price: float, hold_state: Dict[str, Any], sell_fraction: float, reason: str) -> None:
+        try:
+            self._append_csv_dict_row(
+                path=SELL_QUALITY_REVIEWS_CSV_PATH,
+                columns=self._sell_quality_columns(),
+                row={
+                    "ts": f"{now_ts():.6f}",
+                    "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"),
+                    "product_id": product_id,
+                    "trade_id": str(trade_id or ""),
+                    "sell_price": f"{float(sell_price):.10f}",
+                    "review_price": "",
+                    "review_minutes": 0,
+                    "move_after_sell_bps": "",
+                    "peak_before_sell_bps": f"{float(hold_state.get('peak_unrealized_bps', 0.0) or 0.0):.6f}",
+                    "net_after_exit_bps": f"{float(hold_state.get('net_after_exit_bps', 0.0) or 0.0):.6f}",
+                    "executed_sell_fraction": f"{float(sell_fraction):.6f}",
+                    "capture_quality_score": "",
+                    "sell_quality_kind": "seed",
+                    "reason": str(reason or "")[:900],
+                },
+            )
+        except Exception as exc:
+            log(f"[sell-quality] seed failed {product_id}: {exc}")
+
+    def _review_sell_quality(self) -> None:
+        try:
+            if not os.path.exists(SELL_QUALITY_REVIEWS_CSV_PATH):
+                return
+            frame = pd.read_csv(SELL_QUALITY_REVIEWS_CSV_PATH)
+            if frame.empty or "sell_quality_kind" not in frame.columns:
+                return
+            reviewed_keys = set()
+            reviewed = frame[frame["sell_quality_kind"].astype(str) == "review"]
+            for _, row in reviewed.iterrows():
+                reviewed_keys.add((str(row.get("product_id", "")), str(row.get("trade_id", "")), int(float(row.get("review_minutes", 0) or 0))))
+            seeds = frame[frame["sell_quality_kind"].astype(str) == "seed"].copy()
+            for _, row in seeds.iterrows():
+                product_id = str(row.get("product_id", ""))
+                trade_id = str(row.get("trade_id", ""))
+                seed_ts = float(row.get("ts", 0.0) or 0.0)
+                sell_price = float(row.get("sell_price", 0.0) or 0.0)
+                if not product_id or sell_price <= 0:
+                    continue
+                for review_minutes in [5, 15, 30, 60]:
+                    if now_ts() < seed_ts + review_minutes * 60:
+                        continue
+                    key = (product_id, trade_id, review_minutes)
+                    if key in reviewed_keys:
+                        continue
+                    candles = self._live_minute_candles_for_product(product_id)
+                    future = [c for c in candles if float(getattr(c, "ts", getattr(c, "minute_start_ts", 0.0)) or 0.0) >= seed_ts]
+                    if not future:
+                        continue
+                    review_price = float(getattr(future[-1], "close", 0.0) or 0.0)
+                    future_high = max(float(getattr(c, "high", 0.0) or 0.0) for c in future)
+                    move_after_sell_bps = ((review_price / sell_price) - 1.0) * 10000.0
+                    missed_upside_bps = max(0.0, ((future_high / sell_price) - 1.0) * 10000.0)
+                    if missed_upside_bps >= 120:
+                        kind, quality = "sold_too_early_big_missed_upside", 0.20
+                    elif move_after_sell_bps <= -45:
+                        kind, quality = "good_exit_price_fell_after_sell", 0.85
+                    elif abs(move_after_sell_bps) <= 25:
+                        kind, quality = "neutral_exit", 0.55
+                    else:
+                        kind, quality = "mixed_exit", 0.45
+                    self._append_csv_dict_row(path=SELL_QUALITY_REVIEWS_CSV_PATH, columns=self._sell_quality_columns(), row={
+                        "ts": f"{now_ts():.6f}", "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"),
+                        "product_id": product_id, "trade_id": trade_id, "sell_price": f"{sell_price:.10f}",
+                        "review_price": f"{review_price:.10f}", "review_minutes": review_minutes,
+                        "move_after_sell_bps": f"{move_after_sell_bps:.6f}",
+                        "peak_before_sell_bps": row.get("peak_before_sell_bps", ""),
+                        "net_after_exit_bps": row.get("net_after_exit_bps", ""),
+                        "executed_sell_fraction": row.get("executed_sell_fraction", ""),
+                        "capture_quality_score": f"{quality:.6f}", "sell_quality_kind": "review",
+                        "reason": f"sell_quality_review;kind={kind};missed_upside_bps={missed_upside_bps:.2f}",
+                    })
+        except Exception as exc:
+            log(f"[sell-quality] review failed: {exc}")
+
+    def _intraday_drawdown_pct(self) -> float:
+        try:
+            today = now_mst().strftime("%Y-%m-%d")
+            equity = float(self._equity_usd())
+            if getattr(self, "_intraday_equity_day", "") != today:
+                self._intraday_equity_day = today
+                self._intraday_peak_equity_usd = equity
+            self._intraday_peak_equity_usd = max(float(getattr(self, "_intraday_peak_equity_usd", equity) or equity), equity)
+            peak = float(self._intraday_peak_equity_usd)
+            return max(0.0, (peak - equity) / peak) if peak > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _live_readiness_status(self) -> Dict[str, Any]:
+        status = {"viewer_snapshot_recent": False, "websocket_recent": False, "market_csv_recent": False, "council_recent": False, "no_duplicate_process": True, "fee_tier_ready": False, "risk_pause_active": False, "drawdown_brake_active": False, "open_positions_count": 0, "learning_files_writable": False, "sqlite_writable": False, "safe_to_run_overnight": False}
+        try:
+            status["viewer_snapshot_recent"] = os.path.exists(VIEWER_SNAPSHOT_JSON) and now_ts() - os.path.getmtime(VIEWER_SNAPSHOT_JSON) <= 10
+            status["market_csv_recent"] = os.path.exists(MARKET_CSV_PATH) and now_ts() - os.path.getmtime(MARKET_CSV_PATH) <= 30
+            status["council_recent"] = os.path.exists(LEVEL8_COUNCIL_DECISIONS_CSV_PATH) and now_ts() - os.path.getmtime(LEVEL8_COUNCIL_DECISIONS_CSV_PATH) <= 60
+        except Exception:
+            pass
+        try:
+            status["open_positions_count"] = sum(1 for product_id in PRODUCTS if self._has_open_position(product_id))
+        except Exception:
+            pass
+        try:
+            status["risk_pause_active"] = bool(getattr(self, "risk_pause_until_ts", 0.0) > now_ts())
+            status["drawdown_brake_active"] = bool(self._intraday_drawdown_pct() >= float(MAX_INTRADAY_DRAWDOWN_PCT))
+        except Exception:
+            pass
+        try:
+            test_path = os.path.join(BASE_DIR, ".learning_write_test.tmp")
+            with open(test_path, "w", encoding="utf-8") as f: f.write("ok")
+            os.remove(test_path); status["learning_files_writable"] = True
+        except Exception:
+            pass
+        try:
+            from level8_council import append_sqlite_event
+            append_sqlite_event(event_type="readiness_probe", source_path="readiness", row={"ts": f"{now_ts():.6f}"})
+            status["sqlite_writable"] = True
+        except Exception:
+            pass
+        status["safe_to_run_overnight"] = bool(status["viewer_snapshot_recent"] and not status["risk_pause_active"] and not status["drawdown_brake_active"] and status["learning_files_writable"] and status["no_duplicate_process"])
+        return status
 
 
     def _spike_profit_protection_context(
@@ -17085,6 +17301,7 @@ class TradingBot:
                 "coins": coins,
                 "top_products": [r.get("product_id", "") for r in ranked[:8]],
                 "live_positions": [r.get("product_id", "") for r in ranked if bool(r.get("owns_position", False))],
+                "readiness": self._live_readiness_status(),
             }
             now = time.time()
             if now - float(getattr(self, "_last_viewer_snapshot_write_ts", 0.0)) >= float(VIEWER_SNAPSHOT_WRITE_EVERY_SEC):
@@ -17098,6 +17315,7 @@ class TradingBot:
             ts_now = now_ts()
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
                 self._review_level8_missed_opportunities()
+            self._review_sell_quality()
             if (
                 bool(ENABLE_DECISION_AUDIT_REPLAY)
                 and ts_now - float(getattr(self, "last_decision_audit_review_ts", 0.0))
@@ -17562,6 +17780,14 @@ class TradingBot:
                                 exit_role=exit_role,
                             )
                             self._record_trade_timestamp(product_id)
+                            self._append_sell_quality_seed(
+                                product_id=product_id,
+                                trade_id=sell_trade_id,
+                                sell_price=exec_price,
+                                hold_state=hold_state if 'hold_state' in locals() else {},
+                                sell_fraction=executed_sell_fraction,
+                                reason=str(exit_reason or 'level8_direct_exit'),
+                            )
                             self._record_realized_trade_result(pnl_gross - fee)
                             self._fifo_reduce_lots(product_id, sell_qty)
 

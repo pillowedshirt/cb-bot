@@ -32,6 +32,31 @@ FEATURE_COLUMNS = [
     "green_candles",
     "rank_score",
     "buy_ready_count",
+    "expected_utility_bps",
+    "buy_vs_wait_edge_bps",
+    "calibrated_p_win",
+    "payoff_ratio",
+    "maker_adjusted_expected_value_bps",
+    "uncertainty_penalty_bps",
+    "volume_profile_leader_buy_score",
+    "volume_profile_leader_sell_score",
+    "volume_profile_leader_hold_score",
+    "volume_profile_leader_wait_score",
+    "volume_profile_leader_confidence",
+    "poc_distance_bps",
+    "low_volume_path_up_bps",
+    "low_volume_path_down_bps",
+    "unfair_trade_score",
+    "volume_profile_utility_adjust_bps",
+    "candle_context_buy_score",
+    "candle_context_sell_score",
+    "candle_exhaustion_score",
+    "candle_continuation_score",
+    "market_structure_buy_score",
+    "validated_liquidity_buy_score",
+    "fresh_zone_buy_score",
+    "fvg_buy_score",
+    "smt_buy_score",
 ]
 
 
@@ -225,6 +250,10 @@ class LocalAIBrain:
         if len(frame) < self.min_training_rows:
             return {
                 "ok": False,
+                "sample_count": int(len(frame)),
+                "feature_columns_used": list(FEATURE_COLUMNS),
+                "auc_if_available": None,
+                "model_ready": False,
                 "reason": (
                     f"not_enough_training_rows rows={len(frame)} "
                     f"required={self.min_training_rows}"
@@ -236,6 +265,10 @@ class LocalAIBrain:
         if classification_target.nunique() < 2:
             return {
                 "ok": False,
+                "sample_count": int(len(frame)),
+                "feature_columns_used": list(FEATURE_COLUMNS),
+                "auc_if_available": None,
+                "model_ready": False,
                 "reason": "not_enough_label_classes required=2",
             }
 
@@ -281,7 +314,7 @@ class LocalAIBrain:
         }
         joblib.dump(pack, AI_MODEL_PATH)
         self.model_pack = pack
-        return {"ok": True, "rows": int(len(frame)), "auc": auc}
+        return {"ok": True, "sample_count": int(len(frame)), "feature_columns_used": list(FEATURE_COLUMNS), "auc_if_available": auc, "model_ready": True, "reason": "trained"}
 
     @staticmethod
     def _row_to_features(context: Dict[str, Any]) -> pd.DataFrame:

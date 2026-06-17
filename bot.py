@@ -1283,11 +1283,16 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     """
     Rank Level 8-approved candidates by live-money quality.
 
-    This version includes backtest intelligence:
-    - expected replay win rate,
-    - replay quality score,
-    - live gate bias,
-    - product historical expected net bps.
+    Strong candidates rank higher when:
+    - Level 8 is well above threshold,
+    - truth score is high,
+    - projected net after costs is large,
+    - expected edge is strong,
+    - spread/cost are acceptable,
+    - backtest replay quality is strong,
+    - session liquidity shows a high-quality sweep/reclaim or breakout/hold,
+    - upside target distance is large enough,
+    - stop distance is not excessive.
     """
     def f(key: str, default: float = 0.0) -> float:
         try:
@@ -1300,6 +1305,7 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     margin = final_buy - threshold
     truth = f("level8_truth_score")
     recommended_pct = f("level8_recommended_position_pct", f("position_pct"))
+
     raw_prob = f("estimated_prob_up")
     raw_score = f("score")
     expected_edge_bps = f("expected_net_edge_bps")
@@ -1314,6 +1320,11 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     backtest_gate_bias = f("backtest_live_gate_bias_bps", 0.0)
     backtest_confidence = f("backtest_sample_confidence", 0.0)
 
+    session_liquidity_score = f("session_liquidity_score", 0.0)
+    session_liquidity_confidence = f("session_liquidity_confidence", 0.0)
+    session_upside_target_bps = f("session_upside_target_bps", 0.0)
+    session_stop_distance_bps = f("session_stop_distance_bps", 0.0)
+
     backtest_bonus = (
         (backtest_win_rate - 0.50) * 55.0
         + (backtest_quality - 0.50) * 45.0
@@ -1321,18 +1332,26 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         - max(0.0, backtest_gate_bias) * 0.18
     ) * max(0.15, min(1.0, backtest_confidence))
 
+    session_bonus = (
+        session_liquidity_score
+        * session_liquidity_confidence
+        * 35.0
+        + max(0.0, min(220.0, session_upside_target_bps)) * 0.08
+        - max(0.0, session_stop_distance_bps - float(SESSION_LIQUIDITY_STOP_DISTANCE_MAX_BPS)) * 0.08
+    )
+
     timing_reason = str(candidate.get("entry_timing_reason", ""))
     timing_bonus = 0.0
     if "entry_confirmed" in timing_reason:
-        timing_bonus += 20.0
+        timing_bonus += 12.0
     if "realtime_upturn_ok=True" in timing_reason:
-        timing_bonus += 18.0
+        timing_bonus += 10.0
     if "hl=True" in timing_reason:
-        timing_bonus += 8.0
+        timing_bonus += 6.0
     if "vwap=True" in timing_reason:
         timing_bonus += 6.0
     if "lower_low_seq=False" in timing_reason:
-        timing_bonus += 6.0
+        timing_bonus += 4.0
 
     return float(
         margin * 500.0
@@ -1345,6 +1364,7 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + recommended_pct * 45.0
         + timing_bonus
         + backtest_bonus
+        + session_bonus
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
@@ -8388,11 +8408,30 @@ class TradingBot:
             + uncertainty_value - spread_penalty,
             0.0, 1.0,
         )
+        session_liquidity = self._session_liquidity_for_product(
+            product_id=product_id,
+            current_price=float(
+                candidate.get("price", 0.0)
+                or candidate.get("mid", 0.0)
+                or candidate.get("current_price", 0.0)
+                or 0.0
+            ),
+            spread_bps=float(candidate.get("spread_bps", 0.0) or 0.0),
+            cost_bps=float(candidate.get("cost_bps", 0.0) or 0.0),
+            projected_forward_gain_bps=float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0),
+        )
+
         return {
-            "mom1": mom1, "mom3": mom3, "mom5": mom5, "mom15": mom15,
-            "volatility_proxy": volatility_proxy, "market_regime": market_regime,
-            "setup_tag": setup_tag, "execution_state": execution_state,
+            "mom1": mom1,
+            "mom3": mom3,
+            "mom5": mom5,
+            "mom15": mom15,
+            "volatility_proxy": volatility_proxy,
+            "market_regime": market_regime,
+            "setup_tag": setup_tag,
+            "execution_state": execution_state,
             "learning_score": learning_score,
+            "session_liquidity": session_liquidity,
         }
 
     def _max_buy_spread_for_product(self, product_id: str) -> float:
@@ -8632,10 +8671,18 @@ class TradingBot:
         level8_info: Dict[str, Any],
     ) -> Tuple[bool, str]:
         """
-        Convert marginal Level 8 ALLOW_BUY decisions into SHADOW instead of live orders.
+        Final live-money safety gate.
 
-        This version enforces product-specific backtest replay floors for projected
-        net after cost, raw score, raw probability, and expected edge.
+        Level 8 remains the integrated strategy authority.
+        This function keeps hard blocks focused on economics and live-trading safety:
+        - council margin,
+        - truth score,
+        - projected net after round-trip costs,
+        - spread sanity.
+
+        Strategy concepts such as session sweeps, VWAP, momentum, market structure,
+        and timing confirmation are weighted inside the council instead of being
+        excessive pass/fail rails here.
         """
         try:
             product_id = str(candidate.get("product_id", ""))
@@ -8645,16 +8692,17 @@ class TradingBot:
             truth = float(level8_info.get("truth_score", 0.0) or 0.0)
             margin = final_buy - threshold
 
-            raw_prob = float(candidate.get("estimated_prob_up", 0.0) or 0.0)
-            raw_score = float(candidate.get("score", 0.0) or 0.0)
             projected_forward = float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0)
             cost_bps = float(candidate.get("cost_bps", 0.0) or 0.0)
-            expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
             spread_bps = float(candidate.get("spread_bps", 0.0) or 0.0)
+            expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
+            raw_prob = float(candidate.get("estimated_prob_up", 0.0) or 0.0)
+            raw_score = float(candidate.get("score", 0.0) or 0.0)
 
-            projected_net_after_cost = projected_forward - cost_bps
+            projected_net_after_cost = float(projected_forward) - float(cost_bps)
+
             base_min_projected_net = max(
-                float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS),
+                float(LEVEL8_MIN_NET_AFTER_COST_FOR_LIVE_BUY_BPS),
                 float(LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS),
             )
 
@@ -8664,88 +8712,72 @@ class TradingBot:
                 candidate_projected_net_after_cost_bps=float(projected_net_after_cost),
             )
 
-            min_projected_net = float(backtest_gate.get("min_projected_net_bps", base_min_projected_net))
-            min_raw_score = float(backtest_gate.get("min_raw_score", LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY))
-            min_raw_prob = float(backtest_gate.get("min_raw_prob", LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY))
-            min_expected_edge = float(backtest_gate.get("min_expected_edge_bps", LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE))
-            backtest_buy_reason = str(backtest_gate.get("reason", ""))
+            min_projected_net = float(
+                backtest_gate.get("min_projected_net_bps", base_min_projected_net)
+            )
+            backtest_reason = str(backtest_gate.get("reason", ""))
 
-            if final_buy < float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):
-                return False, f"live_buy_shadowed:final_buy_too_low final={final_buy:.3f} min={float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):.3f};{backtest_buy_reason}"
+            if margin < float(LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY):
+                return False, (
+                    f"live_buy_shadowed:council_margin_too_small "
+                    f"margin={margin:.3f};"
+                    f"min={float(LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY):.3f};"
+                    f"final={final_buy:.3f};"
+                    f"threshold={threshold:.3f};"
+                    f"{backtest_reason}"
+                )
 
-            if margin < float(LEVEL8_MIN_LIVE_BUY_MARGIN):
-                return False, f"live_buy_shadowed:margin_too_small margin={margin:.3f} min={float(LEVEL8_MIN_LIVE_BUY_MARGIN):.3f};{backtest_buy_reason}"
-
-            if truth < float(LEVEL8_MIN_LIVE_BUY_TRUTH):
-                return False, f"live_buy_shadowed:truth_too_low truth={truth:.3f} min={float(LEVEL8_MIN_LIVE_BUY_TRUTH):.3f};{backtest_buy_reason}"
+            if truth < float(LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY):
+                return False, (
+                    f"live_buy_shadowed:council_truth_too_low "
+                    f"truth={truth:.3f};"
+                    f"min={float(LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY):.3f};"
+                    f"{backtest_reason}"
+                )
 
             if spread_bps > float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):
-                return False, f"live_buy_shadowed:spread_too_high spread={spread_bps:.2f} max={float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):.2f};{backtest_buy_reason}"
+                return False, (
+                    f"live_buy_shadowed:spread_too_high "
+                    f"spread={spread_bps:.2f};"
+                    f"max={float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):.2f};"
+                    f"{backtest_reason}"
+                )
 
             if projected_net_after_cost < min_projected_net:
                 return False, (
-                    f"live_buy_shadowed:projected_net_after_cost_too_low projected_forward={projected_forward:.2f};"
-                    f"round_trip_cost={cost_bps:.2f};net_after_cost={projected_net_after_cost:.2f};"
-                    f"min={min_projected_net:.2f};{backtest_buy_reason}"
+                    f"live_buy_shadowed:projected_net_after_cost_too_low "
+                    f"projected_forward={projected_forward:.2f};"
+                    f"round_trip_cost={cost_bps:.2f};"
+                    f"net_after_cost={projected_net_after_cost:.2f};"
+                    f"min={min_projected_net:.2f};"
+                    f"edge={expected_edge:.2f};"
+                    f"prob={raw_prob:.3f};"
+                    f"score={raw_score:.2f};"
+                    f"session_agent={candidate.get('session_liquidity_agent', '')};"
+                    f"session_setup={candidate.get('session_liquidity_setup', '')};"
+                    f"{backtest_reason}"
                 )
-
-            if expected_edge < min_expected_edge:
-                return False, f"live_buy_shadowed:expected_edge_too_low edge={expected_edge:.2f};min={min_expected_edge:.2f};{backtest_buy_reason}"
-
-            if raw_prob < min_raw_prob:
-                return False, f"live_buy_shadowed:raw_prob_too_low prob={raw_prob:.3f};min={min_raw_prob:.3f};{backtest_buy_reason}"
-
-            if raw_score < min_raw_score:
-                return False, f"live_buy_shadowed:raw_score_too_low score={raw_score:.2f};min={min_raw_score:.2f};{backtest_buy_reason}"
-
-            moms = self._entry_momentum_snapshot(product_id)
-            mom1 = float(moms.get("mom1", 0.0))
-            mom3 = float(moms.get("mom3", 0.0))
-            mom5 = float(moms.get("mom5", 0.0))
-
-            if bool(LEVEL8_BLOCK_LIVE_BUY_WHILE_MOMENTUM_FALLING):
-                if (
-                    mom1 < float(LEVEL8_MIN_MOM1_FOR_LIVE_BUY_BPS)
-                    and mom3 < float(LEVEL8_MIN_MOM3_FOR_LIVE_BUY_BPS)
-                    and mom5 < float(LEVEL8_MIN_MOM5_FOR_LIVE_BUY_BPS)
-                ):
-                    return False, f"live_buy_shadowed:momentum_falling mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};{backtest_buy_reason}"
-
-            if bool(LEVEL8_REQUIRE_REALTIME_UPTURN_CONFIRMATION):
-                timing_ok, timing_reason = self._entry_timing_confirmation(
-                    product_id=product_id,
-                    signal=candidate.get("signal"),
-                )
-                green_count = self._recent_green_candle_count(product_id, ENTRY_GREEN_CANDLE_LOOKBACK)
-                realtime_upturn_ok = bool(
-                    mom1 >= float(LEVEL8_MIN_REALTIME_UPTURN_MOM1_BPS)
-                    and (
-                        mom3 >= float(LEVEL8_MIN_REALTIME_UPTURN_MOM3_BPS)
-                        or green_count >= int(LEVEL8_MIN_REALTIME_UPTURN_GREEN_CANDLES)
-                    )
-                )
-
-                candidate["entry_timing_ok"] = bool(timing_ok and realtime_upturn_ok)
-                candidate["entry_timing_reason"] = (
-                    f"{timing_reason};realtime_upturn_ok={realtime_upturn_ok};"
-                    f"green_count={green_count};mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
-                )
-
-                if not timing_ok or not realtime_upturn_ok:
-                    return False, (
-                        f"live_buy_shadowed:no_realtime_upturn timing_ok={timing_ok};"
-                        f"realtime_upturn_ok={realtime_upturn_ok};{candidate['entry_timing_reason']};{backtest_buy_reason}"
-                    )
 
             return True, (
-                f"live_buy_quality_ok margin={margin:.3f};truth={truth:.3f};final_buy={final_buy:.3f};"
-                f"threshold={threshold:.3f};projected_net_after_cost={projected_net_after_cost:.2f};"
-                f"edge={expected_edge:.2f};prob={raw_prob:.3f};score={raw_score:.2f};spread={spread_bps:.2f};"
-                f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};{backtest_buy_reason}"
+                f"live_buy_economic_safety_ok "
+                f"margin={margin:.3f};"
+                f"truth={truth:.3f};"
+                f"final_buy={final_buy:.3f};"
+                f"threshold={threshold:.3f};"
+                f"projected_net_after_cost={projected_net_after_cost:.2f};"
+                f"min_projected_net={min_projected_net:.2f};"
+                f"spread={spread_bps:.2f};"
+                f"cost={cost_bps:.2f};"
+                f"edge={expected_edge:.2f};"
+                f"prob={raw_prob:.3f};"
+                f"score={raw_score:.2f};"
+                f"session_agent={candidate.get('session_liquidity_agent', '')};"
+                f"session_setup={candidate.get('session_liquidity_setup', '')};"
+                f"{backtest_reason}"
             )
 
         except Exception as exc:
-            return False, f"live_buy_shadowed:quality_gate_exception:{exc}"
+            return False, f"live_buy_shadowed:economic_safety_gate_exception:{exc}"
 
     def _level8_decision_for_candidate(
         self,
@@ -8843,9 +8875,31 @@ class TradingBot:
             mean_reversion_score = clamp_float(mean_reversion_score + (0.12 if setup_tag == "upper_low" else 0.0), 0.0, 1.0)
             breakout_score = clamp_float(breakout_score - (0.12 if setup_tag == "falling_knife" else 0.0), 0.0, 1.0)
             risk_vote = self.level8_council.risk_agent()
-            common = {"setup_tag": setup_tag, "market_regime": market_regime, "execution_state": execution_state, "learning_score": learning_score}
+            common = {
+                "setup_tag": setup_tag,
+                "market_regime": market_regime,
+                "execution_state": execution_state,
+                "learning_score": learning_score,
+            }
+
             def vote(agent: str, buy: float, hold: float, wait: float, confidence: float, reason: str) -> Dict[str, Any]:
-                return {**common, "agent": agent, "buy": buy, "sell": clamp_float(1.0-buy, 0.0, 1.0), "hold": hold, "wait": wait, "confidence": confidence, "reason": reason}
+                return {
+                    **common,
+                    "agent": agent,
+                    "buy": buy,
+                    "sell": clamp_float(1.0 - buy, 0.0, 1.0),
+                    "hold": hold,
+                    "wait": wait,
+                    "confidence": confidence,
+                    "reason": reason,
+                }
+
+            session_liquidity_vote = self._session_liquidity_vote_from_context(
+                product_id=product_id,
+                context=context,
+                common=common,
+            )
+
             votes = [
                 vote("trend", trend_score, clamp_float(0.40+trend_score*0.30,0.0,1.0), clamp_float(0.60-trend_score*0.35,0.0,1.0), clamp_float(0.35+abs(mom5)/180.0,0.20,0.90), f"trend mom5={mom5:.2f};mom15={mom15:.2f};regime={market_regime}"),
                 vote("mean_reversion", mean_reversion_score, 0.45, clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), clamp_float(0.35+abs(mom5)/220.0,0.20,0.85), f"mean_reversion setup={setup_tag};mom1={mom1:.2f};mom5={mom5:.2f}"),
@@ -8866,12 +8920,34 @@ class TradingBot:
                 ),
                 vote("execution", clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), 0.45, clamp_float(1.0-spread_quality,0.0,1.0), clamp_float(0.30+spread_quality*0.55,0.20,0.95), f"execution spread={spread_bps:.2f};cost={cost_bps:.2f};state={execution_state}"),
                 vote("product_health", clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), clamp_float(0.40+forward_score*0.30,0.0,1.0), clamp_float(0.65-forward_score*0.35,0.0,1.0), clamp_float(0.30+score*0.50,0.20,0.85), f"product score={score:.3f};edge={expected_edge:.2f};forward={projected_forward:.2f}"),
+                session_liquidity_vote,
                 {**common, "agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
                 vote("exploration", learning_score, 0.35, clamp_float(0.70-learning_score*0.45,0.0,1.0), clamp_float(0.30+learning_score*0.55,0.20,0.85), f"learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"),
             ]
-            truth_buy = clamp_float(spread_quality*0.20 + cost_score*0.10 + probability*0.20 + score*0.15 + forward_score*0.15 + learning_score*0.20, 0.0, 1.0)
+            session_buy_score = float(session_liquidity_vote.get("buy", 0.0) or 0.0)
+            session_confidence = float(session_liquidity_vote.get("confidence", 0.0) or 0.0)
+
+            truth_buy = clamp_float(
+                spread_quality * 0.16
+                + cost_score * 0.10
+                + probability * 0.18
+                + score * 0.14
+                + forward_score * 0.14
+                + learning_score * 0.18
+                + session_buy_score * session_confidence * 0.10,
+                0.0,
+                1.0,
+            )
             truth_vote = vote("truth", truth_buy, clamp_float(0.35+truth_buy*0.30,0.0,1.0), clamp_float(0.80-truth_buy*0.55,0.0,1.0), clamp_float(0.30+truth_buy*0.55,0.20,0.90), f"truth evidence={truth_buy:.3f};setup={setup_tag};regime={market_regime}")
-            strategy = f"LEVEL8_DIRECT|regime={market_regime}|setup={setup_tag}|execution={execution_state}"
+            session_agent_for_strategy = str(session_liquidity_vote.get("agent", "session_none"))
+            session_setup_for_strategy = str(session_liquidity_vote.get("session_liquidity_setup", "none"))
+
+            strategy = (
+                f"LEVEL8_DIRECT|regime={market_regime}|setup={setup_tag}|"
+                f"session_agent={session_agent_for_strategy}|"
+                f"session_setup={session_setup_for_strategy}|"
+                f"execution={execution_state}"
+            )
             decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
         except Exception as exc:
             log(f"[level8] decision failed for {product_id}: {exc}")
@@ -8890,7 +8966,16 @@ class TradingBot:
                 "setup_tag": context["setup_tag"], "market_regime": context["market_regime"],
             }
             base_reason = str(decision.get("sizing_reason", decision.get("reason", "")))
-            info["reason"] = f"{base_reason};setup={context['setup_tag']};regime={context['market_regime']};learning_score={info['learning_score']:.3f}"
+            session_context = dict(context.get("session_liquidity", {}) or {})
+            info["reason"] = (
+                f"{base_reason};"
+                f"setup={context['setup_tag']};"
+                f"regime={context['market_regime']};"
+                f"learning_score={info['learning_score']:.3f};"
+                f"session_agent={session_context.get('strongest_agent', '')};"
+                f"session_setup={session_context.get('strongest_setup', '')};"
+                f"session_reason={session_context.get('reason', '')}"
+            )
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")
             return False, {**fallback, "reason": f"level8_malformed_decision_fail_closed:{exc}"}

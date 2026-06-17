@@ -310,7 +310,9 @@ def build_session_liquidity_signal(
         else:
             setup = "sweep_reject_harvest"
             agent = f"{window.key}_liquidity_harvest"
-            buy_score = max(reversal_buy_score, breakout_buy_score)
+
+            # Sweep/reject/harvest is primarily sell or avoid-buy evidence.
+            buy_score = min(0.18, max(reversal_buy_score, breakout_buy_score) * 0.35)
 
         confidence = _clamp(
             0.25
@@ -328,7 +330,14 @@ def build_session_liquidity_signal(
             "setup": setup,
             "buy_score": buy_score,
             "sell_score": sell_score,
-            "hold_score": _clamp(0.42 + buy_score * 0.24 - sell_score * 0.12, 0.0, 1.0),
+            "hold_score": _clamp(
+                0.42
+                + buy_score * 0.18
+                - sell_score * 0.18
+                + (0.10 if setup == "session_breakout_hold" else 0.0),
+                0.0,
+                1.0,
+            ),
             "confidence": confidence,
             "session_high": session_high,
             "session_low": session_low,

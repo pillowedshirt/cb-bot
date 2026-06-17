@@ -864,6 +864,16 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         print(message)
 
     started = time.time()
+    module_debug(
+        MODULE_NAME,
+        "backtest_intelligence_started",
+        data={
+            "base_dir": base_dir,
+            "min_product_rows": min_product_rows,
+        },
+        level="INFO",
+        also_overall=False,
+    )
     base_dir = os.path.abspath(base_dir)
     buy_rows, buy_recs = _candidate_rows(base_dir, min_product_rows=int(min_product_rows))
     sell_rows = _sell_recommendation_rows(base_dir)
@@ -903,6 +913,21 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         f"[backtest] completed buy_recs={len(buy_rows)} sell_recs={len(sell_rows)} "
         f"agent_priors={len(agent_rows)} setup_performance={len(setup_rows)} "
         f"walk_forward={len(walk_forward_rows)} ablation={len(ablation_rows)} seconds={time.time() - started:.2f}"
+    )
+    module_debug(
+        MODULE_NAME,
+        "backtest_intelligence_completed",
+        data={
+            "buy_recommendation_rows": len(buy_rows),
+            "sell_recommendation_rows": len(sell_rows),
+            "agent_prior_rows": len(agent_rows),
+            "setup_performance_rows": len(setup_rows),
+            "walk_forward_rows": len(walk_forward_rows),
+            "agent_ablation_rows": len(ablation_rows),
+            "runtime_sec": round(time.time() - started, 3),
+        },
+        level="INFO",
+        also_overall=True,
     )
     return {
         "buy_recommendations": len(buy_rows),

@@ -1479,6 +1479,32 @@ class Level8Council:
             except Exception:
                 pass
 
+        debug_every(
+            MODULE_NAME,
+            f"decide_buy:{product_id}",
+            15.0,
+            "level8_decide_buy",
+            data={
+                "decision_id": decision_id,
+                "product_id": product_id,
+                "strategy": strategy,
+                "action": action,
+                "final_buy": final_buy,
+                "final_sell": final_sell,
+                "truth_score": truth_score,
+                "buy_threshold": buy_threshold,
+                "bucket": bucket,
+                "position_pct": position_pct,
+                "vote_count": len(votes),
+                "adjusted_vote_count": len(adjusted),
+                "weight_total": weight_total,
+                "contradiction_penalty": contradiction_penalty,
+                "exploration_weight": exploration_weight,
+            },
+            level="DEBUG",
+            also_overall=False,
+        )
+
         return {
             "decision_id": decision_id,
             "action": action,
@@ -1956,6 +1982,34 @@ class Level8Council:
 
         else:
             action = "HOLD"
+
+        debug_every(
+            MODULE_NAME,
+            f"decide_exit:{product_id}",
+            10.0,
+            "level8_decide_exit",
+            data={
+                "decision_id": decision_id,
+                "product_id": product_id,
+                "action": action,
+                "final_sell": final_sell,
+                "final_hold": final_hold,
+                "truth_score": truth_score,
+                "sell_threshold": sell_threshold,
+                "recommended_sell_fraction": recommended_sell_fraction,
+                "net_after_exit_bps": net_after_exit_bps,
+                "peak_unrealized_bps": peak_unrealized_bps,
+                "pullback_from_peak_bps": pullback_from_peak_bps,
+                "spike_armed": spike_armed,
+                "spike_allow_partial": spike_allow_partial,
+                "sell_quality_penalty": sell_quality_penalty,
+                "vote_count": len(votes),
+                "adjusted_vote_count": len(adjusted),
+                "weight_total": weight_total,
+            },
+            level="DEBUG",
+            also_overall=False,
+        )
 
         return {
             "decision_id": decision_id,

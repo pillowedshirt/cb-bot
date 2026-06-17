@@ -116,13 +116,24 @@ class Level5TradingManager:
     def session_health(self) -> Dict[str, Any]:
         trades = self._recent_trades(80)
         if trades.empty or "net_pnl_usd" not in trades.columns:
-            return {
+            summary = {
                 "risk_mode": "NORMAL",
                 "session_net": 0.0,
                 "closed_count": 0,
                 "loss_streak": 0,
                 "reason": "no_recent_trade_data",
             }
+            self.last_summary = summary
+            debug_every(
+                MODULE_NAME,
+                "session_health",
+                30.0,
+                "level5_session_health",
+                data=summary,
+                level="DEBUG",
+                also_overall=False,
+            )
+            return summary
 
         trades["net_pnl_usd"] = pd.to_numeric(
             trades["net_pnl_usd"], errors="coerce"
@@ -164,6 +175,15 @@ class Level5TradingManager:
             ),
         }
         self.last_summary = summary
+        debug_every(
+            MODULE_NAME,
+            "session_health",
+            30.0,
+            "level5_session_health",
+            data=summary,
+            level="DEBUG",
+            also_overall=False,
+        )
         return summary
 
     def product_health(self, product_id: str) -> Dict[str, Any]:
@@ -288,36 +308,66 @@ class Level5TradingManager:
         strategy = str(strategy_info.get("strategy", "STAND_ASIDE"))
 
         if risk_mode == "PAUSE":
-            return ManagerDecision(
+            decision = ManagerDecision(
                 product_id, "PAUSE", "STAND_ASIDE", risk_mode, 1.0, 0.0,
                 f"session_pause;{session.get('reason')}",
             )
+            debug_every(
+                MODULE_NAME, f"level5_decide:{product_id}", 20.0, "level5_decision",
+                data={"product_id": product_id, "action": decision.action if "decision" in locals() and hasattr(decision, "action") else "", "strategy": decision.strategy if "decision" in locals() and hasattr(decision, "strategy") else "", "risk_mode": decision.risk_mode if "decision" in locals() and hasattr(decision, "risk_mode") else "", "confidence": decision.confidence if "decision" in locals() and hasattr(decision, "confidence") else 0.0, "reason": decision.reason if "decision" in locals() and hasattr(decision, "reason") else ""},
+                level="DEBUG", also_overall=False,
+            )
+            return decision
         if not bool(product.get("product_ok", True)):
-            return ManagerDecision(
+            decision = ManagerDecision(
                 product_id, "BLOCK", "STAND_ASIDE", risk_mode, 0.9, 0.0,
                 f"product_underperforming;{product.get('reason')}",
             )
+            debug_every(
+                MODULE_NAME, f"level5_decide:{product_id}", 20.0, "level5_decision",
+                data={"product_id": product_id, "action": decision.action if "decision" in locals() and hasattr(decision, "action") else "", "strategy": decision.strategy if "decision" in locals() and hasattr(decision, "strategy") else "", "risk_mode": decision.risk_mode if "decision" in locals() and hasattr(decision, "risk_mode") else "", "confidence": decision.confidence if "decision" in locals() and hasattr(decision, "confidence") else 0.0, "reason": decision.reason if "decision" in locals() and hasattr(decision, "reason") else ""},
+                level="DEBUG", also_overall=False,
+            )
+            return decision
         if strategy == "STAND_ASIDE":
-            return ManagerDecision(
+            decision = ManagerDecision(
                 product_id, "WAIT", strategy, risk_mode, 0.75, 0.0,
                 f"strategy_stand_aside;{strategy_info.get('reason')}",
             )
+            debug_every(
+                MODULE_NAME, f"level5_decide:{product_id}", 20.0, "level5_decision",
+                data={"product_id": product_id, "action": decision.action if "decision" in locals() and hasattr(decision, "action") else "", "strategy": decision.strategy if "decision" in locals() and hasattr(decision, "strategy") else "", "risk_mode": decision.risk_mode if "decision" in locals() and hasattr(decision, "risk_mode") else "", "confidence": decision.confidence if "decision" in locals() and hasattr(decision, "confidence") else 0.0, "reason": decision.reason if "decision" in locals() and hasattr(decision, "reason") else ""},
+                level="DEBUG", also_overall=False,
+            )
+            return decision
 
         ai_action = str(ai.get("action", "")).upper()
         ai_confidence = float(ai.get("confidence", 0.0) or 0.0)
         ai_expected = float(ai.get("expected_move_30m_bps", 0.0) or 0.0)
         ai_adverse = float(ai.get("expected_adverse_bps", 0.0) or 0.0)
         if ai_action == "BLOCK_BUY" and ai_confidence >= 0.20:
-            return ManagerDecision(
+            decision = ManagerDecision(
                 product_id, "BLOCK", strategy, risk_mode, ai_confidence, 0.0,
                 f"ai_block;move={ai_expected:.2f};adverse={ai_adverse:.2f}",
             )
+            debug_every(
+                MODULE_NAME, f"level5_decide:{product_id}", 20.0, "level5_decision",
+                data={"product_id": product_id, "action": decision.action if "decision" in locals() and hasattr(decision, "action") else "", "strategy": decision.strategy if "decision" in locals() and hasattr(decision, "strategy") else "", "risk_mode": decision.risk_mode if "decision" in locals() and hasattr(decision, "risk_mode") else "", "confidence": decision.confidence if "decision" in locals() and hasattr(decision, "confidence") else 0.0, "reason": decision.reason if "decision" in locals() and hasattr(decision, "reason") else ""},
+                level="DEBUG", also_overall=False,
+            )
+            return decision
         if ai_expected < ai_adverse and ai_confidence >= 0.20:
-            return ManagerDecision(
+            decision = ManagerDecision(
                 product_id, "WAIT", strategy, risk_mode, ai_confidence, 0.0,
                 f"ai_wait_adverse_gt_move;move={ai_expected:.2f};"
                 f"adverse={ai_adverse:.2f}",
             )
+            debug_every(
+                MODULE_NAME, f"level5_decide:{product_id}", 20.0, "level5_decision",
+                data={"product_id": product_id, "action": decision.action if "decision" in locals() and hasattr(decision, "action") else "", "strategy": decision.strategy if "decision" in locals() and hasattr(decision, "strategy") else "", "risk_mode": decision.risk_mode if "decision" in locals() and hasattr(decision, "risk_mode") else "", "confidence": decision.confidence if "decision" in locals() and hasattr(decision, "confidence") else 0.0, "reason": decision.reason if "decision" in locals() and hasattr(decision, "reason") else ""},
+                level="DEBUG", also_overall=False,
+            )
+            return decision
 
         base_pct = {
             "DEFENSIVE": 0.03,
@@ -328,7 +378,7 @@ class Level5TradingManager:
         elif strategy == "MEAN_REVERSION_BOUNCE":
             base_pct *= 0.7
 
-        return ManagerDecision(
+        decision = ManagerDecision(
             product_id=product_id,
             action="HOLD" if has_open_position else "ALLOW_BUY",
             strategy=strategy,
@@ -341,3 +391,20 @@ class Level5TradingManager:
                 f"ai_action={ai_action};ai_conf={ai_confidence:.3f}"
             ),
         )
+        debug_every(
+            MODULE_NAME,
+            f"level5_decide:{product_id}",
+            20.0,
+            "level5_decision",
+            data={
+                "product_id": product_id,
+                "action": decision.action if "decision" in locals() and hasattr(decision, "action") else "",
+                "strategy": decision.strategy if "decision" in locals() and hasattr(decision, "strategy") else "",
+                "risk_mode": decision.risk_mode if "decision" in locals() and hasattr(decision, "risk_mode") else "",
+                "confidence": decision.confidence if "decision" in locals() and hasattr(decision, "confidence") else 0.0,
+                "reason": decision.reason if "decision" in locals() and hasattr(decision, "reason") else "",
+            },
+            level="DEBUG",
+            also_overall=False,
+        )
+        return decision

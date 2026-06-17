@@ -20949,6 +20949,28 @@ async def main() -> None:
     initialize_all_module_debug_logs(BASE_DIR)
     module_debug(
         MODULE_NAME,
+        "per_file_debug_logs_initialized",
+        data={
+            "debug_dir": os.path.join(BASE_DIR, "debug"),
+            "expected_debug_files": [
+                "debug_tools.debug.log",
+                "bot.debug.log",
+                "viewer.debug.log",
+                "ai_brain.debug.log",
+                "backtest_intelligence.debug.log",
+                "level5_manager.debug.log",
+                "level8_council.debug.log",
+                "previous_session_volume_profile.debug.log",
+                "price_action_context.debug.log",
+                "quant_context.debug.log",
+                "session_liquidity.debug.log",
+            ],
+        },
+        level="INFO",
+        also_overall=True,
+    )
+    module_debug(
+        MODULE_NAME,
         "bot_main_starting",
         data={"base_dir": BASE_DIR, "file": __file__},
         level="INFO",

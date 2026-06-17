@@ -209,6 +209,19 @@ def build_session_liquidity_signal(
     This intentionally returns scores, not hard pass/fail decisions.
     The Level 8 council weighs these scores against all other agents.
     """
+    debug_every(
+        MODULE_NAME,
+        f"session_liquidity_start:{product_id}",
+        30.0,
+        "session_liquidity_start",
+        data={
+            "product_id": product_id,
+            "candles_count": len(candles) if candles is not None else 0,
+            "current_price": current_price,
+        },
+        level="DEBUG",
+        also_overall=False,
+    )
     now_value = float(ts if ts is not None else datetime.now(tz=timezone.utc).timestamp())
     current_price = float(current_price)
 
@@ -395,7 +408,7 @@ def build_session_liquidity_signal(
                 best = candidate
 
     if best is None:
-        return SessionLiquiditySignal(
+        signal = SessionLiquiditySignal(
             product_id=product_id,
             active_session=",".join(active_keys),
             strongest_agent="session_liquidity_no_range",
@@ -419,6 +432,25 @@ def build_session_liquidity_signal(
             stop_distance_bps=0.0,
             reason=f"no_session_range_available;active={','.join(active_keys)}",
         )
+        debug_every(
+            MODULE_NAME,
+            f"session_liquidity_result:{product_id}",
+            30.0,
+            "session_liquidity_result",
+            data={
+                "product_id": product_id,
+                "active_session": signal.active_session if "signal" in locals() else "",
+                "agent": signal.strongest_agent if "signal" in locals() and hasattr(signal, "strongest_agent") else "",
+                "buy_score": signal.best_buy_score if "signal" in locals() and hasattr(signal, "best_buy_score") else 0.0,
+                "sell_score": signal.best_sell_score if "signal" in locals() and hasattr(signal, "best_sell_score") else 0.0,
+                "hold_score": signal.best_hold_score if "signal" in locals() and hasattr(signal, "best_hold_score") else 0.0,
+                "wait_score": signal.wait_score if "signal" in locals() and hasattr(signal, "wait_score") else 0.0,
+                "confidence": signal.confidence if "signal" in locals() and hasattr(signal, "confidence") else 0.0,
+            },
+            level="DEBUG",
+            also_overall=False,
+        )
+        return signal
 
     reason = (
         f"session_liquidity;"
@@ -438,7 +470,7 @@ def build_session_liquidity_signal(
         f"range_bps={float(best['session_range_bps']):.2f}"
     )
 
-    return SessionLiquiditySignal(
+    signal = SessionLiquiditySignal(
         product_id=product_id,
         active_session=",".join(active_keys),
         strongest_agent=str(best["agent"]),
@@ -462,6 +494,25 @@ def build_session_liquidity_signal(
         stop_distance_bps=float(best["stop_distance_bps"]),
         reason=reason,
     )
+    debug_every(
+        MODULE_NAME,
+        f"session_liquidity_result:{product_id}",
+        30.0,
+        "session_liquidity_result",
+        data={
+            "product_id": product_id,
+            "active_session": signal.active_session if "signal" in locals() else "",
+            "agent": signal.strongest_agent if "signal" in locals() and hasattr(signal, "strongest_agent") else "",
+            "buy_score": signal.best_buy_score if "signal" in locals() and hasattr(signal, "best_buy_score") else 0.0,
+            "sell_score": signal.best_sell_score if "signal" in locals() and hasattr(signal, "best_sell_score") else 0.0,
+            "hold_score": signal.best_hold_score if "signal" in locals() and hasattr(signal, "best_hold_score") else 0.0,
+            "wait_score": signal.wait_score if "signal" in locals() and hasattr(signal, "wait_score") else 0.0,
+            "confidence": signal.confidence if "signal" in locals() and hasattr(signal, "confidence") else 0.0,
+        },
+        level="DEBUG",
+        also_overall=False,
+    )
+    return signal
 
 
 def signal_to_dict(signal: SessionLiquiditySignal) -> Dict[str, Any]:

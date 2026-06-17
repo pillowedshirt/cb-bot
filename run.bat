@@ -129,16 +129,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 
 if errorlevel 2 (
     echo.
-    echo [warning] A python bot.py process appears to already be running.
-    echo Starting another bot can duplicate live trading logic.
-    echo Close the existing bot window/process first if this is not intentional.
+    echo [ERROR] Another bot.py process appears to be running.
+    echo Close the existing bot window before launching a new live trading instance.
     echo.
-    choice /M "Continue anyway"
-    if errorlevel 2 (
-        echo [cancelled] Launcher stopped before starting another bot.
-        pause
-        exit /b 0
-    )
+    pause
+    exit /b 1
 )
 
 REM ------------------------------------------------------------

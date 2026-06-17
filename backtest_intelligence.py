@@ -15,7 +15,11 @@ BACKTEST_RECOMMENDATIONS_COLUMNS: List[str] = [
     "recommended_min_score", "recommended_min_probability",
     "recommended_min_expected_value_bps", "recommended_min_projected_net_bps",
     "recommended_forward_window_minutes", "expected_win_rate", "expected_net_bps",
-    "expected_adverse_bps", "objective_score", "source", "reason",
+    "expected_adverse_bps", "objective_score",
+    "dominant_session_agent", "dominant_session_setup",
+    "dominant_structure_state", "dominant_value_area_state",
+    "dominant_fvg_state", "dominant_smt_state",
+    "source", "reason",
 ]
 
 
@@ -36,6 +40,11 @@ BACKTEST_AGENT_PRIOR_COLUMNS: List[str] = [
 ]
 
 BACKTEST_SUMMARY_COLUMNS: List[str] = ["ts", "dt_utc", "metric", "value", "reason"]
+
+BACKTEST_SETUP_PERFORMANCE_COLUMNS: List[str] = [
+    "ts", "dt_utc", "product_id", "setup_key", "sample_count",
+    "win_rate", "avg_net_bps", "avg_adverse_bps", "objective_score", "reason",
+]
 
 
 def _utc_ts() -> float:
@@ -80,6 +89,19 @@ def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
     if column not in frame.columns:
         return pd.Series(False, index=frame.index)
     return frame[column].map(_safe_bool)
+
+
+def _mode_text(frame: pd.DataFrame, column: str, default: str = "") -> str:
+    try:
+        if column not in frame.columns or frame.empty:
+            return default
+        values = frame[column].astype(str).replace({"nan": "", "None": ""})
+        values = values[values.str.len() > 0]
+        if values.empty:
+            return default
+        return str(values.mode().iloc[0])
+    except Exception:
+        return default
 
 
 def _candidate_rows(base_dir: str, *, min_product_rows: int) -> Tuple[List[List[Any]], Dict[str, Dict[str, Any]]]:
@@ -279,12 +301,27 @@ def _candidate_rows(base_dir: str, *, min_product_rows: int) -> Tuple[List[List[
             f"objective={objective:.4f}"
         )
 
+        accepted_for_mode = group[
+            (group["score"] >= float(best["score_cut"]))
+            & (group["probability"] >= float(best["prob_cut"]))
+            & (group["expected_net_edge_bps"] >= float(best["ev_cut"]))
+        ].copy()
+
+        dominant_session_agent = _mode_text(accepted_for_mode, "session_liquidity_agent")
+        dominant_session_setup = _mode_text(accepted_for_mode, "session_liquidity_setup")
+        dominant_structure_state = _mode_text(accepted_for_mode, "structure_state")
+        dominant_value_area_state = _mode_text(accepted_for_mode, "value_area_state")
+        dominant_fvg_state = _mode_text(accepted_for_mode, "fvg_state")
+        dominant_smt_state = _mode_text(accepted_for_mode, "smt_state")
+
         rows.append([
             f"{ts_value:.6f}", dt_value, product_id, sample_count, int(best["accepted_count"]),
             f"{sample_confidence:.6f}", f"{replay_quality_score:.6f}", f"{live_gate_bias_bps:.6f}",
             f"{float(best['score_cut']):.6f}", f"{float(best['prob_cut']):.6f}", f"{float(best['ev_cut']):.6f}",
             f"{float(recommended_min_projected_net_bps):.6f}", f"{float(recommended_forward_window_minutes):.6f}",
             f"{win_rate:.6f}", f"{avg_net:.6f}", f"{avg_adverse:.6f}", f"{objective:.6f}",
+            dominant_session_agent, dominant_session_setup, dominant_structure_state,
+            dominant_value_area_state, dominant_fvg_state, dominant_smt_state,
             "candidate_replay.csv", reason,
         ])
 
@@ -298,6 +335,12 @@ def _candidate_rows(base_dir: str, *, min_product_rows: int) -> Tuple[List[List[
             "recommended_forward_window_minutes": float(recommended_forward_window_minutes),
             "expected_win_rate": win_rate, "expected_net_bps": avg_net,
             "expected_adverse_bps": avg_adverse, "objective_score": objective,
+            "dominant_session_agent": dominant_session_agent,
+            "dominant_session_setup": dominant_session_setup,
+            "dominant_structure_state": dominant_structure_state,
+            "dominant_value_area_state": dominant_value_area_state,
+            "dominant_fvg_state": dominant_fvg_state,
+            "dominant_smt_state": dominant_smt_state,
         }
 
     return rows, recs
@@ -440,25 +483,131 @@ def _agent_prior_rows(base_dir: str) -> List[List[Any]]:
 
     return rows
 
+
+def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
+    frame = _read_csv(os.path.join(base_dir, "candidate_replay.csv"))
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+    rows: List[List[Any]] = []
+
+    if frame.empty or "product_id" not in frame.columns:
+        return rows
+
+    if "probability" not in frame.columns and "estimated_prob_up" in frame.columns:
+        frame["probability"] = frame["estimated_prob_up"]
+
+    frame["cost_bps"] = _numeric(frame, "cost_bps", 0.0)
+    frame["max_favorable_bps"] = _numeric(frame, "max_favorable_bps", 0.0)
+    frame["max_adverse_bps"] = _numeric(frame, "max_adverse_bps", 0.0)
+    frame["net_peak_bps"] = frame["max_favorable_bps"] - frame["cost_bps"]
+    frame["net_success"] = frame["net_peak_bps"] >= 45.0
+
+    setup_columns = [
+        "session_liquidity_agent",
+        "session_liquidity_setup",
+        "structure_state",
+        "value_area_state",
+        "fvg_state",
+        "smt_state",
+    ]
+
+    for col in setup_columns:
+        if col not in frame.columns:
+            frame[col] = ""
+
+    frame["setup_key"] = (
+        frame["session_liquidity_agent"].astype(str)
+        + "|session_setup=" + frame["session_liquidity_setup"].astype(str)
+        + "|structure=" + frame["structure_state"].astype(str)
+        + "|value=" + frame["value_area_state"].astype(str)
+        + "|fvg=" + frame["fvg_state"].astype(str)
+        + "|smt=" + frame["smt_state"].astype(str)
+    )
+
+    for (product_id, setup_key), group in frame.groupby(["product_id", "setup_key"]):
+        group = group.copy()
+        sample_count = int(len(group))
+        if sample_count < 12:
+            continue
+
+        win_rate = float(group["net_success"].mean())
+        avg_net = float(group["net_peak_bps"].mean())
+        avg_adverse = float(group["max_adverse_bps"].abs().mean())
+        objective = win_rate * 100.0 + avg_net * 0.35 - avg_adverse * 0.20
+
+        rows.append([
+            f"{ts_value:.6f}",
+            dt_value,
+            str(product_id),
+            str(setup_key),
+            sample_count,
+            f"{win_rate:.6f}",
+            f"{avg_net:.6f}",
+            f"{avg_adverse:.6f}",
+            f"{objective:.6f}",
+            "product_session_setup_profit_replay",
+        ])
+
+    return rows
+
 def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str], None]] = None, min_product_rows: int = 80) -> Dict[str, Any]:
     """Run CSV replay intelligence and write backtest recommendation CSVs."""
     def log(message: str) -> None:
         if log_fn is not None:
             try:
-                log_fn(message); return
+                log_fn(message)
+                return
             except Exception:
                 pass
         print(message)
-    started = time.time(); base_dir = os.path.abspath(base_dir)
-    buy_rows, buy_recs = _candidate_rows(base_dir, min_product_rows=int(min_product_rows)); sell_rows = _sell_recommendation_rows(base_dir); agent_rows = _agent_prior_rows(base_dir)
-    recommendations_path = os.path.join(base_dir, "backtest_recommendations.csv"); sell_recommendations_path = os.path.join(base_dir, "backtest_sell_recommendations.csv"); agent_priors_path = os.path.join(base_dir, "backtest_agent_priors.csv"); summary_path = os.path.join(base_dir, "backtest_summary.csv")
-    _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows); _write_rows(sell_recommendations_path, BACKTEST_SELL_RECOMMENDATIONS_COLUMNS, sell_rows); _write_rows(agent_priors_path, BACKTEST_AGENT_PRIOR_COLUMNS, agent_rows)
-    ts_value = _utc_ts()
-    summary_rows = [[f"{ts_value:.6f}", _utc_dt(ts_value), "buy_recommendation_rows", len(buy_rows), "product-level candidate replay recommendations"], [f"{ts_value:.6f}", _utc_dt(ts_value), "sell_recommendation_rows", len(sell_rows), "product-level sell replay recommendations"], [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_prior_rows", len(agent_rows), "profit-weighted agent priors"], [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"]]
-    _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
-    log(f"[backtest] completed buy_recs={len(buy_rows)} sell_recs={len(sell_rows)} agent_priors={len(agent_rows)} seconds={time.time() - started:.2f}")
-    return {"buy_recommendations": len(buy_rows), "sell_recommendations": len(sell_rows), "agent_priors": len(agent_rows), "runtime_seconds": time.time() - started, "paths": {"backtest_recommendations": recommendations_path, "backtest_sell_recommendations": sell_recommendations_path, "backtest_agent_priors": agent_priors_path, "backtest_summary": summary_path}, "recommendations": buy_recs}
 
+    started = time.time()
+    base_dir = os.path.abspath(base_dir)
+    buy_rows, buy_recs = _candidate_rows(base_dir, min_product_rows=int(min_product_rows))
+    sell_rows = _sell_recommendation_rows(base_dir)
+    agent_rows = _agent_prior_rows(base_dir)
+    setup_rows = _setup_performance_rows(base_dir)
+
+    recommendations_path = os.path.join(base_dir, "backtest_recommendations.csv")
+    sell_recommendations_path = os.path.join(base_dir, "backtest_sell_recommendations.csv")
+    agent_priors_path = os.path.join(base_dir, "backtest_agent_priors.csv")
+    setup_performance_path = os.path.join(base_dir, "backtest_setup_performance.csv")
+    summary_path = os.path.join(base_dir, "backtest_summary.csv")
+
+    _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
+    _write_rows(sell_recommendations_path, BACKTEST_SELL_RECOMMENDATIONS_COLUMNS, sell_rows)
+    _write_rows(agent_priors_path, BACKTEST_AGENT_PRIOR_COLUMNS, agent_rows)
+    _write_rows(setup_performance_path, BACKTEST_SETUP_PERFORMANCE_COLUMNS, setup_rows)
+
+    ts_value = _utc_ts()
+    summary_rows = [
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "buy_recommendation_rows", len(buy_rows), "product-level candidate replay recommendations"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "sell_recommendation_rows", len(sell_rows), "product-level sell replay recommendations"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_prior_rows", len(agent_rows), "profit-weighted agent priors"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "setup_performance_rows", len(setup_rows), "product/session/setup-specific profit replay"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
+    ]
+    _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
+
+    log(
+        f"[backtest] completed buy_recs={len(buy_rows)} sell_recs={len(sell_rows)} "
+        f"agent_priors={len(agent_rows)} setup_performance={len(setup_rows)} seconds={time.time() - started:.2f}"
+    )
+    return {
+        "buy_recommendations": len(buy_rows),
+        "sell_recommendations": len(sell_rows),
+        "agent_priors": len(agent_rows),
+        "setup_performance": len(setup_rows),
+        "runtime_seconds": time.time() - started,
+        "paths": {
+            "backtest_recommendations": recommendations_path,
+            "backtest_sell_recommendations": sell_recommendations_path,
+            "backtest_agent_priors": agent_priors_path,
+            "backtest_setup_performance": setup_performance_path,
+            "backtest_summary": summary_path,
+        },
+        "recommendations": buy_recs,
+    }
 
 if __name__ == "__main__":
     run_backtest_intelligence(base_dir=os.path.dirname(os.path.abspath(__file__)))

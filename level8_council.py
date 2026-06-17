@@ -1223,6 +1223,24 @@ class Level8Council:
         session_agent = str(session_liquidity.get("strongest_agent", "session_liquidity"))
         session_reason = str(session_liquidity.get("reason", "no_session_liquidity_sell_context"))
 
+        price_action_context = dict(context.get("price_action_context", {}) or {})
+        pa_sell_score = float(price_action_context.get("candle_context_sell_score", 0.0) or 0.0)
+        pa_hold_score = float(price_action_context.get("candle_context_hold_score", 0.50) or 0.50)
+        pa_confidence = float(price_action_context.get("candle_context_confidence", 0.0) or 0.0)
+        candle_exhaustion_score = float(price_action_context.get("candle_exhaustion_score", 0.0) or 0.0)
+        candle_continuation_score = float(price_action_context.get("candle_continuation_score", 0.0) or 0.0)
+        volume_profile_sell_score = float(price_action_context.get("volume_profile_sell_score", 0.0) or 0.0)
+        volume_profile_hold_score = float(price_action_context.get("volume_profile_hold_score", 0.50) or 0.50)
+        fvg_sell_score = float(price_action_context.get("fvg_sell_score", 0.0) or 0.0)
+        value_area_state = str(price_action_context.get("value_area_state", ""))
+        fvg_state = str(price_action_context.get("fvg_state", ""))
+        pa_reason = str(price_action_context.get("reason", "no_price_action_sell_context"))
+
+        smt_context = dict(context.get("smt_divergence", {}) or {})
+        smt_sell_score = float(smt_context.get("sell", 0.0) or 0.0)
+        smt_confidence = float(smt_context.get("confidence", 0.0) or 0.0)
+        smt_reason = str(smt_context.get("reason", "no_smt_sell_context"))
+
         min_partial_fraction = float(context.get("min_partial_sell_fraction", 0.25) or 0.25)
         max_partial_fraction = float(context.get("max_partial_sell_fraction", 1.0) or 1.0)
         peak_capture_trigger_bps = float(context.get("peak_capture_trigger_bps", 45.0) or 45.0)
@@ -1244,7 +1262,25 @@ class Level8Council:
         momentum_fade_sell = clamp(0.18 + max(0.0, -momentum_1_bps) / 120.0 + max(0.0, -momentum_3_bps) / 180.0 + max(0.0, pullback_from_peak_bps - peak_capture_trigger_bps) / 180.0, 0.0, 1.0)
         execution_sell_quality = clamp(1.0 - max(0.0, spread_bps) / 120.0, 0.0, 1.0)
         fee_recovery = clamp(0.20 + max(0.0, net_after_exit_bps) / 230.0, 0.0, 1.0)
-        harvest_pressure = clamp(profit_capture * 0.30 + peak_capture * 0.30 + momentum_fade_sell * 0.20 + loss_exit * 0.20, 0.0, 1.0)
+        price_action_harvest_pressure = clamp(
+            candle_exhaustion_score * 0.35
+            + pa_sell_score * pa_confidence * 0.25
+            + volume_profile_sell_score * 0.18
+            + fvg_sell_score * 0.12
+            + smt_sell_score * smt_confidence * 0.10,
+            0.0,
+            1.0,
+        )
+
+        harvest_pressure = clamp(
+            profit_capture * 0.24
+            + peak_capture * 0.25
+            + momentum_fade_sell * 0.18
+            + loss_exit * 0.18
+            + price_action_harvest_pressure * 0.15,
+            0.0,
+            1.0,
+        )
 
         votes = [
             {"agent": "profit_capture", "buy": 0.0, "sell": profit_capture, "hold": 1.0 - profit_capture * 0.55, "wait": 0.20, "confidence": 0.70, "reason": "sell when net profit is actually available"},
@@ -1270,9 +1306,70 @@ class Level8Council:
                 "confidence": clamp(0.25 + session_confidence * 0.55, 0.15, 0.85),
                 "reason": f"session_liquidity_sell_context;{session_reason}",
             },
+            {
+                "agent": "candle_exhaustion_sell",
+                "buy": 0.0,
+                "sell": clamp(candle_exhaustion_score * pa_confidence, 0.0, 1.0),
+                "hold": clamp(0.30 + candle_continuation_score * 0.55 - candle_exhaustion_score * 0.20, 0.0, 1.0),
+                "wait": 0.25,
+                "confidence": clamp(0.25 + pa_confidence * 0.55, 0.15, 0.85),
+                "reason": f"candle_exhaustion_sell;{pa_reason}",
+            },
+            {
+                "agent": "volume_profile_harvest",
+                "buy": 0.0,
+                "sell": clamp(volume_profile_sell_score, 0.0, 1.0),
+                "hold": clamp(volume_profile_hold_score, 0.0, 1.0),
+                "wait": 0.30,
+                "confidence": clamp(0.25 + pa_confidence * 0.45, 0.15, 0.80),
+                "reason": f"volume_profile_harvest;value_area_state={value_area_state};{pa_reason}",
+            },
+            {
+                "agent": "fvg_reclaim_rejection_exit",
+                "buy": 0.0,
+                "sell": clamp(fvg_sell_score, 0.0, 1.0),
+                "hold": clamp(0.55 - fvg_sell_score * 0.25, 0.0, 1.0),
+                "wait": 0.32,
+                "confidence": clamp(0.25 + pa_confidence * 0.40, 0.15, 0.78),
+                "reason": f"fvg_exit_context;fvg_state={fvg_state};{pa_reason}",
+            },
+            {
+                "agent": "smt_divergence_exit",
+                "buy": 0.0,
+                "sell": clamp(smt_sell_score * smt_confidence, 0.0, 1.0),
+                "hold": clamp(0.52 - smt_sell_score * smt_confidence * 0.25, 0.0, 1.0),
+                "wait": 0.35,
+                "confidence": clamp(0.20 + smt_confidence * 0.50, 0.10, 0.75),
+                "reason": f"smt_divergence_exit;{smt_reason}",
+            },
         ]
 
-        truth_vote = {"agent": "exit_truth", "buy": 0.0, "sell": clamp(profit_capture * 0.18 + loss_exit * 0.18 + peak_capture * 0.20 + momentum_fade_sell * 0.14 + execution_sell_quality * 0.10 + fee_recovery * 0.12 + harvest_pressure * 0.08, 0.0, 1.0), "hold": continuation_hold, "wait": 1.0 - execution_sell_quality, "confidence": 0.72, "reason": "exit truth weighs profit, peak capture, continuation, cost, and execution"}
+        truth_vote = {
+            "agent": "exit_truth",
+            "buy": 0.0,
+            "sell": clamp(
+                profit_capture * 0.15
+                + loss_exit * 0.17
+                + peak_capture * 0.17
+                + momentum_fade_sell * 0.13
+                + execution_sell_quality * 0.09
+                + fee_recovery * 0.10
+                + harvest_pressure * 0.09
+                + price_action_harvest_pressure * 0.10,
+                0.0,
+                1.0,
+            ),
+            "hold": clamp(
+                continuation_hold * 0.70
+                + candle_continuation_score * pa_confidence * 0.18
+                + volume_profile_hold_score * 0.12,
+                0.0,
+                1.0,
+            ),
+            "wait": 1.0 - execution_sell_quality,
+            "confidence": 0.72,
+            "reason": "exit truth weighs profit, peak capture, continuation, candle exhaustion, value-area/FVG/SMT context, cost, and execution",
+        }
 
         adjusted = [self._adjust_vote(vote, product_id, "EXIT_REVIEW") for vote in votes]
         adjusted_truth = self._adjust_vote(truth_vote, product_id, "EXIT_REVIEW")
@@ -1321,6 +1418,11 @@ class Level8Council:
             or peak_capture >= 0.62
             or momentum_fade_sell >= 0.62
             or (session_sell_score * session_confidence) >= 0.38
+            or candle_exhaustion_score >= 0.58
+            or price_action_harvest_pressure >= 0.55
+            or volume_profile_sell_score >= 0.58
+            or fvg_sell_score >= 0.58
+            or (smt_sell_score * smt_confidence) >= 0.38
         )
 
         strong_profit_exception = bool(
@@ -1388,6 +1490,12 @@ class Level8Council:
                 f"session_buy_score={session_buy_score:.3f};"
                 f"session_confidence={session_confidence:.3f};"
                 f"session_agent={session_agent};"
+                f"candle_exhaustion_score={candle_exhaustion_score:.3f};"
+                f"candle_continuation_score={candle_continuation_score:.3f};"
+                f"price_action_harvest_pressure={price_action_harvest_pressure:.3f};"
+                f"value_area_state={value_area_state};"
+                f"fvg_state={fvg_state};"
+                f"smt_reason={smt_reason};"
                 f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
                 f"sell_fraction_reason={sell_fraction_reason};"
                 f"hard_stop_hit={hard_stop_hit}"

@@ -10329,7 +10329,11 @@ class TradingBot:
                     )
                     + max(0.0, float(spread_bps) - 25.0) * 0.20
                 )
-            buy_vs_wait_edge_bps = float(maker_adjusted_expected_value_bps) - float(wait_utility_bps)
+
+            # This is recalculated after expected_utility_bps includes
+            # Volume Profile Leader, contradiction, and WAIT penalties.
+            buy_vs_wait_edge_bps = 0.0
+
             vol_mult, realized_vol_bps, vol_reason = self._volatility_size_multiplier_for_candidate(candidate)
             setup_weak = bool(candidate.get("backtest_setup_weak", False))
             setup_strong = bool(candidate.get("backtest_setup_strong", False))
@@ -10348,6 +10352,7 @@ class TradingBot:
                 - float(contradiction_penalty_bps)
                 - max(0.0, float(wait_utility_bps) - 8.0) * 0.35
             )
+            buy_vs_wait_edge_bps = float(expected_utility_bps) - float(wait_utility_bps)
             utility_quality = clamp_float(
                 0.50
                 + expected_utility_bps / 260.0
@@ -10448,6 +10453,8 @@ class TradingBot:
         session_setup = str(candidate.get("session_liquidity_setup", "") or "")
         structure_state = str(candidate.get("structure_state", "") or "")
         value_area_state = str(candidate.get("value_area_state", "") or "")
+        value_acceptance_state = str(candidate.get("value_acceptance_state", "") or "")
+        volume_node_state = str(candidate.get("volume_node_state", "") or "")
         fvg_state = str(candidate.get("fvg_state", "") or "")
         smt_state = str(candidate.get("smt_state", "") or "")
 
@@ -10456,11 +10463,15 @@ class TradingBot:
             + "|session_setup=" + str(session_setup)
             + "|structure=" + str(structure_state)
             + "|value=" + str(value_area_state)
+            + "|acceptance=" + str(value_acceptance_state)
+            + "|volume_node=" + str(volume_node_state)
             + "|fvg=" + str(fvg_state)
             + "|smt=" + str(smt_state)
             + "|pa=" + self._setup_perf_bucket(safe_float(candidate.get("price_action_buy_score"), 0.0))
             + "|exhaust=" + self._setup_perf_bucket(safe_float(candidate.get("candle_exhaustion_score"), 0.0))
             + "|volume=" + self._setup_perf_bucket(safe_float(candidate.get("volume_profile_buy_score"), 0.0))
+            + "|vp_leader=" + self._setup_perf_bucket(safe_float(candidate.get("volume_profile_leader_buy_score"), 0.0))
+            + "|unfair=" + self._setup_perf_bucket(safe_float(candidate.get("unfair_trade_score"), 0.0))
             + "|validated_liq=" + self._setup_perf_bucket(safe_float(candidate.get("validated_liquidity_buy_score"), 0.0))
             + "|fresh_zone=" + self._setup_perf_bucket(safe_float(candidate.get("fresh_zone_buy_score"), 0.0))
             + "|fvg_score=" + self._setup_perf_bucket(safe_float(candidate.get("fvg_buy_score"), 0.0))
@@ -12480,7 +12491,7 @@ class TradingBot:
                 "additional_upside_bps": float(additional_upside_bps),
                 "giveback_risk_bps": float(giveback_risk_bps),
                 "sell_utility_suggested_fraction": (
-                    1.0 if sell_minus_hold <= float(SELL_UTILITY_FULL_EXIT_DISADVANTAGE_BPS)
+                    1.0 if sell_minus_hold >= abs(float(SELL_UTILITY_FULL_EXIT_DISADVANTAGE_BPS))
                     else 0.50 if sell_minus_hold >= float(SELL_UTILITY_PARTIAL_ZONE_BPS)
                     else 0.0
                 ),
@@ -17342,6 +17353,34 @@ class TradingBot:
                             level8_info.get("recommended_position_pct", 0.0) or 0.0
                         )
                         candidate["level8_reason"] = str(level8_info.get("reason", ""))
+
+                        # Preserve Level 8 / Expected Utility / Volume Profile Leader outputs
+                        # on the candidate so later ranking, portfolio selection, logging,
+                        # and execution notes use the real enriched values instead of defaults.
+                        for _level8_copy_key in [
+                            "calibrated_p_win",
+                            "expected_win_bps",
+                            "expected_loss_bps",
+                            "payoff_ratio",
+                            "expected_value_bps",
+                            "uncertainty_penalty_bps",
+                            "maker_fill_probability",
+                            "maker_adjusted_expected_value_bps",
+                            "expected_utility_bps",
+                            "volume_profile_utility_adjust_bps",
+                            "volume_profile_utility_reason",
+                            "utility_quality",
+                            "utility_rank_bonus",
+                            "utility_size_multiplier",
+                            "wait_utility_bps",
+                            "buy_vs_wait_edge_bps",
+                            "realized_volatility_bps_30m",
+                            "volatility_size_multiplier",
+                            "value_acceptance_state",
+                            "volume_node_state",
+                        ]:
+                            if _level8_copy_key in level8_info:
+                                candidate[_level8_copy_key] = level8_info.get(_level8_copy_key)
 
                         self._append_level8_decision_snapshot(
                             product_id=product_id_l8,

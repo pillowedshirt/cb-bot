@@ -669,11 +669,24 @@ def build_price_action_context(*, product_id: str, candles: List[Any], current_p
     volume_profile_buy_score = _clamp(volume_profile_buy_score * 0.35 + float(vp_leader.get("volume_profile_leader_buy_score", 0.0)) * 0.65)
     volume_profile_sell_score = _clamp(volume_profile_sell_score * 0.35 + float(vp_leader.get("volume_profile_leader_sell_score", 0.0)) * 0.65)
     volume_profile_hold_score = _clamp(volume_profile_hold_score * 0.35 + float(vp_leader.get("volume_profile_leader_hold_score", 0.50)) * 0.65)
-    volume_profile_confidence = _clamp(context_confidence * 0.35 + float(vp_leader.get("volume_profile_leader_confidence", 0.10)) * 0.65, 0.10, 0.94)
+
+    context_confidence = _clamp(
+        0.25
+        + min(0.25, len(candles) / 240.0)
+        + min(0.20, last.range_bps / 160.0)
+        + (0.12 if last_swing_high > 0 and last_swing_low > 0 else 0.0)
+    )
+
+    volume_profile_confidence = _clamp(
+        context_confidence * 0.35
+        + float(vp_leader.get("volume_profile_leader_confidence", 0.10)) * 0.65,
+        0.10,
+        0.94,
+    )
+
     bullish_fvg_low, bullish_fvg_high, bearish_fvg_low, bearish_fvg_high, fvg_reason = _fvg_context(candles); fvg_state = fvg_reason.split(";", 1)[0].replace("fvg_state=", "")
     fvg_buy_score = _clamp(0.24 + (0.25 if fvg_state in {"bullish_fvg_retest", "bearish_fvg_inverted_ifvg"} else 0.0) + (0.16 if swept_validated_low else 0.0) + (0.10 if last.direction == "bull" else 0.0))
     fvg_sell_score = _clamp(0.24 + (0.25 if fvg_state in {"bearish_fvg_retest", "bullish_fvg_inverted_ifvg"} else 0.0) + (0.16 if swept_validated_high else 0.0) + (0.10 if last.direction == "bear" else 0.0))
-    context_confidence = _clamp(0.25 + min(0.25, len(candles) / 240.0) + min(0.20, last.range_bps / 160.0) + (0.12 if last_swing_high > 0 and last_swing_low > 0 else 0.0))
     reason = f"price_action;last_dir={last.direction};body_ratio={last.body_ratio:.3f};upper_wick_ratio={last.upper_wick_ratio:.3f};lower_wick_ratio={last.lower_wick_ratio:.3f};close_location={last.close_location:.3f};doji={last.is_doji};upper_rejection={last.is_upper_rejection};lower_rejection={last.is_lower_rejection};advanced_block={advanced_block_exhaustion};structure={structure_state};structure_reason={structure_reason};liquidity_quality={liquidity_quality_score:.3f};validated_high_state={validated_high_state};validated_low_state={validated_low_state};{validation_reason};fresh_zone={zone.reason};value_area_state={value_area_state};value_area_width_bps={value_area_width_bps:.2f};volume_profile_quality={volume_profile_quality:.3f};{vp_reason};{vp_leader.get('volume_profile_leader_reason', '')};{fvg_reason}"
     return PriceActionContext(product_id, float(candle_context_buy_score), float(candle_context_sell_score), float(candle_context_hold_score), float(context_confidence), float(candle_sequence_score), float(candle_exhaustion_score), float(candle_continuation_score), float(market_structure_buy_score), float(market_structure_sell_score), float(market_structure_hold_score), float(context_confidence), float(validated_liquidity_buy_score), float(validated_liquidity_sell_score), float(context_confidence), float(fresh_zone_buy_score), float(fresh_zone_sell_score), float(context_confidence), float(volume_profile_buy_score), float(volume_profile_sell_score), float(volume_profile_hold_score), float(volume_profile_confidence), float(fvg_buy_score), float(fvg_sell_score), float(context_confidence), str(structure_state), str(structure_reason), float(last_swing_high), float(last_swing_low), float(validated_high), float(validated_low), str(validated_high_state), str(validated_low_state), float(liquidity_quality_score), float(nearest_upside), float(nearest_downside), float(vah), float(val), float(poc), str(value_area_state), float(bullish_fvg_low), float(bullish_fvg_high), float(bearish_fvg_low), float(bearish_fvg_high), str(fvg_state), float(zone.zone_low), float(zone.zone_high), str(zone.reason), reason, float(vp_leader.get("volume_profile_leader_buy_score", 0.0)), float(vp_leader.get("volume_profile_leader_sell_score", 0.0)), float(vp_leader.get("volume_profile_leader_hold_score", 0.50)), float(vp_leader.get("volume_profile_leader_wait_score", 0.50)), float(vp_leader.get("volume_profile_leader_confidence", 0.10)), str(vp_leader.get("value_acceptance_state", "unknown")), str(vp_leader.get("volume_node_state", "unknown")), float(vp_leader.get("nearest_high_volume_node", 0.0)), float(vp_leader.get("nearest_low_volume_node", 0.0)), float(vp_leader.get("low_volume_path_up_bps", 0.0)), float(vp_leader.get("low_volume_path_down_bps", 0.0)), float(vp_leader.get("poc_distance_bps", 0.0)), float(vp_leader.get("unfair_trade_score", 0.0)), str(vp_leader.get("volume_profile_leader_reason", "")))
 

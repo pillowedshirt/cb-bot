@@ -47,14 +47,34 @@ BACKTEST_SETUP_PERFORMANCE_COLUMNS: List[str] = [
 ]
 
 WALK_FORWARD_VALIDATION_COLUMNS: List[str] = [
-    "ts", "dt_utc", "product_id", "train_rows", "test_rows",
-    "train_expected_net_bps", "test_expected_net_bps", "test_win_rate",
-    "generalization_ratio", "passed", "reason",
+    "ts",
+    "dt_utc",
+    "product_id",
+    "fold",
+    "train_rows",
+    "test_rows",
+    "train_win_rate",
+    "test_win_rate",
+    "train_avg_net_bps",
+    "test_avg_net_bps",
+    "generalization_gap",
+    "walk_forward_score",
+    "reason",
 ]
 
 AGENT_ABLATION_COLUMNS: List[str] = [
-    "ts", "dt_utc", "agent", "sample_count", "avg_credit",
-    "without_agent_avg_credit", "ablation_delta", "helpful", "reason",
+    "ts",
+    "dt_utc",
+    "agent",
+    "sample_count",
+    "avg_outcome_all_bps",
+    "avg_when_supportive_bps",
+    "avg_when_not_supportive_bps",
+    "support_edge_bps",
+    "win_rate_when_supportive",
+    "win_rate_when_not_supportive",
+    "ablation_score",
+    "reason",
 ]
 
 
@@ -620,13 +640,18 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
     for (product_id, setup_key), group in frame.groupby(["product_id", "setup_key"]):
         group = group.copy()
         sample_count = int(len(group))
-        if sample_count < 12:
+        # Full setup keys are intentionally detailed. Require stronger sample count
+        # so thin combinations do not overfit.
+        if sample_count < 20:
             continue
 
         win_rate = float(group["net_success"].mean())
         avg_net = float(group["net_peak_bps"].mean())
         avg_adverse = float(group["max_adverse_bps"].abs().mean())
-        objective = win_rate * 100.0 + avg_net * 0.35 - avg_adverse * 0.20
+        sample_confidence = min(1.0, sample_count / 80.0)
+        raw_objective = win_rate * 100.0 + avg_net * 0.35 - avg_adverse * 0.20
+        # Shrink toward neutral until enough rows exist.
+        objective = raw_objective * sample_confidence + 50.0 * (1.0 - sample_confidence)
 
         rows.append([
             f"{ts_value:.6f}",
@@ -638,70 +663,162 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
             f"{avg_net:.6f}",
             f"{avg_adverse:.6f}",
             f"{objective:.6f}",
-            "product_session_setup_profit_replay",
+            (
+                f"product_session_setup_profit_replay;"
+                f"sample_confidence={sample_confidence:.3f};"
+                f"raw_objective={raw_objective:.3f};"
+                f"shrunk_objective={objective:.3f}"
+            ),
         ])
 
     return rows
 
+def _compact_setup_key(frame: pd.DataFrame) -> pd.Series:
+    """
+    Compact setup key for validation.
+
+    This intentionally uses fewer fields than the full setup key to reduce
+    sparse-data overfitting during walk-forward validation.
+    """
+    for col in [
+        "session_liquidity_setup",
+        "value_acceptance_state",
+        "volume_node_state",
+        "previous_session_profile_reaction_state",
+        "quant_boundary_state",
+        "market_regime",
+    ]:
+        if col not in frame.columns:
+            frame[col] = ""
+    return (
+        "session=" + frame["session_liquidity_setup"].astype(str)
+        + "|value=" + frame["value_acceptance_state"].astype(str)
+        + "|node=" + frame["volume_node_state"].astype(str)
+        + "|prior=" + frame["previous_session_profile_reaction_state"].astype(str)
+        + "|quant=" + frame["quant_boundary_state"].astype(str)
+        + "|regime=" + frame["market_regime"].astype(str)
+    )
+
+
 def _walk_forward_validation_rows(base_dir: str) -> List[List[Any]]:
-    """Validate product recommendations on later rows using a simple time split."""
     frame = _read_csv(os.path.join(base_dir, "candidate_replay.csv"))
-    if frame.empty or "product_id" not in frame.columns:
-        return []
     ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
-    if "ts" in frame.columns:
-        frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce")
-        frame = frame.sort_values("ts")
-    metric_col = next((c for c in ("future_net_bps", "net_bps", "expected_net_edge_bps", "projected_forward_gain_bps") if c in frame.columns), None)
-    if metric_col is None:
-        return []
-    frame[metric_col] = pd.to_numeric(frame[metric_col], errors="coerce").fillna(0.0)
-    for product_id, group in frame.groupby(frame["product_id"].astype(str)):
-        if len(group) < 20:
+    if frame.empty or "product_id" not in frame.columns:
+        return rows
+    if "ts" not in frame.columns:
+        return rows
+    frame = frame.copy()
+    frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce")
+    frame = frame.dropna(subset=["ts"]).sort_values("ts")
+    frame["cost_bps"] = _numeric(frame, "cost_bps", 0.0)
+    frame["max_favorable_bps"] = _numeric(frame, "max_favorable_bps", 0.0)
+    frame["max_adverse_bps"] = _numeric(frame, "max_adverse_bps", 0.0)
+    frame["net_peak_bps"] = frame["max_favorable_bps"] - frame["cost_bps"]
+    frame["net_success"] = frame["net_peak_bps"] >= 45.0
+    frame["compact_setup_key"] = _compact_setup_key(frame)
+    for product_id, product_frame in frame.groupby("product_id"):
+        product_frame = product_frame.sort_values("ts").reset_index(drop=True)
+        if len(product_frame) < 80:
             continue
-        split = max(1, int(len(group) * 0.70))
-        train = group.iloc[:split]
-        test = group.iloc[split:]
-        if test.empty:
-            continue
-        train_avg = float(train[metric_col].mean())
-        test_avg = float(test[metric_col].mean())
-        test_win_rate = float((test[metric_col] > 0.0).mean())
-        ratio = test_avg / train_avg if abs(train_avg) > 1e-9 else 0.0
-        passed = bool(test_avg > 0.0 and test_win_rate >= 0.50 and ratio >= 0.25)
-        rows.append([
-            f"{ts_value:.6f}", _utc_dt(ts_value), product_id, len(train), len(test),
-            f"{train_avg:.6f}", f"{test_avg:.6f}", f"{test_win_rate:.6f}",
-            f"{ratio:.6f}", str(passed),
-            f"walk_forward_split=70_30;metric={metric_col}",
-        ])
+        fold_count = 4
+        fold_size = max(20, len(product_frame) // fold_count)
+        for fold in range(1, fold_count):
+            split_idx = fold * fold_size
+            train = product_frame.iloc[:split_idx].copy()
+            test = product_frame.iloc[split_idx: split_idx + fold_size].copy()
+            if len(train) < 40 or len(test) < 15:
+                continue
+            train_wr = float(train["net_success"].mean())
+            test_wr = float(test["net_success"].mean())
+            train_avg = float(train["net_peak_bps"].mean())
+            test_avg = float(test["net_peak_bps"].mean())
+            # Generalization gap: large positive gap means train looked better
+            # than later test behavior.
+            generalization_gap = (train_avg - test_avg) + (train_wr - test_wr) * 100.0
+            walk_score = (
+                test_wr * 100.0
+                + test_avg * 0.35
+                - float(test["max_adverse_bps"].abs().mean()) * 0.20
+                - max(0.0, generalization_gap) * 0.35
+            )
+            rows.append([
+                f"{ts_value:.6f}", dt_value, str(product_id), int(fold), int(len(train)), int(len(test)),
+                f"{train_wr:.6f}", f"{test_wr:.6f}", f"{train_avg:.6f}", f"{test_avg:.6f}",
+                f"{generalization_gap:.6f}", f"{walk_score:.6f}",
+                (
+                    f"walk_forward_validation;"
+                    f"train_wr={train_wr:.3f};test_wr={test_wr:.3f};"
+                    f"train_avg={train_avg:.2f};test_avg={test_avg:.2f};"
+                    f"gap={generalization_gap:.2f};score={walk_score:.2f}"
+                ),
+            ])
     return rows
 
 
 def _agent_ablation_rows(base_dir: str) -> List[List[Any]]:
-    """Report whether each agent's observed credit is above the council without it."""
-    frame = _read_csv(os.path.join(base_dir, "backtest_agent_priors.csv"))
-    if frame.empty or "agent" not in frame.columns or "agent_credit_score" not in frame.columns:
-        return []
+    votes = _read_csv(os.path.join(base_dir, "council_votes.csv"))
+    audit = _read_csv(os.path.join(base_dir, "decision_audit.csv"))
+    observations = _read_csv(os.path.join(base_dir, "council_observation_outcomes.csv"))
     ts_value = _utc_ts()
-    frame["agent_credit_score"] = pd.to_numeric(frame["agent_credit_score"], errors="coerce").fillna(0.5)
-    global_avg = float(frame["agent_credit_score"].mean())
+    dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
-    for agent, group in frame.groupby(frame["agent"].astype(str)):
-        n = int(len(group))
-        if n <= 0:
+    if votes.empty or "agent" not in votes.columns or "decision_id" not in votes.columns:
+        return rows
+    outcome = pd.DataFrame()
+    if not audit.empty and "decision_id" in audit.columns:
+        audit = audit.copy()
+        for candidate_col in ["move_bps", "max_favorable_bps", "realized_net_pnl_bps"]:
+            if candidate_col in audit.columns:
+                audit["outcome_bps"] = pd.to_numeric(audit[candidate_col], errors="coerce").fillna(0.0)
+                break
+        if "outcome_bps" in audit.columns:
+            outcome = audit[["decision_id", "outcome_bps"]].copy()
+    if outcome.empty and not observations.empty and "decision_id" in observations.columns and "move_bps" in observations.columns:
+        observations = observations.copy()
+        observations["outcome_bps"] = pd.to_numeric(observations["move_bps"], errors="coerce").fillna(0.0)
+        outcome = observations[["decision_id", "outcome_bps"]].copy()
+    if outcome.empty:
+        return rows
+    votes = votes.copy()
+    for col in ["adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "weight"]:
+        votes[col] = _numeric(votes, col, 0.0)
+    merged = votes.merge(outcome, on="decision_id", how="inner")
+    if merged.empty:
+        return rows
+    merged["support_strength"] = (
+        merged["adjusted_buy_score"]
+        + merged["adjusted_sell_score"]
+        + merged["adjusted_hold_score"] * 0.35
+        - merged["adjusted_wait_score"] * 0.25
+    ) * merged["confidence"].clip(lower=0.0, upper=1.0)
+    for agent, group in merged.groupby("agent"):
+        if len(group) < 12:
             continue
-        agent_avg = float(group["agent_credit_score"].mean())
-        without = frame[frame["agent"].astype(str) != str(agent)]
-        without_avg = float(without["agent_credit_score"].mean()) if not without.empty else global_avg
-        delta = agent_avg - without_avg
+        threshold = float(group["support_strength"].median())
+        supportive = group[group["support_strength"] >= threshold]
+        not_supportive = group[group["support_strength"] < threshold]
+        if supportive.empty or not_supportive.empty:
+            continue
+        avg_all = float(group["outcome_bps"].mean())
+        avg_support = float(supportive["outcome_bps"].mean())
+        avg_not = float(not_supportive["outcome_bps"].mean())
+        support_edge = avg_support - avg_not
+        wr_support = float((supportive["outcome_bps"] > 0.0).mean())
+        wr_not = float((not_supportive["outcome_bps"] > 0.0).mean())
+        score = support_edge * 0.70 + (wr_support - wr_not) * 100.0 * 0.30
         rows.append([
-            f"{ts_value:.6f}", _utc_dt(ts_value), str(agent), n,
-            f"{agent_avg:.6f}", f"{without_avg:.6f}", f"{delta:.6f}",
-            str(delta > 0.0), "leave_one_agent_out_credit_proxy",
+            f"{ts_value:.6f}", dt_value, str(agent), int(len(group)),
+            f"{avg_all:.6f}", f"{avg_support:.6f}", f"{avg_not:.6f}", f"{support_edge:.6f}",
+            f"{wr_support:.6f}", f"{wr_not:.6f}", f"{score:.6f}",
+            (
+                f"agent_ablation;agent={agent};n={len(group)};"
+                f"support_edge_bps={support_edge:.2f};"
+                f"wr_support={wr_support:.3f};wr_not={wr_not:.3f};"
+                f"score={score:.2f}"
+            ),
         ])
-    rows.sort(key=lambda row: float(row[6]), reverse=True)
     return rows
 
 def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str], None]] = None, min_product_rows: int = 80) -> Dict[str, Any]:
@@ -721,7 +838,8 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     sell_rows = _sell_recommendation_rows(base_dir)
     agent_rows = _agent_prior_rows(base_dir)
     setup_rows = _setup_performance_rows(base_dir)
-    walk_rows = _walk_forward_validation_rows(base_dir)
+    walk_forward_rows = _walk_forward_validation_rows(base_dir)
+    ablation_rows = _agent_ablation_rows(base_dir)
 
     recommendations_path = os.path.join(base_dir, "backtest_recommendations.csv")
     sell_recommendations_path = os.path.join(base_dir, "backtest_sell_recommendations.csv")
@@ -735,9 +853,8 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     _write_rows(sell_recommendations_path, BACKTEST_SELL_RECOMMENDATIONS_COLUMNS, sell_rows)
     _write_rows(agent_priors_path, BACKTEST_AGENT_PRIOR_COLUMNS, agent_rows)
     _write_rows(setup_performance_path, BACKTEST_SETUP_PERFORMANCE_COLUMNS, setup_rows)
-    agent_ablation_rows = _agent_ablation_rows(base_dir)
-    _write_rows(walk_forward_path, WALK_FORWARD_VALIDATION_COLUMNS, walk_rows)
-    _write_rows(agent_ablation_path, AGENT_ABLATION_COLUMNS, agent_ablation_rows)
+    _write_rows(walk_forward_path, WALK_FORWARD_VALIDATION_COLUMNS, walk_forward_rows)
+    _write_rows(agent_ablation_path, AGENT_ABLATION_COLUMNS, ablation_rows)
 
     ts_value = _utc_ts()
     summary_rows = [
@@ -745,8 +862,8 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "sell_recommendation_rows", len(sell_rows), "product-level sell replay recommendations"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_prior_rows", len(agent_rows), "profit-weighted agent priors"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "setup_performance_rows", len(setup_rows), "product/session/setup-specific profit replay"],
-        [f"{ts_value:.6f}", _utc_dt(ts_value), "walk_forward_validation_rows", len(walk_rows), "out-of-sample product validation"],
-        [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_ablation_rows", len(agent_ablation_rows), "leave-one-agent-out credit report"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "walk_forward_validation_rows", len(walk_forward_rows), "out-of-sample validation rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_ablation_rows", len(ablation_rows), "agent marginal contribution report"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
     ]
     _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
@@ -754,15 +871,15 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     log(
         f"[backtest] completed buy_recs={len(buy_rows)} sell_recs={len(sell_rows)} "
         f"agent_priors={len(agent_rows)} setup_performance={len(setup_rows)} "
-        f"walk_forward={len(walk_rows)} ablation={len(agent_ablation_rows)} seconds={time.time() - started:.2f}"
+        f"walk_forward={len(walk_forward_rows)} ablation={len(ablation_rows)} seconds={time.time() - started:.2f}"
     )
     return {
         "buy_recommendations": len(buy_rows),
         "sell_recommendations": len(sell_rows),
         "agent_priors": len(agent_rows),
         "setup_performance": len(setup_rows),
-        "walk_forward_validation": len(walk_rows),
-        "agent_ablation": len(agent_ablation_rows),
+        "walk_forward_validation": len(walk_forward_rows),
+        "agent_ablation": len(ablation_rows),
         "runtime_seconds": time.time() - started,
         "paths": {
             "backtest_recommendations": recommendations_path,

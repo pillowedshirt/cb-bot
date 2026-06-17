@@ -22,6 +22,7 @@ AGENT_ADJUSTMENTS_CSV = os.path.join(BASE_DIR, "agent_adjustments.csv")
 ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
 SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
 AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
+AGENT_ABLATION_CSV = os.path.join(BASE_DIR, "agent_ablation.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
 # Initial council reliability priors.
@@ -34,6 +35,7 @@ INITIAL_AGENT_RELIABILITY_PRIORS = {
     "utility_leader": 1.24,
     "sell_utility_leader": 1.22,
     "setup_performance_agent": 1.14,
+    "order_book_liquidity_agent": 1.14,
     # Execution / risk authorities.
     "product_health": 1.10,
     "execution": 1.10,
@@ -113,7 +115,9 @@ def agent_redundancy_group(agent: str) -> str:
         return "previous_session"
     if "quant" in text or "stationarity" in text or "forecast" in text:
         return "quant"
-    if ("candle" in text or "structure" in text or "liquidity_agent" in text or "fresh_zone" in text or "fair_value_gap" in text or "fvg" in text):
+    if "order_book" in text or "liquidity_agent" in text:
+        return "risk_execution"
+    if ("candle" in text or "structure" in text or "fresh_zone" in text or "fair_value_gap" in text or "fvg" in text):
         return "price_action"
     if "session" in text or "sweep" in text or "breakout_continuation" in text:
         return "session_liquidity"
@@ -334,6 +338,8 @@ class Level8Council:
         self._agent_leaderboard_cache: Dict[str, Dict[str, float]] = {}
         self._agent_leaderboard_cache_ts: float = 0.0
         self._agent_leaderboard_cache_sec: float = 60.0
+        self._agent_ablation_cache: Dict[str, Dict[str, float]] = {}
+        self._agent_ablation_cache_ts: float = 0.0
         # Lightweight in-process caches prevent every agent vote from re-reading
         # the same large CSV files over and over.
         self._csv_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
@@ -938,6 +944,47 @@ class Level8Council:
         except Exception:
             return neutral
 
+    def _agent_ablation_score(self, agent: str) -> Dict[str, float]:
+        neutral = {
+            "ablation_score": 0.0,
+            "support_edge_bps": 0.0,
+            "sample_count": 0.0,
+            "weight_adjust": 0.0,
+        }
+        try:
+            now_value = utc_ts()
+            if (
+                self._agent_ablation_cache
+                and now_value - float(self._agent_ablation_cache_ts) < 300.0
+            ):
+                return dict(self._agent_ablation_cache.get(str(agent), neutral))
+            self._agent_ablation_cache = {}
+            self._agent_ablation_cache_ts = now_value
+            if not os.path.exists(AGENT_ABLATION_CSV):
+                return neutral
+            frame = pd.read_csv(AGENT_ABLATION_CSV)
+            if frame.empty or "agent" not in frame.columns:
+                return neutral
+            frame["ablation_score"] = pd.to_numeric(frame.get("ablation_score", 0.0), errors="coerce").fillna(0.0)
+            frame["support_edge_bps"] = pd.to_numeric(frame.get("support_edge_bps", 0.0), errors="coerce").fillna(0.0)
+            frame["sample_count"] = pd.to_numeric(frame.get("sample_count", 0.0), errors="coerce").fillna(0.0)
+            for name, group in frame.groupby("agent"):
+                recent = group.tail(3)
+                score = float(recent["ablation_score"].mean())
+                edge = float(recent["support_edge_bps"].mean())
+                samples = float(recent["sample_count"].max())
+                confidence = clamp(samples / 80.0, 0.0, 1.0)
+                weight_adjust = clamp((score / 200.0) * confidence, -0.10, 0.10)
+                self._agent_ablation_cache[str(name)] = {
+                    "ablation_score": score,
+                    "support_edge_bps": edge,
+                    "sample_count": samples,
+                    "weight_adjust": weight_adjust,
+                }
+            return dict(self._agent_ablation_cache.get(str(agent), neutral))
+        except Exception:
+            return neutral
+
     def _agent_adjustments(
         self,
         agent: str,
@@ -972,6 +1019,8 @@ class Level8Council:
         strategy_adj = (strategy_win_rate - 0.5) * 0.60 * sample_factor
         recent_adj = (recent_win_rate - 0.5) * 0.85 * sample_factor
         competition = self._agent_competition_score(agent)
+        ablation = self._agent_ablation_score(agent)
+        ablation_adjust = float(ablation.get("weight_adjust", 0.0))
         leader_bonus = float(competition.get("leader_bonus", 0.0))
         leader_penalty = float(competition.get("leader_penalty", 0.0))
         product_adj = clamp(product_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
@@ -982,7 +1031,7 @@ class Level8Council:
             float(AGENT_UNPROVEN_MAX_DIRECTIONAL_ADJ) * (1.0 - strong_sample_factor)
             + float(AGENT_PROVEN_MAX_DIRECTIONAL_ADJ) * strong_sample_factor
         )
-        directional = clamp(raw_directional, -dynamic_directional_cap, dynamic_directional_cap)
+        directional = clamp(raw_directional + ablation_adjust, -dynamic_directional_cap, dynamic_directional_cap)
         initial_prior = initial_agent_reliability_prior(agent)
         # Reliability starts near the prior, but outcome credit is shrunk toward
         # neutral until the agent has enough samples.
@@ -990,7 +1039,11 @@ class Level8Council:
             0.86 * float(initial_prior)
             + (agent_credit - 0.5) * 1.05 * sample_factor
         )
-        reliability = clamp(base_reliability + leader_bonus - leader_penalty, self.min_agent_reliability, self.max_agent_reliability)
+        reliability = clamp(
+            base_reliability + leader_bonus - leader_penalty + ablation_adjust,
+            self.min_agent_reliability,
+            self.max_agent_reliability,
+        )
 
         try:
             ts = utc_ts()
@@ -1003,7 +1056,7 @@ class Level8Council:
                     "final_reliability", "sample_size", "agent_credit",
                     "product_win_rate", "strategy_win_rate", "recent_win_rate",
                     "leaderboard_rank", "leaderboard_score", "leader_bonus",
-                    "leader_penalty", "reason",
+                    "leader_penalty", "ablation_adjustment", "reason",
                 ],
                 {
                     "ts": f"{ts:.6f}", "dt_utc": utc_dt(ts), "agent": agent,
@@ -1024,6 +1077,7 @@ class Level8Council:
                     "leaderboard_score": f"{float(competition.get('leaderboard_score', 0.5)):.6f}",
                     "leader_bonus": f"{leader_bonus:.6f}",
                     "leader_penalty": f"{leader_penalty:.6f}",
+                    "ablation_adjustment": f"{ablation_adjust:.6f}",
                     "reason": (
                         f"agent={agent};competitive_goal=profit_weighted_shrunk_reliability;"
                         f"initial_prior={initial_prior:.3f};credit={agent_credit:.3f};"
@@ -1031,7 +1085,8 @@ class Level8Council:
                         f"directional_cap={dynamic_directional_cap:.3f};"
                         f"leader_rank={float(competition.get('leaderboard_rank', 999.0)):.0f};"
                         f"leader_score={float(competition.get('leaderboard_score', 0.5)):.3f};"
-                        f"bonus={leader_bonus:.3f};penalty={leader_penalty:.3f}"
+                        f"bonus={leader_bonus:.3f};penalty={leader_penalty:.3f};"
+                        f"ablation_adjust={ablation_adjust:.3f};"
                     ),
                 },
             )
@@ -1043,6 +1098,7 @@ class Level8Council:
             "leaderboard_rank": float(competition.get("leaderboard_rank", 999.0)),
             "leaderboard_score": float(competition.get("leaderboard_score", 0.5)),
             "leader_bonus": leader_bonus, "leader_penalty": leader_penalty,
+            "ablation_adjustment": ablation_adjust,
         }
 
     def _adjust_vote(

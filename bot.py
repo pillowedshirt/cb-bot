@@ -38,6 +38,11 @@ try:
 except Exception:
     Level8Council = None
 
+try:
+    from backtest_intelligence import run_backtest_intelligence
+except Exception:
+    run_backtest_intelligence = None
+
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 TZ_NAME: str = "America/Phoenix"
@@ -124,6 +129,10 @@ COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH: str = os.path.join(
 )
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
+BACKTEST_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_recommendations.csv")
+BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_sell_recommendations.csv")
+BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
+BACKTEST_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_summary.csv")
 
 # Startup CSV-state detection.
 # This must check for meaningful pre-existing data rows, not just file existence.
@@ -148,6 +157,10 @@ STARTUP_STATE_CSV_PATHS: List[str] = [
     COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH,
     RECONCILIATION_CSV_PATH,
     AGENT_PERFORMANCE_CSV_PATH,
+    BACKTEST_RECOMMENDATIONS_CSV_PATH,
+    BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH,
+    BACKTEST_AGENT_PRIORS_CSV_PATH,
+    BACKTEST_SUMMARY_CSV_PATH,
 ]
 
 
@@ -434,6 +447,20 @@ LEVEL8_COUNCIL_HEARTBEAT_MAX_PRODUCTS: int = 3
 # Agent-performance updates read/join large CSVs. Keep them frequent enough to
 # learn, but not so frequent that they stall live trading.
 LEVEL8_AGENT_PERFORMANCE_UPDATE_EVERY_SEC: float = 180.0
+
+# Backtesting intelligence / profit-weighted learning.
+# This reads existing CSV history and creates:
+# - product-specific buy replay recommendations,
+# - product-specific sell replay recommendations,
+# - profit-weighted agent priors for the Level 8 council.
+ENABLE_BACKTEST_INTELLIGENCE: bool = True
+BACKTEST_INTELLIGENCE_RUN_ON_STARTUP: bool = True
+BACKTEST_INTELLIGENCE_UPDATE_EVERY_SEC: float = 30 * 60
+BACKTEST_INTELLIGENCE_MIN_PRODUCT_ROWS: int = 80
+BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS: bool = True
+BACKTEST_USE_PRODUCT_SELL_RECOMMENDATIONS: bool = True
+BACKTEST_MAX_BUY_GATE_TIGHTEN_BPS: float = 80.0
+BACKTEST_MAX_BUY_GATE_RELIEF_BPS: float = 25.0
 
 # Active mode. No observe-only staged approach.
 LEVEL8_MODE: str = "FILTER_AND_SIZE"
@@ -4921,6 +4948,9 @@ class TradingBot:
         self.last_ai_train_ts: float = 0.0
         self.last_agent_performance_update_ts: float = 0.0
         self.last_level8_missed_opportunity_review_ts: float = 0.0
+        self.last_backtest_intelligence_ts: float = 0.0
+        self.backtest_recommendations_by_product: Dict[str, Dict[str, Any]] = {}
+        self.backtest_sell_recommendations_by_product: Dict[str, Dict[str, Any]] = {}
         if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
             try:
                 self.ai_brain = LocalAIBrain(
@@ -4937,6 +4967,13 @@ class TradingBot:
             except Exception as exc:
                 self.level8_council = None
                 log(f"[level8] council initialization failed: {exc}")
+
+        if bool(ENABLE_BACKTEST_INTELLIGENCE) and bool(BACKTEST_INTELLIGENCE_RUN_ON_STARTUP):
+            try:
+                self._run_backtest_intelligence_if_due(force=True)
+                self._load_backtest_recommendations()
+            except Exception as exc:
+                log(f"[backtest] startup backtest intelligence failed: {exc}")
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
         self.inverted_markers: Dict[str, Dict[str, Any]] = {}
@@ -8166,6 +8203,117 @@ class TradingBot:
             return False, f"spread_too_high spread={float(spread_bps):.3f} max={max_spread:.3f}"
         return True, f"spread_ok spread={float(spread_bps):.3f} max={max_spread:.3f}"
 
+    def _run_backtest_intelligence_if_due(self, *, force: bool = False) -> None:
+        """Run CSV replay/backtest intelligence on startup and periodically."""
+        if not bool(ENABLE_BACKTEST_INTELLIGENCE):
+            return
+        if run_backtest_intelligence is None:
+            log("[backtest] backtest_intelligence.py unavailable")
+            return
+        ts_value = now_ts()
+        if (
+            not force
+            and ts_value - float(self.last_backtest_intelligence_ts or 0.0)
+            < float(BACKTEST_INTELLIGENCE_UPDATE_EVERY_SEC)
+        ):
+            return
+        self.last_backtest_intelligence_ts = ts_value
+        try:
+            result = run_backtest_intelligence(
+                base_dir=BASE_DIR,
+                log_fn=log,
+                min_product_rows=int(BACKTEST_INTELLIGENCE_MIN_PRODUCT_ROWS),
+            )
+            log(
+                f"[backtest] intelligence updated "
+                f"buy_recs={result.get('buy_recommendations', 0)} "
+                f"sell_recs={result.get('sell_recommendations', 0)} "
+                f"agent_priors={result.get('agent_priors', 0)}"
+            )
+            if self.level8_council is not None and hasattr(self.level8_council, "_clear_level8_memory_cache"):
+                self.level8_council._clear_level8_memory_cache()
+        except Exception as exc:
+            log_exception("backtest intelligence update failed", exc)
+
+    def _load_backtest_recommendations(self) -> None:
+        """Load latest backtest recommendations into memory."""
+        self.backtest_recommendations_by_product = {}
+        self.backtest_sell_recommendations_by_product = {}
+        try:
+            if os.path.exists(BACKTEST_RECOMMENDATIONS_CSV_PATH) and os.path.getsize(BACKTEST_RECOMMENDATIONS_CSV_PATH) > 0:
+                recs = pd.read_csv(BACKTEST_RECOMMENDATIONS_CSV_PATH)
+                if not recs.empty and "product_id" in recs.columns:
+                    for _, row in recs.iterrows():
+                        product_id = str(row.get("product_id", "")).strip()
+                        if product_id:
+                            self.backtest_recommendations_by_product[product_id] = row.to_dict()
+        except Exception as exc:
+            log(f"[backtest] failed to load buy recommendations: {exc}")
+        try:
+            if os.path.exists(BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH) and os.path.getsize(BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH) > 0:
+                recs = pd.read_csv(BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH)
+                if not recs.empty and "product_id" in recs.columns:
+                    for _, row in recs.iterrows():
+                        product_id = str(row.get("product_id", "")).strip()
+                        if product_id:
+                            self.backtest_sell_recommendations_by_product[product_id] = row.to_dict()
+        except Exception as exc:
+            log(f"[backtest] failed to load sell recommendations: {exc}")
+        log(
+            f"[backtest] loaded recommendations "
+            f"buy_products={len(self.backtest_recommendations_by_product)} "
+            f"sell_products={len(self.backtest_sell_recommendations_by_product)}"
+        )
+
+    def _backtest_buy_recommendation_for_product(self, product_id: str) -> Dict[str, Any]:
+        try:
+            return dict(self.backtest_recommendations_by_product.get(str(product_id), {}) or {})
+        except Exception:
+            return {}
+
+    def _backtest_sell_recommendation_for_product(self, product_id: str) -> Dict[str, Any]:
+        try:
+            return dict(self.backtest_sell_recommendations_by_product.get(str(product_id), {}) or {})
+        except Exception:
+            return {}
+
+    def _backtest_adjusted_min_projected_net_bps(
+        self,
+        *,
+        product_id: str,
+        base_min_projected_net_bps: float,
+        candidate_projected_net_after_cost_bps: float,
+    ) -> Tuple[float, str]:
+        """Adjust the live buy projected-net requirement using replayed candidate history."""
+        if not bool(BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS):
+            return float(base_min_projected_net_bps), "backtest_buy_recommendations_disabled"
+        rec = self._backtest_buy_recommendation_for_product(product_id)
+        if not rec:
+            return float(base_min_projected_net_bps), "no_backtest_buy_recommendation"
+        try:
+            recommended_min = safe_float(rec.get("recommended_min_projected_net_bps"), float(base_min_projected_net_bps))
+            expected_win_rate = safe_float(rec.get("expected_win_rate"), 0.5)
+            expected_net_bps = safe_float(rec.get("expected_net_bps"), 0.0)
+            objective_score = safe_float(rec.get("objective_score"), 0.0)
+            adjusted = float(base_min_projected_net_bps)
+            if expected_win_rate >= 0.58 and expected_net_bps >= 70.0 and objective_score > 0.0:
+                adjusted -= min(float(BACKTEST_MAX_BUY_GATE_RELIEF_BPS), max(0.0, float(base_min_projected_net_bps) - float(recommended_min)))
+            else:
+                adjusted += min(float(BACKTEST_MAX_BUY_GATE_TIGHTEN_BPS), max(0.0, float(recommended_min) - float(base_min_projected_net_bps)))
+            adjusted = max(35.0, float(adjusted))
+            return adjusted, (
+                f"backtest_buy_adjustment "
+                f"base={float(base_min_projected_net_bps):.2f};"
+                f"recommended={float(recommended_min):.2f};"
+                f"adjusted={float(adjusted):.2f};"
+                f"candidate_projected_net={float(candidate_projected_net_after_cost_bps):.2f};"
+                f"expected_win_rate={float(expected_win_rate):.3f};"
+                f"expected_net_bps={float(expected_net_bps):.2f};"
+                f"objective={float(objective_score):.2f}"
+            )
+        except Exception as exc:
+            return float(base_min_projected_net_bps), f"backtest_buy_adjustment_failed:{exc}"
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -8199,6 +8347,12 @@ class TradingBot:
             min_projected_net = max(
                 float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS),
                 float(LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS),
+            )
+
+            min_projected_net, backtest_buy_reason = self._backtest_adjusted_min_projected_net_bps(
+                product_id=product_id,
+                base_min_projected_net_bps=float(min_projected_net),
+                candidate_projected_net_after_cost_bps=float(projected_net_after_cost),
             )
 
             if final_buy < float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):
@@ -8235,7 +8389,8 @@ class TradingBot:
                     f"projected_forward={projected_forward:.2f} "
                     f"round_trip_cost={cost_bps:.2f} "
                     f"net_after_cost={projected_net_after_cost:.2f} "
-                    f"min={min_projected_net:.2f}"
+                    f"min={min_projected_net:.2f} "
+                    f"{backtest_buy_reason}"
                 )
 
             if expected_edge < float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):
@@ -8272,7 +8427,8 @@ class TradingBot:
                 ):
                     return False, (
                         f"live_buy_shadowed:momentum_falling "
-                        f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+                        f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};"
+                f"{backtest_buy_reason}"
                     )
 
             if bool(LEVEL8_REQUIRE_REALTIME_UPTURN_CONFIRMATION):
@@ -9126,6 +9282,21 @@ class TradingBot:
             return False, f"level8_disabled_hold_not_net_profitable;{default_exit_reason}", 0.0
 
         try:
+            sell_backtest_rec = self._backtest_sell_recommendation_for_product(product_id)
+
+            peak_capture_trigger_bps = safe_float(
+                sell_backtest_rec.get("recommended_peak_capture_trigger_bps"),
+                float(LEVEL8_PEAK_CAPTURE_TRIGGER_BPS),
+            )
+            peak_capture_strong_pullback_bps = safe_float(
+                sell_backtest_rec.get("recommended_strong_pullback_bps"),
+                float(LEVEL8_PEAK_CAPTURE_STRONG_PULLBACK_BPS),
+            )
+            peak_capture_full_exit_pullback_bps = safe_float(
+                sell_backtest_rec.get("recommended_full_exit_pullback_bps"),
+                float(LEVEL8_PEAK_CAPTURE_FULL_EXIT_PULLBACK_BPS),
+            )
+
             context = {
                 "entry_price": float(entry_price),
                 "current_price": float(current_price),
@@ -9152,11 +9323,14 @@ class TradingBot:
                 "green_candles": int(hold_state.get("green_candles", 0) or 0),
                 "min_partial_sell_fraction": float(LEVEL8_MIN_PARTIAL_SELL_FRACTION),
                 "max_partial_sell_fraction": float(LEVEL8_MAX_PARTIAL_SELL_FRACTION),
-                "peak_capture_trigger_bps": float(LEVEL8_PEAK_CAPTURE_TRIGGER_BPS),
-                "peak_capture_strong_pullback_bps": float(LEVEL8_PEAK_CAPTURE_STRONG_PULLBACK_BPS),
-                "peak_capture_full_exit_pullback_bps": float(LEVEL8_PEAK_CAPTURE_FULL_EXIT_PULLBACK_BPS),
+                "peak_capture_trigger_bps": float(peak_capture_trigger_bps),
+                "peak_capture_strong_pullback_bps": float(peak_capture_strong_pullback_bps),
+                "peak_capture_full_exit_pullback_bps": float(peak_capture_full_exit_pullback_bps),
                 "strong_continuation_mom3_bps": float(LEVEL8_STRONG_CONTINUATION_MOM3_BPS),
                 "strong_continuation_pullback_max_bps": float(LEVEL8_STRONG_CONTINUATION_PULLBACK_MAX_BPS),
+                "backtest_sell_recommendation_reason": str(
+                    sell_backtest_rec.get("reason", "no_backtest_sell_recommendation")
+                ),
             }
 
             if hasattr(self.level8_council, "decide_exit"):
@@ -13098,6 +13272,12 @@ class TradingBot:
                 >= float(LEVEL8_AGENT_PERFORMANCE_UPDATE_EVERY_SEC)
             ):
                 self.last_agent_performance_update_ts = ts_now
+
+                try:
+                    self._run_backtest_intelligence_if_due(force=False)
+                    self._load_backtest_recommendations()
+                except Exception as exc:
+                    log_exception("backtest intelligence periodic update failed", exc)
 
                 try:
                     self._classify_level8_sell_outcomes()

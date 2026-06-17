@@ -16,6 +16,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADES_CSV = os.path.join(BASE_DIR, "trades.csv")
 MISSED_OPPORTUNITIES_CSV = os.path.join(BASE_DIR, "missed_opportunities.csv")
 AGENT_PERFORMANCE_CSV = os.path.join(BASE_DIR, "agent_performance.csv")
+BACKTEST_AGENT_PRIORS_CSV = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
 COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(BASE_DIR, "council_observation_outcomes.csv")
 AGENT_ADJUSTMENTS_CSV = os.path.join(BASE_DIR, "agent_adjustments.csv")
 ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
@@ -445,6 +446,25 @@ class Level8Council:
             pass
 
         try:
+            if os.path.exists(BACKTEST_AGENT_PRIORS_CSV):
+                priors = self._read_csv_cached(BACKTEST_AGENT_PRIORS_CSV, ttl_sec=20.0)
+
+                if not priors.empty:
+                    priors = priors.rename(columns={
+                        "outcome_move_bps": "move_bps",
+                        "outcome_success": "success",
+                    })
+
+                    if "outcome_source" in priors.columns:
+                        priors["source"] = priors["outcome_source"].astype(str)
+                    elif "source" not in priors.columns:
+                        priors["source"] = "backtest_profit_replay"
+
+                    frames.append(priors)
+        except Exception:
+            pass
+
+        try:
             if os.path.exists(COUNCIL_OBSERVATION_OUTCOMES_CSV):
                 obs = self._read_csv_cached(COUNCIL_OBSERVATION_OUTCOMES_CSV, ttl_sec=20.0)
 
@@ -556,9 +576,10 @@ class Level8Council:
 
         source = data["source"].astype(str) if "source" in data.columns else pd.Series("unknown", index=data.index)
         source_weight = source.map({
-            "real_trade": 1.00,
-            "trade_outcome": 1.00,
-            "sell_outcome": 1.00,
+            "backtest_profit_replay": 1.25,
+            "real_trade": 1.15,
+            "trade_outcome": 1.15,
+            "sell_outcome": 1.15,
             "agent_performance": 0.80,
             "level8_observation": 0.45,
             "observation_outcome": 0.35,
@@ -576,7 +597,7 @@ class Level8Council:
             weighted_move = 0.0
             weighted_adverse = 0.0
 
-        real_trade_n = float(source.isin(["real_trade", "trade_outcome", "sell_outcome"]).sum())
+        real_trade_n = float(source.isin(["backtest_profit_replay", "real_trade", "trade_outcome", "sell_outcome"]).sum())
         observation_n = float(source.isin(["level8_observation", "observation_outcome"]).sum())
 
         result = {

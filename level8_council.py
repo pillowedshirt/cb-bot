@@ -1381,7 +1381,27 @@ class Level8Council:
 
         thresholds = self.adaptive_thresholds(product_id, "EXIT_REVIEW")
         sell_threshold = float(thresholds["sell_threshold"])
-        strong_continuation = bool(continuation_quality >= 0.68 and momentum_3_bps >= strong_continuation_mom3_bps and pullback_from_peak_bps <= strong_continuation_pullback_max_bps and not max_hold_elapsed and not hard_stop_hit)
+        raw_strong_continuation = bool(
+            continuation_quality >= 0.68
+            and momentum_3_bps >= strong_continuation_mom3_bps
+            and pullback_from_peak_bps <= strong_continuation_pullback_max_bps
+            and not max_hold_elapsed
+            and not hard_stop_hit
+        )
+
+        continuation_override_by_harvest = bool(
+            price_action_harvest_pressure >= 0.68
+            or candle_exhaustion_score >= 0.72
+            or volume_profile_sell_score >= 0.72
+            or fvg_sell_score >= 0.70
+            or (session_sell_score * session_confidence) >= 0.55
+            or (smt_sell_score * smt_confidence) >= 0.55
+        )
+
+        strong_continuation = bool(
+            raw_strong_continuation
+            and not continuation_override_by_harvest
+        )
 
         if hard_stop_hit:
             recommended_sell_fraction = 1.0
@@ -1398,8 +1418,15 @@ class Level8Council:
             fraction += clamp((pullback_from_peak_bps - peak_capture_trigger_bps) / 170.0, 0.0, 0.25)
             fraction += clamp((final_sell - sell_threshold) / 0.35, 0.0, 0.20)
             fraction += clamp((harvest_pressure - 0.50) / 1.50, 0.0, 0.15)
-            if continuation_quality >= 0.64 and momentum_3_bps > 0 and pullback_from_peak_bps < strong_pullback_bps:
+            if (
+                continuation_quality >= 0.64
+                and momentum_3_bps > 0
+                and pullback_from_peak_bps < strong_pullback_bps
+                and not continuation_override_by_harvest
+            ):
                 fraction -= 0.18
+            if continuation_override_by_harvest and net_after_exit_bps >= min_net_after_exit_bps:
+                fraction = max(fraction, 0.35)
             if max_hold_elapsed:
                 fraction = max(fraction, 0.50)
             if pullback_from_peak_bps >= strong_pullback_bps and peak_unrealized_bps > min_net_after_exit_bps:
@@ -1434,6 +1461,12 @@ class Level8Council:
         if hard_stop_hit:
             action = "ALLOW_SELL"
 
+        elif (
+            strong_profit_exception
+            and recommended_sell_fraction > 0.0
+        ):
+            action = "ALLOW_SELL"
+
         elif strong_continuation:
             action = "HOLD"
 
@@ -1442,12 +1475,6 @@ class Level8Council:
             and harvest_confirmation
             and final_sell >= sell_threshold
             and net_after_exit_bps >= min_net_after_exit_bps
-            and recommended_sell_fraction > 0.0
-        ):
-            action = "ALLOW_SELL"
-
-        elif (
-            strong_profit_exception
             and recommended_sell_fraction > 0.0
         ):
             action = "ALLOW_SELL"
@@ -1483,7 +1510,9 @@ class Level8Council:
                 f"net_after_exit_bps={net_after_exit_bps:.2f};min_net_after_exit_bps={min_net_after_exit_bps:.2f};peak_unrealized_bps={peak_unrealized_bps:.2f};"
                 f"pullback_from_peak_bps={pullback_from_peak_bps:.2f};mom1={momentum_1_bps:.2f};mom3={momentum_3_bps:.2f};mom5={momentum_5_bps:.2f};"
                 f"green={green_candles};"
+                f"raw_strong_continuation={raw_strong_continuation};"
                 f"strong_continuation={strong_continuation};"
+                f"continuation_override_by_harvest={continuation_override_by_harvest};"
                 f"harvest_confirmation={harvest_confirmation};"
                 f"strong_profit_exception={strong_profit_exception};"
                 f"session_sell_score={session_sell_score:.3f};"

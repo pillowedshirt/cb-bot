@@ -181,6 +181,8 @@ BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_s
 BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
 BACKTEST_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_summary.csv")
 BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_setup_performance.csv")
+WALK_FORWARD_VALIDATION_CSV_PATH: str = os.path.join(BASE_DIR, "walk_forward_validation.csv")
+AGENT_ABLATION_CSV_PATH: str = os.path.join(BASE_DIR, "agent_ablation.csv")
 PREVIOUS_SESSION_PROFILE_CSV_PATH: str = os.path.join(BASE_DIR, "previous_session_profile.csv")
 QUANT_CONTEXT_CSV_PATH: str = os.path.join(BASE_DIR, "quant_context.csv")
 
@@ -1231,6 +1233,9 @@ ORDER_BOOK_IMBALANCE_STRONG_SELL: float = -0.18
 ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE: float = 0.72
 SPREAD_INSTABILITY_WINDOW: int = 12
 SPREAD_INSTABILITY_BLOCK_BPS: float = 18.0
+ENABLE_STALE_DATA_LIVE_BUY_GATE: bool = True
+MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC: float = 9.0
+MAX_VIEWER_SNAPSHOT_AGE_WARN_SEC: float = 12.0
 
 # Post-buy outcome research windows.
 POST_BUY_REVIEW_WINDOWS_MINUTES: List[int] = [5, 15, 30, 60, 120]
@@ -1660,6 +1665,10 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     buy_vs_wait_edge_bps = f("buy_vs_wait_edge_bps", 0.0)
     volatility_size_multiplier = f("volatility_size_multiplier", 1.0)
     portfolio_rank_bonus = f("portfolio_rank_bonus", 0.0)
+    order_book_imbalance = f("order_book_imbalance", 0.0)
+    order_book_top_depth_usd = f("order_book_top_depth_usd", 0.0)
+    spread_instability_bps = f("spread_instability_bps", 0.0)
+    liquidity_risk_score = f("liquidity_risk_score", 0.0)
 
     price_action_bonus = (
         price_action_buy_score * price_action_confidence * 28.0
@@ -1737,6 +1746,10 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         - max(0.0, wait_utility_bps - 12.0) * 0.08
         + (volatility_size_multiplier - 1.0) * 24.0
         + portfolio_rank_bonus
+        + max(-20.0, min(25.0, order_book_imbalance * 45.0))
+        + min(18.0, order_book_top_depth_usd / max(float(ORDER_BOOK_MIN_TOP_DEPTH_USD), 1.0) * 4.0)
+        - spread_instability_bps * 0.60
+        - liquidity_risk_score * 45.0
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
@@ -10265,6 +10278,10 @@ class TradingBot:
                 "sell_quality_reviews.csv",
                 "decision_audit.csv",
                 "maker_fill_outcomes.csv",
+                "maker_miss_outcomes.csv",
+                "order_book_snapshots.csv",
+                "agent_ablation.csv",
+                "walk_forward_validation.csv",
             }:
                 try:
                     from level8_council import append_sqlite_event
@@ -11136,6 +11153,49 @@ class TradingBot:
             ),
         }
 
+
+    def _market_data_age_for_product(self, product_id: str) -> float:
+        try:
+            last_ts = 0.0
+            # Prefer websocket quote timestamp if available.
+            tob = getattr(self, "top_of_book", {}).get(product_id, {})
+            if isinstance(tob, dict):
+                last_ts = float(tob.get("ts", tob.get("updated_ts", 0.0)) or 0.0)
+            # Fallback to market CSV is too heavy here; if in-memory timestamp is
+            # missing, return a high age to keep live buys safe.
+            if last_ts <= 0:
+                return 9999.0
+            return max(0.0, now_ts() - last_ts)
+        except Exception:
+            return 9999.0
+
+    def _walk_forward_penalty_for_product(self, product_id: str) -> Dict[str, Any]:
+        try:
+            if not os.path.exists(WALK_FORWARD_VALIDATION_CSV_PATH):
+                return {"penalty_bps": 0.0, "reason": "walk_forward_unavailable"}
+            frame = pd.read_csv(WALK_FORWARD_VALIDATION_CSV_PATH)
+            if frame.empty or "product_id" not in frame.columns:
+                return {"penalty_bps": 0.0, "reason": "walk_forward_empty"}
+            frame = frame[frame["product_id"].astype(str) == str(product_id)].copy()
+            if frame.empty:
+                return {"penalty_bps": 0.0, "reason": "walk_forward_no_product"}
+            frame["walk_forward_score"] = pd.to_numeric(frame["walk_forward_score"], errors="coerce").fillna(50.0)
+            frame["generalization_gap"] = pd.to_numeric(frame["generalization_gap"], errors="coerce").fillna(0.0)
+            recent = frame.tail(4)
+            avg_score = float(recent["walk_forward_score"].mean())
+            avg_gap = float(recent["generalization_gap"].mean())
+            penalty = 0.0
+            if avg_score < 45.0:
+                penalty += min(60.0, (45.0 - avg_score) * 1.1)
+            if avg_gap > 40.0:
+                penalty += min(45.0, (avg_gap - 40.0) * 0.45)
+            return {
+                "penalty_bps": float(penalty),
+                "reason": f"walk_forward product={product_id};avg_score={avg_score:.2f};avg_gap={avg_gap:.2f};penalty={penalty:.2f}",
+            }
+        except Exception as exc:
+            return {"penalty_bps": 0.0, "reason": f"walk_forward_error:{exc}"}
+
     def _expected_utility_for_candidate(
         self,
         *,
@@ -11175,6 +11235,9 @@ class TradingBot:
             quant_context_utility_reason = str(
                 quant_utility.get("quant_context_utility_reason", "")
             )
+            walk_forward = self._walk_forward_penalty_for_product(str(candidate.get("product_id", "")))
+            walk_forward_penalty_bps = float(walk_forward.get("penalty_bps", 0.0) or 0.0)
+            walk_forward_reason = str(walk_forward.get("reason", ""))
             maker_adjusted_expected_value_bps = (
                 float(maker_fill_probability) * float(expected_value_bps)
                 - (1.0 - float(maker_fill_probability)) * float(UTILITY_MAKER_NO_FILL_PENALTY_BPS)
@@ -11211,6 +11274,7 @@ class TradingBot:
                 + float(volume_profile_utility_adjust_bps)
                 + float(previous_session_profile_utility_adjust_bps)
                 + float(quant_context_utility_adjust_bps)
+                - float(walk_forward_penalty_bps)
                 - float(contradiction_penalty_bps)
                 - max(0.0, float(wait_utility_bps) - 8.0) * 0.35
             )
@@ -11250,6 +11314,8 @@ class TradingBot:
                 f"{previous_session_profile_utility_reason};"
                 f"quant_adjust={quant_context_utility_adjust_bps:.2f};"
                 f"{quant_context_utility_reason};"
+                f"walk_forward_penalty={walk_forward_penalty_bps:.2f};"
+                f"{walk_forward_reason};"
                 f"wait_utility={wait_utility_bps:.2f};buy_vs_wait={buy_vs_wait_edge_bps:.2f};"
                 f"realized_vol_30m={realized_vol_bps:.2f};vol_size_mult={vol_mult:.3f};"
                 f"{vol_reason};{p_reason};{maker_reason}"
@@ -11271,6 +11337,8 @@ class TradingBot:
                 "previous_session_profile_utility_reason": str(previous_session_profile_utility_reason),
                 "quant_context_utility_adjust_bps": float(quant_context_utility_adjust_bps),
                 "quant_context_utility_reason": str(quant_context_utility_reason),
+                "walk_forward_penalty_bps": float(walk_forward_penalty_bps),
+                "walk_forward_reason": str(walk_forward_reason),
                 "utility_quality": float(utility_quality),
                 "utility_rank_bonus": float(utility_rank_bonus),
                 "utility_size_multiplier": float(utility_size_multiplier),
@@ -11846,6 +11914,15 @@ class TradingBot:
         """
         try:
             product_id = str(candidate.get("product_id", ""))
+            if bool(ENABLE_STALE_DATA_LIVE_BUY_GATE):
+                market_age_sec = self._market_data_age_for_product(product_id)
+                candidate["market_data_age_sec"] = float(market_age_sec)
+                if market_age_sec > float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):
+                    return False, (
+                        f"live_buy_blocked:stale_market_data "
+                        f"market_data_age_sec={market_age_sec:.2f};"
+                        f"max_allowed={float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):.2f}"
+                    )
             current_price_for_stack_check = float(
                 candidate.get("price", 0.0)
                 or candidate.get("mid", 0.0)
@@ -11899,6 +11976,13 @@ class TradingBot:
             calibrated_p_win = float(candidate.get("calibrated_p_win", 0.50) or 0.50)
             payoff_ratio = float(candidate.get("payoff_ratio", 0.0) or 0.0)
             expected_utility_bps = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
+            walk_forward_penalty_bps = float(candidate.get("walk_forward_penalty_bps", 0.0) or 0.0)
+            if walk_forward_penalty_bps >= 55.0:
+                return False, (
+                    f"live_buy_shadowed:walk_forward_validation_failed "
+                    f"walk_forward_penalty_bps={walk_forward_penalty_bps:.2f};"
+                    f"reason={candidate.get('walk_forward_reason', '')}"
+                )
             maker_adjusted_ev_bps = float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0)
             maker_fill_probability = float(candidate.get("maker_fill_probability", 0.0) or 0.0)
             wait_utility_bps = float(candidate.get("wait_utility_bps", 0.0) or 0.0)
@@ -12091,6 +12175,22 @@ class TradingBot:
                     f"live_buy_shadowed:quant_unstable_low_edge "
                     f"stationarity={quant_stationarity:.3f};wait={quant_wait:.3f};"
                     f"vol_state={quant_vol_state};expected_utility={expected_utility_bps:.2f}"
+                )
+
+            liquidity_risk_score = float(candidate.get("liquidity_risk_score", 0.0) or 0.0)
+            spread_instability_bps = float(candidate.get("spread_instability_bps", 0.0) or 0.0)
+            if liquidity_risk_score >= float(ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE):
+                return False, (
+                    f"live_buy_shadowed:order_book_liquidity_risk "
+                    f"liquidity_risk_score={liquidity_risk_score:.3f};"
+                    f"spread_instability_bps={spread_instability_bps:.2f};"
+                    f"order_book_reason={candidate.get('order_book_reason', '')}"
+                )
+            if spread_instability_bps >= float(SPREAD_INSTABILITY_BLOCK_BPS):
+                return False, (
+                    f"live_buy_shadowed:spread_instability "
+                    f"spread_instability_bps={spread_instability_bps:.2f};"
+                    f"max_allowed={float(SPREAD_INSTABILITY_BLOCK_BPS):.2f}"
                 )
 
             if margin < float(effective_min_margin):
@@ -12505,13 +12605,19 @@ class TradingBot:
             order_book_available = bool(candidate.get("order_book_available", False))
             order_book_vote = {
                 **common,
-                "agent": "execution_order_book",
-                "buy": clamp_float(order_book_buy_score, 0.0, 1.0),
-                "sell": clamp_float(order_book_sell_score, 0.0, 1.0),
-                "hold": clamp_float(0.45 + max(0.0, 0.50 - order_book_liquidity_risk) * 0.25, 0.0, 1.0),
-                "wait": clamp_float(order_book_wait_score, 0.0, 1.0),
-                "confidence": clamp_float(0.12 + (0.44 if order_book_available else 0.0) + order_book_liquidity_risk * 0.10, 0.10, 0.66),
-                "reason": str(candidate.get("order_book_reason", "order_book_context_absent")),
+                "agent": "order_book_liquidity_agent",
+                "buy": clamp_float(float(candidate.get("order_book_buy_score", 0.50) or 0.50), 0.0, 1.0),
+                "sell": clamp_float(float(candidate.get("order_book_sell_score", 0.50) or 0.50), 0.0, 1.0),
+                "hold": clamp_float(0.45 + max(0.0, float(candidate.get("order_book_imbalance", 0.0) or 0.0)) * 0.25, 0.0, 1.0),
+                "wait": clamp_float(float(candidate.get("order_book_wait_score", 0.20) or 0.20), 0.0, 1.0),
+                "confidence": clamp_float(
+                    0.20
+                    + (0.35 if bool(candidate.get("order_book_available", False)) else 0.0)
+                    + min(0.25, float(candidate.get("order_book_top_depth_usd", 0.0) or 0.0) / max(float(ORDER_BOOK_MIN_TOP_DEPTH_USD) * 4.0, 1e-9)),
+                    0.10,
+                    0.82,
+                ),
+                "reason": str(candidate.get("order_book_reason", "order_book_no_reason")),
             }
 
             utility_leader_vote = {
@@ -18342,6 +18448,7 @@ class TradingBot:
             "order_book_sell_score": _json_safe_float(candidate.get("order_book_sell_score", 0.0)),
             "order_book_wait_score": _json_safe_float(candidate.get("order_book_wait_score", 0.0)),
             "order_book_reason": str(candidate.get("order_book_reason", "")),
+            "market_data_age_sec": _json_safe_float(candidate.get("market_data_age_sec", 0.0)),
         })
         return row
 

@@ -384,6 +384,27 @@ def render_volume_context_note(coin: Dict[str, Any]) -> None:
         """, unsafe_allow_html=True)
 
 
+def render_order_book_context(coin: Dict[str, Any]) -> None:
+    st.markdown(
+        f"""
+        <div class="panel-card">
+            <div class="section-title">Order Book / Liquidity Context</div>
+            <div class="muted">
+                Available: <b>{bool(coin.get("order_book_available", False))}</b><br>
+                Imbalance: <b>{_safe_float(coin.get("order_book_imbalance", 0.0)):.3f}</b><br>
+                Bid depth: <b>${_safe_float(coin.get("order_book_bid_depth_usd", 0.0)):.2f}</b><br>
+                Ask depth: <b>${_safe_float(coin.get("order_book_ask_depth_usd", 0.0)):.2f}</b><br>
+                Top depth: <b>${_safe_float(coin.get("order_book_top_depth_usd", 0.0)):.2f}</b><br>
+                Spread instability: <b>{_safe_float(coin.get("spread_instability_bps", 0.0)):.2f} bps</b><br>
+                Liquidity risk: <b>{_safe_float(coin.get("liquidity_risk_score", 0.0)):.3f}</b><br>
+                Market data age: <b>{_safe_float(coin.get("market_data_age_sec", 0.0)):.1f}s</b>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_transcript_strategy_context(coin: Dict[str, Any]) -> None:
     st.markdown(
         f"""
@@ -439,6 +460,7 @@ def main() -> None:
     st.plotly_chart(build_coin_chart(history, coin, confirmed, target), use_container_width=True)
     render_volume_context_note(coin)
     render_transcript_strategy_context(coin)
+    render_order_book_context(coin)
     render_confirmed_trades(confirmed)
     render_targets_panel(coin, target)
     render_coin_analytics(coin)

@@ -8698,6 +8698,22 @@ class TradingBot:
                 pass
         return count
 
+
+    def _live_minute_candles_for_product(self, product_id: str) -> List['MinuteCandle']:
+        """
+        Return the current live 1-minute candles for a product.
+
+        The bot stores live candle data in self.live_1m rather than a legacy minute-candle attribute.
+        This helper gives newer strategy modules a safe live-candle accessor.
+        """
+        try:
+            series = self.live_1m.get(product_id)
+            if series is None:
+                return []
+            return list(series.candles)
+        except Exception:
+            return []
+
     def _recent_lower_low_sequence(self, product_id: str, lookback: int = 4) -> bool:
         try:
             candles = list(self.live_1m[product_id].candles)
@@ -8853,13 +8869,13 @@ class TradingBot:
 
             peer = ""
             for a, b in pairs:
-                if product_id == a and b in self.minute_candles:
+                if product_id == a and b in self.live_1m:
                     peer = b
                     break
 
             if not peer:
                 # Fallback: compare altcoins to BTC when BTC is available.
-                if product_id != "BTC-USD" and "BTC-USD" in self.minute_candles:
+                if product_id != "BTC-USD" and "BTC-USD" in self.live_1m:
                     peer = "BTC-USD"
 
             if not peer:
@@ -8878,8 +8894,8 @@ class TradingBot:
             return self._smt_divergence_context_from_candles(
                 product_id=product_id,
                 peer=peer,
-                own_candles=list(self.minute_candles.get(product_id, [])),
-                peer_candles=list(self.minute_candles.get(peer, [])),
+                own_candles=self._live_minute_candles_for_product(product_id),
+                peer_candles=self._live_minute_candles_for_product(peer),
                 lookback=lookback,
             )
 
@@ -8921,7 +8937,7 @@ class TradingBot:
         try:
             candles = minute_candles
             if candles is None:
-                candles = list(self.minute_candles.get(product_id, []))
+                candles = self._live_minute_candles_for_product(product_id)
 
             if not candles:
                 return {}
@@ -9032,7 +9048,7 @@ class TradingBot:
         try:
             candles = minute_candles
             if candles is None:
-                candles = list(self.minute_candles.get(product_id, []))
+                candles = self._live_minute_candles_for_product(product_id)
 
             if not candles:
                 return {}
@@ -9985,7 +10001,7 @@ class TradingBot:
             adjusted_position_pct = clamp_float(
                 raw_position_pct * setup_size_multiplier,
                 0.0,
-                float(LEVEL8_MAX_SINGLE_POSITION_PCT),
+                float(LEVEL8_MAX_SINGLE_TRADE_PCT),
             )
 
             info = {

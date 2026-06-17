@@ -10042,6 +10042,11 @@ class TradingBot:
             expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
             raw_prob = float(candidate.get("estimated_prob_up", 0.0) or 0.0)
             raw_score = float(candidate.get("score", 0.0) or 0.0)
+            calibrated_p_win = float(candidate.get("calibrated_p_win", 0.50) or 0.50)
+            payoff_ratio = float(candidate.get("payoff_ratio", 0.0) or 0.0)
+            expected_utility_bps = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
+            maker_adjusted_ev_bps = float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0)
+            maker_fill_probability = float(candidate.get("maker_fill_probability", 0.0) or 0.0)
             setup_tag_text = str(
                 candidate.get("setup_tag", "")
                 or candidate.get("setup", "")
@@ -10069,6 +10074,47 @@ class TradingBot:
                 backtest_gate.get("min_projected_net_bps", base_min_projected_net)
             )
             backtest_reason = str(backtest_gate.get("reason", ""))
+
+            if bool(ENABLE_EXPECTED_UTILITY_LEADER):
+                if calibrated_p_win < float(UTILITY_MIN_CALIBRATED_P_WIN):
+                    return False, (
+                        f"live_buy_shadowed:utility_calibrated_probability_too_low "
+                        f"calibrated_p_win={calibrated_p_win:.3f};"
+                        f"min={float(UTILITY_MIN_CALIBRATED_P_WIN):.3f};"
+                        f"expected_utility={expected_utility_bps:.2f};"
+                    )
+
+                if payoff_ratio < float(UTILITY_MIN_PAYOFF_RATIO):
+                    return False, (
+                        f"live_buy_shadowed:utility_payoff_ratio_too_low "
+                        f"payoff={payoff_ratio:.3f};"
+                        f"min={float(UTILITY_MIN_PAYOFF_RATIO):.3f};"
+                        f"expected_utility={expected_utility_bps:.2f};"
+                    )
+
+                if expected_utility_bps < float(UTILITY_MIN_EXPECTED_BPS_FOR_LIVE_BUY):
+                    return False, (
+                        f"live_buy_shadowed:expected_utility_too_low "
+                        f"expected_utility={expected_utility_bps:.2f};"
+                        f"min={float(UTILITY_MIN_EXPECTED_BPS_FOR_LIVE_BUY):.2f};"
+                        f"maker_adjusted_ev={maker_adjusted_ev_bps:.2f};"
+                    )
+
+                if maker_adjusted_ev_bps < float(UTILITY_MIN_MAKER_ADJUSTED_BPS_FOR_LIVE_BUY):
+                    return False, (
+                        f"live_buy_shadowed:maker_adjusted_ev_too_low "
+                        f"maker_adjusted_ev={maker_adjusted_ev_bps:.2f};"
+                        f"min={float(UTILITY_MIN_MAKER_ADJUSTED_BPS_FOR_LIVE_BUY):.2f};"
+                        f"maker_fill_probability={maker_fill_probability:.3f};"
+                    )
+
+                if maker_fill_probability < float(UTILITY_MIN_MAKER_FILL_PROBABILITY):
+                    return False, (
+                        f"live_buy_shadowed:maker_fill_probability_too_low "
+                        f"maker_fill_probability={maker_fill_probability:.3f};"
+                        f"min={float(UTILITY_MIN_MAKER_FILL_PROBABILITY):.3f};"
+                        f"expected_utility={expected_utility_bps:.2f};"
+                    )
 
             if margin < float(LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY):
                 return False, (
@@ -10153,6 +10199,11 @@ class TradingBot:
                 f"score={raw_score:.2f};"
                 f"session_agent={candidate.get('session_liquidity_agent', '')};"
                 f"session_setup={candidate.get('session_liquidity_setup', '')};"
+                f"calibrated_p_win={calibrated_p_win:.3f};"
+                f"payoff_ratio={payoff_ratio:.3f};"
+                f"expected_utility={expected_utility_bps:.2f};"
+                f"maker_adjusted_ev={maker_adjusted_ev_bps:.2f};"
+                f"maker_fill_probability={maker_fill_probability:.3f};"
                 f"{backtest_reason}"
             )
 
@@ -10413,19 +10464,43 @@ class TradingBot:
                     for v in price_action_votes
                 ) / max(1.0, float(len(price_action_votes)))
 
-            truth_buy = clamp_float(
-                spread_quality * 0.14
-                + cost_score * 0.10
-                + probability * 0.16
-                + score * 0.13
-                + forward_score * 0.13
-                + learning_score * 0.16
-                + session_buy_score * session_confidence * 0.09
-                + price_action_buy_weighted * price_action_conf_weighted * 0.09,
+            utility_truth_component = clamp_float(
+                0.50
+                + float(candidate.get("expected_utility_bps", 0.0) or 0.0) / 260.0
+                + (float(candidate.get("calibrated_p_win", 0.50) or 0.50) - 0.50) * 0.50
+                + (float(candidate.get("payoff_ratio", 0.0) or 0.0) - 1.0) * 0.14,
                 0.0,
                 1.0,
             )
-            truth_vote = vote("truth", truth_buy, clamp_float(0.35+truth_buy*0.30,0.0,1.0), clamp_float(0.80-truth_buy*0.55,0.0,1.0), clamp_float(0.30+truth_buy*0.55,0.20,0.90), f"truth evidence={truth_buy:.3f};setup={setup_tag};regime={market_regime}")
+
+            truth_buy = clamp_float(
+                spread_quality * 0.12
+                + cost_score * 0.10
+                + probability * 0.13
+                + score * 0.11
+                + forward_score * 0.11
+                + learning_score * 0.12
+                + session_buy_score * session_confidence * 0.08
+                + price_action_buy_weighted * price_action_conf_weighted * 0.08
+                + utility_truth_component * 0.15,
+                0.0,
+                1.0,
+            )
+            truth_vote = vote(
+                "truth",
+                truth_buy,
+                clamp_float(0.35 + truth_buy * 0.30, 0.0, 1.0),
+                clamp_float(0.80 - truth_buy * 0.55, 0.0, 1.0),
+                clamp_float(0.30 + truth_buy * 0.55, 0.20, 0.90),
+                (
+                    f"truth evidence={truth_buy:.3f};"
+                    f"utility_component={utility_truth_component:.3f};"
+                    f"expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f};"
+                    f"calibrated_p_win={float(candidate.get('calibrated_p_win', 0.50) or 0.50):.3f};"
+                    f"payoff={float(candidate.get('payoff_ratio', 0.0) or 0.0):.3f};"
+                    f"setup={setup_tag};regime={market_regime}"
+                ),
+            )
             session_agent_for_strategy = str(session_liquidity_vote.get("agent", "session_none"))
             session_setup_for_strategy = str(session_liquidity_vote.get("session_liquidity_setup", "none"))
             pa_context_for_strategy = dict(context.get("price_action_context", {}) or {})
@@ -10435,6 +10510,12 @@ class TradingBot:
             smt_for_strategy = dict(context.get("smt_divergence", {}) or {})
             smt_state_for_strategy = str(smt_for_strategy.get("smt_state", ""))
 
+            utility_state_for_strategy = (
+                "positive_utility"
+                if float(candidate.get("expected_utility_bps", 0.0) or 0.0) >= float(UTILITY_MIN_EXPECTED_BPS_FOR_LIVE_BUY)
+                else "negative_or_uncertain_utility"
+            )
+
             strategy = (
                 f"LEVEL8_DIRECT|regime={market_regime}|setup={setup_tag}|"
                 f"session_agent={session_agent_for_strategy}|"
@@ -10443,6 +10524,7 @@ class TradingBot:
                 f"value_area={value_area_for_strategy}|"
                 f"fvg={fvg_state_for_strategy}|"
                 f"smt={smt_state_for_strategy}|"
+                f"utility={utility_state_for_strategy}|"
                 f"execution={execution_state}"
             )
             decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
@@ -10458,9 +10540,14 @@ class TradingBot:
                 float(BACKTEST_SETUP_MIN_SIZE_MULTIPLIER),
                 float(BACKTEST_SETUP_MAX_SIZE_BOOST),
             )
+            utility_size_multiplier = clamp_float(
+                float(candidate.get("utility_size_multiplier", 1.0) or 1.0),
+                float(UTILITY_MIN_SIZE_MULTIPLIER),
+                float(UTILITY_MAX_SIZE_MULTIPLIER),
+            )
             raw_position_pct = float(decision.get("position_pct", 0.0) or 0.0)
             adjusted_position_pct = clamp_float(
-                raw_position_pct * setup_size_multiplier,
+                raw_position_pct * setup_size_multiplier * utility_size_multiplier,
                 0.0,
                 float(LEVEL8_MAX_SINGLE_TRADE_PCT),
             )
@@ -10473,6 +10560,18 @@ class TradingBot:
                 "confidence": float(decision.get("confidence", decision.get("truth_score", 0.0)) or 0.0),
                 "learning_score": float(decision.get("learning_score", context["learning_score"]) or 0.0),
                 "setup_tag": context["setup_tag"], "market_regime": context["market_regime"],
+
+                "calibrated_p_win": float(candidate.get("calibrated_p_win", 0.50) or 0.50),
+                "expected_win_bps": float(candidate.get("expected_win_bps", 0.0) or 0.0),
+                "expected_loss_bps": float(candidate.get("expected_loss_bps", 0.0) or 0.0),
+                "payoff_ratio": float(candidate.get("payoff_ratio", 0.0) or 0.0),
+                "expected_value_bps": float(candidate.get("expected_value_bps", 0.0) or 0.0),
+                "uncertainty_penalty_bps": float(candidate.get("uncertainty_penalty_bps", 0.0) or 0.0),
+                "maker_fill_probability": float(candidate.get("maker_fill_probability", 0.0) or 0.0),
+                "maker_adjusted_expected_value_bps": float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0),
+                "expected_utility_bps": float(candidate.get("expected_utility_bps", 0.0) or 0.0),
+                "utility_size_multiplier": float(candidate.get("utility_size_multiplier", 1.0) or 1.0),
+                "utility_decision_reason": str(candidate.get("utility_decision_reason", "")),
             }
             base_reason = str(decision.get("sizing_reason", decision.get("reason", "")))
             session_context = dict(context.get("session_liquidity", {}) or {})
@@ -10487,7 +10586,8 @@ class TradingBot:
                 f"session_reason={session_context.get('reason', '')};"
                 f"price_action_reason={price_context.get('reason', '')};"
                 f"smt_reason={dict(context.get('smt_divergence', {}) or {}).get('reason', '')};"
-                f"setup_performance={candidate.get('backtest_setup_reason', '')}"
+                f"setup_performance={candidate.get('backtest_setup_reason', '')};"
+                f"utility_leader={candidate.get('utility_decision_reason', '')}"
             )
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")
@@ -10669,6 +10769,15 @@ class TradingBot:
                     sell_threshold=0.0,
                     recommended_position_pct=recommended_pct,
                     confidence=confidence,
+                    calibrated_p_win=float(level8_info.get("calibrated_p_win", 0.50) or 0.50),
+                    expected_win_bps=float(level8_info.get("expected_win_bps", 0.0) or 0.0),
+                    expected_loss_bps=float(level8_info.get("expected_loss_bps", 0.0) or 0.0),
+                    payoff_ratio=float(level8_info.get("payoff_ratio", 0.0) or 0.0),
+                    expected_value_bps=float(level8_info.get("expected_value_bps", 0.0) or 0.0),
+                    uncertainty_penalty_bps=float(level8_info.get("uncertainty_penalty_bps", 0.0) or 0.0),
+                    maker_fill_probability=float(level8_info.get("maker_fill_probability", 0.0) or 0.0),
+                    maker_adjusted_expected_value_bps=float(level8_info.get("maker_adjusted_expected_value_bps", 0.0) or 0.0),
+                    expected_utility_bps=float(level8_info.get("expected_utility_bps", 0.0) or 0.0),
                     reason=(
                         f"heartbeat_only=True;"
                         f"raw_level8_action={raw_action};"
@@ -10821,6 +10930,15 @@ class TradingBot:
         recommended_position_pct: float,
         confidence: float,
         reason: str,
+        calibrated_p_win: float = 0.50,
+        expected_win_bps: float = 0.0,
+        expected_loss_bps: float = 0.0,
+        payoff_ratio: float = 0.0,
+        expected_value_bps: float = 0.0,
+        uncertainty_penalty_bps: float = 0.0,
+        maker_fill_probability: float = 0.0,
+        maker_adjusted_expected_value_bps: float = 0.0,
+        expected_utility_bps: float = 0.0,
     ) -> None:
         """
         Write a normalized Level 8 decision row for live and heartbeat decisions.
@@ -10843,11 +10961,38 @@ class TradingBot:
                 "sell_threshold",
                 "recommended_position_pct",
                 "confidence",
+                "calibrated_p_win",
+                "expected_win_bps",
+                "expected_loss_bps",
+                "payoff_ratio",
+                "expected_value_bps",
+                "uncertainty_penalty_bps",
+                "maker_fill_probability",
+                "maker_adjusted_expected_value_bps",
+                "expected_utility_bps",
                 "reason",
             ]
             write_header = not os.path.exists(
                 LEVEL8_COUNCIL_DECISIONS_CSV_PATH
             )
+
+            # If an older council_decisions.csv exists with the old header,
+            # rotate it so the new utility columns are written cleanly.
+            if not write_header:
+                try:
+                    with open(LEVEL8_COUNCIL_DECISIONS_CSV_PATH, newline="", encoding="utf-8") as existing_file:
+                        existing_header = next(csv.reader(existing_file), [])
+                    if existing_header != columns:
+                        rotated_path = (
+                            LEVEL8_COUNCIL_DECISIONS_CSV_PATH
+                            + f".pre_utility_{int(time.time())}.csv"
+                        )
+                        os.replace(LEVEL8_COUNCIL_DECISIONS_CSV_PATH, rotated_path)
+                        log(f"[level8] rotated old council decisions schema to {rotated_path}")
+                        write_header = True
+                except Exception:
+                    write_header = True
+
             ts_val = now_ts()
             dt_mst = (
                 datetime.fromtimestamp(ts_val, tz=timezone.utc)
@@ -10882,6 +11027,15 @@ class TradingBot:
                     f"{float(sell_threshold):.6f}",
                     f"{float(recommended_position_pct):.6f}",
                     f"{float(confidence):.6f}",
+                    f"{float(calibrated_p_win):.6f}",
+                    f"{float(expected_win_bps):.6f}",
+                    f"{float(expected_loss_bps):.6f}",
+                    f"{float(payoff_ratio):.6f}",
+                    f"{float(expected_value_bps):.6f}",
+                    f"{float(uncertainty_penalty_bps):.6f}",
+                    f"{float(maker_fill_probability):.6f}",
+                    f"{float(maker_adjusted_expected_value_bps):.6f}",
+                    f"{float(expected_utility_bps):.6f}",
                     reason,
                 ])
         except Exception as exc:
@@ -13316,6 +13470,10 @@ class TradingBot:
             score=f"{float(candidate.get('score', 0.0)):.6f}",
             probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
             ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+            expected_utility_bps=f"{float(candidate.get('expected_utility_bps', 0.0)):.6f}",
+            calibrated_p_win=f"{float(candidate.get('calibrated_p_win', 0.50)):.6f}",
+            payoff_ratio=f"{float(candidate.get('payoff_ratio', 0.0)):.6f}",
+            maker_adjusted_expected_value_bps=f"{float(candidate.get('maker_adjusted_expected_value_bps', 0.0)):.6f}",
             projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
             cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
             spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
@@ -15705,6 +15863,17 @@ class TradingBot:
                     "smt_state": str(getattr(live_signal, "smt_state", "")),
                     "smt_peer": str(getattr(live_signal, "smt_peer", "")),
                     "smt_reason": str(getattr(live_signal, "smt_reason", "")),
+                    "calibrated_p_win": 0.50,
+                    "expected_win_bps": 0.0,
+                    "expected_loss_bps": 0.0,
+                    "payoff_ratio": 0.0,
+                    "expected_value_bps": 0.0,
+                    "uncertainty_penalty_bps": 0.0,
+                    "maker_fill_probability": 0.0,
+                    "maker_adjusted_expected_value_bps": 0.0,
+                    "expected_utility_bps": 0.0,
+                    "utility_size_multiplier": 1.0,
+                    "utility_decision_reason": "",
                     "signal": live_signal,
                     "entry_timing_ok": False,
                     "entry_timing_reason": "heartbeat_market_watch",
@@ -15879,6 +16048,15 @@ class TradingBot:
                             ),
                             confidence=float(level8_info.get("confidence", 0.0) or 0.0),
                             reason=str(level8_info.get("reason", "")),
+                            calibrated_p_win=float(level8_info.get("calibrated_p_win", 0.50) or 0.50),
+                            expected_win_bps=float(level8_info.get("expected_win_bps", 0.0) or 0.0),
+                            expected_loss_bps=float(level8_info.get("expected_loss_bps", 0.0) or 0.0),
+                            payoff_ratio=float(level8_info.get("payoff_ratio", 0.0) or 0.0),
+                            expected_value_bps=float(level8_info.get("expected_value_bps", 0.0) or 0.0),
+                            uncertainty_penalty_bps=float(level8_info.get("uncertainty_penalty_bps", 0.0) or 0.0),
+                            maker_fill_probability=float(level8_info.get("maker_fill_probability", 0.0) or 0.0),
+                            maker_adjusted_expected_value_bps=float(level8_info.get("maker_adjusted_expected_value_bps", 0.0) or 0.0),
+                            expected_utility_bps=float(level8_info.get("expected_utility_bps", 0.0) or 0.0),
                         )
 
                         try:
@@ -15891,6 +16069,10 @@ class TradingBot:
                                 score=f"{float(candidate.get('score', 0.0)):.6f}",
                                 probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
                                 ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                                expected_utility_bps=f"{float(candidate.get('expected_utility_bps', 0.0)):.6f}",
+                                calibrated_p_win=f"{float(candidate.get('calibrated_p_win', 0.50)):.6f}",
+                                payoff_ratio=f"{float(candidate.get('payoff_ratio', 0.0)):.6f}",
+                                maker_adjusted_expected_value_bps=f"{float(candidate.get('maker_adjusted_expected_value_bps', 0.0)):.6f}",
                                 projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
                                 cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
                                 spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
@@ -16006,6 +16188,10 @@ class TradingBot:
                             score=f"{float(candidate.get('score', 0.0)):.6f}",
                             probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
                             ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                            expected_utility_bps=f"{float(candidate.get('expected_utility_bps', 0.0)):.6f}",
+                            calibrated_p_win=f"{float(candidate.get('calibrated_p_win', 0.50)):.6f}",
+                            payoff_ratio=f"{float(candidate.get('payoff_ratio', 0.0)):.6f}",
+                            maker_adjusted_expected_value_bps=f"{float(candidate.get('maker_adjusted_expected_value_bps', 0.0)):.6f}",
                             spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",
                             action="reject",
                             reason="trade_rate_limited_before_live_slice",
@@ -16276,6 +16462,10 @@ class TradingBot:
                     score=f"{float(candidate.get('score', 0.0)):.6f}",
                     probability=f"{float(candidate.get('estimated_prob_up', 0.0)):.6f}",
                     ev_bps=f"{float(candidate.get('expected_net_edge_bps', 0.0)):.6f}",
+                    expected_utility_bps=f"{float(candidate.get('expected_utility_bps', 0.0)):.6f}",
+                    calibrated_p_win=f"{float(candidate.get('calibrated_p_win', 0.50)):.6f}",
+                    payoff_ratio=f"{float(candidate.get('payoff_ratio', 0.0)):.6f}",
+                    maker_adjusted_expected_value_bps=f"{float(candidate.get('maker_adjusted_expected_value_bps', 0.0)):.6f}",
                     projected_forward_bps=f"{float(candidate.get('projected_forward_gain_bps', 0.0)):.6f}",
                     cost_bps=f"{float(candidate.get('cost_bps', 0.0)):.6f}",
                     spread_bps=f"{float(candidate.get('spread_bps', 0.0)):.6f}",

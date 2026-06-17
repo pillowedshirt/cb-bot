@@ -5187,6 +5187,9 @@ class TradingBot:
         self.calibration_observation_bank: Dict[str, List[CalibrationObservation]] = {
             product: [] for product in PRODUCTS
         }
+        # Historical candle cache used for replay SMT/correlation context.
+        # Product -> candles from the latest startup/hourly calibration pass.
+        self.historical_replay_candles_by_product: Dict[str, List[Candle]] = {}
         self.last_hourly_calibration_update_ts: float = 0.0
         self.last_buy_gate_log_ts_by_product: Dict[str, float] = {}
         self.last_sell_failure_ts_by_product: Dict[str, float] = {}
@@ -6636,17 +6639,83 @@ class TradingBot:
             bool(survived_to_profit),
         )
 
+    def _historical_smt_context_for_product(
+        self,
+        *,
+        product_id: str,
+        own_candles: List[Candle],
+        replay_ts: Optional[int] = None,
+        lookback: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        Historical/replay SMT using candle windows up to replay_ts.
+
+        Falls back to no_peer if the related product has not been loaded yet.
+        """
+        pairs = [
+            ("BTC-USD", "ETH-USD"),
+            ("ETH-USD", "BTC-USD"),
+            ("SOL-USD", "AVAX-USD"),
+            ("AVAX-USD", "SOL-USD"),
+            ("DOGE-USD", "SHIB-USD"),
+            ("SHIB-USD", "DOGE-USD"),
+        ]
+
+        peer = ""
+        for a, b in pairs:
+            if product_id == a and b in self.historical_replay_candles_by_product:
+                peer = b
+                break
+
+        if not peer and product_id != "BTC-USD" and "BTC-USD" in self.historical_replay_candles_by_product:
+            peer = "BTC-USD"
+
+        if not peer:
+            return {
+                "agent": "smt_divergence_agent",
+                "buy": 0.0,
+                "sell": 0.0,
+                "hold": 0.50,
+                "wait": 0.50,
+                "confidence": 0.10,
+                "smt_state": "no_historical_peer",
+                "peer": "",
+                "reason": "historical_smt_no_peer_available",
+            }
+
+        peer_candles = list(self.historical_replay_candles_by_product.get(peer, []) or [])
+
+        if replay_ts is not None:
+            own_window = [c for c in own_candles if int(getattr(c, "ts", 0) or 0) <= int(replay_ts)]
+            peer_window = [c for c in peer_candles if int(getattr(c, "ts", 0) or 0) <= int(replay_ts)]
+        else:
+            own_window = list(own_candles or [])
+            peer_window = peer_candles
+
+        return self._smt_divergence_context_from_candles(
+            product_id=product_id,
+            peer=peer,
+            own_candles=own_window,
+            peer_candles=peer_window,
+            lookback=lookback,
+        )
+
     def _calibration_context_kwargs_from_signal(
         self,
         *,
         signal: LiveSignal,
         product_id: str,
+        smt_context_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Extract setup-specific context from a signal so candidate_replay.csv can
         learn which product/session/setup/price-action states actually worked.
         """
-        smt_context = self._smt_divergence_context_for_product(product_id=product_id)
+        smt_context = dict(
+            smt_context_override
+            if smt_context_override is not None
+            else self._smt_divergence_context_for_product(product_id=product_id)
+        )
 
         return {
             "session_liquidity_agent": str(getattr(signal, "session_liquidity_agent", "")),
@@ -6741,9 +6810,16 @@ class TradingBot:
                 bar_minutes=bar_minutes,
             )
             expected_value_bps = win_bps if reached_min_profit else -loss_bps
+            historical_smt_context = self._historical_smt_context_for_product(
+                product_id=product_id,
+                own_candles=prefix,
+                replay_ts=int(prefix[-1].ts),
+            )
+
             setup_context = self._calibration_context_kwargs_from_signal(
                 signal=signal,
                 product_id=product_id,
+                smt_context_override=historical_smt_context,
             )
             observations.append(CalibrationObservation(
                 product_id=product_id,
@@ -6831,9 +6907,16 @@ class TradingBot:
                     bar_minutes=bar_minutes,
                 )
                 expected_value_bps = win_bps if reached_min_profit else -loss_bps
+                historical_smt_context = self._historical_smt_context_for_product(
+                    product_id=product_id,
+                    own_candles=prefix,
+                    replay_ts=int(prefix[-1].ts),
+                )
+
                 setup_context = self._calibration_context_kwargs_from_signal(
                     signal=signal,
                     product_id=product_id,
+                    smt_context_override=historical_smt_context,
                 )
                 time_penalty = 0.0 if time_to_min_profit_minutes is None else max(
                     0.0, time_to_min_profit_minutes - PREFERRED_TIME_TO_MIN_PROFIT_MINUTES
@@ -7660,6 +7743,11 @@ class TradingBot:
                 week_candles = await self.fetcher.fetch_chunked(
                     product, start_week, end_ts, CALIB_WEEK_GRANULARITY
                 )
+                if day_candles:
+                    self.historical_replay_candles_by_product[product] = list(day_candles)
+                elif week_candles:
+                    self.historical_replay_candles_by_product[product] = list(week_candles)
+
                 if not day_candles and not week_candles:
                     log(
                         f"[calibration] no historical candles for {product}; "
@@ -8618,6 +8706,124 @@ class TradingBot:
             return False
 
 
+    def _smt_divergence_context_from_candles(
+        self,
+        *,
+        product_id: str,
+        peer: str,
+        own_candles: List[Any],
+        peer_candles: List[Any],
+        lookback: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        Compute SMT/correlation divergence from explicit candle windows.
+
+        This is used for both live and historical/replay contexts.
+        """
+        try:
+            own = list(own_candles or [])[-int(lookback):]
+            other = list(peer_candles or [])[-int(lookback):]
+
+            if len(own) < 4 or len(other) < 4:
+                return {
+                    "agent": "smt_divergence_agent",
+                    "buy": 0.0,
+                    "sell": 0.0,
+                    "hold": 0.50,
+                    "wait": 0.50,
+                    "confidence": 0.10,
+                    "smt_state": "insufficient_candles",
+                    "peer": peer,
+                    "reason": f"smt_insufficient_candles;peer={peer}",
+                }
+
+            def low(c: Any) -> float:
+                return float(getattr(c, "low", 0.0) or (c.get("low", 0.0) if isinstance(c, dict) else 0.0) or 0.0)
+
+            def high(c: Any) -> float:
+                return float(getattr(c, "high", 0.0) or (c.get("high", 0.0) if isinstance(c, dict) else 0.0) or 0.0)
+
+            def close(c: Any) -> float:
+                return float(getattr(c, "close", 0.0) or (c.get("close", 0.0) if isinstance(c, dict) else 0.0) or 0.0)
+
+            own_prev_lows = [low(c) for c in own[:-2] if low(c) > 0]
+            own_recent_lows = [low(c) for c in own[-2:] if low(c) > 0]
+            peer_prev_lows = [low(c) for c in other[:-2] if low(c) > 0]
+            peer_recent_lows = [low(c) for c in other[-2:] if low(c) > 0]
+
+            own_prev_highs = [high(c) for c in own[:-2] if high(c) > 0]
+            own_recent_highs = [high(c) for c in own[-2:] if high(c) > 0]
+            peer_prev_highs = [high(c) for c in other[:-2] if high(c) > 0]
+            peer_recent_highs = [high(c) for c in other[-2:] if high(c) > 0]
+
+            if not all([own_prev_lows, own_recent_lows, peer_prev_lows, peer_recent_lows, own_prev_highs, own_recent_highs, peer_prev_highs, peer_recent_highs]):
+                return {
+                    "agent": "smt_divergence_agent",
+                    "buy": 0.0,
+                    "sell": 0.0,
+                    "hold": 0.50,
+                    "wait": 0.50,
+                    "confidence": 0.10,
+                    "smt_state": "insufficient_price_points",
+                    "peer": peer,
+                    "reason": f"smt_insufficient_price_points;peer={peer}",
+                }
+
+            own_prev_low = min(own_prev_lows)
+            own_recent_low = min(own_recent_lows)
+            peer_prev_low = min(peer_prev_lows)
+            peer_recent_low = min(peer_recent_lows)
+
+            own_prev_high = max(own_prev_highs)
+            own_recent_high = max(own_recent_highs)
+            peer_prev_high = max(peer_prev_highs)
+            peer_recent_high = max(peer_recent_highs)
+
+            own_swept_low = bool(own_recent_low < own_prev_low and close(own[-1]) > own_prev_low)
+            peer_refused_low = bool(peer_recent_low >= peer_prev_low)
+
+            own_swept_high = bool(own_recent_high > own_prev_high and close(own[-1]) < own_prev_high)
+            peer_refused_high = bool(peer_recent_high <= peer_prev_high)
+
+            bullish_smt = bool(own_swept_low and peer_refused_low)
+            bearish_smt = bool(own_swept_high and peer_refused_high)
+
+            buy_score = clamp_float(0.30 + (0.38 if bullish_smt else 0.0), 0.0, 1.0)
+            sell_score = clamp_float(0.28 + (0.38 if bearish_smt else 0.0), 0.0, 1.0)
+            hold_score = clamp_float(0.48 + buy_score * 0.18 - sell_score * 0.12, 0.0, 1.0)
+            confidence = clamp_float(0.22 + (0.42 if bullish_smt or bearish_smt else 0.0), 0.10, 0.85)
+
+            smt_state = "bullish_smt" if bullish_smt else "bearish_smt" if bearish_smt else "no_smt"
+
+            return {
+                "agent": "smt_divergence_agent",
+                "buy": float(buy_score),
+                "sell": float(sell_score),
+                "hold": float(hold_score),
+                "wait": clamp_float(0.60 - max(buy_score, sell_score) * 0.25, 0.0, 1.0),
+                "confidence": float(confidence),
+                "smt_state": smt_state,
+                "peer": peer,
+                "reason": (
+                    f"smt_state={smt_state};peer={peer};"
+                    f"own_swept_low={own_swept_low};peer_refused_low={peer_refused_low};"
+                    f"own_swept_high={own_swept_high};peer_refused_high={peer_refused_high}"
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "agent": "smt_divergence_agent",
+                "buy": 0.0,
+                "sell": 0.0,
+                "hold": 0.50,
+                "wait": 0.50,
+                "confidence": 0.10,
+                "smt_state": "smt_error",
+                "peer": peer,
+                "reason": f"smt_error:{exc}",
+            }
+
     def _smt_divergence_context_for_product(
         self,
         *,
@@ -8628,12 +8834,6 @@ class TradingBot:
         Compare related crypto products for SMT/correlation divergence.
 
         This is weighted evidence, not a hard trigger.
-
-        Bullish SMT:
-        - this product sweeps lower or makes a lower low while the paired product refuses.
-
-        Bearish SMT:
-        - this product sweeps higher or makes a higher high while the paired product refuses.
         """
         try:
             pairs = [
@@ -8669,72 +8869,13 @@ class TradingBot:
                     "reason": "smt_no_peer_available",
                 }
 
-            own = list(self.minute_candles.get(product_id, []))[-int(lookback):]
-            other = list(self.minute_candles.get(peer, []))[-int(lookback):]
-
-            if len(own) < 4 or len(other) < 4:
-                return {
-                    "agent": "smt_divergence_agent",
-                    "buy": 0.0,
-                    "sell": 0.0,
-                    "hold": 0.50,
-                    "wait": 0.50,
-                    "confidence": 0.10,
-                    "smt_state": "insufficient_candles",
-                    "peer": peer,
-                    "reason": f"smt_insufficient_candles;peer={peer}",
-                }
-
-            def low(c):
-                return float(getattr(c, "low", 0.0) or 0.0)
-
-            def high(c):
-                return float(getattr(c, "high", 0.0) or 0.0)
-
-            def close(c):
-                return float(getattr(c, "close", 0.0) or 0.0)
-
-            own_prev_low = min(low(c) for c in own[:-2] if low(c) > 0)
-            own_recent_low = min(low(c) for c in own[-2:] if low(c) > 0)
-            peer_prev_low = min(low(c) for c in other[:-2] if low(c) > 0)
-            peer_recent_low = min(low(c) for c in other[-2:] if low(c) > 0)
-
-            own_prev_high = max(high(c) for c in own[:-2])
-            own_recent_high = max(high(c) for c in own[-2:])
-            peer_prev_high = max(high(c) for c in other[:-2])
-            peer_recent_high = max(high(c) for c in other[-2:])
-
-            own_swept_low = bool(own_recent_low < own_prev_low and close(own[-1]) > own_prev_low)
-            peer_refused_low = bool(peer_recent_low >= peer_prev_low)
-
-            own_swept_high = bool(own_recent_high > own_prev_high and close(own[-1]) < own_prev_high)
-            peer_refused_high = bool(peer_recent_high <= peer_prev_high)
-
-            bullish_smt = bool(own_swept_low and peer_refused_low)
-            bearish_smt = bool(own_swept_high and peer_refused_high)
-
-            buy_score = clamp_float(0.30 + (0.38 if bullish_smt else 0.0), 0.0, 1.0)
-            sell_score = clamp_float(0.28 + (0.38 if bearish_smt else 0.0), 0.0, 1.0)
-            hold_score = clamp_float(0.48 + buy_score * 0.18 - sell_score * 0.12, 0.0, 1.0)
-            confidence = clamp_float(0.22 + (0.42 if bullish_smt or bearish_smt else 0.0), 0.10, 0.85)
-
-            smt_state = "bullish_smt" if bullish_smt else "bearish_smt" if bearish_smt else "no_smt"
-
-            return {
-                "agent": "smt_divergence_agent",
-                "buy": float(buy_score),
-                "sell": float(sell_score),
-                "hold": float(hold_score),
-                "wait": clamp_float(0.60 - max(buy_score, sell_score) * 0.25, 0.0, 1.0),
-                "confidence": float(confidence),
-                "smt_state": smt_state,
-                "peer": peer,
-                "reason": (
-                    f"smt_state={smt_state};peer={peer};"
-                    f"own_swept_low={own_swept_low};peer_refused_low={peer_refused_low};"
-                    f"own_swept_high={own_swept_high};peer_refused_high={peer_refused_high}"
-                ),
-            }
+            return self._smt_divergence_context_from_candles(
+                product_id=product_id,
+                peer=peer,
+                own_candles=list(self.minute_candles.get(product_id, [])),
+                peer_candles=list(self.minute_candles.get(peer, [])),
+                lookback=lookback,
+            )
 
         except Exception as exc:
             return {

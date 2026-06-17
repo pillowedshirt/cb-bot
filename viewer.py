@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 try:
@@ -19,6 +20,7 @@ MARKET_CSV_PATH = os.path.join(BASE_DIR, "market.csv")
 TRADES_CSV_PATH = os.path.join(BASE_DIR, "trades.csv")
 POSITION_TARGETS_PATH = os.path.join(BASE_DIR, "position_targets.csv")
 COUNCIL_DECISIONS_PATH = os.path.join(BASE_DIR, "council_decisions.csv")
+COUNCIL_VOTES_CSV_PATH = os.path.join(BASE_DIR, "council_votes.csv")
 ORDERS_CSV_PATH = os.path.join(BASE_DIR, "orders.csv")
 
 FAST_REFRESH_MS = 3000
@@ -75,6 +77,16 @@ def load_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+@st.cache_data(ttl=FAST_TTL_SEC, show_spinner=False)
+def load_council_votes_df() -> pd.DataFrame:
+    if not os.path.exists(COUNCIL_VOTES_CSV_PATH):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(COUNCIL_VOTES_CSV_PATH)
+    except Exception:
+        return pd.DataFrame()
+
+
 def freshness_class(age_sec: float) -> str:
     return "fresh-good" if age_sec <= 8 else "fresh-warn" if age_sec <= 20 else "fresh-bad"
 
@@ -125,16 +137,24 @@ def latest_targets_for_coin(df: pd.DataFrame, product_id: str) -> Dict[str, Any]
 
 
 def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confirmed_trades_df: pd.DataFrame, target_state: Dict[str, Any]) -> go.Figure:
-    fig = go.Figure()
+    has_volume = "volume" in history_df.columns if not history_df.empty else False
+    if has_volume:
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.035, row_heights=[0.76, 0.24])
+    else:
+        fig = go.Figure()
     if history_df.empty:
         fig.update_layout(template="plotly_dark", title="No market history available", paper_bgcolor="#221a14", plot_bgcolor="#221a14", font=dict(color="#f3ead6"), height=520)
         return fig
     ts_col = "ts" if "ts" in history_df.columns else history_df.columns[0]
     close_col = "close" if "close" in history_df.columns else "mid" if "mid" in history_df.columns else "price"
     if all(c in history_df.columns for c in ["open", "high", "low", close_col]):
-        fig.add_trace(go.Candlestick(x=history_df[ts_col], open=history_df["open"], high=history_df["high"], low=history_df["low"], close=history_df[close_col], name="Price"))
+        price_trace = go.Candlestick(x=history_df[ts_col], open=history_df["open"], high=history_df["high"], low=history_df["low"], close=history_df[close_col], name="Price")
+        fig.add_trace(price_trace, row=1, col=1) if has_volume else fig.add_trace(price_trace)
     elif close_col in history_df.columns:
-        fig.add_trace(go.Scatter(x=history_df[ts_col], y=history_df[close_col], mode="lines", name="Price", line=dict(color="#8ee0ff", width=2)))
+        price_trace = go.Scatter(x=history_df[ts_col], y=history_df[close_col], mode="lines", name="Price", line=dict(color="#8ee0ff", width=2))
+        fig.add_trace(price_trace, row=1, col=1) if has_volume else fig.add_trace(price_trace)
+    if has_volume:
+        fig.add_trace(go.Bar(x=history_df[ts_col], y=pd.to_numeric(history_df["volume"], errors="coerce").fillna(0.0), name="Volume", marker=dict(color="rgba(232,193,111,0.35)")), row=2, col=1)
     lines = [
         ("VAH", target_state.get("value_area_high", coin_state.get("value_area_high", 0.0)), "#e8c16f", "dot"),
         ("VAL", target_state.get("value_area_low", coin_state.get("value_area_low", 0.0)), "#e8c16f", "dot"),
@@ -148,15 +168,23 @@ def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confi
     for label, y, color, dash in lines:
         y = _safe_float(y)
         if y > 0:
-            fig.add_hline(y=y, line_width=1.5, line_color=color, line_dash=dash, annotation_text=label, annotation_position="right")
+            if has_volume:
+                fig.add_hline(y=y, line_width=1.5, line_color=color, line_dash=dash, annotation_text=label, annotation_position="right", row=1, col=1)
+            else:
+                fig.add_hline(y=y, line_width=1.5, line_color=color, line_dash=dash, annotation_text=label, annotation_position="right")
     if not confirmed_trades_df.empty and {"side", "price", "ts"}.issubset(confirmed_trades_df.columns):
         buys = confirmed_trades_df[confirmed_trades_df["side"].astype(str).str.upper() == "BUY"]
         sells = confirmed_trades_df[confirmed_trades_df["side"].astype(str).str.upper() == "SELL"]
         if not buys.empty:
-            fig.add_trace(go.Scatter(x=buys["ts"], y=buys["price"], mode="markers", name="Confirmed Buys", marker=dict(symbol="triangle-up", size=10, color="#78d6a8")))
+            buy_trace = go.Scatter(x=buys["ts"], y=buys["price"], mode="markers", name="Confirmed Buys", marker=dict(symbol="triangle-up", size=10, color="#78d6a8"))
+            fig.add_trace(buy_trace, row=1, col=1) if has_volume else fig.add_trace(buy_trace)
         if not sells.empty:
-            fig.add_trace(go.Scatter(x=sells["ts"], y=sells["price"], mode="markers", name="Confirmed Sells", marker=dict(symbol="triangle-down", size=10, color="#ff8e8e")))
-    fig.update_layout(template="plotly_dark", paper_bgcolor="#221a14", plot_bgcolor="#221a14", font=dict(color="#f3ead6"), legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1.0), margin=dict(l=15, r=15, t=55, b=15), height=560, xaxis_title=None, yaxis_title="Price")
+            sell_trace = go.Scatter(x=sells["ts"], y=sells["price"], mode="markers", name="Confirmed Sells", marker=dict(symbol="triangle-down", size=10, color="#ff8e8e"))
+            fig.add_trace(sell_trace, row=1, col=1) if has_volume else fig.add_trace(sell_trace)
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#221a14", plot_bgcolor="#221a14", font=dict(color="#f3ead6"), legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1.0), margin=dict(l=15, r=15, t=55, b=15), height=650 if has_volume else 560, xaxis_title=None, yaxis_title="Price")
+    if has_volume:
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="Volume", row=2, col=1, showgrid=False)
     return fig
 
 
@@ -176,6 +204,40 @@ def pick_selected_coin(snapshot: Dict[str, Any]) -> str | None:
     selected = st.selectbox("Select Coin", options=available, index=available.index(st.session_state.selected_coin), key="selected_coin_selectbox")
     st.session_state.selected_coin = selected
     return selected
+
+
+def render_held_positions(snapshot: Dict[str, Any]) -> None:
+    coins = snapshot.get("coins", {}) or {}
+    held = []
+    for product_id, coin in coins.items():
+        if bool(coin.get("owns_position", False)):
+            held.append((product_id, dict(coin or {})))
+
+    st.markdown('<div class="panel-card"><div class="section-title">Currently Held Positions</div><div class="muted">Owned coins are shown here before choosing a chart.</div></div>', unsafe_allow_html=True)
+    if not held:
+        st.info("No currently held positions.")
+        return
+
+    cols = st.columns(min(4, max(1, len(held))))
+    for idx, (product_id, coin) in enumerate(held):
+        with cols[idx % len(cols)]:
+            bought_at = _safe_float(coin.get("avg_entry", 0.0))
+            current_price = _safe_float(coin.get("price", 0.0))
+            net_after_exit = _safe_float(coin.get("net_after_exit_bps", 0.0))
+            peak = _safe_float(coin.get("peak_unrealized_bps", 0.0))
+            sell_target = _safe_float(coin.get("selected_target_sell_price", coin.get("target_sell_price", coin.get("min_profitable_exit_price", 0.0))))
+            st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">{product_id}</div>
+                    <div class="metric-value">{current_price:.8f}</div>
+                    <div class="muted">
+                        Bought at: <b>{bought_at:.8f}</b><br>
+                        Looking to sell near: <b>{sell_target:.8f}</b><br>
+                        Net after exit: <b>{net_after_exit:.2f} bps</b><br>
+                        Peak unrealized: <b>{peak:.2f} bps</b>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
 
 def render_leader_and_council(snapshot: Dict[str, Any], selected_coin: str) -> None:
@@ -244,6 +306,63 @@ def render_coin_analytics(coin: Dict[str, Any]) -> None:
     cols[3].metric("Low Volume Path Down (bps)", f"{_safe_float(coin.get('low_volume_path_down_bps')):.2f}")
 
 
+def render_agent_statements(votes_df: pd.DataFrame, selected_coin: str) -> None:
+    st.markdown('<div class="panel-card"><div class="section-title">Council Agent Statements</div><div class="muted">The Volume Profile King leads, but the full council is still shown here.</div></div>', unsafe_allow_html=True)
+    if votes_df.empty or "product_id" not in votes_df.columns:
+        st.info("No council vote statements found yet.")
+        return
+    df = votes_df[votes_df["product_id"].astype(str) == str(selected_coin)].copy()
+    if df.empty:
+        st.info("No council vote statements found for this selected coin yet.")
+        return
+    if "ts" in df.columns:
+        df["ts_num"] = pd.to_numeric(df["ts"], errors="coerce")
+        latest_decision_ts = df["ts_num"].max()
+        df = df[df["ts_num"] == latest_decision_ts].copy()
+    important_order = {"volume_profile_leader": 0, "utility_leader": 1, "setup_performance_agent": 2, "session_liquidity": 3, "candle_context_agent": 4, "candle_sequence_agent": 5, "candle_exhaustion_agent": 6, "market_structure_agent": 7, "validated_liquidity_agent": 8, "fresh_zone_retest_agent": 9, "fair_value_gap_agent": 10, "volume_profile_agent": 11, "smt_divergence_agent": 12, "risk": 13, "truth": 14, "volume_profile_leader_exit": 15, "spike_profit_protection": 16}
+
+    def sort_key(agent: str) -> int:
+        a = str(agent)
+        if a in important_order:
+            return important_order[a]
+        if "session" in a or "liquidity" in a:
+            return 3
+        return 99
+
+    if "agent" in df.columns:
+        df["agent_sort"] = df["agent"].map(sort_key)
+        df = df.sort_values(["agent_sort"])
+    cards = df.head(16).to_dict("records")
+    for i in range(0, len(cards), 4):
+        cols = st.columns(4)
+        for col, row in zip(cols, cards[i:i + 4]):
+            agent = str(row.get("agent", "unknown"))
+            buy = _safe_float(row.get("adjusted_buy_score", row.get("raw_buy_score", 0.0)))
+            sell = _safe_float(row.get("adjusted_sell_score", row.get("raw_sell_score", 0.0)))
+            hold = _safe_float(row.get("adjusted_hold_score", row.get("raw_hold_score", 0.0)))
+            wait = _safe_float(row.get("adjusted_wait_score", row.get("raw_wait_score", 0.0)))
+            confidence = _safe_float(row.get("confidence", 0.0))
+            reason = str(row.get("reason", ""))[:280]
+            with col:
+                st.markdown(f"""<div class="metric-card"><div class="metric-label">{agent}</div><div class="muted">Buy: <b>{buy:.3f}</b> · Sell: <b>{sell:.3f}</b><br>Hold: <b>{hold:.3f}</b> · Wait: <b>{wait:.3f}</b><br>Confidence: <b>{confidence:.3f}</b><br><span>{reason}</span></div></div>""", unsafe_allow_html=True)
+
+
+def render_volume_context_note(coin: Dict[str, Any]) -> None:
+    st.markdown(f"""
+        <div class="panel-card">
+            <div class="section-title">Volume Profile Context</div>
+            <div class="muted">
+                Value acceptance: <b>{coin.get("value_acceptance_state", "—")}</b><br>
+                Volume node: <b>{coin.get("volume_node_state", "—")}</b><br>
+                POC distance: <b>{_safe_float(coin.get("poc_distance_bps", 0.0)):.2f} bps</b><br>
+                Low-volume path up: <b>{_safe_float(coin.get("low_volume_path_up_bps", 0.0)):.2f} bps</b><br>
+                Low-volume path down: <b>{_safe_float(coin.get("low_volume_path_down_bps", 0.0)):.2f} bps</b><br>
+                Unfair trade score: <b>{_safe_float(coin.get("unfair_trade_score", 0.0)):.3f}</b>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
 def main() -> None:
     inject_medieval_css()
     if st_autorefresh is not None:
@@ -251,24 +370,30 @@ def main() -> None:
     st.markdown("<div style='height:1.25rem;'></div>", unsafe_allow_html=True)
     render_header()
     snapshot = load_viewer_snapshot()
+    render_held_positions(snapshot)
+    st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
     selected = pick_selected_coin(snapshot)
     if not selected:
         st.warning("No coin data is available yet. Start the bot and wait for viewer_snapshot.json to update.")
         return
-    render_leader_and_council(snapshot, selected)
-    st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
-    render_freshness_banner(snapshot, selected)
     market_df = load_csv(MARKET_CSV_PATH)
     trades_df = load_csv(TRADES_CSV_PATH)
     targets_df = load_csv(POSITION_TARGETS_PATH)
     decisions_df = load_csv(COUNCIL_DECISIONS_PATH)
+    council_votes_df = load_council_votes_df()
     orders_df = load_csv(ORDERS_CSV_PATH)
+    render_leader_and_council(snapshot, selected)
+    st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
+    render_agent_statements(council_votes_df, selected)
+    st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
+    render_freshness_banner(snapshot, selected)
     coin = dict((snapshot.get("coins", {}) or {}).get(selected, {}) or {})
     history = coin_market_history(market_df, selected)
     confirmed = confirmed_trades_only(trades_df, selected)
     target = latest_targets_for_coin(targets_df, selected)
     st.markdown('<div class="panel-card"><div class="section-title">Primary Market Chart</div><div class="muted">This is the main chart the chamber should prioritize for buy and sell judgment.</div></div>', unsafe_allow_html=True)
     st.plotly_chart(build_coin_chart(history, coin, confirmed, target), use_container_width=True)
+    render_volume_context_note(coin)
     render_confirmed_trades(confirmed)
     render_targets_panel(coin, target)
     render_coin_analytics(coin)

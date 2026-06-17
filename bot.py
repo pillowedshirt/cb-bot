@@ -17221,9 +17221,13 @@ class TradingBot:
             "decision_action": str(candidate.get("level8_action", candidate.get("action", ""))),
             "decision_reason": str(candidate.get("level8_reason", candidate.get("reason", ""))),
             "council_mode": "POSITION_MANAGEMENT" if owns_position else "ENTRY",
-            "selected_target_buy_price": _viewer_safe_float(candidate.get("target_buy_price", 0.0)),
-            "selected_target_sell_price": _viewer_safe_float(candidate.get("target_sell_price", 0.0)),
-            "selected_target_stop_price": _viewer_safe_float(candidate.get("target_stop_price", 0.0)),
+            "selected_target_buy_price": _viewer_safe_float(candidate.get("selected_target_buy_price", candidate.get("target_buy_price", 0.0))),
+            "selected_target_sell_price": _viewer_safe_float(candidate.get("selected_target_sell_price", candidate.get("target_sell_price", 0.0))),
+            "selected_target_stop_price": _viewer_safe_float(candidate.get("selected_target_stop_price", candidate.get("target_stop_price", 0.0))),
+            "min_profitable_exit_price": _viewer_safe_float(candidate.get("min_profitable_exit_price", 0.0)),
+            "value_area_high": _viewer_safe_float(candidate.get("value_area_high", 0.0)),
+            "value_area_low": _viewer_safe_float(candidate.get("value_area_low", 0.0)),
+            "point_of_control": _viewer_safe_float(candidate.get("point_of_control", 0.0)),
         }
 
     def _build_viewer_snapshot_row(

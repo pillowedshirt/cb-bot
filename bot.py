@@ -8,6 +8,7 @@
 import os
 import json
 import time
+import sys
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import csv
@@ -16548,39 +16549,135 @@ def _pid_is_running(pid: int) -> bool:
         return False
 
 
+def _read_process_command_line(pid: int) -> str:
+    """
+    Best-effort process command-line reader.
+
+    On Windows, use PowerShell/CIM. On non-Windows systems, fall back to an
+    empty string so stale lock files do not produce unverifiable PID matches.
+    """
+    try:
+        if os.name != "nt":
+            return ""
+
+        import subprocess
+
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            (
+                "$p = Get-CimInstance Win32_Process -Filter "
+                f"\"ProcessId={int(pid)}\"; "
+                "if ($p) { [Console]::Out.Write($p.CommandLine) }"
+            ),
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+
+        return str(result.stdout or "").strip()
+
+    except Exception:
+        return ""
+
+
+def _pid_is_this_bot_process(pid: int, script_path: str) -> bool:
+    """
+    Return True only when the PID appears to be a Python process running this bot.py.
+
+    This prevents stale lock files from blocking launch when Windows reuses an old
+    PID for a totally unrelated process.
+    """
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+
+        if not _pid_is_running(pid):
+            return False
+
+        cmdline = _read_process_command_line(pid)
+        if not cmdline:
+            return False
+
+        normalized_cmd = cmdline.lower().replace("\\", "/")
+        normalized_script = os.path.abspath(script_path).lower().replace("\\", "/")
+
+        return (
+            "python" in normalized_cmd
+            and "bot.py" in normalized_cmd
+            and normalized_script in normalized_cmd
+        )
+
+    except Exception:
+        return False
+
+
 def acquire_bot_process_lock() -> int:
     """
     Prevent multiple live bot.py instances from running at the same time.
 
-    This is a live-trading safety rail. Shadow learning can continue in the single
-    active bot process, but multiple live processes can duplicate orders.
+    The lock stores metadata instead of only a PID. This prevents stale lock files
+    from blocking launch when the old bot crashed or when Windows reused an old PID.
     """
     lock_path = BOT_PROCESS_LOCK_PATH
     current_pid = os.getpid()
+    current_script = os.path.abspath(__file__)
 
     if os.path.exists(lock_path):
+        existing_lock: Dict[str, Any] = {}
+
         try:
             with open(lock_path, "r", encoding="utf-8") as file:
-                existing_pid_text = file.read().strip()
-            existing_pid = int(existing_pid_text or "0")
-        except Exception:
-            existing_pid = 0
+                raw = file.read().strip()
 
-        if existing_pid and _pid_is_running(existing_pid):
+            if raw.startswith("{"):
+                existing_lock = json.loads(raw)
+            else:
+                existing_lock = {"pid": int(raw or "0"), "legacy": True}
+
+        except Exception:
+            existing_lock = {"pid": 0, "invalid": True}
+
+        existing_pid = int(safe_float(existing_lock.get("pid"), 0.0))
+        existing_script = str(existing_lock.get("script_path", current_script) or current_script)
+
+        if existing_pid and _pid_is_this_bot_process(existing_pid, existing_script):
             raise RuntimeError(
                 f"Another live bot.py process appears to be running "
-                f"(pid={existing_pid}). Close it before starting a new one."
+                f"(pid={existing_pid}). Close it before starting a new one. "
+                f"lock_path={lock_path}"
             )
 
         try:
             os.remove(lock_path)
-            log(f"[process-lock] removed stale bot lock pid={existing_pid}")
-        except Exception:
-            pass
+            log(
+                f"[process-lock] removed stale bot lock "
+                f"pid={existing_pid} lock={existing_lock}"
+            )
+        except Exception as exc:
+            log(f"[process-lock] failed removing stale lock: {exc}")
+
+    lock_payload = {
+        "pid": current_pid,
+        "created_ts": time.time(),
+        "created_dt": now_mst().isoformat(),
+        "script_path": current_script,
+        "base_dir": BASE_DIR,
+        "command": " ".join(str(x) for x in sys.argv),
+    }
 
     fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     with os.fdopen(fd, "w", encoding="utf-8") as file:
-        file.write(str(current_pid))
+        json.dump(lock_payload, file, indent=2)
 
     log(f"[process-lock] acquired {lock_path} pid={current_pid}")
     return current_pid
@@ -16588,12 +16685,28 @@ def acquire_bot_process_lock() -> int:
 
 def release_bot_process_lock() -> None:
     try:
-        if os.path.exists(BOT_PROCESS_LOCK_PATH):
+        if not os.path.exists(BOT_PROCESS_LOCK_PATH):
+            return
+
+        existing_pid = ""
+
+        try:
             with open(BOT_PROCESS_LOCK_PATH, "r", encoding="utf-8") as file:
-                existing_pid = file.read().strip()
-            if existing_pid == str(os.getpid()):
-                os.remove(BOT_PROCESS_LOCK_PATH)
-                log("[process-lock] released")
+                raw = file.read().strip()
+
+            if raw.startswith("{"):
+                payload = json.loads(raw)
+                existing_pid = str(payload.get("pid", ""))
+            else:
+                existing_pid = raw
+
+        except Exception:
+            existing_pid = ""
+
+        if existing_pid == str(os.getpid()):
+            os.remove(BOT_PROCESS_LOCK_PATH)
+            log("[process-lock] released")
+
     except Exception as exc:
         log(f"[process-lock] release failed: {exc}")
 

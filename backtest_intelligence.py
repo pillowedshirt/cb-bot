@@ -509,11 +509,40 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "value_area_state",
         "fvg_state",
         "smt_state",
+        "price_action_buy_score",
+        "candle_exhaustion_score",
+        "volume_profile_buy_score",
+        "validated_liquidity_buy_score",
+        "fresh_zone_buy_score",
+        "fvg_buy_score",
     ]
 
     for col in setup_columns:
         if col not in frame.columns:
             frame[col] = ""
+
+    for numeric_col in [
+        "price_action_buy_score",
+        "candle_exhaustion_score",
+        "volume_profile_buy_score",
+        "validated_liquidity_buy_score",
+        "fresh_zone_buy_score",
+        "fvg_buy_score",
+    ]:
+        frame[numeric_col] = _numeric(frame, numeric_col, 0.0)
+
+    def _bucket(value: float) -> str:
+        try:
+            v = float(value)
+        except Exception:
+            v = 0.0
+        if v >= 0.70:
+            return "high"
+        if v >= 0.45:
+            return "medium"
+        if v > 0.0:
+            return "low"
+        return "none"
 
     frame["setup_key"] = (
         frame["session_liquidity_agent"].astype(str)
@@ -522,6 +551,12 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         + "|value=" + frame["value_area_state"].astype(str)
         + "|fvg=" + frame["fvg_state"].astype(str)
         + "|smt=" + frame["smt_state"].astype(str)
+        + "|pa=" + frame["price_action_buy_score"].map(_bucket).astype(str)
+        + "|exhaust=" + frame["candle_exhaustion_score"].map(_bucket).astype(str)
+        + "|volume=" + frame["volume_profile_buy_score"].map(_bucket).astype(str)
+        + "|validated_liq=" + frame["validated_liquidity_buy_score"].map(_bucket).astype(str)
+        + "|fresh_zone=" + frame["fresh_zone_buy_score"].map(_bucket).astype(str)
+        + "|fvg_score=" + frame["fvg_buy_score"].map(_bucket).astype(str)
     )
 
     for (product_id, setup_key), group in frame.groupby(["product_id", "setup_key"]):

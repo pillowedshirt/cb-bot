@@ -100,7 +100,10 @@ def _candles_in_window(candles: List[Any], window: SessionWindow, now_ts: float)
     min_ts = float(now_ts) - 36.0 * 3600.0
 
     for candle in candles:
-        ts = _safe_float(getattr(candle, "minute_start_ts", 0.0), 0.0)
+        ts = _safe_float(
+            getattr(candle, "minute_start_ts", getattr(candle, "ts", 0.0)),
+            0.0,
+        )
         if ts < min_ts:
             continue
         hour = _utc_hour(ts)

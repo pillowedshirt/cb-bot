@@ -165,6 +165,19 @@ def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confi
         ("Stop", target_state.get("target_stop_price", coin_state.get("selected_target_stop_price", 0.0)), "#d46cff", "dot"),
         ("Avg Entry", coin_state.get("avg_entry", 0.0), "#a5dcff", "solid"),
     ]
+    prior_poc = coin_state.get("previous_session_profile_poc", 0.0)
+    prior_vah = coin_state.get("previous_session_profile_vah", 0.0)
+    prior_val = coin_state.get("previous_session_profile_val", 0.0)
+    prior_poc = _safe_float(prior_poc)
+    prior_vah = _safe_float(prior_vah)
+    prior_val = _safe_float(prior_val)
+    if prior_poc > 0:
+        lines.append(("Prior POC", prior_poc, "#facc15", "dash"))
+    if prior_vah > 0:
+        lines.append(("Prior VAH", prior_vah, "#fde68a", "dot"))
+    if prior_val > 0:
+        lines.append(("Prior VAL", prior_val, "#fde68a", "dot"))
+
     for label, y, color, dash in lines:
         y = _safe_float(y)
         if y > 0:
@@ -326,7 +339,7 @@ def render_agent_statements(votes_df: pd.DataFrame, selected_coin: str) -> None:
         df["ts_num"] = pd.to_numeric(df["ts"], errors="coerce")
         latest_decision_ts = df["ts_num"].max()
         df = df[df["ts_num"] == latest_decision_ts].copy()
-    important_order = {"volume_profile_leader": 0, "previous_session_profile_agent": 1, "quant_boundary_agent": 2, "utility_leader": 3, "setup_performance_agent": 4, "session_liquidity": 5, "candle_context_agent": 6, "candle_sequence_agent": 7, "candle_exhaustion_agent": 8, "market_structure_agent": 9, "validated_liquidity_agent": 10, "fresh_zone_retest_agent": 11, "fair_value_gap_agent": 12, "volume_profile_agent": 13, "smt_divergence_agent": 14, "risk": 15, "truth": 16, "volume_profile_leader_exit": 17, "spike_profit_protection": 18}
+    important_order = {"volume_profile_leader": 0, "previous_session_volume_profile_agent": 1, "quant_boundary_agent": 2, "utility_leader": 3, "setup_performance_agent": 4, "session_liquidity": 5, "candle_context_agent": 6, "candle_sequence_agent": 7, "candle_exhaustion_agent": 8, "market_structure_agent": 9, "validated_liquidity_agent": 10, "fresh_zone_retest_agent": 11, "fair_value_gap_agent": 12, "volume_profile_agent": 13, "smt_divergence_agent": 14, "risk": 15, "truth": 16, "volume_profile_leader_exit": 17, "previous_session_profile_exit": 18, "quant_boundary_exit": 19, "spike_profit_protection": 20}
 
     def sort_key(agent: str) -> int:
         a = str(agent)
@@ -370,6 +383,29 @@ def render_volume_context_note(coin: Dict[str, Any]) -> None:
         """, unsafe_allow_html=True)
 
 
+def render_transcript_strategy_context(coin: Dict[str, Any]) -> None:
+    st.markdown(
+        f"""
+        <div class="panel-card">
+            <div class="section-title">Previous-Session Profile + Quant Boundary</div>
+            <div class="muted">
+                Prior session: <b>{coin.get("previous_session_profile_session_key", "—")}</b><br>
+                Reaction: <b>{coin.get("previous_session_profile_reaction_state", "—")}</b><br>
+                Higher-timeframe bias: <b>{coin.get("previous_session_profile_bias", "—")}</b><br>
+                Prior POC / VAH / VAL: <b>{_safe_float(coin.get("previous_session_profile_poc", 0.0)):.8f}</b> / <b>{_safe_float(coin.get("previous_session_profile_vah", 0.0)):.8f}</b> / <b>{_safe_float(coin.get("previous_session_profile_val", 0.0)):.8f}</b><br><br>
+                Quant boundary: <b>{coin.get("quant_boundary_state", "—")}</b><br>
+                Volatility cluster: <b>{coin.get("quant_volatility_cluster_state", "—")}</b><br>
+                Stationarity score: <b>{_safe_float(coin.get("quant_stationarity_score", 0.0)):.3f}</b><br>
+                Forecast return: <b>{_safe_float(coin.get("quant_forecast_return_bps", 0.0)):.2f} bps</b><br>
+                Conditional volatility: <b>{_safe_float(coin.get("quant_conditional_volatility_bps", 0.0)):.2f} bps</b><br>
+                Peer: <b>{coin.get("quant_peer_product", "—")}</b> / <b>{coin.get("quant_peer_state", "—")}</b> / z=<b>{_safe_float(coin.get("quant_peer_spread_z", 0.0)):.2f}</b>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     inject_medieval_css()
     if st_autorefresh is not None:
@@ -401,6 +437,7 @@ def main() -> None:
     st.markdown('<div class="panel-card"><div class="section-title">Primary Market Chart</div><div class="muted">This is the main chart the chamber should prioritize for buy and sell judgment.</div></div>', unsafe_allow_html=True)
     st.plotly_chart(build_coin_chart(history, coin, confirmed, target), use_container_width=True)
     render_volume_context_note(coin)
+    render_transcript_strategy_context(coin)
     render_confirmed_trades(confirmed)
     render_targets_panel(coin, target)
     render_coin_analytics(coin)

@@ -1313,6 +1313,13 @@ class Level8Council:
         smt_confidence = float(smt_context.get("confidence", 0.0) or 0.0)
         smt_reason = str(smt_context.get("reason", "no_smt_sell_context"))
 
+        sell_utility_context = dict(context.get("sell_side_expected_utility", {}) or {})
+        hold_utility_bps = float(sell_utility_context.get("hold_utility_bps", 0.0) or 0.0)
+        sell_utility_bps = float(sell_utility_context.get("sell_utility_bps", 0.0) or 0.0)
+        sell_minus_hold_utility_bps = float(sell_utility_context.get("sell_minus_hold_utility_bps", 0.0) or 0.0)
+        sell_utility_reason = str(sell_utility_context.get("reason", "no_sell_utility_context"))
+        sell_utility_fraction = float(sell_utility_context.get("sell_utility_suggested_fraction", 0.0) or 0.0)
+
         min_partial_fraction = float(context.get("min_partial_sell_fraction", 0.25) or 0.25)
         max_partial_fraction = float(context.get("max_partial_sell_fraction", 1.0) or 1.0)
         peak_capture_trigger_bps = float(context.get("peak_capture_trigger_bps", 45.0) or 45.0)
@@ -1414,6 +1421,15 @@ class Level8Council:
                 "confidence": clamp(0.20 + smt_confidence * 0.50, 0.10, 0.75),
                 "reason": f"smt_divergence_exit;{smt_reason}",
             },
+            {
+                "agent": "sell_utility_leader",
+                "buy": 0.0,
+                "sell": clamp(0.45 + sell_minus_hold_utility_bps / 180.0, 0.0, 1.0),
+                "hold": clamp(0.45 + hold_utility_bps / 180.0, 0.0, 1.0),
+                "wait": 0.20,
+                "confidence": clamp(0.35 + abs(sell_minus_hold_utility_bps) / 260.0, 0.20, 0.88),
+                "reason": f"sell_utility_leader;{sell_utility_reason}",
+            },
         ]
 
         truth_vote = {
@@ -1499,6 +1515,12 @@ class Level8Council:
                 fraction -= 0.18
             if continuation_override_by_harvest and net_after_exit_bps >= min_net_after_exit_bps:
                 fraction = max(fraction, 0.35)
+
+            if sell_minus_hold_utility_bps >= 20.0:
+                fraction = max(fraction, 0.35)
+
+            if sell_utility_fraction > 0.0:
+                fraction = max(fraction, sell_utility_fraction)
             if max_hold_elapsed:
                 fraction = max(fraction, 0.50)
             if pullback_from_peak_bps >= strong_pullback_bps and peak_unrealized_bps > min_net_after_exit_bps:
@@ -1522,6 +1544,7 @@ class Level8Council:
             or volume_profile_sell_score >= 0.58
             or fvg_sell_score >= 0.58
             or (smt_sell_score * smt_confidence) >= 0.38
+            or sell_minus_hold_utility_bps >= 20.0
         )
 
         strong_profit_exception = bool(
@@ -1599,6 +1622,9 @@ class Level8Council:
                 f"smt_reason={smt_reason};"
                 f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
                 f"sell_fraction_reason={sell_fraction_reason};"
+                f"sell_utility_hold={hold_utility_bps:.2f};"
+                f"sell_utility_sell={sell_utility_bps:.2f};"
+                f"sell_minus_hold_utility={sell_minus_hold_utility_bps:.2f};"
                 f"hard_stop_hit={hard_stop_hit}"
             ),
         }

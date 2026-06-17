@@ -1503,6 +1503,10 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     payoff_ratio = f("payoff_ratio", 0.0)
     utility_rank_bonus = f("utility_rank_bonus", 0.0)
     uncertainty_penalty_bps = f("uncertainty_penalty_bps", 0.0)
+    wait_utility_bps = f("wait_utility_bps", 0.0)
+    buy_vs_wait_edge_bps = f("buy_vs_wait_edge_bps", 0.0)
+    volatility_size_multiplier = f("volatility_size_multiplier", 1.0)
+    portfolio_rank_bonus = f("portfolio_rank_bonus", 0.0)
 
     price_action_bonus = (
         price_action_buy_score * price_action_confidence * 28.0
@@ -1563,6 +1567,10 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + (calibrated_p_win - 0.50) * 70.0
         + max(-20.0, min(25.0, (payoff_ratio - 1.0) * 22.0))
         - max(0.0, uncertainty_penalty_bps - 55.0) * 0.10
+        + max(-35.0, min(45.0, buy_vs_wait_edge_bps * 0.18))
+        - max(0.0, wait_utility_bps - 12.0) * 0.08
+        + (volatility_size_multiplier - 1.0) * 24.0
+        + portfolio_rank_bonus
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
@@ -10530,6 +10538,175 @@ class TradingBot:
         except Exception:
             return 0.0
 
+    def _apply_portfolio_opportunity_context(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        equity_usd: float,
+        cash_usd: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Rank candidates as a portfolio decision.
+
+        This prevents the bot from spending limited cash on a barely acceptable
+        setup when a materially better candidate exists.
+        """
+        if not bool(ENABLE_PORTFOLIO_OPPORTUNITY_RANKING) or not candidates:
+            return candidates
+
+        try:
+            enriched = []
+            best_utility = max(
+                float(c.get("expected_utility_bps", 0.0) or 0.0)
+                for c in candidates
+            )
+
+            for c in candidates:
+                product_id = str(c.get("product_id", "") or "")
+                utility = float(c.get("expected_utility_bps", 0.0) or 0.0)
+                maker_ev = float(c.get("maker_adjusted_expected_value_bps", 0.0) or 0.0)
+                existing_exposure = self._current_product_exposure_usd(product_id)
+                exposure_pct = existing_exposure / max(float(equity_usd), 1e-9)
+
+                reserve_penalty = 0.0
+                if cash_usd < float(equity_usd) * float(PORTFOLIO_RESERVE_FOR_BETTER_SETUP_PCT):
+                    reserve_penalty += 12.0
+
+                correlated_penalty = 0.0
+                if product_id != "BTC-USD" and self._current_product_exposure_usd("BTC-USD") > 0:
+                    correlated_penalty += float(PORTFOLIO_CORRELATED_SECOND_BUY_PENALTY) * 0.35
+
+                if exposure_pct > 0.25:
+                    correlated_penalty += 15.0
+
+                opportunity_bonus = max(
+                    -45.0,
+                    min(
+                        75.0,
+                        (utility - best_utility) * 0.25
+                        + maker_ev * 0.10
+                        - reserve_penalty
+                        - correlated_penalty,
+                    ),
+                )
+
+                c["portfolio_best_utility_bps"] = float(best_utility)
+                c["portfolio_rank_bonus"] = float(opportunity_bonus)
+                c["portfolio_exposure_pct"] = float(exposure_pct)
+                c["portfolio_reason"] = (
+                    f"portfolio best_utility={best_utility:.2f};utility={utility:.2f};"
+                    f"maker_ev={maker_ev:.2f};exposure_pct={exposure_pct:.3f};"
+                    f"reserve_penalty={reserve_penalty:.2f};correlated_penalty={correlated_penalty:.2f};"
+                    f"bonus={opportunity_bonus:.2f}"
+                )
+                enriched.append(c)
+
+            enriched.sort(key=candidate_rank_score, reverse=True)
+            return enriched[:max(1, int(PORTFOLIO_TOP_N_LIVE_BUY_CANDIDATES))]
+
+        except Exception as exc:
+            log(f"[portfolio-ranking] failed: {exc}")
+            return candidates
+
+    def _adaptive_guardrail_adjustments(self) -> Dict[str, Any]:
+        """
+        Slow adaptive guardrails based on decision audits and sell outcomes.
+
+        This adjusts thresholds gently. It does not rewrite strategy logic.
+        """
+        if not bool(ENABLE_ADAPTIVE_GUARDRAILS):
+            return {
+                "utility_adjust_bps": 0.0,
+                "truth_adjust": 0.0,
+                "margin_adjust": 0.0,
+                "reason": "adaptive_guardrails_disabled",
+            }
+
+        try:
+            reviewed_count = 0
+            live_good = 0
+            live_bad = 0
+            missed_good = 0
+
+            if os.path.exists(DECISION_AUDIT_CSV_PATH) and os.path.getsize(DECISION_AUDIT_CSV_PATH) > 0:
+                frame = pd.read_csv(DECISION_AUDIT_CSV_PATH).tail(int(ADAPTIVE_GUARDRAIL_LOOKBACK_ROWS))
+                reviews = frame[frame.get("event_type", "").astype(str) == "review"]
+                reviewed_count = len(reviews)
+
+                for _, r in reviews.iterrows():
+                    grade = str(r.get("decision_grade", ""))
+                    action = str(r.get("original_action", ""))
+
+                    if action == "ALLOW_BUY" and grade == "GOOD_BUY":
+                        live_good += 1
+                    if action == "ALLOW_BUY" and "BAD_BUY" in grade:
+                        live_bad += 1
+                    if action in {"WAIT", "SHADOW"} and "MISSED" in grade:
+                        missed_good += 1
+
+            if reviewed_count < int(ADAPTIVE_MIN_REVIEWED_DECISIONS):
+                return {
+                    "utility_adjust_bps": 0.0,
+                    "truth_adjust": 0.0,
+                    "margin_adjust": 0.0,
+                    "reason": f"adaptive_waiting_for_reviews;n={reviewed_count}",
+                }
+
+            live_total = max(1, live_good + live_bad)
+            live_win_rate = live_good / live_total
+
+            utility_adjust = 0.0
+            truth_adjust = 0.0
+            margin_adjust = 0.0
+
+            if live_win_rate <= float(ADAPTIVE_BAD_LIVE_WIN_RATE):
+                utility_adjust += float(ADAPTIVE_MAX_UTILITY_ADJUST_BPS) * 0.75
+                truth_adjust += float(ADAPTIVE_MAX_TRUTH_ADJUST) * 0.75
+                margin_adjust += float(ADAPTIVE_MAX_MARGIN_ADJUST) * 0.75
+
+            elif live_win_rate >= float(ADAPTIVE_GOOD_LIVE_WIN_RATE) and missed_good > live_bad:
+                utility_adjust -= float(ADAPTIVE_MAX_UTILITY_ADJUST_BPS) * 0.35
+                truth_adjust -= float(ADAPTIVE_MAX_TRUTH_ADJUST) * 0.25
+                margin_adjust -= float(ADAPTIVE_MAX_MARGIN_ADJUST) * 0.25
+
+            utility_adjust = clamp_float(utility_adjust, -float(ADAPTIVE_MAX_UTILITY_ADJUST_BPS), float(ADAPTIVE_MAX_UTILITY_ADJUST_BPS))
+            truth_adjust = clamp_float(truth_adjust, -float(ADAPTIVE_MAX_TRUTH_ADJUST), float(ADAPTIVE_MAX_TRUTH_ADJUST))
+            margin_adjust = clamp_float(margin_adjust, -float(ADAPTIVE_MAX_MARGIN_ADJUST), float(ADAPTIVE_MAX_MARGIN_ADJUST))
+
+            reason = (
+                f"adaptive reviewed={reviewed_count};live_good={live_good};"
+                f"live_bad={live_bad};missed_good={missed_good};"
+                f"live_win_rate={live_win_rate:.3f};"
+                f"utility_adjust={utility_adjust:.2f};"
+                f"truth_adjust={truth_adjust:.3f};margin_adjust={margin_adjust:.3f}"
+            )
+
+            now_value = now_ts()
+            if now_value - float(getattr(self, "last_adaptive_guardrail_write_ts", 0.0)) >= 300.0:
+                self.last_adaptive_guardrail_write_ts = now_value
+                self._append_csv_dict_row(
+                    path=ADAPTIVE_GUARDRAILS_CSV_PATH,
+                    columns=["ts", "dt_mst", "reviewed_count", "live_good", "live_bad", "missed_good", "live_win_rate", "utility_adjust_bps", "truth_adjust", "margin_adjust", "reason"],
+                    row={
+                        "ts": f"{now_value:.6f}",
+                        "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"),
+                        "reviewed_count": reviewed_count,
+                        "live_good": live_good,
+                        "live_bad": live_bad,
+                        "missed_good": missed_good,
+                        "live_win_rate": f"{live_win_rate:.6f}",
+                        "utility_adjust_bps": f"{utility_adjust:.6f}",
+                        "truth_adjust": f"{truth_adjust:.6f}",
+                        "margin_adjust": f"{margin_adjust:.6f}",
+                        "reason": reason,
+                    },
+                )
+
+            return {"utility_adjust_bps": float(utility_adjust), "truth_adjust": float(truth_adjust), "margin_adjust": float(margin_adjust), "reason": reason}
+
+        except Exception as exc:
+            return {"utility_adjust_bps": 0.0, "truth_adjust": 0.0, "margin_adjust": 0.0, "reason": f"adaptive_guardrail_error:{exc}"}
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -10600,6 +10777,31 @@ class TradingBot:
             expected_utility_bps = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
             maker_adjusted_ev_bps = float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0)
             maker_fill_probability = float(candidate.get("maker_fill_probability", 0.0) or 0.0)
+            wait_utility_bps = float(candidate.get("wait_utility_bps", 0.0) or 0.0)
+            buy_vs_wait_edge_bps = float(candidate.get("buy_vs_wait_edge_bps", 0.0) or 0.0)
+
+            regime_adj = self._regime_specific_adjustments(candidate)
+            adaptive_adj = self._adaptive_guardrail_adjustments()
+
+            regime_utility_adjust_bps = float(regime_adj.get("regime_utility_adjust_bps", 0.0) or 0.0)
+            adaptive_utility_adjust_bps = float(adaptive_adj.get("utility_adjust_bps", 0.0) or 0.0)
+
+            effective_min_utility_bps = (
+                float(UTILITY_MIN_EXPECTED_BPS_FOR_LIVE_BUY)
+                + regime_utility_adjust_bps
+                + adaptive_utility_adjust_bps
+            )
+            effective_min_truth = (
+                float(LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY)
+                + float(regime_adj.get("regime_truth_adjust", 0.0) or 0.0)
+                + float(adaptive_adj.get("truth_adjust", 0.0) or 0.0)
+            )
+            effective_min_margin = (
+                float(LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY)
+                + float(regime_adj.get("regime_margin_adjust", 0.0) or 0.0)
+                + float(adaptive_adj.get("margin_adjust", 0.0) or 0.0)
+            )
+
             setup_tag_text = str(
                 candidate.get("setup_tag", "")
                 or candidate.get("setup", "")
@@ -10645,12 +10847,23 @@ class TradingBot:
                         f"expected_utility={expected_utility_bps:.2f};"
                     )
 
-                if expected_utility_bps < float(UTILITY_MIN_EXPECTED_BPS_FOR_LIVE_BUY):
+                if expected_utility_bps < float(effective_min_utility_bps):
                     return False, (
                         f"live_buy_shadowed:expected_utility_too_low "
                         f"expected_utility={expected_utility_bps:.2f};"
-                        f"min={float(UTILITY_MIN_EXPECTED_BPS_FOR_LIVE_BUY):.2f};"
+                        f"min={float(effective_min_utility_bps):.2f};"
                         f"maker_adjusted_ev={maker_adjusted_ev_bps:.2f};"
+                        f"regime={regime_adj.get('reason', '')};"
+                        f"adaptive={adaptive_adj.get('reason', '')};"
+                    )
+
+                if bool(ENABLE_WAIT_UTILITY_SCORING) and buy_vs_wait_edge_bps < float(BUY_MUST_BEAT_WAIT_BY_BPS):
+                    return False, (
+                        f"live_buy_shadowed:buy_does_not_beat_wait_enough "
+                        f"buy_vs_wait_edge={buy_vs_wait_edge_bps:.2f};"
+                        f"min={float(BUY_MUST_BEAT_WAIT_BY_BPS):.2f};"
+                        f"wait_utility={wait_utility_bps:.2f};"
+                        f"expected_utility={expected_utility_bps:.2f};"
                     )
 
                 if maker_adjusted_ev_bps < float(UTILITY_MIN_MAKER_ADJUSTED_BPS_FOR_LIVE_BUY):
@@ -10669,21 +10882,21 @@ class TradingBot:
                         f"expected_utility={expected_utility_bps:.2f};"
                     )
 
-            if margin < float(LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY):
+            if margin < float(effective_min_margin):
                 return False, (
                     f"live_buy_shadowed:council_margin_too_small "
                     f"margin={margin:.3f};"
-                    f"min={float(LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY):.3f};"
+                    f"min={float(effective_min_margin):.3f};"
                     f"final={final_buy:.3f};"
                     f"threshold={threshold:.3f};"
                     f"{backtest_reason}"
                 )
 
-            if truth < float(LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY):
+            if truth < float(effective_min_truth):
                 return False, (
                     f"live_buy_shadowed:council_truth_too_low "
                     f"truth={truth:.3f};"
-                    f"min={float(LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY):.3f};"
+                    f"min={float(effective_min_truth):.3f};"
                     f"{backtest_reason}"
                 )
 
@@ -10757,6 +10970,10 @@ class TradingBot:
                 f"expected_utility={expected_utility_bps:.2f};"
                 f"maker_adjusted_ev={maker_adjusted_ev_bps:.2f};"
                 f"maker_fill_probability={maker_fill_probability:.3f};"
+                f"wait_utility={wait_utility_bps:.2f};"
+                f"buy_vs_wait_edge={buy_vs_wait_edge_bps:.2f};"
+                f"regime_adjust={regime_utility_adjust_bps:.2f};"
+                f"adaptive_adjust={adaptive_utility_adjust_bps:.2f};"
                 f"{backtest_reason}"
             )
 
@@ -11124,6 +11341,11 @@ class TradingBot:
                 "maker_adjusted_expected_value_bps": float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0),
                 "expected_utility_bps": float(candidate.get("expected_utility_bps", 0.0) or 0.0),
                 "utility_size_multiplier": float(candidate.get("utility_size_multiplier", 1.0) or 1.0),
+                "wait_utility_bps": float(candidate.get("wait_utility_bps", 0.0) or 0.0),
+                "buy_vs_wait_edge_bps": float(candidate.get("buy_vs_wait_edge_bps", 0.0) or 0.0),
+                "realized_volatility_bps_30m": float(candidate.get("realized_volatility_bps_30m", 0.0) or 0.0),
+                "volatility_size_multiplier": float(candidate.get("volatility_size_multiplier", 1.0) or 1.0),
+                "portfolio_rank_bonus": float(candidate.get("portfolio_rank_bonus", 0.0) or 0.0),
                 "utility_decision_reason": str(candidate.get("utility_decision_reason", "")),
             }
             base_reason = str(decision.get("sizing_reason", decision.get("reason", "")))
@@ -11140,7 +11362,8 @@ class TradingBot:
                 f"price_action_reason={price_context.get('reason', '')};"
                 f"smt_reason={dict(context.get('smt_divergence', {}) or {}).get('reason', '')};"
                 f"setup_performance={candidate.get('backtest_setup_reason', '')};"
-                f"utility_leader={candidate.get('utility_decision_reason', '')}"
+                f"utility_leader={candidate.get('utility_decision_reason', '')};"
+                f"portfolio={candidate.get('portfolio_reason', '')}"
             )
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")
@@ -11496,6 +11719,10 @@ class TradingBot:
         maker_fill_probability: float = 0.0,
         maker_adjusted_expected_value_bps: float = 0.0,
         expected_utility_bps: float = 0.0,
+        wait_utility_bps: float = 0.0,
+        buy_vs_wait_edge_bps: float = 0.0,
+        realized_volatility_bps_30m: float = 0.0,
+        volatility_size_multiplier: float = 1.0,
     ) -> None:
         """
         Write a normalized Level 8 decision row for live and heartbeat decisions.
@@ -11527,6 +11754,10 @@ class TradingBot:
                 "maker_fill_probability",
                 "maker_adjusted_expected_value_bps",
                 "expected_utility_bps",
+                "wait_utility_bps",
+                "buy_vs_wait_edge_bps",
+                "realized_volatility_bps_30m",
+                "volatility_size_multiplier",
                 "reason",
             ]
             write_header = not os.path.exists(
@@ -11593,6 +11824,10 @@ class TradingBot:
                     f"{float(maker_fill_probability):.6f}",
                     f"{float(maker_adjusted_expected_value_bps):.6f}",
                     f"{float(expected_utility_bps):.6f}",
+                    f"{float(wait_utility_bps):.6f}",
+                    f"{float(buy_vs_wait_edge_bps):.6f}",
+                    f"{float(realized_volatility_bps_30m):.6f}",
+                    f"{float(volatility_size_multiplier):.6f}",
                     reason,
                 ])
         except Exception as exc:
@@ -11841,6 +12076,92 @@ class TradingBot:
             "green_candles": int(green_count),
         }
 
+    def _sell_side_expected_utility_context(
+        self,
+        *,
+        product_id: str,
+        hold_state: Dict[str, Any],
+        current_price: float,
+        spread_bps: float,
+        cost_bps: float,
+    ) -> Dict[str, Any]:
+        """
+        Estimate whether holding has more expected value than selling now.
+
+        This is passed to the sell council as another weighted context.
+        """
+        if not bool(ENABLE_SELL_SIDE_EXPECTED_UTILITY):
+            return {
+                "sell_utility_enabled": False,
+                "hold_utility_bps": 0.0,
+                "sell_utility_bps": 0.0,
+                "sell_minus_hold_utility_bps": 0.0,
+                "reason": "sell_side_utility_disabled",
+            }
+
+        try:
+            net_after_exit_bps = float(hold_state.get("net_after_exit_bps", 0.0) or 0.0)
+            peak_unrealized_bps = float(hold_state.get("peak_unrealized_bps", 0.0) or 0.0)
+            pullback_from_peak_bps = float(hold_state.get("pullback_from_peak_bps", 0.0) or 0.0)
+            mom3 = float(hold_state.get("momentum_3_bps", 0.0) or 0.0)
+            mom5 = float(hold_state.get("momentum_5_bps", 0.0) or 0.0)
+
+            pa = self._price_action_context_for_product(
+                product_id=product_id,
+                current_price=float(current_price),
+                spread_bps=float(spread_bps),
+                cost_bps=float(cost_bps),
+                projected_forward_gain_bps=0.0,
+            )
+
+            continuation = float(pa.get("candle_continuation_score", 0.0) or 0.0)
+            exhaustion = float(pa.get("candle_exhaustion_score", 0.0) or 0.0)
+            value_sell = float(pa.get("volume_profile_sell_score", 0.0) or 0.0)
+            fvg_sell = float(pa.get("fvg_sell_score", 0.0) or 0.0)
+
+            additional_upside_bps = max(0.0, mom3 * 0.45 + mom5 * 0.25 + continuation * 80.0)
+            giveback_risk_bps = (
+                pullback_from_peak_bps * 0.45
+                + exhaustion * 90.0
+                + value_sell * 55.0
+                + fvg_sell * 45.0
+            )
+
+            hold_utility_bps = additional_upside_bps - giveback_risk_bps
+            sell_utility_bps = net_after_exit_bps - max(0.0, additional_upside_bps * 0.25)
+
+            sell_minus_hold = sell_utility_bps - hold_utility_bps
+
+            return {
+                "sell_utility_enabled": True,
+                "hold_utility_bps": float(hold_utility_bps),
+                "sell_utility_bps": float(sell_utility_bps),
+                "sell_minus_hold_utility_bps": float(sell_minus_hold),
+                "additional_upside_bps": float(additional_upside_bps),
+                "giveback_risk_bps": float(giveback_risk_bps),
+                "sell_utility_suggested_fraction": (
+                    1.0 if sell_minus_hold <= float(SELL_UTILITY_FULL_EXIT_DISADVANTAGE_BPS)
+                    else 0.50 if sell_minus_hold >= float(SELL_UTILITY_PARTIAL_ZONE_BPS)
+                    else 0.0
+                ),
+                "reason": (
+                    f"sell_utility hold={hold_utility_bps:.2f};sell={sell_utility_bps:.2f};"
+                    f"sell_minus_hold={sell_minus_hold:.2f};add_upside={additional_upside_bps:.2f};"
+                    f"giveback_risk={giveback_risk_bps:.2f};continuation={continuation:.3f};"
+                    f"exhaustion={exhaustion:.3f};peak={peak_unrealized_bps:.2f};"
+                    f"pullback={pullback_from_peak_bps:.2f}"
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "sell_utility_enabled": True,
+                "hold_utility_bps": 0.0,
+                "sell_utility_bps": 0.0,
+                "sell_minus_hold_utility_bps": 0.0,
+                "reason": f"sell_utility_error:{exc}",
+            }
+
     def _level8_should_hold_or_exit(
         self,
         *,
@@ -11960,6 +12281,13 @@ class TradingBot:
                     projected_forward_gain_bps=0.0,
                 ),
                 "smt_divergence": self._smt_divergence_context_for_product(product_id=product_id),
+                "sell_side_expected_utility": self._sell_side_expected_utility_context(
+                    product_id=product_id,
+                    hold_state=hold_state,
+                    current_price=float(current_price),
+                    spread_bps=float(spread_bps),
+                    cost_bps=float(cost_bps),
+                ),
             }
 
             if hasattr(self.level8_council, "decide_exit"):
@@ -16498,6 +16826,11 @@ class TradingBot:
                     "expected_utility_bps": 0.0,
                     "utility_size_multiplier": 1.0,
                     "utility_decision_reason": "",
+                    "wait_utility_bps": 0.0,
+                    "buy_vs_wait_edge_bps": 0.0,
+                    "realized_volatility_bps_30m": 0.0,
+                    "volatility_size_multiplier": 1.0,
+                    "portfolio_rank_bonus": 0.0,
                     "signal": live_signal,
                     "entry_timing_ok": False,
                     "entry_timing_reason": "heartbeat_market_watch",
@@ -16681,6 +17014,10 @@ class TradingBot:
                             maker_fill_probability=float(level8_info.get("maker_fill_probability", 0.0) or 0.0),
                             maker_adjusted_expected_value_bps=float(level8_info.get("maker_adjusted_expected_value_bps", 0.0) or 0.0),
                             expected_utility_bps=float(level8_info.get("expected_utility_bps", 0.0) or 0.0),
+                            wait_utility_bps=float(level8_info.get("wait_utility_bps", 0.0) or 0.0),
+                            buy_vs_wait_edge_bps=float(level8_info.get("buy_vs_wait_edge_bps", 0.0) or 0.0),
+                            realized_volatility_bps_30m=float(level8_info.get("realized_volatility_bps_30m", 0.0) or 0.0),
+                            volatility_size_multiplier=float(level8_info.get("volatility_size_multiplier", 1.0) or 1.0),
                         )
 
                         try:
@@ -16722,6 +17059,12 @@ class TradingBot:
                         continue
 
                 candidates = level8_filtered_candidates
+
+                candidates = self._apply_portfolio_opportunity_context(
+                    candidates,
+                    equity_usd=float(equity_usd),
+                    cash_usd=float(cash_usd),
+                )
 
                 candidates.sort(key=candidate_rank_score, reverse=True)
                 for c in candidates:

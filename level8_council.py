@@ -37,7 +37,9 @@ INITIAL_AGENT_RELIABILITY_PRIORS = {
     "validated_liquidity_agent": 1.12,
     "candle_context_agent": 1.10,
     "candle_sequence_agent": 1.08,
-    "volume_profile_agent": 1.04,
+    "volume_profile_agent": 1.12,
+    "volume_profile_leader": 1.35,
+    "volume_profile_leader_exit": 1.28,
     "fair_value_gap_agent": 1.02,
     "fresh_zone_retest_agent": 1.02,
     "trend": 1.00,
@@ -1303,6 +1305,11 @@ class Level8Council:
         candle_continuation_score = float(price_action_context.get("candle_continuation_score", 0.0) or 0.0)
         volume_profile_sell_score = float(price_action_context.get("volume_profile_sell_score", 0.0) or 0.0)
         volume_profile_hold_score = float(price_action_context.get("volume_profile_hold_score", 0.50) or 0.50)
+        volume_profile_leader_sell_score = float(price_action_context.get("volume_profile_leader_sell_score", volume_profile_sell_score) or volume_profile_sell_score)
+        volume_profile_leader_hold_score = float(price_action_context.get("volume_profile_leader_hold_score", volume_profile_hold_score) or volume_profile_hold_score)
+        volume_profile_leader_wait_score = float(price_action_context.get("volume_profile_leader_wait_score", 0.50) or 0.50)
+        value_acceptance_state = str(price_action_context.get("value_acceptance_state", ""))
+        volume_node_state = str(price_action_context.get("volume_node_state", ""))
         fvg_sell_score = float(price_action_context.get("fvg_sell_score", 0.0) or 0.0)
         value_area_state = str(price_action_context.get("value_area_state", ""))
         fvg_state = str(price_action_context.get("fvg_state", ""))
@@ -1344,7 +1351,8 @@ class Level8Council:
         price_action_harvest_pressure = clamp(
             candle_exhaustion_score * 0.35
             + pa_sell_score * pa_confidence * 0.25
-            + volume_profile_sell_score * 0.18
+            + volume_profile_sell_score * 0.08
+            + volume_profile_leader_sell_score * 0.24
             + fvg_sell_score * 0.12
             + smt_sell_score * smt_confidence * 0.10,
             0.0,
@@ -1404,6 +1412,23 @@ class Level8Council:
                 "reason": f"volume_profile_harvest;value_area_state={value_area_state};{pa_reason}",
             },
             {
+                "agent": "volume_profile_leader_exit",
+                "buy": 0.0,
+                "sell": clamp(volume_profile_leader_sell_score, 0.0, 1.0),
+                "hold": clamp(volume_profile_leader_hold_score, 0.0, 1.0),
+                "wait": clamp(volume_profile_leader_wait_score, 0.0, 1.0),
+                "confidence": 0.78,
+                "reason": (
+                    f"volume_profile_leader_exit;"
+                    f"value_acceptance_state={value_acceptance_state};"
+                    f"volume_node_state={volume_node_state};"
+                    f"sell={volume_profile_leader_sell_score:.3f};"
+                    f"hold={volume_profile_leader_hold_score:.3f};"
+                    f"wait={volume_profile_leader_wait_score:.3f};"
+                    f"{pa_reason}"
+                ),
+            },
+            {
                 "agent": "fvg_reclaim_rejection_exit",
                 "buy": 0.0,
                 "sell": clamp(fvg_sell_score, 0.0, 1.0),
@@ -1450,7 +1475,8 @@ class Level8Council:
             "hold": clamp(
                 continuation_hold * 0.70
                 + candle_continuation_score * pa_confidence * 0.18
-                + volume_profile_hold_score * 0.12,
+                + volume_profile_hold_score * 0.06
+                + volume_profile_leader_hold_score * 0.18,
                 0.0,
                 1.0,
             ),
@@ -1481,6 +1507,7 @@ class Level8Council:
             price_action_harvest_pressure >= 0.68
             or candle_exhaustion_score >= 0.72
             or volume_profile_sell_score >= 0.72
+            or volume_profile_leader_sell_score >= 0.66
             or fvg_sell_score >= 0.70
             or (session_sell_score * session_confidence) >= 0.55
             or (smt_sell_score * smt_confidence) >= 0.55
@@ -1542,6 +1569,8 @@ class Level8Council:
             or candle_exhaustion_score >= 0.58
             or price_action_harvest_pressure >= 0.55
             or volume_profile_sell_score >= 0.58
+            or volume_profile_leader_sell_score >= 0.58
+            or value_acceptance_state in {"rejected_above_value", "accepted_below_value"}
             or fvg_sell_score >= 0.58
             or (smt_sell_score * smt_confidence) >= 0.38
             or sell_minus_hold_utility_bps >= 20.0
@@ -1618,6 +1647,10 @@ class Level8Council:
                 f"candle_continuation_score={candle_continuation_score:.3f};"
                 f"price_action_harvest_pressure={price_action_harvest_pressure:.3f};"
                 f"value_area_state={value_area_state};"
+                f"value_acceptance_state={value_acceptance_state};"
+                f"volume_node_state={volume_node_state};"
+                f"volume_profile_leader_sell={volume_profile_leader_sell_score:.3f};"
+                f"volume_profile_leader_hold={volume_profile_leader_hold_score:.3f};"
                 f"fvg_state={fvg_state};"
                 f"smt_reason={smt_reason};"
                 f"recommended_sell_fraction={recommended_sell_fraction:.3f};"

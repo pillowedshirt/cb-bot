@@ -1267,7 +1267,7 @@ ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE: float = 0.72
 SPREAD_INSTABILITY_WINDOW: int = 12
 SPREAD_INSTABILITY_BLOCK_BPS: float = 18.0
 ENABLE_STALE_DATA_LIVE_BUY_GATE: bool = True
-MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC: float = 9.0
+MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC: float = 15.0
 MAX_VIEWER_SNAPSHOT_AGE_WARN_SEC: float = 12.0
 
 # Post-buy outcome research windows.
@@ -11288,7 +11288,7 @@ class TradingBot:
                     f"market_data_age_missing:{product_id}",
                     30.0,
                     "market_data_age_missing",
-                    data={"product_id": product_id, "reason": "no_tob_ts"},
+                    data={"product_id": product_id, "reason": "no_tob_ts", "max_allowed_sec": float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC), "tob_present": tob_obj is not None, "source": "self.tob"},
                     level="WARN",
                     also_overall=True,
                 )
@@ -11299,7 +11299,7 @@ class TradingBot:
                 f"market_data_age:{product_id}",
                 60.0,
                 "market_data_age_checked",
-                data={"product_id": product_id, "age_sec": age, "last_ts": last_ts},
+                data={"product_id": product_id, "age_sec": age, "max_allowed_sec": float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC), "tob_present": tob_obj is not None, "bid": float(getattr(tob_obj, "bid", 0.0) or 0.0) if tob_obj is not None else 0.0, "ask": float(getattr(tob_obj, "ask", 0.0) or 0.0) if tob_obj is not None else 0.0, "spread_bps": float(getattr(tob_obj, "spread_bps", 0.0) or 0.0) if tob_obj is not None else 0.0, "last_ts": last_ts, "source": "self.tob"},
                 level="DEBUG",
                 also_overall=False,
             )
@@ -13917,6 +13917,9 @@ class TradingBot:
 
     def _live_readiness_status(self) -> Dict[str, Any]:
         status = {"viewer_snapshot_recent": False, "websocket_recent": False, "market_csv_recent": False, "council_recent": False, "no_duplicate_process": True, "fee_tier_ready": False, "risk_pause_active": False, "drawdown_brake_active": False, "open_positions_count": 0, "learning_files_writable": False, "sqlite_writable": False, "safe_to_run_overnight": False}
+        maker_fee_bps = getattr(self, "current_maker_fee_bps", None)
+        taker_fee_bps = getattr(self, "current_taker_fee_bps", None)
+        status.update({"fee_tier_ready": maker_fee_bps is not None and taker_fee_bps is not None, "maker_fee_bps": maker_fee_bps, "taker_fee_bps": taker_fee_bps, "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""), "high_fee_tier_active": bool((maker_fee_bps is not None and float(maker_fee_bps) >= 50.0) or (taker_fee_bps is not None and float(taker_fee_bps) >= 100.0)), "live_trading_strict_reason": "High Coinbase fees require fewer, higher-edge maker-first trades."})
         try:
             status["viewer_snapshot_recent"] = os.path.exists(VIEWER_SNAPSHOT_JSON) and now_ts() - os.path.getmtime(VIEWER_SNAPSHOT_JSON) <= 10
             status["market_csv_recent"] = os.path.exists(MARKET_CSV_PATH) and now_ts() - os.path.getmtime(MARKET_CSV_PATH) <= 30
@@ -15987,6 +15990,7 @@ class TradingBot:
     async def run(self) -> None:
         """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
         log("[run] TradingBot.run() started")
+        self._write_startup_viewer_snapshot("bot_started_waiting_for_history_and_first_eval")
         log(f"[run] mode=LIVE_ONLY products={PRODUCTS}")
         self.active_products_log.write_products(PRODUCTS)
         log(f"[startup] active products written: {PRODUCTS}")
@@ -18675,6 +18679,35 @@ class TradingBot:
                 also_overall=True,
             )
 
+
+    def _write_startup_viewer_snapshot(self, reason: str = "bot_starting") -> None:
+        snapshot = {
+            "updated_ts": time.time(),
+            "coins": {},
+            "top_products": [],
+            "live_positions": [],
+            "readiness": {
+                "startup_state": reason,
+                "viewer_snapshot_recent": True,
+                "fee_tier_ready": getattr(self, "current_maker_fee_bps", None) is not None and getattr(self, "current_taker_fee_bps", None) is not None,
+                "maker_fee_bps": getattr(self, "current_maker_fee_bps", None),
+                "taker_fee_bps": getattr(self, "current_taker_fee_bps", None),
+                "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""),
+                "high_fee_tier_active": bool((getattr(self, "current_maker_fee_bps", None) is not None and float(getattr(self, "current_maker_fee_bps", 0.0)) >= 50.0) or (getattr(self, "current_taker_fee_bps", None) is not None and float(getattr(self, "current_taker_fee_bps", 0.0)) >= 100.0)),
+                "live_trading_strict_reason": "High Coinbase fees require fewer, higher-edge maker-first trades.",
+            },
+        }
+        self._write_viewer_snapshot(snapshot)
+
+    def _log_hot_loop_timing(self, section: str, elapsed_sec: float) -> None:
+        if elapsed_sec >= 1.0:
+            module_debug(
+                MODULE_NAME,
+                "eval_loop_section_slow",
+                data={"section": section, "elapsed_sec": round(float(elapsed_sec), 4)},
+                level="WARN" if elapsed_sec >= 3.0 else "INFO",
+                also_overall=elapsed_sec >= 3.0,
+            )
     def _refresh_viewer_snapshot_from_candidates(self, candidates: List[Dict[str, Any]]) -> None:
         try:
             coins: Dict[str, Dict[str, Any]] = {}
@@ -18710,17 +18743,18 @@ class TradingBot:
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
+            self._last_eval_loop_section_timings = {}
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
-                self._review_level8_missed_opportunities()
-            self._review_maker_miss_outcomes()
-            self._review_sell_quality()
+                _t = time.perf_counter(); self._review_level8_missed_opportunities(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["missed_opportunity_review"] = round(_e, 4); self._log_hot_loop_timing("missed_opportunity_review", _e)
+            _t = time.perf_counter(); self._review_maker_miss_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["maker_miss_review"] = round(_e, 4); self._log_hot_loop_timing("maker_miss_review", _e)
+            _t = time.perf_counter(); self._review_sell_quality(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_quality_review"] = round(_e, 4); self._log_hot_loop_timing("sell_quality_review", _e)
             if (
                 bool(ENABLE_DECISION_AUDIT_REPLAY)
                 and ts_now - float(getattr(self, "last_decision_audit_review_ts", 0.0))
                 >= float(DECISION_AUDIT_REVIEW_EVERY_SEC)
             ):
                 self.last_decision_audit_review_ts = ts_now
-                self._review_decision_audits()
+                _t = time.perf_counter(); self._review_decision_audits(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["decision_audit_review"] = round(_e, 4); self._log_hot_loop_timing("decision_audit_review", _e)
             if (
                 ENABLE_LEVEL8_COUNCIL
                 and ts_now - float(self.last_agent_performance_update_ts)
@@ -18728,15 +18762,15 @@ class TradingBot:
             ):
                 self.last_agent_performance_update_ts = ts_now
 
-                self._maybe_reload_backtest_background()
+                _t = time.perf_counter(); self._maybe_reload_backtest_background(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["backtest_reload_scheduling"] = round(_e, 4); self._log_hot_loop_timing("backtest_reload_scheduling", _e)
 
                 try:
-                    self._classify_level8_sell_outcomes()
+                    _t = time.perf_counter(); self._classify_level8_sell_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_outcome_classification"] = round(_e, 4); self._log_hot_loop_timing("sell_outcome_classification", _e)
                 except Exception as exc:
                     log_exception("level8 sell outcome classification failed", exc)
 
                 try:
-                    self._append_agent_performance_from_outcomes()
+                    _t = time.perf_counter(); self._append_agent_performance_from_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["agent_performance_update"] = round(_e, 4); self._log_hot_loop_timing("agent_performance_update", _e)
                 except Exception as exc:
                     log_exception("level8 agent performance update failed", exc)
 
@@ -18745,7 +18779,7 @@ class TradingBot:
                         self.level8_council._clear_level8_memory_cache()
                 except Exception:
                     pass
-            self._maybe_train_ai_brain_background()
+            _t = time.perf_counter(); self._maybe_train_ai_brain_background(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["ai_training_scheduling"] = round(_e, 4); self._log_hot_loop_timing("ai_training_scheduling", _e)
             loop_gap = ts_now - float(self.last_loop_lag_check_ts or ts_now)
             if loop_gap > EVENT_LOOP_LAG_WARN_SEC:
                 startup_age = ts_now - float(getattr(self, "bot_start_ts", ts_now) or ts_now)
@@ -18758,7 +18792,7 @@ class TradingBot:
                     f"[lag] eval_loop gap={loop_gap:.2f}s; severity={severity}; "
                     f"startup_age={startup_age:.1f}s; "
                     f"live_recalibration_running={bool(getattr(self, 'live_recalibration_running', False))}; "
-                    f"possible_blocking_work=True"
+                    f"possible_blocking_work=True; section_timings={getattr(self, '_last_eval_loop_section_timings', {})}; ai_training_running={bool(getattr(self, 'ai_training_running', False))}; backtest_reload_running={bool(getattr(self, 'backtest_reload_running', False))}; macro_refresh_running={bool(getattr(self, 'macro_refresh_running', False))}; pending_buy_reconciliations={len(getattr(self, 'pending_buy_reconciliations', {}) or {})}"
                 )
             self.last_loop_lag_check_ts = ts_now
 

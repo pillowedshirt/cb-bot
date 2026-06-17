@@ -1327,6 +1327,13 @@ class Level8Council:
         sell_utility_reason = str(sell_utility_context.get("reason", "no_sell_utility_context"))
         sell_utility_fraction = float(sell_utility_context.get("sell_utility_suggested_fraction", 0.0) or 0.0)
 
+        spike_context = dict(context.get("spike_profit_protection", {}) or {})
+        spike_armed = bool(spike_context.get("armed", False))
+        spike_allow_partial = bool(spike_context.get("allow_partial", False))
+        spike_immediate_partial = bool(spike_context.get("allow_immediate_partial", False))
+        spike_suggested_fraction = float(spike_context.get("suggested_fraction", 0.0) or 0.0)
+        spike_reason = str(spike_context.get("reason", "no_spike_profit_protection"))
+
         min_partial_fraction = float(context.get("min_partial_sell_fraction", 0.25) or 0.25)
         max_partial_fraction = float(context.get("max_partial_sell_fraction", 1.0) or 1.0)
         peak_capture_trigger_bps = float(context.get("peak_capture_trigger_bps", 45.0) or 45.0)
@@ -1455,6 +1462,34 @@ class Level8Council:
                 "confidence": clamp(0.35 + abs(sell_minus_hold_utility_bps) / 260.0, 0.20, 0.88),
                 "reason": f"sell_utility_leader;{sell_utility_reason}",
             },
+            {
+                "agent": "spike_profit_protection",
+                "buy": 0.0,
+                "sell": clamp(
+                    0.20
+                    + (0.46 if spike_armed else 0.0)
+                    + (0.28 if spike_allow_partial else 0.0)
+                    + (0.18 if spike_immediate_partial else 0.0),
+                    0.0,
+                    1.0,
+                ),
+                "hold": clamp(
+                    0.55
+                    - (0.25 if spike_allow_partial else 0.0)
+                    - (0.18 if spike_immediate_partial else 0.0),
+                    0.0,
+                    1.0,
+                ),
+                "wait": 0.20,
+                "confidence": clamp(
+                    0.30
+                    + (0.28 if spike_armed else 0.0)
+                    + (0.22 if spike_allow_partial else 0.0),
+                    0.15,
+                    0.88,
+                ),
+                "reason": f"spike_profit_protection_vote;{spike_reason}",
+            },
         ]
 
         truth_vote = {
@@ -1511,6 +1546,8 @@ class Level8Council:
             or fvg_sell_score >= 0.70
             or (session_sell_score * session_confidence) >= 0.55
             or (smt_sell_score * smt_confidence) >= 0.55
+            or spike_allow_partial
+            or spike_immediate_partial
         )
 
         strong_continuation = bool(
@@ -1548,6 +1585,8 @@ class Level8Council:
 
             if sell_utility_fraction > 0.0:
                 fraction = max(fraction, sell_utility_fraction)
+            if spike_allow_partial and spike_suggested_fraction > 0.0:
+                fraction = max(fraction, spike_suggested_fraction)
             if max_hold_elapsed:
                 fraction = max(fraction, 0.50)
             if pullback_from_peak_bps >= strong_pullback_bps and peak_unrealized_bps > min_net_after_exit_bps:
@@ -1574,6 +1613,8 @@ class Level8Council:
             or fvg_sell_score >= 0.58
             or (smt_sell_score * smt_confidence) >= 0.38
             or sell_minus_hold_utility_bps >= 20.0
+            or spike_allow_partial
+            or spike_immediate_partial
         )
 
         strong_profit_exception = bool(
@@ -1658,6 +1699,11 @@ class Level8Council:
                 f"sell_utility_hold={hold_utility_bps:.2f};"
                 f"sell_utility_sell={sell_utility_bps:.2f};"
                 f"sell_minus_hold_utility={sell_minus_hold_utility_bps:.2f};"
+                f"spike_profit_armed={spike_armed};"
+                f"spike_profit_partial={spike_allow_partial};"
+                f"spike_profit_immediate={spike_immediate_partial};"
+                f"spike_profit_fraction={spike_suggested_fraction:.3f};"
+                f"spike_profit_reason={spike_reason};"
                 f"hard_stop_hit={hard_stop_hit}"
             ),
         }

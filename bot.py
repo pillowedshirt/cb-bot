@@ -894,6 +894,32 @@ ADAPTIVE_GOOD_LIVE_WIN_RATE: float = 0.56
 ADAPTIVE_BAD_LIVE_WIN_RATE: float = 0.42
 ADAPTIVE_MIN_REVIEWED_DECISIONS: int = 12
 
+
+# ============================================================
+# POSITION-AWARE COUNCIL MODE
+# ============================================================
+
+ENABLE_POSITION_AWARE_COUNCIL_MODE: bool = True
+ENTRY_COUNCIL_MAP_SELL_TO_AVOID_BUY: bool = True
+SKIP_ENTRY_BUY_EVAL_FOR_OWNED_PRODUCTS: bool = True
+ALLOW_ADD_TO_EXISTING_POSITION: bool = False
+
+# ============================================================
+# SPIKE PROFIT PROTECTION / PARTIAL HARVEST
+# ============================================================
+
+ENABLE_SPIKE_PROFIT_PROTECTION: bool = True
+SPIKE_PROTECT_MIN_NET_AFTER_EXIT_BPS: float = 45.0
+SPIKE_PROTECT_ARM_PEAK_BPS: float = 80.0
+SPIKE_PROTECT_PULLBACK_FROM_PEAK_BPS: float = 14.0
+SPIKE_PROTECT_IMMEDIATE_PARTIAL_PEAK_BPS: float = 145.0
+SPIKE_PROTECT_IMMEDIATE_PARTIAL_NET_BPS: float = 70.0
+SPIKE_PROTECT_SMALL_PARTIAL_FRACTION: float = 0.25
+SPIKE_PROTECT_NORMAL_PARTIAL_FRACTION: float = 0.40
+SPIKE_PROTECT_LARGE_PARTIAL_FRACTION: float = 0.55
+SPIKE_PROTECT_CONTINUATION_REDUCE_MULT: float = 0.65
+SPIKE_PROTECT_ALLOW_MARKET_FALLBACK: bool = True
+
 # ============================================================
 # VOLUME PROFILE LEADER
 # ============================================================
@@ -11284,6 +11310,53 @@ class TradingBot:
         except Exception as exc:
             return False, f"live_buy_shadowed:economic_safety_gate_exception:{exc}"
 
+
+    def _normalize_entry_votes_for_position_state(
+        self,
+        *,
+        product_id: str,
+        votes: List[Dict[str, Any]],
+        owns_position: bool,
+    ) -> List[Dict[str, Any]]:
+        """Map impossible entry-council sell/add signals to position-aware evidence."""
+        if not bool(ENABLE_POSITION_AWARE_COUNCIL_MODE):
+            return votes
+
+        normalized = []
+        for vote in list(votes or []):
+            v = dict(vote or {})
+            agent = str(v.get("agent", ""))
+            buy_score = float(v.get("buy", 0.0) or 0.0)
+            sell_score = float(v.get("sell", 0.0) or 0.0)
+            hold_score = float(v.get("hold", 0.0) or 0.0)
+            wait_score = float(v.get("wait", 0.0) or 0.0)
+            reason = str(v.get("reason", ""))
+
+            if not owns_position and bool(ENTRY_COUNCIL_MAP_SELL_TO_AVOID_BUY):
+                wait_score = max(wait_score, sell_score)
+                hold_score = max(hold_score, min(0.50, sell_score * 0.65))
+                v["sell"] = 0.0
+                v["wait"] = wait_score
+                v["hold"] = hold_score
+                v["reason"] = (
+                    f"entry_mode_no_position;"
+                    f"sell_score_mapped_to_avoid_buy={sell_score:.3f};"
+                    f"agent={agent};{reason}"
+                )
+            elif owns_position and not bool(ALLOW_ADD_TO_EXISTING_POSITION):
+                hold_score = max(hold_score, buy_score * 0.80)
+                v["buy"] = 0.0
+                v["hold"] = hold_score
+                v["reason"] = (
+                    f"position_mode_owned_product;"
+                    f"buy_score_mapped_to_hold_continuation={buy_score:.3f};"
+                    f"agent={agent};{reason}"
+                )
+
+            normalized.append(v)
+
+        return normalized
+
     def _level8_decision_for_candidate(
         self,
         *,
@@ -11291,6 +11364,48 @@ class TradingBot:
     ) -> Tuple[bool, Dict[str, Any]]:
         """Build a context-aware multi-agent Level 8 council vote."""
         product_id = str(candidate.get("product_id", ""))
+        owns_position = self._has_open_position(product_id)
+        if (
+            bool(ENABLE_POSITION_AWARE_COUNCIL_MODE)
+            and bool(SKIP_ENTRY_BUY_EVAL_FOR_OWNED_PRODUCTS)
+            and owns_position
+            and not bool(ALLOW_ADD_TO_EXISTING_POSITION)
+        ):
+            return False, {
+                "action": "WAIT",
+                "strategy": "POSITION_OWNED|entry_buy_eval_skipped|use_sell_council",
+                "bucket": "POSITION_MANAGEMENT",
+                "risk_mode": "NORMAL",
+                "recommended_position_pct": 0.0,
+                "decision_id": str(uuid.uuid4()),
+                "truth_score": 0.0,
+                "final_buy_score": 0.0,
+                "buy_threshold": 0.0,
+                "confidence": 0.0,
+                "learning_score": 0.0,
+                "setup_tag": str(candidate.get("setup_tag", "owned_position")),
+                "market_regime": str(candidate.get("market_regime", "owned_position")),
+                "calibrated_p_win": float(candidate.get("calibrated_p_win", 0.50) or 0.50),
+                "expected_win_bps": float(candidate.get("expected_win_bps", 0.0) or 0.0),
+                "expected_loss_bps": float(candidate.get("expected_loss_bps", 0.0) or 0.0),
+                "payoff_ratio": float(candidate.get("payoff_ratio", 0.0) or 0.0),
+                "expected_value_bps": 0.0,
+                "uncertainty_penalty_bps": 0.0,
+                "maker_fill_probability": 0.0,
+                "maker_adjusted_expected_value_bps": 0.0,
+                "expected_utility_bps": 0.0,
+                "utility_size_multiplier": 1.0,
+                "wait_utility_bps": 0.0,
+                "buy_vs_wait_edge_bps": 0.0,
+                "value_acceptance_state": str(candidate.get("value_acceptance_state", "")),
+                "volume_node_state": str(candidate.get("volume_node_state", "")),
+                "volume_profile_utility_adjust_bps": float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0),
+                "utility_decision_reason": "entry_buy_eval_skipped_because_position_is_owned",
+                "reason": (
+                    f"position_aware_entry_skip product={product_id};"
+                    f"owns_position=True;use_sell_council_for_hold_or_exit"
+                ),
+            }
         fallback = {
             "action": "WAIT", "strategy": candidate.get("manager_strategy", "LEVEL8_UNAVAILABLE"),
             "bucket": "BLOCKED", "risk_mode": "NORMAL", "recommended_position_pct": 0.0,
@@ -11401,6 +11516,8 @@ class TradingBot:
                 "market_regime": market_regime,
                 "execution_state": execution_state,
                 "learning_score": learning_score,
+                "owns_position": bool(owns_position),
+                "council_mode": "POSITION_MANAGEMENT" if owns_position else "ENTRY",
                 "expected_utility_bps": float(candidate.get("expected_utility_bps", 0.0) or 0.0),
                 "expected_value_bps": float(candidate.get("expected_value_bps", 0.0) or 0.0),
                 "calibrated_p_win": float(candidate.get("calibrated_p_win", 0.50) or 0.50),
@@ -11618,6 +11735,11 @@ class TradingBot:
                 f"utility={utility_state_for_strategy}|"
                 f"execution={execution_state}"
             )
+            votes = self._normalize_entry_votes_for_position_state(
+                product_id=product_id,
+                votes=votes,
+                owns_position=owns_position,
+            )
             decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
         except Exception as exc:
             log(f"[level8] decision failed for {product_id}: {exc}")
@@ -11625,6 +11747,19 @@ class TradingBot:
 
         try:
             action = str(decision.get("action", "WAIT"))
+            if (
+                bool(ENABLE_POSITION_AWARE_COUNCIL_MODE)
+                and not owns_position
+                and action in {"ALLOW_SELL", "SELL", "PARTIAL_SELL", "FULL_SELL"}
+            ):
+                action = "WAIT"
+                decision["action"] = "WAIT"
+                decision["bucket"] = "ENTRY_AVOID_BUY"
+                decision["reason"] = (
+                    f"entry_mode_sell_action_converted_to_wait;"
+                    f"product={product_id};no_position_owned;"
+                    f"{decision.get('reason', '')}"
+                )
             strategy = str(decision.get("strategy", strategy))
             setup_size_multiplier = clamp_float(
                 float(candidate.get("backtest_setup_size_multiplier", 1.0) or 1.0),
@@ -11677,6 +11812,8 @@ class TradingBot:
             session_context = dict(context.get("session_liquidity", {}) or {})
             price_context = dict(context.get("price_action_context", {}) or {})
             info["reason"] = (
+                f"council_mode={'POSITION_MANAGEMENT' if owns_position else 'ENTRY'};"
+                f"owns_position={owns_position};"
                 f"{base_reason};"
                 f"setup={context['setup_tag']};"
                 f"regime={context['market_regime']};"
@@ -12411,6 +12548,89 @@ class TradingBot:
             "green_candles": int(green_count),
         }
 
+
+    def _spike_profit_protection_context(
+        self,
+        *,
+        product_id: str,
+        hold_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Protect fast net-profitable spikes with partial harvest guidance."""
+        if not bool(ENABLE_SPIKE_PROFIT_PROTECTION):
+            return {
+                "enabled": False,
+                "armed": False,
+                "allow_partial": False,
+                "allow_immediate_partial": False,
+                "suggested_fraction": 0.0,
+                "reason": "spike_profit_protection_disabled",
+            }
+
+        try:
+            net_after_exit_bps = float(hold_state.get("net_after_exit_bps", 0.0) or 0.0)
+            peak_unrealized_bps = float(hold_state.get("peak_unrealized_bps", 0.0) or 0.0)
+            pullback_from_peak_bps = float(hold_state.get("pullback_from_peak_bps", 0.0) or 0.0)
+            continuation_quality = float(hold_state.get("continuation_quality", 0.0) or 0.0)
+            momentum_3_bps = float(hold_state.get("momentum_3_bps", 0.0) or 0.0)
+            momentum_5_bps = float(hold_state.get("momentum_5_bps", 0.0) or 0.0)
+
+            net_profitable = bool(net_after_exit_bps >= float(SPIKE_PROTECT_MIN_NET_AFTER_EXIT_BPS))
+            armed = bool(net_profitable and peak_unrealized_bps >= float(SPIKE_PROTECT_ARM_PEAK_BPS))
+            pullback_trigger = bool(armed and pullback_from_peak_bps >= float(SPIKE_PROTECT_PULLBACK_FROM_PEAK_BPS))
+            immediate_partial = bool(
+                net_after_exit_bps >= float(SPIKE_PROTECT_IMMEDIATE_PARTIAL_NET_BPS)
+                and peak_unrealized_bps >= float(SPIKE_PROTECT_IMMEDIATE_PARTIAL_PEAK_BPS)
+            )
+            momentum_fade = bool(momentum_3_bps < 0.0 or momentum_5_bps < 0.0)
+
+            suggested_fraction = 0.0
+            if immediate_partial:
+                suggested_fraction = max(suggested_fraction, float(SPIKE_PROTECT_SMALL_PARTIAL_FRACTION))
+            if pullback_trigger:
+                suggested_fraction = max(suggested_fraction, float(SPIKE_PROTECT_NORMAL_PARTIAL_FRACTION))
+            if pullback_trigger and momentum_fade:
+                suggested_fraction = max(suggested_fraction, float(SPIKE_PROTECT_LARGE_PARTIAL_FRACTION))
+
+            if continuation_quality >= 0.72 and suggested_fraction > 0.0:
+                suggested_fraction *= float(SPIKE_PROTECT_CONTINUATION_REDUCE_MULT)
+                suggested_fraction = max(float(SPIKE_PROTECT_SMALL_PARTIAL_FRACTION), suggested_fraction)
+
+            allow_partial = bool(suggested_fraction > 0.0)
+            return {
+                "enabled": True,
+                "armed": bool(armed),
+                "net_profitable": bool(net_profitable),
+                "allow_partial": bool(allow_partial),
+                "allow_immediate_partial": bool(immediate_partial),
+                "pullback_trigger": bool(pullback_trigger),
+                "momentum_fade": bool(momentum_fade),
+                "suggested_fraction": float(max(0.0, min(1.0, suggested_fraction))),
+                "net_after_exit_bps": float(net_after_exit_bps),
+                "peak_unrealized_bps": float(peak_unrealized_bps),
+                "pullback_from_peak_bps": float(pullback_from_peak_bps),
+                "continuation_quality": float(continuation_quality),
+                "reason": (
+                    f"spike_profit_protection;"
+                    f"product={product_id};"
+                    f"net_after_exit={net_after_exit_bps:.2f};"
+                    f"peak={peak_unrealized_bps:.2f};"
+                    f"pullback={pullback_from_peak_bps:.2f};"
+                    f"armed={armed};immediate_partial={immediate_partial};"
+                    f"pullback_trigger={pullback_trigger};momentum_fade={momentum_fade};"
+                    f"continuation_quality={continuation_quality:.3f};"
+                    f"suggested_fraction={suggested_fraction:.3f}"
+                ),
+            }
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "armed": False,
+                "allow_partial": False,
+                "allow_immediate_partial": False,
+                "suggested_fraction": 0.0,
+                "reason": f"spike_profit_protection_error:{exc}",
+            }
+
     def _sell_side_expected_utility_context(
         self,
         *,
@@ -12541,6 +12761,13 @@ class TradingBot:
         The sell council remains the strategy authority.
         bot.py only applies mechanical safety checks after the council decides.
         """
+        if bool(ENABLE_POSITION_AWARE_COUNCIL_MODE) and not self._has_open_position(product_id):
+            return False, (
+                f"sell_council_skipped_no_position_owned;"
+                f"product={product_id};"
+                f"mode=ENTRY_ONLY"
+            ), 0.0
+
         hold_state = dict(hold_state or {})
         net_after_exit_for_hard_check = float(
             hold_state.get("net_after_exit_bps", 0.0) or 0.0
@@ -12590,6 +12817,8 @@ class TradingBot:
             context = {
                 "entry_price": float(entry_price),
                 "current_price": float(current_price),
+                "owns_position": True,
+                "council_mode": "POSITION_MANAGEMENT",
                 "unrealized_bps": float(unrealized_bps),
                 "spread_bps": float(spread_bps),
                 "cost_bps": float(cost_bps),
@@ -12642,6 +12871,10 @@ class TradingBot:
                     current_price=float(current_price),
                     spread_bps=float(spread_bps),
                     cost_bps=float(cost_bps),
+                ),
+                "spike_profit_protection": self._spike_profit_protection_context(
+                    product_id=product_id,
+                    hold_state=hold_state,
                 ),
             }
 
@@ -13291,6 +13524,10 @@ class TradingBot:
             "risk_pause",
             "risk_exit",
             "drawdown_exit",
+            "spike_profit_protection",
+            "spike_profit_partial",
+            "profit_spike",
+            "fast_profit_capture",
         ]
 
         return any(term in text for term in urgent_terms)
@@ -13414,7 +13651,14 @@ class TradingBot:
         """Execute a live sell using maker-first unless the reason requires market urgency."""
         requested_mode = str(mode_override or EXIT_EXECUTION_MODE or "MAKER_FIRST").upper()
         urgent_market = self._sell_reason_requires_market(reason, mode_override=mode_override)
-        if urgent_market and bool(HARD_EXIT_USES_MARKET):
+        spike_profit_market = bool(
+            bool(ENABLE_SPIKE_PROFIT_PROTECTION)
+            and bool(SPIKE_PROTECT_ALLOW_MARKET_FALLBACK)
+            and "spike_profit" in str(reason or "").lower()
+        )
+        if spike_profit_market:
+            urgent_market = True
+        if urgent_market and (bool(HARD_EXIT_USES_MARKET) or spike_profit_market):
             requested_mode = "MARKET"
         mode = requested_mode
         result = None
@@ -14479,6 +14723,39 @@ class TradingBot:
 
         return float(sum(l.qty for l in self.positions.get(product_id, [])) * tob.mid)
 
+
+    def _has_open_position(self, product_id: str) -> bool:
+        """Return True when the bot owns a meaningful open position."""
+        try:
+            product_id = str(product_id or "")
+
+            lots = list(getattr(self, "open_lots", {}).get(product_id, []) or [])
+            lots += list(getattr(self, "positions", {}).get(product_id, []) or [])
+            for lot in lots:
+                if isinstance(lot, dict):
+                    qty = float(lot.get("qty", 0.0) or lot.get("base_qty", 0.0) or 0.0)
+                else:
+                    qty = float(getattr(lot, "qty", 0.0) or getattr(lot, "base_qty", 0.0) or 0.0)
+                if qty > 0:
+                    return True
+
+            positions = getattr(self, "positions", {}) or {}
+            pos = positions.get(product_id)
+            if isinstance(pos, dict):
+                qty = float(pos.get("qty", 0.0) or pos.get("base_qty", 0.0) or 0.0)
+                if qty > 0:
+                    return True
+
+            try:
+                exposure = float(self._current_product_exposure_usd(product_id))
+            except Exception:
+                exposure = 0.0
+
+            return bool(exposure > 0.50)
+
+        except Exception:
+            return False
+
     def _current_total_exposure_usd(self) -> float:
         total = 0.0
         for product_id in PRODUCTS:
@@ -15372,7 +15649,7 @@ class TradingBot:
             entry_price=fifo_avg_entry,
             exit_price=avg_px,
             weekly_bias=None,
-            note=f"inverted_cycle_sell reason={reason} order_id={order_id}",
+            note=f"inverted_cycle_sell reason={reason};spike_profit_protection_checked=True order_id={order_id}",
             filled_notional_usd=filled_notional_f,
         )
         self._record_trade_timestamp(product_id)
@@ -17088,7 +17365,8 @@ class TradingBot:
                                     f"executed_sell_fraction={executed_sell_fraction:.6f} "
                                     f"position_qty_before_sell={float(position_qty):.12f} "
                                     f"gross_pnl_usd={float(pnl_gross):.8f} "
-                                    f"net_pnl_usd={float(pnl_gross - fee):.8f}"
+                                    f"net_pnl_usd={float(pnl_gross - fee):.8f} "
+                                    ";spike_profit_protection_checked=True"
                                 ),
                                 filled_notional_usd=float(filled_notional) if filled_notional is not None else None,
                                 exit_role=exit_role,

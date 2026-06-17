@@ -1,3 +1,34 @@
+
+try:
+    from debug_tools import (
+        module_debug,
+        module_exception,
+        debug_every,
+        debug_timer,
+    )
+except Exception:
+    def module_debug(*args, **kwargs):
+        pass
+    def module_exception(*args, **kwargs):
+        pass
+    def debug_every(*args, **kwargs):
+        pass
+    class debug_timer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+MODULE_NAME = __name__.split(".")[-1]
+module_debug(
+    MODULE_NAME,
+    "module_loaded",
+    data={"file": __file__},
+    level="DEBUG",
+    also_overall=False,
+)
 """Level 8 trading council capital allocation and risk guidance."""
 
 import csv
@@ -115,9 +146,16 @@ def agent_redundancy_group(agent: str) -> str:
         return "previous_session"
     if "quant" in text or "stationarity" in text or "forecast" in text:
         return "quant"
-    if "order_book" in text or "liquidity_agent" in text:
+    if "order_book" in text or text == "order_book_liquidity_agent":
         return "risk_execution"
-    if ("candle" in text or "structure" in text or "fresh_zone" in text or "fair_value_gap" in text or "fvg" in text):
+    if (
+        "validated_liquidity" in text
+        or "candle" in text
+        or "structure" in text
+        or "fresh_zone" in text
+        or "fair_value_gap" in text
+        or "fvg" in text
+    ):
         return "price_action"
     if "session" in text or "sweep" in text or "breakout_continuation" in text:
         return "session_liquidity"

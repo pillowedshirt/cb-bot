@@ -9,6 +9,37 @@ import numpy as np
 import pandas as pd
 
 
+
+try:
+    from debug_tools import (
+        module_debug,
+        module_exception,
+        debug_every,
+        debug_timer,
+    )
+except Exception:
+    def module_debug(*args, **kwargs):
+        pass
+    def module_exception(*args, **kwargs):
+        pass
+    def debug_every(*args, **kwargs):
+        pass
+    class debug_timer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+MODULE_NAME = __name__.split(".")[-1]
+module_debug(
+    MODULE_NAME,
+    "module_loaded",
+    data={"file": __file__},
+    level="DEBUG",
+    also_overall=False,
+)
 BACKTEST_RECOMMENDATIONS_COLUMNS: List[str] = [
     "ts", "dt_utc", "product_id", "sample_count", "accepted_count",
     "sample_confidence", "replay_quality_score", "live_gate_bias_bps",

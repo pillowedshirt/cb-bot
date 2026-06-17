@@ -160,6 +160,11 @@ BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_pri
 BACKTEST_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_summary.csv")
 BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_setup_performance.csv")
 
+# Decision-engine completion logs.
+DECISION_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "decision_audit.csv")
+MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.csv")
+ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
+
 # Startup CSV-state detection.
 # This must check for meaningful pre-existing data rows, not just file existence.
 # Several logger classes create header-only CSVs during bot startup, so header-only
@@ -187,6 +192,9 @@ STARTUP_STATE_CSV_PATHS: List[str] = [
     BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH,
     BACKTEST_AGENT_PRIORS_CSV_PATH,
     BACKTEST_SETUP_PERFORMANCE_CSV_PATH,
+    DECISION_AUDIT_CSV_PATH,
+    MAKER_FILL_OUTCOMES_CSV_PATH,
+    ADAPTIVE_GUARDRAILS_CSV_PATH,
     BACKTEST_SUMMARY_CSV_PATH,
 ]
 
@@ -824,6 +832,67 @@ UTILITY_MAX_RANK_BONUS: float = 70.0
 UTILITY_MAX_RANK_PENALTY: float = 65.0
 UTILITY_MIN_SIZE_MULTIPLIER: float = 0.45
 UTILITY_MAX_SIZE_MULTIPLIER: float = 1.25
+
+# ============================================================
+# DECISION ENGINE COMPLETION SYSTEMS
+# ============================================================
+
+# 1. Decision Audit Replay
+ENABLE_DECISION_AUDIT_REPLAY: bool = True
+DECISION_AUDIT_REVIEW_WINDOWS_MIN: List[int] = [5, 15, 30, 60, 120]
+DECISION_AUDIT_REVIEW_EVERY_SEC: float = 60.0
+DECISION_AUDIT_MIN_NET_SUCCESS_BPS: float = 45.0
+DECISION_AUDIT_GOOD_MOVE_BPS: float = 90.0
+DECISION_AUDIT_BIG_MISSED_MOVE_BPS: float = 160.0
+
+# 2. Regime-Specific Thresholds
+ENABLE_REGIME_SPECIFIC_THRESHOLDS: bool = True
+REGIME_STRONG_UPTREND_UTILITY_RELIEF_BPS: float = 10.0
+REGIME_RANGE_CHOP_EXTRA_UTILITY_BPS: float = 22.0
+REGIME_WEAK_DOWNTREND_EXTRA_UTILITY_BPS: float = 45.0
+REGIME_VOL_EXPANSION_EXTRA_UTILITY_BPS: float = 35.0
+REGIME_FALLING_KNIFE_EXTRA_UTILITY_BPS: float = 70.0
+
+# 3. Sell-Side Expected Utility
+ENABLE_SELL_SIDE_EXPECTED_UTILITY: bool = True
+SELL_UTILITY_MIN_HOLD_ADVANTAGE_BPS: float = 22.0
+SELL_UTILITY_PARTIAL_ZONE_BPS: float = 20.0
+SELL_UTILITY_FULL_EXIT_DISADVANTAGE_BPS: float = -35.0
+
+# 4. Maker Fill Learning
+ENABLE_MAKER_FILL_LEARNING: bool = True
+MAKER_FILL_LEARNING_MIN_SAMPLES: int = 8
+MAKER_FILL_LEARNING_BLEND_WEIGHT: float = 0.55
+
+# 5. Volatility-Normalized Sizing
+ENABLE_VOLATILITY_NORMALIZED_SIZING: bool = True
+VOL_TARGET_REALIZED_BPS_30M: float = 90.0
+VOL_SIZE_MIN_MULTIPLIER: float = 0.45
+VOL_SIZE_MAX_MULTIPLIER: float = 1.12
+VOL_HIGH_RISK_BPS_30M: float = 180.0
+
+# 6. Portfolio-Level Opportunity Ranking
+ENABLE_PORTFOLIO_OPPORTUNITY_RANKING: bool = True
+PORTFOLIO_TOP_N_LIVE_BUY_CANDIDATES: int = 2
+PORTFOLIO_MIN_TOP_UTILITY_EDGE_BPS: float = 15.0
+PORTFOLIO_CORRELATED_SECOND_BUY_PENALTY: float = 28.0
+PORTFOLIO_RESERVE_FOR_BETTER_SETUP_PCT: float = 0.20
+
+# 7. WAIT as a Scored Decision
+ENABLE_WAIT_UTILITY_SCORING: bool = True
+WAIT_UTILITY_BASE_BPS: float = 8.0
+WAIT_UTILITY_UNCERTAINTY_BONUS_MAX_BPS: float = 45.0
+BUY_MUST_BEAT_WAIT_BY_BPS: float = 18.0
+
+# 8. Adaptive Thresholds with Guardrails
+ENABLE_ADAPTIVE_GUARDRAILS: bool = True
+ADAPTIVE_GUARDRAIL_LOOKBACK_ROWS: int = 80
+ADAPTIVE_MAX_UTILITY_ADJUST_BPS: float = 45.0
+ADAPTIVE_MAX_TRUTH_ADJUST: float = 0.06
+ADAPTIVE_MAX_MARGIN_ADJUST: float = 0.05
+ADAPTIVE_GOOD_LIVE_WIN_RATE: float = 0.56
+ADAPTIVE_BAD_LIVE_WIN_RATE: float = 0.42
+ADAPTIVE_MIN_REVIEWED_DECISIONS: int = 12
 
 # Execution friction
 MAX_SPREAD_BPS: float = 18.0
@@ -2234,7 +2303,18 @@ class SignalEventsLogger(_ResearchCSVLogger):
         "entry_timing_ok", "entry_timing_reason",
         "momentum_1_bps", "momentum_3_bps", "momentum_5_bps",
         "momentum_15_bps", "vwap_ok", "higher_low_ok", "green_candles",
-        "candidate_rank_reason", "action", "reason",
+        "candidate_rank_reason",
+        "expected_utility_bps",
+        "calibrated_p_win",
+        "payoff_ratio",
+        "maker_adjusted_expected_value_bps",
+        "wait_utility_bps",
+        "buy_vs_wait_edge_bps",
+        "regime_utility_adjust_bps",
+        "volatility_size_multiplier",
+        "portfolio_rank_bonus",
+        "action",
+        "reason",
     ]
 
     def log_event(self, **kwargs: Any) -> None:
@@ -3178,6 +3258,8 @@ class LiveSignal:
     smt_state: str = ""
     smt_peer: str = ""
     smt_reason: str = ""
+    realized_volatility_bps_30m: float = 0.0
+    volatility_size_multiplier: float = 1.0
 
 
 @dataclass
@@ -5276,6 +5358,8 @@ class TradingBot:
         self.last_level8_council_heartbeat_ts: float = 0.0
         self.last_ai_train_ts: float = 0.0
         self.last_agent_performance_update_ts: float = 0.0
+        self.last_decision_audit_review_ts: float = 0.0
+        self.last_adaptive_guardrail_write_ts: float = 0.0
         self.last_level8_missed_opportunity_review_ts: float = 0.0
         self.last_backtest_intelligence_ts: float = 0.0
         self.backtest_recommendations_by_product: Dict[str, Dict[str, Any]] = {}
@@ -9426,6 +9510,275 @@ class TradingBot:
             f"setup_keys={len(self.backtest_setup_performance_by_key)}"
         )
 
+    def _append_csv_dict_row(
+        self,
+        *,
+        path: str,
+        columns: List[str],
+        row: Dict[str, Any],
+    ) -> None:
+        """Append a dict row to a CSV and create/migrate the header safely."""
+        try:
+            write_header = not os.path.exists(path) or os.path.getsize(path) <= 0
+
+            if not write_header:
+                try:
+                    with open(path, newline="", encoding="utf-8") as existing_file:
+                        existing_header = next(csv.reader(existing_file), [])
+                    if existing_header != columns:
+                        rotated_path = path + f".schema_{int(time.time())}.csv"
+                        os.replace(path, rotated_path)
+                        log(f"[csv] rotated schema path={path} to {rotated_path}")
+                        write_header = True
+                except Exception:
+                    write_header = True
+
+            with open(path, "a", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=columns)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({col: row.get(col, "") for col in columns})
+
+        except Exception as exc:
+            log(f"[csv] append failed path={path}: {exc}")
+
+    def _decision_audit_columns(self) -> List[str]:
+        return [
+            "ts", "dt_mst", "event_type", "decision_id", "product_id",
+            "original_action", "strategy", "bucket",
+            "decision_ts", "review_window_min", "review_due_ts",
+            "entry_price", "review_price",
+            "max_favorable_bps", "max_adverse_bps",
+            "would_have_cleared_costs", "decision_grade",
+            "missed_profit_bps", "avoidable_loss_bps",
+            "expected_utility_bps", "maker_adjusted_expected_value_bps",
+            "calibrated_p_win", "payoff_ratio",
+            "reason",
+        ]
+
+    def _append_decision_audit_seed(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        level8_info: Dict[str, Any],
+    ) -> None:
+        """Seed future replay reviews for every Level 8 decision."""
+        if not bool(ENABLE_DECISION_AUDIT_REPLAY):
+            return
+
+        try:
+            decision_id = str(level8_info.get("decision_id", "") or "")
+            product_id = str(candidate.get("product_id", "") or "")
+            if not decision_id or not product_id:
+                return
+
+            entry_price = float(
+                candidate.get("mid", 0.0)
+                or candidate.get("price", 0.0)
+                or candidate.get("current_price", 0.0)
+                or 0.0
+            )
+            if entry_price <= 0:
+                return
+
+            decision_ts = now_ts()
+            for window_min in DECISION_AUDIT_REVIEW_WINDOWS_MIN:
+                self._append_csv_dict_row(
+                    path=DECISION_AUDIT_CSV_PATH,
+                    columns=self._decision_audit_columns(),
+                    row={
+                        "ts": f"{decision_ts:.6f}",
+                        "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"),
+                        "event_type": "seed",
+                        "decision_id": decision_id,
+                        "product_id": product_id,
+                        "original_action": str(level8_info.get("action", "")),
+                        "strategy": str(level8_info.get("strategy", "")),
+                        "bucket": str(level8_info.get("bucket", "")),
+                        "decision_ts": f"{decision_ts:.6f}",
+                        "review_window_min": int(window_min),
+                        "review_due_ts": f"{decision_ts + int(window_min) * 60:.6f}",
+                        "entry_price": f"{entry_price:.10f}",
+                        "decision_grade": "PENDING",
+                        "expected_utility_bps": f"{float(level8_info.get('expected_utility_bps', 0.0) or 0.0):.6f}",
+                        "maker_adjusted_expected_value_bps": f"{float(level8_info.get('maker_adjusted_expected_value_bps', 0.0) or 0.0):.6f}",
+                        "calibrated_p_win": f"{float(level8_info.get('calibrated_p_win', 0.50) or 0.50):.6f}",
+                        "payoff_ratio": f"{float(level8_info.get('payoff_ratio', 0.0) or 0.0):.6f}",
+                        "reason": str(level8_info.get("reason", ""))[:900],
+                    },
+                )
+
+        except Exception as exc:
+            log(f"[decision-audit] seed failed: {exc}")
+
+    def _review_decision_audits(self) -> None:
+        """Append completed audit reviews for due seed rows."""
+        if not bool(ENABLE_DECISION_AUDIT_REPLAY):
+            return
+
+        try:
+            if not os.path.exists(DECISION_AUDIT_CSV_PATH) or os.path.getsize(DECISION_AUDIT_CSV_PATH) <= 0:
+                return
+            frame = pd.read_csv(DECISION_AUDIT_CSV_PATH)
+            if frame.empty:
+                return
+
+            reviewed_keys = set()
+            if "event_type" in frame.columns:
+                reviews = frame[frame["event_type"].astype(str) == "review"]
+                for _, r in reviews.iterrows():
+                    reviewed_keys.add((str(r.get("decision_id", "")), int(safe_float(r.get("review_window_min"), 0))))
+
+            seeds = frame[frame["event_type"].astype(str) == "seed"].copy()
+            if seeds.empty:
+                return
+
+            now_value = now_ts()
+            for _, row in seeds.iterrows():
+                decision_id = str(row.get("decision_id", ""))
+                product_id = str(row.get("product_id", ""))
+                window_min = int(safe_float(row.get("review_window_min"), 0))
+                due_ts = float(safe_float(row.get("review_due_ts"), 0.0))
+                decision_ts = float(safe_float(row.get("decision_ts"), 0.0))
+                entry_price = float(safe_float(row.get("entry_price"), 0.0))
+                action = str(row.get("original_action", ""))
+                key = (decision_id, window_min)
+                if not decision_id or not product_id or key in reviewed_keys:
+                    continue
+                if now_value < due_ts or entry_price <= 0:
+                    continue
+
+                candles = self._live_minute_candles_for_product(product_id)
+                path = [c for c in candles if float(getattr(c, "ts", 0.0) or 0.0) >= decision_ts]
+                if path:
+                    high = max(float(c.high) for c in path)
+                    low = min(float(c.low) for c in path)
+                    review_price = float(path[-1].close)
+                else:
+                    tob = self.tob.get(product_id)
+                    review_price = float(tob.mid) if tob and tob.mid > 0 else 0.0
+                    high = review_price
+                    low = review_price
+                if review_price <= 0:
+                    continue
+
+                max_fav_bps = ((high / entry_price) - 1.0) * 10000.0
+                max_adv_bps = ((entry_price / low) - 1.0) * 10000.0 if low > 0 else 0.0
+                cleared_costs = bool(max_fav_bps >= float(DECISION_AUDIT_MIN_NET_SUCCESS_BPS))
+                missed_profit_bps = 0.0
+                avoidable_loss_bps = 0.0
+                grade = "NEUTRAL"
+                if action in {"WAIT", "SHADOW"}:
+                    if max_fav_bps >= float(DECISION_AUDIT_BIG_MISSED_MOVE_BPS):
+                        grade = "MISSED_BIG_WIN"
+                        missed_profit_bps = max_fav_bps
+                    elif cleared_costs:
+                        grade = "MISSED_GOOD_MOVE"
+                        missed_profit_bps = max_fav_bps
+                    else:
+                        grade = "GOOD_SKIP"
+                elif action == "ALLOW_BUY":
+                    if cleared_costs:
+                        grade = "GOOD_BUY"
+                    elif max_adv_bps >= float(DECISION_AUDIT_GOOD_MOVE_BPS):
+                        grade = "BAD_BUY_AVOIDABLE_LOSS"
+                        avoidable_loss_bps = max_adv_bps
+                    else:
+                        grade = "UNCLEAR_BUY"
+
+                self._append_csv_dict_row(
+                    path=DECISION_AUDIT_CSV_PATH,
+                    columns=self._decision_audit_columns(),
+                    row={
+                        "ts": f"{now_value:.6f}",
+                        "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"),
+                        "event_type": "review",
+                        "decision_id": decision_id,
+                        "product_id": product_id,
+                        "original_action": action,
+                        "strategy": str(row.get("strategy", "")),
+                        "bucket": str(row.get("bucket", "")),
+                        "decision_ts": f"{decision_ts:.6f}",
+                        "review_window_min": int(window_min),
+                        "review_due_ts": f"{due_ts:.6f}",
+                        "entry_price": f"{entry_price:.10f}",
+                        "review_price": f"{review_price:.10f}",
+                        "max_favorable_bps": f"{max_fav_bps:.6f}",
+                        "max_adverse_bps": f"{max_adv_bps:.6f}",
+                        "would_have_cleared_costs": bool(cleared_costs),
+                        "decision_grade": grade,
+                        "missed_profit_bps": f"{missed_profit_bps:.6f}",
+                        "avoidable_loss_bps": f"{avoidable_loss_bps:.6f}",
+                        "expected_utility_bps": row.get("expected_utility_bps", ""),
+                        "maker_adjusted_expected_value_bps": row.get("maker_adjusted_expected_value_bps", ""),
+                        "calibrated_p_win": row.get("calibrated_p_win", ""),
+                        "payoff_ratio": row.get("payoff_ratio", ""),
+                        "reason": f"decision_audit_review;grade={grade}",
+                    },
+                )
+        except Exception as exc:
+            log(f"[decision-audit] review failed: {exc}")
+
+    def _regime_specific_adjustments(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Adjust live-buy math by market regime."""
+        if not bool(ENABLE_REGIME_SPECIFIC_THRESHOLDS):
+            return {"regime_utility_adjust_bps": 0.0, "regime_truth_adjust": 0.0, "regime_margin_adjust": 0.0, "regime_reason": "regime_adjustments_disabled"}
+        regime = str(candidate.get("market_regime", "") or candidate.get("setup_tag", "") or candidate.get("level8_strategy", "") or "").lower()
+        setup = str(candidate.get("setup_tag", "") or candidate.get("setup", "") or "").lower()
+        utility_adjust = 0.0
+        truth_adjust = 0.0
+        margin_adjust = 0.0
+        reasons = []
+        if "strong_uptrend" in regime or "uptrend" in regime:
+            utility_adjust -= float(REGIME_STRONG_UPTREND_UTILITY_RELIEF_BPS)
+            reasons.append("strong_uptrend_relief")
+        if "range" in regime or "chop" in regime:
+            utility_adjust += float(REGIME_RANGE_CHOP_EXTRA_UTILITY_BPS)
+            truth_adjust += 0.02
+            reasons.append("range_chop_requires_more_edge")
+        if "weak_downtrend" in regime or "downtrend" in regime:
+            utility_adjust += float(REGIME_WEAK_DOWNTREND_EXTRA_UTILITY_BPS)
+            truth_adjust += 0.04
+            margin_adjust += 0.025
+            reasons.append("weak_downtrend_requires_more_edge")
+        if "volatility_expansion" in regime or "vol_expansion" in regime:
+            utility_adjust += float(REGIME_VOL_EXPANSION_EXTRA_UTILITY_BPS)
+            truth_adjust += 0.025
+            reasons.append("volatility_expansion_requires_more_edge")
+        if "falling_knife" in setup or "falling_knife" in regime:
+            utility_adjust += float(REGIME_FALLING_KNIFE_EXTRA_UTILITY_BPS)
+            truth_adjust += 0.05
+            margin_adjust += 0.035
+            reasons.append("falling_knife_requires_extreme_edge")
+        return {"regime_utility_adjust_bps": float(utility_adjust), "regime_truth_adjust": float(truth_adjust), "regime_margin_adjust": float(margin_adjust), "regime_reason": ",".join(reasons) or "neutral_regime"}
+
+    def _realized_volatility_bps_for_product(self, product_id: str, *, lookback: int = 30) -> float:
+        """Estimate short-term realized volatility from live 1-minute candles."""
+        try:
+            candles = self._live_minute_candles_for_product(product_id)[-int(lookback):]
+            closes = [float(c.close) for c in candles if float(c.close) > 0]
+            if len(closes) < 6:
+                return 0.0
+            returns = [((b / a) - 1.0) * 10000.0 for a, b in zip(closes[:-1], closes[1:]) if a > 0]
+            if not returns:
+                return 0.0
+            return float(np.std(returns) * math.sqrt(len(returns)))
+        except Exception:
+            return 0.0
+
+    def _volatility_size_multiplier_for_candidate(self, candidate: Dict[str, Any]) -> Tuple[float, float, str]:
+        """Reduce size when current volatility is too high."""
+        if not bool(ENABLE_VOLATILITY_NORMALIZED_SIZING):
+            return 1.0, 0.0, "vol_sizing_disabled"
+        product_id = str(candidate.get("product_id", "") or "")
+        realized_vol = self._realized_volatility_bps_for_product(product_id, lookback=30)
+        if realized_vol <= 0:
+            return 1.0, 0.0, "vol_unavailable"
+        multiplier = clamp_float(float(VOL_TARGET_REALIZED_BPS_30M) / max(float(realized_vol), 1.0), float(VOL_SIZE_MIN_MULTIPLIER), float(VOL_SIZE_MAX_MULTIPLIER))
+        if realized_vol >= float(VOL_HIGH_RISK_BPS_30M):
+            multiplier = min(multiplier, 0.70)
+        return float(multiplier), float(realized_vol), f"vol_size realized_30m={realized_vol:.2f};mult={multiplier:.3f}"
+
     def _utility_sample_confidence(self, sample_count: float) -> float:
         """
         Convert a sample count into confidence.
@@ -9559,6 +9912,98 @@ class TradingBot:
 
         return clamp_float(calibrated, 0.0, 1.0), total_confidence, reason
 
+    def _maker_fill_outcome_columns(self) -> List[str]:
+        return [
+            "ts", "dt_mst", "product_id", "side", "mode",
+            "filled", "partial_fill",
+            "spread_bps", "bid", "ask", "limit_price",
+            "time_on_book_sec", "requested_size", "filled_size",
+            "missed_move_bps", "maker_fill_quality", "reason",
+        ]
+
+    def _append_maker_fill_outcome(
+        self,
+        *,
+        product_id: str,
+        side: str,
+        mode: str,
+        filled: bool,
+        partial_fill: bool,
+        spread_bps: float,
+        bid: float,
+        ask: float,
+        limit_price: float,
+        time_on_book_sec: float,
+        requested_size: float,
+        filled_size: float,
+        reason: str,
+    ) -> None:
+        if not bool(ENABLE_MAKER_FILL_LEARNING):
+            return
+        try:
+            mid_before = (float(bid) + float(ask)) / 2.0 if bid > 0 and ask > 0 else 0.0
+            current_mid = 0.0
+            tob = self.tob.get(product_id)
+            if tob and tob.mid > 0:
+                current_mid = float(tob.mid)
+            missed_move_bps = 0.0
+            if mid_before > 0 and current_mid > 0:
+                if str(side).upper() == "BUY":
+                    missed_move_bps = ((current_mid / mid_before) - 1.0) * 10000.0
+                else:
+                    missed_move_bps = ((mid_before / current_mid) - 1.0) * 10000.0
+            quality = 1.0 if filled else (-0.5 if missed_move_bps > 35.0 else 0.0)
+            self._append_csv_dict_row(
+                path=MAKER_FILL_OUTCOMES_CSV_PATH,
+                columns=self._maker_fill_outcome_columns(),
+                row={
+                    "ts": f"{now_ts():.6f}",
+                    "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"),
+                    "product_id": product_id,
+                    "side": str(side).upper(),
+                    "mode": mode,
+                    "filled": bool(filled),
+                    "partial_fill": bool(partial_fill),
+                    "spread_bps": f"{float(spread_bps):.6f}",
+                    "bid": f"{float(bid):.10f}",
+                    "ask": f"{float(ask):.10f}",
+                    "limit_price": f"{float(limit_price):.10f}",
+                    "time_on_book_sec": f"{float(time_on_book_sec):.6f}",
+                    "requested_size": f"{float(requested_size):.12f}",
+                    "filled_size": f"{float(filled_size):.12f}",
+                    "missed_move_bps": f"{float(missed_move_bps):.6f}",
+                    "maker_fill_quality": f"{float(quality):.6f}",
+                    "reason": str(reason)[:500],
+                },
+            )
+        except Exception as exc:
+            log(f"[maker-fill-learning] append failed: {exc}")
+
+    def _maker_fill_learned_probability(self, *, candidate: Dict[str, Any], side: str = "BUY") -> Tuple[Optional[float], float, str]:
+        """Return learned maker fill probability and confidence."""
+        if not bool(ENABLE_MAKER_FILL_LEARNING):
+            return None, 0.0, "maker_fill_learning_disabled"
+        try:
+            if not os.path.exists(MAKER_FILL_OUTCOMES_CSV_PATH) or os.path.getsize(MAKER_FILL_OUTCOMES_CSV_PATH) <= 0:
+                return None, 0.0, "no_maker_fill_history"
+            frame = pd.read_csv(MAKER_FILL_OUTCOMES_CSV_PATH)
+            if frame.empty:
+                return None, 0.0, "empty_maker_fill_history"
+            product_id = str(candidate.get("product_id", "") or "")
+            side_text = str(side).upper()
+            subset = frame[
+                (frame.get("product_id", "").astype(str) == product_id)
+                & (frame.get("side", "").astype(str).str.upper() == side_text)
+            ].tail(80)
+            if len(subset) < int(MAKER_FILL_LEARNING_MIN_SAMPLES):
+                return None, 0.0, f"maker_fill_samples_too_low;n={len(subset)}"
+            filled = subset.get("filled", pd.Series(dtype=str)).astype(str).str.lower().isin(["true", "1", "yes"])
+            fill_rate = float(filled.mean())
+            confidence = clamp_float(math.sqrt(len(subset) / 80.0), 0.0, 1.0)
+            return clamp_float(fill_rate, 0.02, 0.95), confidence, f"learned_maker_fill product={product_id};side={side_text};n={len(subset)};fill_rate={fill_rate:.3f};conf={confidence:.3f}"
+        except Exception as exc:
+            return None, 0.0, f"maker_fill_learning_error:{exc}"
+
     def _utility_maker_fill_probability(self, candidate: Dict[str, Any]) -> Tuple[float, str]:
         """
         Estimate maker fill probability from spread, volatility, momentum, and execution mode.
@@ -9588,11 +10033,27 @@ class TradingBot:
             0.85,
         )
 
+        learned_probability, learned_confidence, learned_reason = self._maker_fill_learned_probability(
+            candidate=candidate,
+            side="BUY",
+        )
+
+        if learned_probability is not None and learned_confidence > 0.0:
+            blend = clamp_float(
+                float(MAKER_FILL_LEARNING_BLEND_WEIGHT) * learned_confidence,
+                0.0,
+                0.85,
+            )
+            fill_probability = (
+                fill_probability * (1.0 - blend)
+                + float(learned_probability) * blend
+            )
+
         reason = (
             f"maker_fill spread={spread_bps:.2f};spread_component={spread_component:.3f};"
             f"score={raw_score:.3f};pa_conf={price_action_conf:.3f};"
             f"session_conf={session_conf:.3f};timing_bonus={timing_bonus:.3f};"
-            f"fill_prob={fill_probability:.3f}"
+            f"fill_prob={fill_probability:.3f};{learned_reason}"
         )
 
         return float(fill_probability), reason
@@ -9611,9 +10072,30 @@ class TradingBot:
             spread_bps = max(0.0, safe_float(candidate.get("spread_bps"), 0.0) or 0.0)
             payoff_ratio = float(expected_win_bps) / max(1.0, float(expected_loss_bps))
             uncertainty_penalty_bps = float(UTILITY_BASE_UNCERTAINTY_BPS) * (1.0 - float(p_confidence))
-            expected_value_bps = (float(p_win) * float(expected_win_bps) - (1.0 - float(p_win)) * float(expected_loss_bps) - float(cost_bps) - float(spread_bps) * 0.35 - float(uncertainty_penalty_bps))
+            expected_value_bps = (
+                float(p_win) * float(expected_win_bps)
+                - (1.0 - float(p_win)) * float(expected_loss_bps)
+                - float(cost_bps)
+                - float(spread_bps) * 0.35
+                - float(uncertainty_penalty_bps)
+            )
             maker_fill_probability, maker_reason = self._utility_maker_fill_probability(candidate)
-            maker_adjusted_expected_value_bps = (float(maker_fill_probability) * float(expected_value_bps) - (1.0 - float(maker_fill_probability)) * float(UTILITY_MAKER_NO_FILL_PENALTY_BPS))
+            maker_adjusted_expected_value_bps = (
+                float(maker_fill_probability) * float(expected_value_bps)
+                - (1.0 - float(maker_fill_probability)) * float(UTILITY_MAKER_NO_FILL_PENALTY_BPS)
+            )
+            wait_utility_bps = 0.0
+            if bool(ENABLE_WAIT_UTILITY_SCORING):
+                wait_utility_bps = (
+                    float(WAIT_UTILITY_BASE_BPS)
+                    + min(
+                        float(WAIT_UTILITY_UNCERTAINTY_BONUS_MAX_BPS),
+                        max(0.0, float(uncertainty_penalty_bps) * 0.35),
+                    )
+                    + max(0.0, float(spread_bps) - 25.0) * 0.20
+                )
+            buy_vs_wait_edge_bps = float(maker_adjusted_expected_value_bps) - float(wait_utility_bps)
+            vol_mult, realized_vol_bps, vol_reason = self._volatility_size_multiplier_for_candidate(candidate)
             setup_weak = bool(candidate.get("backtest_setup_weak", False))
             setup_strong = bool(candidate.get("backtest_setup_strong", False))
             contradiction_penalty_bps = 35.0 if setup_weak else 0.0
@@ -9625,14 +10107,85 @@ class TradingBot:
             candle_continuation = safe_float(candidate.get("candle_continuation_score"), 0.0) or 0.0
             if candle_exhaustion > 0.62 and candle_continuation < 0.50:
                 contradiction_penalty_bps += 25.0
-            expected_utility_bps = float(maker_adjusted_expected_value_bps) - float(contradiction_penalty_bps)
-            utility_quality = clamp_float(0.50 + expected_utility_bps / 260.0 + (p_win - 0.50) * 0.50 + (payoff_ratio - 1.0) * 0.18 - max(0.0, uncertainty_penalty_bps - 45.0) / 260.0, 0.0, 1.0)
-            utility_size_multiplier = clamp_float(0.65 + expected_utility_bps / 260.0 + p_confidence * 0.22 + (0.10 if setup_strong else 0.0) - (0.18 if setup_weak else 0.0), float(UTILITY_MIN_SIZE_MULTIPLIER), float(UTILITY_MAX_SIZE_MULTIPLIER))
+            expected_utility_bps = (
+                float(maker_adjusted_expected_value_bps)
+                - float(contradiction_penalty_bps)
+                - max(0.0, float(wait_utility_bps) - 8.0) * 0.35
+            )
+            utility_quality = clamp_float(
+                0.50
+                + expected_utility_bps / 260.0
+                + (p_win - 0.50) * 0.50
+                + (payoff_ratio - 1.0) * 0.18
+                - max(0.0, uncertainty_penalty_bps - 45.0) / 260.0,
+                0.0,
+                1.0,
+            )
+            utility_size_multiplier = clamp_float(
+                (
+                    0.65
+                    + expected_utility_bps / 260.0
+                    + p_confidence * 0.22
+                    + (0.10 if setup_strong else 0.0)
+                    - (0.18 if setup_weak else 0.0)
+                )
+                * float(vol_mult),
+                float(UTILITY_MIN_SIZE_MULTIPLIER),
+                float(UTILITY_MAX_SIZE_MULTIPLIER),
+            )
             utility_rank_bonus = clamp_float(expected_utility_bps * float(UTILITY_RANK_BONUS_MULT), -float(UTILITY_MAX_RANK_PENALTY), float(UTILITY_MAX_RANK_BONUS))
-            decision_reason = (f"utility p_win={p_win:.3f};p_conf={p_confidence:.3f};expected_win={expected_win_bps:.2f};expected_loss={expected_loss_bps:.2f};payoff={payoff_ratio:.3f};cost={cost_bps:.2f};spread={spread_bps:.2f};uncertainty={uncertainty_penalty_bps:.2f};ev={expected_value_bps:.2f};maker_fill={maker_fill_probability:.3f};maker_ev={maker_adjusted_expected_value_bps:.2f};contradiction_penalty={contradiction_penalty_bps:.2f};expected_utility={expected_utility_bps:.2f};utility_quality={utility_quality:.3f};size_mult={utility_size_multiplier:.3f};rank_bonus={utility_rank_bonus:.2f};{p_reason};{maker_reason}")
-            return {"calibrated_p_win": float(p_win), "utility_probability_confidence": float(p_confidence), "expected_win_bps": float(expected_win_bps), "expected_loss_bps": float(expected_loss_bps), "payoff_ratio": float(payoff_ratio), "expected_value_bps": float(expected_value_bps), "uncertainty_penalty_bps": float(uncertainty_penalty_bps), "maker_fill_probability": float(maker_fill_probability), "maker_adjusted_expected_value_bps": float(maker_adjusted_expected_value_bps), "expected_utility_bps": float(expected_utility_bps), "utility_quality": float(utility_quality), "utility_rank_bonus": float(utility_rank_bonus), "utility_size_multiplier": float(utility_size_multiplier), "utility_decision_reason": decision_reason}
+            decision_reason = (
+                f"utility p_win={p_win:.3f};p_conf={p_confidence:.3f};expected_win={expected_win_bps:.2f};"
+                f"expected_loss={expected_loss_bps:.2f};payoff={payoff_ratio:.3f};cost={cost_bps:.2f};"
+                f"spread={spread_bps:.2f};uncertainty={uncertainty_penalty_bps:.2f};ev={expected_value_bps:.2f};"
+                f"maker_fill={maker_fill_probability:.3f};maker_ev={maker_adjusted_expected_value_bps:.2f};"
+                f"contradiction_penalty={contradiction_penalty_bps:.2f};expected_utility={expected_utility_bps:.2f};"
+                f"utility_quality={utility_quality:.3f};size_mult={utility_size_multiplier:.3f};rank_bonus={utility_rank_bonus:.2f};"
+                f"wait_utility={wait_utility_bps:.2f};buy_vs_wait={buy_vs_wait_edge_bps:.2f};"
+                f"realized_vol_30m={realized_vol_bps:.2f};vol_size_mult={vol_mult:.3f};"
+                f"{vol_reason};{p_reason};{maker_reason}"
+            )
+            return {
+                "calibrated_p_win": float(p_win),
+                "utility_probability_confidence": float(p_confidence),
+                "expected_win_bps": float(expected_win_bps),
+                "expected_loss_bps": float(expected_loss_bps),
+                "payoff_ratio": float(payoff_ratio),
+                "expected_value_bps": float(expected_value_bps),
+                "uncertainty_penalty_bps": float(uncertainty_penalty_bps),
+                "maker_fill_probability": float(maker_fill_probability),
+                "maker_adjusted_expected_value_bps": float(maker_adjusted_expected_value_bps),
+                "expected_utility_bps": float(expected_utility_bps),
+                "utility_quality": float(utility_quality),
+                "utility_rank_bonus": float(utility_rank_bonus),
+                "utility_size_multiplier": float(utility_size_multiplier),
+                "wait_utility_bps": float(wait_utility_bps),
+                "buy_vs_wait_edge_bps": float(buy_vs_wait_edge_bps),
+                "realized_volatility_bps_30m": float(realized_vol_bps),
+                "volatility_size_multiplier": float(vol_mult),
+                "utility_decision_reason": decision_reason,
+            }
         except Exception as exc:
-            return {"calibrated_p_win": 0.50, "utility_probability_confidence": 0.0, "expected_win_bps": 0.0, "expected_loss_bps": float(UTILITY_DEFAULT_EXPECTED_LOSS_BPS), "payoff_ratio": 0.0, "expected_value_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS), "uncertainty_penalty_bps": float(UTILITY_BASE_UNCERTAINTY_BPS), "maker_fill_probability": 0.0, "maker_adjusted_expected_value_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS), "expected_utility_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS), "utility_quality": 0.0, "utility_rank_bonus": -float(UTILITY_MAX_RANK_PENALTY), "utility_size_multiplier": 1.0, "utility_decision_reason": f"utility_failed:{exc}"}
+            return {
+                "calibrated_p_win": 0.50,
+                "utility_probability_confidence": 0.0,
+                "expected_win_bps": 0.0,
+                "expected_loss_bps": float(UTILITY_DEFAULT_EXPECTED_LOSS_BPS),
+                "payoff_ratio": 0.0,
+                "expected_value_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS),
+                "uncertainty_penalty_bps": float(UTILITY_BASE_UNCERTAINTY_BPS),
+                "maker_fill_probability": 0.0,
+                "maker_adjusted_expected_value_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS),
+                "expected_utility_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS),
+                "utility_quality": 0.0,
+                "utility_rank_bonus": -float(UTILITY_MAX_RANK_PENALTY),
+                "utility_size_multiplier": 1.0,
+                "wait_utility_bps": float(WAIT_UTILITY_BASE_BPS),
+                "buy_vs_wait_edge_bps": -float(WAIT_UTILITY_BASE_BPS),
+                "realized_volatility_bps_30m": 0.0,
+                "volatility_size_multiplier": 1.0,
+                "utility_decision_reason": f"utility_failed:{exc}",
+            }
 
     def _setup_perf_bucket(self, value: float) -> str:
         try:
@@ -10599,6 +11152,10 @@ class TradingBot:
             votes=decision.get("votes", votes) if isinstance(decision, dict) else votes,
             truth_vote=decision.get("truth_vote", truth_vote) if isinstance(decision, dict) else truth_vote,
             reason=info["reason"],
+        )
+        self._append_decision_audit_seed(
+            candidate=candidate,
+            level8_info=info,
         )
         if (
             bool(ENABLE_BACKTEST_SETUP_PERFORMANCE_FEEDBACK)
@@ -12101,6 +12658,21 @@ class TradingBot:
                 self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
                 fill = self._require_live_fill(result, product_id=product_id, side="BUY")
                 if fill is not None:
+                    self._append_maker_fill_outcome(
+                        product_id=product_id,
+                        side="BUY",
+                        mode=mode,
+                        filled=True,
+                        partial_fill=False,
+                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
+                        bid=float(bid),
+                        ask=float(ask),
+                        limit_price=float(bid),
+                        time_on_book_sec=float(MAKER_FIRST_BUY_TIMEOUT_SEC),
+                        requested_size=float(quote_usd),
+                        filled_size=float(fill[0] if fill else 0.0),
+                        reason="maker_buy_filled",
+                    )
                     if LOG_ORDER_ATTEMPTS:
                         self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_filled;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
                     return fill
@@ -12111,6 +12683,21 @@ class TradingBot:
                 if not allow_market_fallback:
                     if LOG_ORDER_ATTEMPTS:
                         self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_no_fill_skip_market;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                    self._append_maker_fill_outcome(
+                        product_id=product_id,
+                        side="BUY",
+                        mode=mode,
+                        filled=False,
+                        partial_fill=False,
+                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
+                        bid=float(bid),
+                        ask=float(ask),
+                        limit_price=float(bid),
+                        time_on_book_sec=float(MAKER_FIRST_BUY_TIMEOUT_SEC),
+                        requested_size=float(quote_usd),
+                        filled_size=0.0,
+                        reason="maker_buy_no_fill_skip_market",
+                    )
                     log(f"[buy-skip] {product_id} maker_no_fill; skipping market fallback to avoid taker fee")
                     return None
 
@@ -12156,6 +12743,21 @@ class TradingBot:
                 result = await self._live_sell_maker(product_id=product_id, base_qty=float(base_qty), ask=float(ask))
                 fill = self._require_live_fill(result, product_id=product_id, side="SELL")
                 if fill is not None:
+                    self._append_maker_fill_outcome(
+                        product_id=product_id,
+                        side="SELL",
+                        mode=mode,
+                        filled=True,
+                        partial_fill=False,
+                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
+                        bid=float(bid),
+                        ask=float(ask),
+                        limit_price=float(ask),
+                        time_on_book_sec=float(MAKER_FIRST_SELL_TIMEOUT_SEC),
+                        requested_size=float(base_qty),
+                        filled_size=float(fill[0] if fill else 0.0),
+                        reason="maker_sell_filled",
+                    )
                     if LOG_ORDER_ATTEMPTS:
                         self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"fee_efficient_maker_sell_filled;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
                     return fill
@@ -12163,6 +12765,21 @@ class TradingBot:
                 if not bool(ALLOW_MARKET_FALLBACK_FOR_PROFIT_SELLS):
                     if LOG_ORDER_ATTEMPTS:
                         self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"fee_efficient_maker_sell_no_fill_skip_market;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                    self._append_maker_fill_outcome(
+                        product_id=product_id,
+                        side="SELL",
+                        mode=mode,
+                        filled=False,
+                        partial_fill=False,
+                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
+                        bid=float(bid),
+                        ask=float(ask),
+                        limit_price=float(ask),
+                        time_on_book_sec=float(MAKER_FIRST_SELL_TIMEOUT_SEC),
+                        requested_size=float(base_qty),
+                        filled_size=0.0,
+                        reason="maker_sell_no_fill_skip_market",
+                    )
                     log(f"[sell-skip] {product_id} maker_no_fill; skipping market fallback to avoid taker fee")
                     return None
                 log(f"[sell-fallback] {product_id} maker_no_fill; using market fallback for exit")
@@ -15331,6 +15948,13 @@ class TradingBot:
             ts_now = now_ts()
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
                 self._review_level8_missed_opportunities()
+            if (
+                bool(ENABLE_DECISION_AUDIT_REPLAY)
+                and ts_now - float(getattr(self, "last_decision_audit_review_ts", 0.0))
+                >= float(DECISION_AUDIT_REVIEW_EVERY_SEC)
+            ):
+                self.last_decision_audit_review_ts = ts_now
+                self._review_decision_audits()
             if (
                 ENABLE_LEVEL8_COUNCIL
                 and ts_now - float(self.last_agent_performance_update_ts)

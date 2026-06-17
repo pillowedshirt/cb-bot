@@ -459,8 +459,20 @@ BACKTEST_INTELLIGENCE_UPDATE_EVERY_SEC: float = 30 * 60
 BACKTEST_INTELLIGENCE_MIN_PRODUCT_ROWS: int = 80
 BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS: bool = True
 BACKTEST_USE_PRODUCT_SELL_RECOMMENDATIONS: bool = True
+
+# Backtest buy enforcement.
+# Poor replay results tighten live buying. Strong replay results get only small relief.
+BACKTEST_ENFORCE_BUY_SCORE_PROB_EV: bool = True
+BACKTEST_MIN_SAMPLE_CONFIDENCE_TO_RELAX: float = 0.60
+BACKTEST_MIN_REPLAY_QUALITY_TO_RELAX: float = 0.58
+BACKTEST_POOR_WIN_RATE_TIGHTEN_BELOW: float = 0.48
+BACKTEST_POOR_EXPECTED_NET_TIGHTEN_BELOW_BPS: float = 0.0
 BACKTEST_MAX_BUY_GATE_TIGHTEN_BPS: float = 80.0
 BACKTEST_MAX_BUY_GATE_RELIEF_BPS: float = 25.0
+BACKTEST_MAX_SCORE_FLOOR_LIFT: float = 18.0
+BACKTEST_MAX_PROB_FLOOR_LIFT: float = 0.08
+BACKTEST_MAX_EDGE_FLOOR_LIFT_BPS: float = 60.0
+BACKTEST_MIN_PROJECTED_NET_FLOOR_BPS: float = 35.0
 
 # Active mode. No observe-only staged approach.
 LEVEL8_MODE: str = "FILTER_AND_SIZE"
@@ -1245,15 +1257,11 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     """
     Rank Level 8-approved candidates by live-money quality.
 
-    Highest priority:
-    - margin above Level 8 buy threshold,
-    - truth score,
-    - final buy score,
-    - projected net after cost,
-    - expected edge,
-    - lower spread,
-    - recommended position percentage,
-    - raw probability and raw score.
+    This version includes backtest intelligence:
+    - expected replay win rate,
+    - replay quality score,
+    - live gate bias,
+    - product historical expected net bps.
     """
     def f(key: str, default: float = 0.0) -> float:
         try:
@@ -1273,6 +1281,19 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     projected_bps = f("projected_forward_gain_bps")
     cost_bps = f("cost_bps")
     projected_net_after_cost = projected_bps - cost_bps
+
+    backtest_win_rate = f("backtest_expected_win_rate", 0.50)
+    backtest_quality = f("backtest_replay_quality_score", 0.50)
+    backtest_expected_net = f("backtest_expected_net_bps", 0.0)
+    backtest_gate_bias = f("backtest_live_gate_bias_bps", 0.0)
+    backtest_confidence = f("backtest_sample_confidence", 0.0)
+
+    backtest_bonus = (
+        (backtest_win_rate - 0.50) * 55.0
+        + (backtest_quality - 0.50) * 45.0
+        + max(-120.0, min(180.0, backtest_expected_net)) * 0.10
+        - max(0.0, backtest_gate_bias) * 0.18
+    ) * max(0.15, min(1.0, backtest_confidence))
 
     timing_reason = str(candidate.get("entry_timing_reason", ""))
     timing_bonus = 0.0
@@ -1297,6 +1318,7 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + raw_score * 0.35
         + recommended_pct * 45.0
         + timing_bonus
+        + backtest_bonus
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
@@ -8277,6 +8299,135 @@ class TradingBot:
         except Exception:
             return {}
 
+    def _backtest_live_buy_requirements(
+        self,
+        *,
+        product_id: str,
+        base_min_projected_net_bps: float,
+        candidate_projected_net_after_cost_bps: float,
+    ) -> Dict[str, Any]:
+        """
+        Build product-specific live-buy floors from backtest replay.
+
+        Returns floors for projected net after cost, raw score, raw probability,
+        and expected edge. Poor replay tightens the gate. Strong replay can
+        slightly relax projected-net only when sample confidence is high.
+        """
+        base_projected = float(base_min_projected_net_bps)
+        base_score = float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY)
+        base_prob = float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY)
+        base_edge = float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE)
+
+        result = {
+            "min_projected_net_bps": base_projected,
+            "min_raw_score": base_score,
+            "min_raw_prob": base_prob,
+            "min_expected_edge_bps": base_edge,
+            "sample_confidence": 0.0,
+            "replay_quality_score": 0.50,
+            "expected_win_rate": 0.50,
+            "expected_net_bps": 0.0,
+            "live_gate_bias_bps": 0.0,
+            "reason": "no_backtest_buy_recommendation",
+        }
+
+        if not bool(BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS):
+            result["reason"] = "backtest_buy_recommendations_disabled"
+            return result
+
+        rec = self._backtest_buy_recommendation_for_product(product_id)
+        if not rec:
+            return result
+
+        try:
+            sample_conf = safe_float(rec.get("sample_confidence"), 0.0)
+            replay_quality = safe_float(rec.get("replay_quality_score"), 0.50)
+            expected_win_rate = safe_float(rec.get("expected_win_rate"), 0.50)
+            expected_net_bps = safe_float(rec.get("expected_net_bps"), 0.0)
+            gate_bias_bps = safe_float(rec.get("live_gate_bias_bps"), 0.0)
+            recommended_projected = safe_float(rec.get("recommended_min_projected_net_bps"), base_projected)
+            recommended_score = safe_float(rec.get("recommended_min_score"), base_score)
+            recommended_prob = safe_float(rec.get("recommended_min_probability"), base_prob)
+            recommended_edge = safe_float(rec.get("recommended_min_expected_value_bps"), base_edge)
+            accepted_count = safe_float(rec.get("accepted_count"), 0.0)
+            sample_count = safe_float(rec.get("sample_count"), 0.0)
+
+            poor_replay = bool(
+                expected_win_rate < float(BACKTEST_POOR_WIN_RATE_TIGHTEN_BELOW)
+                or expected_net_bps < float(BACKTEST_POOR_EXPECTED_NET_TIGHTEN_BELOW_BPS)
+                or replay_quality < 0.45
+            )
+
+            strong_replay = bool(
+                sample_conf >= float(BACKTEST_MIN_SAMPLE_CONFIDENCE_TO_RELAX)
+                and replay_quality >= float(BACKTEST_MIN_REPLAY_QUALITY_TO_RELAX)
+                and expected_win_rate >= 0.58
+                and expected_net_bps >= 70.0
+            )
+
+            min_projected = base_projected
+            min_score = base_score
+            min_prob = base_prob
+            min_edge = base_edge
+
+            if poor_replay:
+                tighten = min(
+                    float(BACKTEST_MAX_BUY_GATE_TIGHTEN_BPS),
+                    max(
+                        20.0,
+                        max(0.0, gate_bias_bps),
+                        max(0.0, recommended_projected - base_projected),
+                        max(0.0, -expected_net_bps) * 0.12,
+                    ),
+                )
+                min_projected = base_projected + tighten
+
+                if bool(BACKTEST_ENFORCE_BUY_SCORE_PROB_EV):
+                    min_score = max(base_score, min(base_score + float(BACKTEST_MAX_SCORE_FLOOR_LIFT), recommended_score))
+                    min_prob = max(base_prob, min(base_prob + float(BACKTEST_MAX_PROB_FLOOR_LIFT), recommended_prob))
+                    min_edge = max(base_edge, min(base_edge + float(BACKTEST_MAX_EDGE_FLOOR_LIFT_BPS), recommended_edge))
+
+            elif strong_replay:
+                relief = min(
+                    float(BACKTEST_MAX_BUY_GATE_RELIEF_BPS),
+                    max(0.0, base_projected - recommended_projected),
+                    abs(min(0.0, gate_bias_bps)),
+                )
+                min_projected = base_projected - relief
+            else:
+                min_projected = max(base_projected, recommended_projected)
+                if bool(BACKTEST_ENFORCE_BUY_SCORE_PROB_EV) and sample_conf >= 0.35:
+                    min_score = max(base_score, min(base_score + float(BACKTEST_MAX_SCORE_FLOOR_LIFT) * 0.50, recommended_score))
+                    min_prob = max(base_prob, min(base_prob + float(BACKTEST_MAX_PROB_FLOOR_LIFT) * 0.50, recommended_prob))
+                    min_edge = max(base_edge, min(base_edge + float(BACKTEST_MAX_EDGE_FLOOR_LIFT_BPS) * 0.50, recommended_edge))
+
+            min_projected = max(float(BACKTEST_MIN_PROJECTED_NET_FLOOR_BPS), float(min_projected))
+
+            result.update({
+                "min_projected_net_bps": float(min_projected),
+                "min_raw_score": float(min_score),
+                "min_raw_prob": float(min_prob),
+                "min_expected_edge_bps": float(min_edge),
+                "sample_confidence": float(sample_conf),
+                "replay_quality_score": float(replay_quality),
+                "expected_win_rate": float(expected_win_rate),
+                "expected_net_bps": float(expected_net_bps),
+                "live_gate_bias_bps": float(gate_bias_bps),
+                "reason": (
+                    f"backtest_buy_gate poor={poor_replay};strong={strong_replay};"
+                    f"base_projected={base_projected:.2f};min_projected={float(min_projected):.2f};"
+                    f"min_score={float(min_score):.2f};min_prob={float(min_prob):.3f};"
+                    f"min_edge={float(min_edge):.2f};candidate_projected_net={float(candidate_projected_net_after_cost_bps):.2f};"
+                    f"win_rate={float(expected_win_rate):.3f};expected_net={float(expected_net_bps):.2f};"
+                    f"sample_confidence={float(sample_conf):.3f};replay_quality={float(replay_quality):.3f};"
+                    f"accepted_count={float(accepted_count):.0f};sample_count={float(sample_count):.0f};gate_bias={float(gate_bias_bps):.2f}"
+                ),
+            })
+            return result
+        except Exception as exc:
+            result["reason"] = f"backtest_buy_gate_failed:{exc}"
+            return result
+
     def _backtest_adjusted_min_projected_net_bps(
         self,
         *,
@@ -8284,35 +8435,13 @@ class TradingBot:
         base_min_projected_net_bps: float,
         candidate_projected_net_after_cost_bps: float,
     ) -> Tuple[float, str]:
-        """Adjust the live buy projected-net requirement using replayed candidate history."""
-        if not bool(BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS):
-            return float(base_min_projected_net_bps), "backtest_buy_recommendations_disabled"
-        rec = self._backtest_buy_recommendation_for_product(product_id)
-        if not rec:
-            return float(base_min_projected_net_bps), "no_backtest_buy_recommendation"
-        try:
-            recommended_min = safe_float(rec.get("recommended_min_projected_net_bps"), float(base_min_projected_net_bps))
-            expected_win_rate = safe_float(rec.get("expected_win_rate"), 0.5)
-            expected_net_bps = safe_float(rec.get("expected_net_bps"), 0.0)
-            objective_score = safe_float(rec.get("objective_score"), 0.0)
-            adjusted = float(base_min_projected_net_bps)
-            if expected_win_rate >= 0.58 and expected_net_bps >= 70.0 and objective_score > 0.0:
-                adjusted -= min(float(BACKTEST_MAX_BUY_GATE_RELIEF_BPS), max(0.0, float(base_min_projected_net_bps) - float(recommended_min)))
-            else:
-                adjusted += min(float(BACKTEST_MAX_BUY_GATE_TIGHTEN_BPS), max(0.0, float(recommended_min) - float(base_min_projected_net_bps)))
-            adjusted = max(35.0, float(adjusted))
-            return adjusted, (
-                f"backtest_buy_adjustment "
-                f"base={float(base_min_projected_net_bps):.2f};"
-                f"recommended={float(recommended_min):.2f};"
-                f"adjusted={float(adjusted):.2f};"
-                f"candidate_projected_net={float(candidate_projected_net_after_cost_bps):.2f};"
-                f"expected_win_rate={float(expected_win_rate):.3f};"
-                f"expected_net_bps={float(expected_net_bps):.2f};"
-                f"objective={float(objective_score):.2f}"
-            )
-        except Exception as exc:
-            return float(base_min_projected_net_bps), f"backtest_buy_adjustment_failed:{exc}"
+        """Compatibility wrapper for older code paths."""
+        req = self._backtest_live_buy_requirements(
+            product_id=product_id,
+            base_min_projected_net_bps=base_min_projected_net_bps,
+            candidate_projected_net_after_cost_bps=candidate_projected_net_after_cost_bps,
+        )
+        return float(req.get("min_projected_net_bps", base_min_projected_net_bps)), str(req.get("reason", ""))
 
     def _level8_live_buy_quality_ok(
         self,
@@ -8323,10 +8452,8 @@ class TradingBot:
         """
         Convert marginal Level 8 ALLOW_BUY decisions into SHADOW instead of live orders.
 
-        Live-money rule:
-        - Level 8 remains the strategy authority.
-        - bot.py applies mechanical and quality controls before risking real funds.
-        - Weak but interesting ideas continue through SHADOW and observation learning.
+        This version enforces product-specific backtest replay floors for projected
+        net after cost, raw score, raw probability, and expected edge.
         """
         try:
             product_id = str(candidate.get("product_id", ""))
@@ -8344,75 +8471,50 @@ class TradingBot:
             spread_bps = float(candidate.get("spread_bps", 0.0) or 0.0)
 
             projected_net_after_cost = projected_forward - cost_bps
-            min_projected_net = max(
+            base_min_projected_net = max(
                 float(LEVEL8_MIN_PROJECTED_NET_AFTER_COST_BPS),
                 float(LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS),
             )
 
-            min_projected_net, backtest_buy_reason = self._backtest_adjusted_min_projected_net_bps(
+            backtest_gate = self._backtest_live_buy_requirements(
                 product_id=product_id,
-                base_min_projected_net_bps=float(min_projected_net),
+                base_min_projected_net_bps=float(base_min_projected_net),
                 candidate_projected_net_after_cost_bps=float(projected_net_after_cost),
             )
 
+            min_projected_net = float(backtest_gate.get("min_projected_net_bps", base_min_projected_net))
+            min_raw_score = float(backtest_gate.get("min_raw_score", LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY))
+            min_raw_prob = float(backtest_gate.get("min_raw_prob", LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY))
+            min_expected_edge = float(backtest_gate.get("min_expected_edge_bps", LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE))
+            backtest_buy_reason = str(backtest_gate.get("reason", ""))
+
             if final_buy < float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):
-                return False, (
-                    f"live_buy_shadowed:final_buy_too_low "
-                    f"final={final_buy:.3f} "
-                    f"min={float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):.3f}"
-                )
+                return False, f"live_buy_shadowed:final_buy_too_low final={final_buy:.3f} min={float(LEVEL8_MIN_LIVE_BUY_FINAL_SCORE):.3f};{backtest_buy_reason}"
 
             if margin < float(LEVEL8_MIN_LIVE_BUY_MARGIN):
-                return False, (
-                    f"live_buy_shadowed:margin_too_small "
-                    f"margin={margin:.3f} "
-                    f"min={float(LEVEL8_MIN_LIVE_BUY_MARGIN):.3f}"
-                )
+                return False, f"live_buy_shadowed:margin_too_small margin={margin:.3f} min={float(LEVEL8_MIN_LIVE_BUY_MARGIN):.3f};{backtest_buy_reason}"
 
             if truth < float(LEVEL8_MIN_LIVE_BUY_TRUTH):
-                return False, (
-                    f"live_buy_shadowed:truth_too_low "
-                    f"truth={truth:.3f} "
-                    f"min={float(LEVEL8_MIN_LIVE_BUY_TRUTH):.3f}"
-                )
+                return False, f"live_buy_shadowed:truth_too_low truth={truth:.3f} min={float(LEVEL8_MIN_LIVE_BUY_TRUTH):.3f};{backtest_buy_reason}"
 
             if spread_bps > float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):
-                return False, (
-                    f"live_buy_shadowed:spread_too_high "
-                    f"spread={spread_bps:.2f} "
-                    f"max={float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):.2f}"
-                )
+                return False, f"live_buy_shadowed:spread_too_high spread={spread_bps:.2f} max={float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):.2f};{backtest_buy_reason}"
 
             if projected_net_after_cost < min_projected_net:
                 return False, (
-                    f"live_buy_shadowed:projected_net_after_cost_too_low "
-                    f"projected_forward={projected_forward:.2f} "
-                    f"round_trip_cost={cost_bps:.2f} "
-                    f"net_after_cost={projected_net_after_cost:.2f} "
-                    f"min={min_projected_net:.2f} "
-                    f"{backtest_buy_reason}"
+                    f"live_buy_shadowed:projected_net_after_cost_too_low projected_forward={projected_forward:.2f};"
+                    f"round_trip_cost={cost_bps:.2f};net_after_cost={projected_net_after_cost:.2f};"
+                    f"min={min_projected_net:.2f};{backtest_buy_reason}"
                 )
 
-            if expected_edge < float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):
-                return False, (
-                    f"live_buy_shadowed:expected_edge_too_low "
-                    f"edge={expected_edge:.2f} "
-                    f"min={float(LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE):.2f}"
-                )
+            if expected_edge < min_expected_edge:
+                return False, f"live_buy_shadowed:expected_edge_too_low edge={expected_edge:.2f};min={min_expected_edge:.2f};{backtest_buy_reason}"
 
-            if raw_prob < float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY):
-                return False, (
-                    f"live_buy_shadowed:raw_prob_too_low "
-                    f"prob={raw_prob:.3f} "
-                    f"min={float(LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY):.3f}"
-                )
+            if raw_prob < min_raw_prob:
+                return False, f"live_buy_shadowed:raw_prob_too_low prob={raw_prob:.3f};min={min_raw_prob:.3f};{backtest_buy_reason}"
 
-            if raw_score < float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY):
-                return False, (
-                    f"live_buy_shadowed:raw_score_too_low "
-                    f"score={raw_score:.2f} "
-                    f"min={float(LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY):.2f}"
-                )
+            if raw_score < min_raw_score:
+                return False, f"live_buy_shadowed:raw_score_too_low score={raw_score:.2f};min={min_raw_score:.2f};{backtest_buy_reason}"
 
             moms = self._entry_momentum_snapshot(product_id)
             mom1 = float(moms.get("mom1", 0.0))
@@ -8425,21 +8527,14 @@ class TradingBot:
                     and mom3 < float(LEVEL8_MIN_MOM3_FOR_LIVE_BUY_BPS)
                     and mom5 < float(LEVEL8_MIN_MOM5_FOR_LIVE_BUY_BPS)
                 ):
-                    return False, (
-                        f"live_buy_shadowed:momentum_falling "
-                        f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};"
-                f"{backtest_buy_reason}"
-                    )
+                    return False, f"live_buy_shadowed:momentum_falling mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};{backtest_buy_reason}"
 
             if bool(LEVEL8_REQUIRE_REALTIME_UPTURN_CONFIRMATION):
                 timing_ok, timing_reason = self._entry_timing_confirmation(
                     product_id=product_id,
                     signal=candidate.get("signal"),
                 )
-                green_count = self._recent_green_candle_count(
-                    product_id,
-                    ENTRY_GREEN_CANDLE_LOOKBACK,
-                )
+                green_count = self._recent_green_candle_count(product_id, ENTRY_GREEN_CANDLE_LOOKBACK)
                 realtime_upturn_ok = bool(
                     mom1 >= float(LEVEL8_MIN_REALTIME_UPTURN_MOM1_BPS)
                     and (
@@ -8450,30 +8545,21 @@ class TradingBot:
 
                 candidate["entry_timing_ok"] = bool(timing_ok and realtime_upturn_ok)
                 candidate["entry_timing_reason"] = (
-                    f"{timing_reason};"
-                    f"realtime_upturn_ok={realtime_upturn_ok};"
-                    f"green_count={green_count};"
-                    f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+                    f"{timing_reason};realtime_upturn_ok={realtime_upturn_ok};"
+                    f"green_count={green_count};mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
                 )
 
                 if not timing_ok or not realtime_upturn_ok:
                     return False, (
-                        f"live_buy_shadowed:no_realtime_upturn "
-                        f"timing_ok={timing_ok};"
-                        f"realtime_upturn_ok={realtime_upturn_ok};"
-                        f"{candidate['entry_timing_reason']}"
+                        f"live_buy_shadowed:no_realtime_upturn timing_ok={timing_ok};"
+                        f"realtime_upturn_ok={realtime_upturn_ok};{candidate['entry_timing_reason']};{backtest_buy_reason}"
                     )
 
             return True, (
-                f"live_buy_quality_ok "
-                f"margin={margin:.3f};"
-                f"truth={truth:.3f};"
-                f"final_buy={final_buy:.3f};"
-                f"threshold={threshold:.3f};"
-                f"projected_net_after_cost={projected_net_after_cost:.2f};"
-                f"edge={expected_edge:.2f};"
-                f"spread={spread_bps:.2f};"
-                f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f}"
+                f"live_buy_quality_ok margin={margin:.3f};truth={truth:.3f};final_buy={final_buy:.3f};"
+                f"threshold={threshold:.3f};projected_net_after_cost={projected_net_after_cost:.2f};"
+                f"edge={expected_edge:.2f};prob={raw_prob:.3f};score={raw_score:.2f};spread={spread_bps:.2f};"
+                f"mom1={mom1:.2f};mom3={mom3:.2f};mom5={mom5:.2f};{backtest_buy_reason}"
             )
 
         except Exception as exc:
@@ -8496,6 +8582,19 @@ class TradingBot:
         }
         if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
             return False, fallback
+
+        try:
+            bt_rec = self._backtest_buy_recommendation_for_product(product_id)
+            if bt_rec:
+                candidate["backtest_expected_win_rate"] = safe_float(bt_rec.get("expected_win_rate"), 0.50)
+                candidate["backtest_expected_net_bps"] = safe_float(bt_rec.get("expected_net_bps"), 0.0)
+                candidate["backtest_expected_adverse_bps"] = safe_float(bt_rec.get("expected_adverse_bps"), 0.0)
+                candidate["backtest_replay_quality_score"] = safe_float(bt_rec.get("replay_quality_score"), 0.50)
+                candidate["backtest_sample_confidence"] = safe_float(bt_rec.get("sample_confidence"), 0.0)
+                candidate["backtest_live_gate_bias_bps"] = safe_float(bt_rec.get("live_gate_bias_bps"), 0.0)
+                candidate["backtest_objective_score"] = safe_float(bt_rec.get("objective_score"), 0.0)
+        except Exception:
+            pass
 
         try:
             context = self._level8_market_context(product_id=product_id, candidate=candidate)

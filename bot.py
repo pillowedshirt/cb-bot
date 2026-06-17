@@ -68,6 +68,11 @@ BOT_PROCESS_LOCK_PATH: str = os.path.join(BASE_DIR, "bot_live_process.lock")
 TZ_NAME: str = "America/Phoenix"
 TZ = ZoneInfo(TZ_NAME)
 
+
+def now_mst() -> datetime:
+    """Return current time in the bot's configured Arizona timezone."""
+    return datetime.now(TZ)
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -16669,7 +16674,7 @@ def acquire_bot_process_lock() -> int:
     lock_payload = {
         "pid": current_pid,
         "created_ts": time.time(),
-        "created_dt": now_mst().isoformat(),
+        "created_dt": datetime.now(TZ).isoformat(),
         "script_path": current_script,
         "base_dir": BASE_DIR,
         "command": " ".join(str(x) for x in sys.argv),

@@ -15,6 +15,8 @@ SIGNAL_EVENTS_CSV = os.path.join(BASE_DIR, "signal_events.csv")
 TRADE_OUTCOMES_CSV = os.path.join(BASE_DIR, "trade_outcomes.csv")
 COUNCIL_OBSERVATION_OUTCOMES_CSV = os.path.join(BASE_DIR, "council_observation_outcomes.csv")
 COUNCIL_DECISIONS_CSV = os.path.join(BASE_DIR, "council_decisions.csv")
+DECISION_AUDIT_CSV = os.path.join(BASE_DIR, "decision_audit.csv")
+SELL_QUALITY_REVIEWS_CSV = os.path.join(BASE_DIR, "sell_quality_reviews.csv")
 AI_MODEL_PATH = os.path.join(BASE_DIR, "ai_brain.joblib")
 AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
 
@@ -137,6 +139,9 @@ class LocalAIBrain:
         signals = self._safe_read(SIGNAL_EVENTS_CSV)
         trade_outcomes = self._safe_read(TRADE_OUTCOMES_CSV)
         observation_outcomes = self._safe_read(COUNCIL_OBSERVATION_OUTCOMES_CSV)
+        council_decisions = self._safe_read(COUNCIL_DECISIONS_CSV)
+        decision_audit = self._safe_read(DECISION_AUDIT_CSV)
+        sell_quality = self._safe_read(SELL_QUALITY_REVIEWS_CSV)
 
         frames = []
 
@@ -210,6 +215,46 @@ class LocalAIBrain:
 
             obs["training_source"] = "level8_observation"
             frames.append(obs)
+
+        if not council_decisions.empty:
+            decisions = council_decisions.copy()
+            if "review_minutes" not in decisions.columns:
+                decisions["review_minutes"] = 30
+            if "move_bps" not in decisions.columns:
+                if "projected_forward_gain_bps" in decisions.columns:
+                    decisions["move_bps"] = pd.to_numeric(decisions["projected_forward_gain_bps"], errors="coerce").fillna(0.0)
+                else:
+                    decisions["move_bps"] = 0.0
+            decisions["training_source"] = "council_decision"
+            frames.append(decisions)
+
+        if not decision_audit.empty:
+            audit = decision_audit.copy()
+            if "review_minutes" not in audit.columns:
+                audit["review_minutes"] = 30
+            if "move_bps" not in audit.columns:
+                for candidate_column in ["future_move_bps", "max_favorable_bps", "realized_net_pnl_bps"]:
+                    if candidate_column in audit.columns:
+                        audit["move_bps"] = pd.to_numeric(audit[candidate_column], errors="coerce").fillna(0.0)
+                        break
+                else:
+                    audit["move_bps"] = 0.0
+            audit["training_source"] = "decision_audit"
+            frames.append(audit)
+
+        if not sell_quality.empty:
+            quality = sell_quality.copy()
+            if "review_minutes" not in quality.columns:
+                quality["review_minutes"] = 30
+            if "move_bps" not in quality.columns:
+                for candidate_column in ["move_after_sell_bps", "missed_upside_bps", "capture_quality_score"]:
+                    if candidate_column in quality.columns:
+                        quality["move_bps"] = pd.to_numeric(quality[candidate_column], errors="coerce").fillna(0.0)
+                        break
+                else:
+                    quality["move_bps"] = 0.0
+            quality["training_source"] = "sell_quality_review"
+            frames.append(quality)
 
         if not frames:
             return pd.DataFrame()

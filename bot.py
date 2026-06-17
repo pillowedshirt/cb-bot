@@ -1623,6 +1623,15 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     volume_profile_leader_sell_score = f("volume_profile_leader_sell_score", 0.0)
     volume_profile_leader_wait_score = f("volume_profile_leader_wait_score", 0.50)
     volume_profile_leader_confidence = f("volume_profile_leader_confidence", 0.10)
+    previous_session_profile_buy_score = f("previous_session_profile_buy_score", 0.0)
+    previous_session_profile_sell_score = f("previous_session_profile_sell_score", 0.0)
+    previous_session_profile_confidence = f("previous_session_profile_confidence", 0.10)
+    quant_buy_score = f("quant_buy_score", 0.0)
+    quant_sell_score = f("quant_sell_score", 0.0)
+    quant_wait_score = f("quant_wait_score", 0.50)
+    quant_confidence = f("quant_confidence", 0.10)
+    quant_stationarity_score = f("quant_stationarity_score", 0.0)
+    quant_forecast_return_bps = f("quant_forecast_return_bps", 0.0)
     low_volume_path_up_bps = f("low_volume_path_up_bps", 0.0)
     poc_distance_bps = f("poc_distance_bps", 0.0)
     unfair_trade_score = f("unfair_trade_score", 0.0)
@@ -1651,6 +1660,13 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + volume_profile_leader_buy_score * volume_profile_leader_confidence * 36.0
         - volume_profile_leader_sell_score * volume_profile_leader_confidence * 28.0
         - max(0.0, volume_profile_leader_wait_score - 0.55) * volume_profile_leader_confidence * 20.0
+        + previous_session_profile_buy_score * previous_session_profile_confidence * 26.0
+        - previous_session_profile_sell_score * previous_session_profile_confidence * 18.0
+        + quant_buy_score * quant_confidence * 20.0
+        - quant_sell_score * quant_confidence * 18.0
+        - max(0.0, quant_wait_score - 0.60) * quant_confidence * 16.0
+        + max(0.0, quant_stationarity_score - 0.50) * 14.0
+        + max(0.0, quant_forecast_return_bps) * 0.08
         + min(220.0, max(0.0, low_volume_path_up_bps)) * 0.08
         + unfair_trade_score * 18.0
         - max(0.0, 24.0 - poc_distance_bps) * 0.45
@@ -17812,6 +17828,14 @@ class TradingBot:
                         outcome.get("earnings_quality_score"),
                         0.5,
                     )
+                    sell_capture_quality_score = safe_float(
+                        outcome.get("sell_capture_quality_score", outcome.get("capture_quality_score")),
+                        0.0,
+                    )
+                    previous_session_profile_reaction_state = str(
+                        outcome.get("previous_session_profile_reaction_state", outcome.get("previous_session_reaction_state", "")) or ""
+                    )
+                    quant_boundary_state = str(outcome.get("quant_boundary_state", "") or "")
                     decision_action_for_outcome = str(
                         outcome.get("decision_action", "")
                     ).upper()
@@ -17977,6 +18001,9 @@ class TradingBot:
                             f"realized_net_pnl_usd={realized_net_pnl_usd:.8f};"
                             f"realized_net_pnl_bps={realized_net_pnl_bps:.2f};"
                             f"earnings_quality_score={earnings_quality_score:.3f};"
+                            f"sell_capture_quality_score={sell_capture_quality_score:.3f};"
+                            f"previous_session_profile_reaction_state={previous_session_profile_reaction_state};"
+                            f"quant_boundary_state={quant_boundary_state};"
                             f"credit={agent_credit_score:.3f};"
                             f"weighted_credit={weighted_agent_credit_score:.3f};"
                             f"source={outcome_source};weight={outcome_weight:.2f}"
@@ -18112,6 +18139,34 @@ class TradingBot:
                 candidate.get("volume_profile_utility_adjust_bps", 0.0)
             ),
             "volume_profile_utility_reason": str(candidate.get("volume_profile_utility_reason", "")),
+            "previous_session_profile_buy_score": _json_safe_float(candidate.get("previous_session_profile_buy_score", 0.0)),
+            "previous_session_profile_sell_score": _json_safe_float(candidate.get("previous_session_profile_sell_score", 0.0)),
+            "previous_session_profile_hold_score": _json_safe_float(candidate.get("previous_session_profile_hold_score", 0.50)),
+            "previous_session_profile_wait_score": _json_safe_float(candidate.get("previous_session_profile_wait_score", 0.50)),
+            "previous_session_profile_confidence": _json_safe_float(candidate.get("previous_session_profile_confidence", 0.10)),
+            "previous_session_profile_session_key": str(candidate.get("previous_session_profile_session_key", "")),
+            "previous_session_profile_reaction_state": str(candidate.get("previous_session_profile_reaction_state", "")),
+            "previous_session_profile_bias": str(candidate.get("previous_session_profile_bias", "")),
+            "previous_session_profile_poc": _json_safe_float(candidate.get("previous_session_profile_poc", 0.0)),
+            "previous_session_profile_vah": _json_safe_float(candidate.get("previous_session_profile_vah", 0.0)),
+            "previous_session_profile_val": _json_safe_float(candidate.get("previous_session_profile_val", 0.0)),
+            "previous_session_profile_reason": str(candidate.get("previous_session_profile_reason", "")),
+            "previous_session_profile_utility_adjust_bps": _json_safe_float(candidate.get("previous_session_profile_utility_adjust_bps", 0.0)),
+            "quant_buy_score": _json_safe_float(candidate.get("quant_buy_score", 0.0)),
+            "quant_sell_score": _json_safe_float(candidate.get("quant_sell_score", 0.0)),
+            "quant_hold_score": _json_safe_float(candidate.get("quant_hold_score", 0.50)),
+            "quant_wait_score": _json_safe_float(candidate.get("quant_wait_score", 0.50)),
+            "quant_confidence": _json_safe_float(candidate.get("quant_confidence", 0.10)),
+            "quant_boundary_state": str(candidate.get("quant_boundary_state", "")),
+            "quant_volatility_cluster_state": str(candidate.get("quant_volatility_cluster_state", "")),
+            "quant_stationarity_score": _json_safe_float(candidate.get("quant_stationarity_score", 0.0)),
+            "quant_forecast_return_bps": _json_safe_float(candidate.get("quant_forecast_return_bps", 0.0)),
+            "quant_conditional_volatility_bps": _json_safe_float(candidate.get("quant_conditional_volatility_bps", 0.0)),
+            "quant_peer_product": str(candidate.get("quant_peer_product", "")),
+            "quant_peer_state": str(candidate.get("quant_peer_state", "")),
+            "quant_peer_spread_z": _json_safe_float(candidate.get("quant_peer_spread_z", 0.0)),
+            "quant_reason": str(candidate.get("quant_reason", "")),
+            "quant_context_utility_adjust_bps": _json_safe_float(candidate.get("quant_context_utility_adjust_bps", 0.0)),
         })
         return row
 

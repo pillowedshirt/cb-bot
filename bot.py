@@ -1344,6 +1344,25 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     session_upside_target_bps = f("session_upside_target_bps", 0.0)
     session_stop_distance_bps = f("session_stop_distance_bps", 0.0)
 
+    price_action_buy_score = f("price_action_buy_score", 0.0)
+    price_action_confidence = f("price_action_confidence", 0.0)
+    candle_sequence_score = f("candle_sequence_score", 0.0)
+    market_structure_buy_score = f("market_structure_buy_score", 0.0)
+    validated_liquidity_buy_score = f("validated_liquidity_buy_score", 0.0)
+    fresh_zone_buy_score = f("fresh_zone_buy_score", 0.0)
+    volume_profile_buy_score = f("volume_profile_buy_score", 0.0)
+    fvg_buy_score = f("fvg_buy_score", 0.0)
+
+    price_action_bonus = (
+        price_action_buy_score * price_action_confidence * 28.0
+        + candle_sequence_score * price_action_confidence * 10.0
+        + market_structure_buy_score * price_action_confidence * 12.0
+        + validated_liquidity_buy_score * price_action_confidence * 12.0
+        + fresh_zone_buy_score * price_action_confidence * 8.0
+        + volume_profile_buy_score * price_action_confidence * 8.0
+        + fvg_buy_score * price_action_confidence * 8.0
+    )
+
     backtest_bonus = (
         (backtest_win_rate - 0.50) * 55.0
         + (backtest_quality - 0.50) * 45.0
@@ -1384,6 +1403,7 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + timing_bonus
         + backtest_bonus
         + session_bonus
+        + price_action_bonus
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
@@ -9156,25 +9176,48 @@ class TradingBot:
             session_buy_score = float(session_liquidity_vote.get("buy", 0.0) or 0.0)
             session_confidence = float(session_liquidity_vote.get("confidence", 0.0) or 0.0)
 
+            price_action_buy_weighted = 0.0
+            price_action_conf_weighted = 0.0
+            if price_action_votes:
+                price_action_buy_weighted = sum(
+                    float(v.get("buy", 0.0) or 0.0) * float(v.get("confidence", 0.0) or 0.0)
+                    for v in price_action_votes
+                ) / max(
+                    1e-9,
+                    sum(float(v.get("confidence", 0.0) or 0.0) for v in price_action_votes),
+                )
+                price_action_conf_weighted = sum(
+                    float(v.get("confidence", 0.0) or 0.0)
+                    for v in price_action_votes
+                ) / max(1.0, float(len(price_action_votes)))
+
             truth_buy = clamp_float(
-                spread_quality * 0.16
+                spread_quality * 0.14
                 + cost_score * 0.10
-                + probability * 0.18
-                + score * 0.14
-                + forward_score * 0.14
-                + learning_score * 0.18
-                + session_buy_score * session_confidence * 0.10,
+                + probability * 0.16
+                + score * 0.13
+                + forward_score * 0.13
+                + learning_score * 0.16
+                + session_buy_score * session_confidence * 0.09
+                + price_action_buy_weighted * price_action_conf_weighted * 0.09,
                 0.0,
                 1.0,
             )
             truth_vote = vote("truth", truth_buy, clamp_float(0.35+truth_buy*0.30,0.0,1.0), clamp_float(0.80-truth_buy*0.55,0.0,1.0), clamp_float(0.30+truth_buy*0.55,0.20,0.90), f"truth evidence={truth_buy:.3f};setup={setup_tag};regime={market_regime}")
             session_agent_for_strategy = str(session_liquidity_vote.get("agent", "session_none"))
             session_setup_for_strategy = str(session_liquidity_vote.get("session_liquidity_setup", "none"))
+            pa_context_for_strategy = dict(context.get("price_action_context", {}) or {})
+            value_area_for_strategy = str(pa_context_for_strategy.get("value_area_state", ""))
+            fvg_state_for_strategy = str(pa_context_for_strategy.get("fvg_state", ""))
+            structure_for_strategy = str(pa_context_for_strategy.get("structure_state", ""))
 
             strategy = (
                 f"LEVEL8_DIRECT|regime={market_regime}|setup={setup_tag}|"
                 f"session_agent={session_agent_for_strategy}|"
                 f"session_setup={session_setup_for_strategy}|"
+                f"structure={structure_for_strategy}|"
+                f"value_area={value_area_for_strategy}|"
+                f"fvg={fvg_state_for_strategy}|"
                 f"execution={execution_state}"
             )
             decision = self.level8_council.decide_buy(product_id=product_id, strategy=strategy, votes=votes, truth_vote=truth_vote)
@@ -9196,6 +9239,7 @@ class TradingBot:
             }
             base_reason = str(decision.get("sizing_reason", decision.get("reason", "")))
             session_context = dict(context.get("session_liquidity", {}) or {})
+            price_context = dict(context.get("price_action_context", {}) or {})
             info["reason"] = (
                 f"{base_reason};"
                 f"setup={context['setup_tag']};"
@@ -9203,7 +9247,8 @@ class TradingBot:
                 f"learning_score={info['learning_score']:.3f};"
                 f"session_agent={session_context.get('strongest_agent', '')};"
                 f"session_setup={session_context.get('strongest_setup', '')};"
-                f"session_reason={session_context.get('reason', '')}"
+                f"session_reason={session_context.get('reason', '')};"
+                f"price_action_reason={price_context.get('reason', '')}"
             )
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")

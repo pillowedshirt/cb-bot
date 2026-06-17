@@ -9,6 +9,37 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
 
+
+try:
+    from debug_tools import (
+        module_debug,
+        module_exception,
+        debug_every,
+        debug_timer,
+    )
+except Exception:
+    def module_debug(*args, **kwargs):
+        pass
+    def module_exception(*args, **kwargs):
+        pass
+    def debug_every(*args, **kwargs):
+        pass
+    class debug_timer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+MODULE_NAME = __name__.split(".")[-1]
+module_debug(
+    MODULE_NAME,
+    "module_loaded",
+    data={"file": __file__},
+    level="DEBUG",
+    also_overall=False,
+)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SIGNAL_EVENTS_CSV = os.path.join(BASE_DIR, "signal_events.csv")

@@ -82,6 +82,39 @@ except Exception:
     quant_context_to_dict = None
 
 
+try:
+    from debug_tools import (
+        module_debug,
+        module_exception,
+        debug_every,
+        debug_timer,
+        initialize_all_module_debug_logs,
+        csv_debug_summary,
+        viewer_snapshot_summary,
+    )
+except Exception:
+    def module_debug(*args, **kwargs):
+        pass
+    def module_exception(*args, **kwargs):
+        pass
+    def debug_every(*args, **kwargs):
+        pass
+    class debug_timer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+    def initialize_all_module_debug_logs(*args, **kwargs):
+        pass
+    def csv_debug_summary(*args, **kwargs):
+        return {}
+    def viewer_snapshot_summary(*args, **kwargs):
+        return {}
+
+MODULE_NAME = "bot"
+
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 BOT_PROCESS_LOCK_PATH: str = os.path.join(BASE_DIR, "bot_live_process.lock")
 TZ_NAME: str = "America/Phoenix"
@@ -1518,7 +1551,7 @@ def _rotate_debug_log_if_needed() -> None:
 
 
 def log(msg: str) -> None:
-    """Write a timestamped bot log line to both the terminal and debug.log."""
+    """Write a timestamped bot log line to terminal, debug.log, and debug/bot.debug.log."""
     try:
         ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     except Exception:
@@ -1526,6 +1559,16 @@ def log(msg: str) -> None:
 
     line = f"{ts} {msg}"
     print(line, flush=True)
+
+    try:
+        module_debug(
+            MODULE_NAME,
+            str(msg),
+            level="INFO",
+            also_overall=False,
+        )
+    except Exception:
+        pass
 
     if not DEBUG_LOG_ENABLED:
         return
@@ -1540,7 +1583,16 @@ def log(msg: str) -> None:
 
 
 def log_exception(context: str, exc: Exception) -> None:
-    """Write a compact exception line to debug.log and the terminal."""
+    """Write a compact exception line to debug.log, terminal, and debug/bot.debug.log."""
+    try:
+        module_exception(
+            MODULE_NAME,
+            context,
+            exc,
+            also_overall=True,
+        )
+    except Exception:
+        pass
     log(f"[exception] {context}: {type(exc).__name__}: {exc}")
 
 def now_ts() -> float:
@@ -11216,17 +11268,50 @@ class TradingBot:
 
     def _market_data_age_for_product(self, product_id: str) -> float:
         try:
+            product_id = str(product_id)
+            # The actual bot top-of-book cache is self.tob: Dict[str, Optional[TopOfBook]].
+            tob_obj = getattr(self, "tob", {}).get(product_id)
             last_ts = 0.0
-            # Prefer websocket quote timestamp if available.
-            tob = getattr(self, "top_of_book", {}).get(product_id, {})
-            if isinstance(tob, dict):
-                last_ts = float(tob.get("ts", tob.get("updated_ts", 0.0)) or 0.0)
-            # Fallback to market CSV is too heavy here; if in-memory timestamp is
-            # missing, return a high age to keep live buys safe.
+            if tob_obj is not None:
+                try:
+                    last_ts = float(getattr(tob_obj, "ts", 0.0) or 0.0)
+                except Exception:
+                    last_ts = 0.0
+            # Optional compatibility fallback if a future patch adds dict cache.
             if last_ts <= 0:
+                tob_dict = getattr(self, "top_of_book", {}).get(product_id, {})
+                if isinstance(tob_dict, dict):
+                    last_ts = float(tob_dict.get("ts", tob_dict.get("updated_ts", 0.0)) or 0.0)
+            if last_ts <= 0:
+                debug_every(
+                    MODULE_NAME,
+                    f"market_data_age_missing:{product_id}",
+                    30.0,
+                    "market_data_age_missing",
+                    data={"product_id": product_id, "reason": "no_tob_ts"},
+                    level="WARN",
+                    also_overall=True,
+                )
                 return 9999.0
-            return max(0.0, now_ts() - last_ts)
-        except Exception:
+            age = max(0.0, now_ts() - last_ts)
+            debug_every(
+                MODULE_NAME,
+                f"market_data_age:{product_id}",
+                60.0,
+                "market_data_age_checked",
+                data={"product_id": product_id, "age_sec": age, "last_ts": last_ts},
+                level="DEBUG",
+                also_overall=False,
+            )
+            return age
+        except Exception as exc:
+            module_exception(
+                MODULE_NAME,
+                "_market_data_age_for_product failed",
+                exc,
+                data={"product_id": product_id},
+                also_overall=True,
+            )
             return 9999.0
 
     def _walk_forward_penalty_for_product(self, product_id: str) -> Dict[str, Any]:
@@ -18570,12 +18655,25 @@ class TradingBot:
                     f"[viewer_snapshot] wrote coins={len(rows)} "
                     f"positions={sum(1 for r in rows.values() if bool(r.get('owns_position', False)))}"
                 )
+                module_debug(
+                    MODULE_NAME,
+                    "viewer_snapshot_written",
+                    data=viewer_snapshot_summary(snapshot),
+                    level="DEBUG",
+                    also_overall=False,
+                )
                 self._last_viewer_snapshot_success_log_ts = now_ts()
         except Exception as exc:
-            try:
-                self._log_debug(f"[viewer_snapshot] write failed: {exc}")
-            except Exception:
-                pass
+            module_exception(
+                MODULE_NAME,
+                "_write_viewer_snapshot failed",
+                exc,
+                data={
+                    "path": VIEWER_SNAPSHOT_PATH,
+                    "snapshot_keys": list(snapshot.keys()) if isinstance(snapshot, dict) else [],
+                },
+                also_overall=True,
+            )
 
     def _refresh_viewer_snapshot_from_candidates(self, candidates: List[Dict[str, Any]]) -> None:
         try:
@@ -20848,6 +20946,14 @@ def release_bot_process_lock() -> None:
 async def main() -> None:
     global PRODUCTS
 
+    initialize_all_module_debug_logs(BASE_DIR)
+    module_debug(
+        MODULE_NAME,
+        "bot_main_starting",
+        data={"base_dir": BASE_DIR, "file": __file__},
+        level="INFO",
+        also_overall=True,
+    )
     process_lock_pid = acquire_bot_process_lock()
 
     try:

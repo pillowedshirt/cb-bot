@@ -9,11 +9,58 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 try:
+    from debug_tools import (
+        module_debug,
+        module_exception,
+        debug_every,
+        debug_timer,
+        initialize_all_module_debug_logs,
+        dataframe_debug_summary,
+        viewer_snapshot_summary,
+        csv_debug_summary,
+    )
+except Exception:
+    def module_debug(*args, **kwargs):
+        pass
+    def module_exception(*args, **kwargs):
+        pass
+    def debug_every(*args, **kwargs):
+        pass
+    class debug_timer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+    def initialize_all_module_debug_logs(*args, **kwargs):
+        pass
+    def dataframe_debug_summary(*args, **kwargs):
+        return {}
+    def viewer_snapshot_summary(*args, **kwargs):
+        return {}
+    def csv_debug_summary(*args, **kwargs):
+        return {}
+
+MODULE_NAME = "viewer"
+
+try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
     st_autorefresh = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+initialize_all_module_debug_logs(BASE_DIR)
+module_debug(
+    MODULE_NAME,
+    "viewer_module_loaded",
+    data={
+        "base_dir": BASE_DIR,
+        "file": __file__,
+    },
+    level="INFO",
+    also_overall=True,
+)
 VIEWER_SNAPSHOT_PATH = os.path.join(BASE_DIR, "viewer_snapshot.json")
 VIEWER_SNAPSHOT_CSV_SAFE_PATH = VIEWER_SNAPSHOT_PATH
 MARKET_CSV_PATH = os.path.join(BASE_DIR, "market.csv")
@@ -68,17 +115,87 @@ div[data-testid="stMetric"] { background: rgba(37,29,23,0.95); border: 1px solid
 
 @st.cache_data(ttl=FAST_TTL_SEC, show_spinner=False)
 def load_viewer_snapshot() -> Dict[str, Any]:
-    if not os.path.exists(VIEWER_SNAPSHOT_CSV_SAFE_PATH):
-        return {"updated_ts": 0.0, "coins": {}, "top_products": [], "live_positions": []}
-    with open(VIEWER_SNAPSHOT_CSV_SAFE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        if not os.path.exists(VIEWER_SNAPSHOT_CSV_SAFE_PATH):
+            debug_every(
+                MODULE_NAME,
+                "viewer_snapshot_missing",
+                10.0,
+                "viewer_snapshot_missing",
+                data={"path": VIEWER_SNAPSHOT_CSV_SAFE_PATH},
+                level="WARN",
+                also_overall=True,
+            )
+            return {
+                "updated_ts": 0.0,
+                "coins": {},
+                "top_products": [],
+                "live_positions": [],
+                "_viewer_snapshot_error": "viewer_snapshot.json not found",
+            }
+        with open(VIEWER_SNAPSHOT_CSV_SAFE_PATH, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        debug_every(
+            MODULE_NAME,
+            "viewer_snapshot_loaded",
+            10.0,
+            "viewer_snapshot_loaded",
+            data=viewer_snapshot_summary(snapshot),
+            level="DEBUG",
+            also_overall=False,
+        )
+        return snapshot
+    except Exception as exc:
+        module_exception(
+            MODULE_NAME,
+            "load_viewer_snapshot failed",
+            exc,
+            data={"path": VIEWER_SNAPSHOT_CSV_SAFE_PATH},
+            also_overall=True,
+        )
+        return {
+            "updated_ts": 0.0,
+            "coins": {},
+            "top_products": [],
+            "live_positions": [],
+            "_viewer_snapshot_error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 @st.cache_data(ttl=SLOW_TTL_SEC, show_spinner=False)
 def load_csv(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
+    try:
+        if not os.path.exists(path):
+            debug_every(
+                MODULE_NAME,
+                f"csv_missing:{os.path.basename(path)}",
+                30.0,
+                "viewer_csv_missing",
+                data={"path": path},
+                level="DEBUG",
+                also_overall=False,
+            )
+            return pd.DataFrame()
+        frame = pd.read_csv(path)
+        debug_every(
+            MODULE_NAME,
+            f"csv_loaded:{os.path.basename(path)}",
+            30.0,
+            "viewer_csv_loaded",
+            data=dataframe_debug_summary(frame, name=os.path.basename(path)),
+            level="DEBUG",
+            also_overall=False,
+        )
+        return frame
+    except Exception as exc:
+        module_exception(
+            MODULE_NAME,
+            "viewer_csv_load_failed",
+            exc,
+            data={"path": path},
+            also_overall=True,
+        )
         return pd.DataFrame()
-    return pd.read_csv(path)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -98,12 +215,7 @@ def load_ai_feature_importance_df() -> pd.DataFrame:
 
 @st.cache_data(ttl=FAST_TTL_SEC, show_spinner=False)
 def load_council_votes_df() -> pd.DataFrame:
-    if not os.path.exists(COUNCIL_VOTES_CSV_PATH):
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(COUNCIL_VOTES_CSV_PATH)
-    except Exception:
-        return pd.DataFrame()
+    return load_csv(COUNCIL_VOTES_CSV_PATH)
 
 
 def freshness_class(age_sec: float) -> str:
@@ -156,6 +268,26 @@ def latest_targets_for_coin(df: pd.DataFrame, product_id: str) -> Dict[str, Any]
 
 
 def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confirmed_trades_df: pd.DataFrame, target_state: Dict[str, Any]) -> go.Figure:
+    selected_product_for_debug = str(coin_state.get("product_id", "unknown"))
+    debug_every(
+        MODULE_NAME,
+        f"chart_input:{selected_product_for_debug}",
+        10.0,
+        "chart_build_input",
+        data={
+            "product_id": selected_product_for_debug,
+            "history": dataframe_debug_summary(history_df, required_columns=["ts"], name="history_df"),
+            "confirmed_trades": dataframe_debug_summary(
+                confirmed_trades_df,
+                required_columns=["ts", "side", "price"],
+                name="confirmed_trades_df",
+            ),
+            "target_keys": list(target_state.keys()) if isinstance(target_state, dict) else [],
+            "coin_state_keys": list(coin_state.keys())[:120] if isinstance(coin_state, dict) else [],
+        },
+        level="DEBUG",
+        also_overall=False,
+    )
     has_volume = "volume" in history_df.columns if not history_df.empty else False
     if has_volume:
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.035, row_heights=[0.76, 0.24])
@@ -163,6 +295,25 @@ def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confi
         fig = go.Figure()
     if history_df.empty:
         fig.update_layout(template="plotly_dark", title="No market history available", paper_bgcolor="#221a14", plot_bgcolor="#221a14", font=dict(color="#f3ead6"), height=520)
+        try:
+            debug_every(
+                MODULE_NAME,
+                f"chart_output:{selected_product_for_debug}",
+                10.0,
+                "chart_build_output",
+                data={
+                    "product_id": selected_product_for_debug,
+                    "has_volume": False,
+                    "trace_count": len(getattr(fig, "data", []) or []),
+                    "height": 520,
+                    "line_count": 0,
+                    "empty_history": True,
+                },
+                level="DEBUG",
+                also_overall=False,
+            )
+        except Exception:
+            pass
         return fig
     ts_col = "ts" if "ts" in history_df.columns else history_df.columns[0]
     close_col = "close" if "close" in history_df.columns else "mid" if "mid" in history_df.columns else "price"
@@ -217,6 +368,24 @@ def build_coin_chart(history_df: pd.DataFrame, coin_state: Dict[str, Any], confi
     if has_volume:
         fig.update_yaxes(title_text="Price", row=1, col=1)
         fig.update_yaxes(title_text="Volume", row=2, col=1, showgrid=False)
+    try:
+        debug_every(
+            MODULE_NAME,
+            f"chart_output:{selected_product_for_debug}",
+            10.0,
+            "chart_build_output",
+            data={
+                "product_id": selected_product_for_debug,
+                "has_volume": bool(has_volume),
+                "trace_count": len(getattr(fig, "data", []) or []),
+                "height": 650 if has_volume else 560,
+                "line_count": len(lines),
+            },
+            level="DEBUG",
+            also_overall=False,
+        )
+    except Exception:
+        pass
     return fig
 
 
@@ -447,6 +616,90 @@ def render_transcript_strategy_context(coin: Dict[str, Any]) -> None:
     )
 
 
+def viewer_runtime_audit(
+    *,
+    snapshot: Dict[str, Any],
+    selected: str,
+    market_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    targets_df: pd.DataFrame,
+    decisions_df: pd.DataFrame,
+    council_votes_df: pd.DataFrame,
+    orders_df: pd.DataFrame,
+    walk_forward_df: pd.DataFrame,
+    agent_ablation_df: pd.DataFrame,
+    ai_importance_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    coins = dict(snapshot.get("coins", {}) or {})
+    coin = dict(coins.get(selected, {}) or {})
+    required_coin_fields = [
+        "product_id",
+        "price",
+        "truth_score",
+        "final_buy_score",
+        "expected_utility_bps",
+        "buy_vs_wait_edge_bps",
+        "volume_profile_leader_buy_score",
+        "volume_profile_leader_sell_score",
+        "value_acceptance_state",
+        "volume_node_state",
+        "previous_session_profile_reaction_state",
+        "quant_boundary_state",
+        "order_book_imbalance",
+        "liquidity_risk_score",
+    ]
+    missing_coin_fields = [field for field in required_coin_fields if field not in coin]
+    if market_df.empty or "product_id" not in market_df.columns:
+        selected_market_rows = 0
+    else:
+        selected_market_rows = int((market_df["product_id"].astype(str) == str(selected)).sum())
+    if trades_df.empty or "product_id" not in trades_df.columns:
+        selected_trade_rows = 0
+    else:
+        selected_trade_rows = int((trades_df["product_id"].astype(str) == str(selected)).sum())
+    if council_votes_df.empty or "product_id" not in council_votes_df.columns:
+        selected_vote_rows = 0
+    else:
+        selected_vote_rows = int((council_votes_df["product_id"].astype(str) == str(selected)).sum())
+    updated_ts = _safe_float(snapshot.get("updated_ts", 0.0))
+    snapshot_age = max(0.0, time.time() - updated_ts) if updated_ts > 0 else 999999.0
+    health = {
+        "selected": selected,
+        "snapshot_age_sec": snapshot_age,
+        "coin_count": len(coins),
+        "selected_coin_present": bool(coin),
+        "missing_coin_fields": missing_coin_fields,
+        "selected_market_rows": selected_market_rows,
+        "selected_trade_rows": selected_trade_rows,
+        "selected_vote_rows": selected_vote_rows,
+        "market_df": dataframe_debug_summary(market_df, required_columns=["ts", "product_id"], name="market.csv"),
+        "trades_df": dataframe_debug_summary(
+            trades_df, required_columns=["ts", "product_id", "side", "price"], name="trades.csv"
+        ),
+        "targets_df": dataframe_debug_summary(targets_df, required_columns=["product_id"], name="position_targets.csv"),
+        "decisions_df": dataframe_debug_summary(decisions_df, required_columns=["product_id"], name="council_decisions.csv"),
+        "council_votes_df": dataframe_debug_summary(
+            council_votes_df, required_columns=["product_id", "agent"], name="council_votes.csv"
+        ),
+        "orders_df": dataframe_debug_summary(orders_df, name="orders.csv"),
+        "walk_forward_df": dataframe_debug_summary(walk_forward_df, name="walk_forward_validation.csv"),
+        "agent_ablation_df": dataframe_debug_summary(agent_ablation_df, name="agent_ablation.csv"),
+        "ai_importance_df": dataframe_debug_summary(ai_importance_df, name="ai_feature_importance.csv"),
+    }
+    level = "INFO"
+    if missing_coin_fields or snapshot_age > 20 or selected_market_rows <= 0:
+        level = "WARN"
+    debug_every(
+        MODULE_NAME,
+        f"viewer_runtime_audit:{selected}",
+        10.0,
+        "viewer_runtime_audit",
+        data=health,
+        level=level,
+        also_overall=(level == "WARN"),
+    )
+    return health
+
 def main() -> None:
     inject_medieval_css()
     if st_autorefresh is not None:
@@ -469,6 +722,19 @@ def main() -> None:
     walk_forward_df = load_walk_forward_validation_df()
     agent_ablation_df = load_agent_ablation_df()
     ai_importance_df = load_ai_feature_importance_df()
+    viewer_health = viewer_runtime_audit(
+        snapshot=snapshot,
+        selected=selected,
+        market_df=market_df,
+        trades_df=trades_df,
+        targets_df=targets_df,
+        decisions_df=decisions_df,
+        council_votes_df=council_votes_df,
+        orders_df=orders_df,
+        walk_forward_df=walk_forward_df,
+        agent_ablation_df=agent_ablation_df,
+        ai_importance_df=ai_importance_df,
+    )
     render_leader_and_council(snapshot, selected)
     st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
     render_agent_statements(council_votes_df, selected)
@@ -490,6 +756,8 @@ def main() -> None:
         st.json({"live_positions": snapshot.get("live_positions", []), "top_products": snapshot.get("top_products", [])})
     with st.expander("Live Readiness", expanded=False):
         st.json(snapshot.get("readiness", {}))
+    with st.expander("Viewer Debug Health", expanded=False):
+        st.json(viewer_health)
     with st.expander("Raw Council Tables", expanded=False):
         if decisions_df.empty:
             st.info("No council decision log found.")
@@ -509,10 +777,18 @@ def main() -> None:
             st.info("No walk-forward validation rows yet.")
         st.markdown("### Agent Ablation")
         if not agent_ablation_df.empty:
-            if "ablation_score" in agent_ablation_df.columns:
-                agent_ablation_view = agent_ablation_df.sort_values("ablation_score", ascending=False).tail(50)
+            agent_ablation_view = agent_ablation_df.copy()
+            if "ablation_score" in agent_ablation_view.columns:
+                agent_ablation_view["ablation_score_num"] = pd.to_numeric(
+                    agent_ablation_view["ablation_score"],
+                    errors="coerce",
+                ).fillna(0.0)
+                agent_ablation_view = agent_ablation_view.sort_values(
+                    "ablation_score_num",
+                    ascending=False,
+                ).head(50)
             else:
-                agent_ablation_view = agent_ablation_df.tail(50)
+                agent_ablation_view = agent_ablation_view.tail(50)
             st.dataframe(agent_ablation_view, use_container_width=True, hide_index=True)
         else:
             st.info("No agent ablation rows yet.")
@@ -524,4 +800,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        module_exception(
+            MODULE_NAME,
+            "viewer main crashed",
+            exc,
+            also_overall=True,
+        )
+        try:
+            st.error("Viewer crashed. Check debug/viewer.debug.log for the full traceback.")
+            st.exception(exc)
+        except Exception:
+            pass
+        raise

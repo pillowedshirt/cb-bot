@@ -790,6 +790,41 @@ MARKET_FALLBACK_BUY_MIN_FINAL_SCORE: float = 0.82
 MARKET_FALLBACK_BUY_MIN_TRUTH: float = 0.72
 MARKET_FALLBACK_BUY_MIN_PROJECTED_NET_BPS: float = 180.0
 
+# ============================================================
+# EXPECTED UTILITY LEADER
+# ============================================================
+
+ENABLE_EXPECTED_UTILITY_LEADER: bool = True
+
+# A live trade should have enough expected value to justify fees, uncertainty,
+# no-fill risk, and adverse path risk.
+UTILITY_MIN_EXPECTED_BPS_FOR_LIVE_BUY: float = 35.0
+UTILITY_MIN_MAKER_ADJUSTED_BPS_FOR_LIVE_BUY: float = 20.0
+
+# Required probability/payoff quality. These are not strategy gates; they are
+# mathematical quality rails after the council has weighed the evidence.
+UTILITY_MIN_CALIBRATED_P_WIN: float = 0.46
+UTILITY_MIN_PAYOFF_RATIO: float = 0.85
+
+# Shrink small sample sizes toward neutral.
+UTILITY_TARGET_SAMPLE_COUNT: float = 80.0
+UTILITY_BASE_UNCERTAINTY_BPS: float = 90.0
+
+# Expected loss defaults when setup/backtest data is thin.
+UTILITY_DEFAULT_EXPECTED_LOSS_BPS: float = 120.0
+UTILITY_MIN_EXPECTED_WIN_BPS: float = 35.0
+
+# Maker-first execution. Maker orders save fees when filled, but can miss.
+UTILITY_MIN_MAKER_FILL_PROBABILITY: float = 0.25
+UTILITY_MAKER_NO_FILL_PENALTY_BPS: float = 12.0
+
+# Utility affects ranking and sizing, but remains bounded.
+UTILITY_RANK_BONUS_MULT: float = 0.45
+UTILITY_MAX_RANK_BONUS: float = 70.0
+UTILITY_MAX_RANK_PENALTY: float = 65.0
+UTILITY_MIN_SIZE_MULTIPLIER: float = 0.45
+UTILITY_MAX_SIZE_MULTIPLIER: float = 1.25
+
 # Execution friction
 MAX_SPREAD_BPS: float = 18.0
 SCALP_MAX_SPREAD_BPS: float = 10.0
@@ -1393,6 +1428,12 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     backtest_setup_rank_bonus = f("backtest_setup_rank_bonus", 0.0)
     backtest_setup_quality = f("backtest_setup_quality", 0.50)
     backtest_setup_confidence = f("backtest_setup_confidence", 0.0)
+    expected_utility_bps = f("expected_utility_bps", 0.0)
+    maker_adjusted_expected_value_bps = f("maker_adjusted_expected_value_bps", 0.0)
+    calibrated_p_win = f("calibrated_p_win", 0.50)
+    payoff_ratio = f("payoff_ratio", 0.0)
+    utility_rank_bonus = f("utility_rank_bonus", 0.0)
+    uncertainty_penalty_bps = f("uncertainty_penalty_bps", 0.0)
 
     price_action_bonus = (
         price_action_buy_score * price_action_confidence * 28.0
@@ -1447,6 +1488,12 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + price_action_bonus
         + backtest_setup_rank_bonus
         + (backtest_setup_quality - 0.50) * backtest_setup_confidence * 35.0
+        + utility_rank_bonus
+        + max(-40.0, min(70.0, expected_utility_bps * 0.22))
+        + max(-30.0, min(45.0, maker_adjusted_expected_value_bps * 0.15))
+        + (calibrated_p_win - 0.50) * 70.0
+        + max(-20.0, min(25.0, (payoff_ratio - 1.0) * 22.0))
+        - max(0.0, uncertainty_penalty_bps - 55.0) * 0.10
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
@@ -9379,6 +9426,214 @@ class TradingBot:
             f"setup_keys={len(self.backtest_setup_performance_by_key)}"
         )
 
+    def _utility_sample_confidence(self, sample_count: float) -> float:
+        """
+        Convert a sample count into confidence.
+
+        Small samples are pulled toward neutral. Larger samples earn more trust.
+        """
+        try:
+            n = max(0.0, float(sample_count))
+            return clamp_float(
+                math.sqrt(n / max(1.0, float(UTILITY_TARGET_SAMPLE_COUNT))),
+                0.0,
+                1.0,
+            )
+        except Exception:
+            return 0.0
+
+    def _utility_expected_loss_bps(self, candidate: Dict[str, Any]) -> float:
+        """
+        Estimate expected adverse/loss size.
+
+        Use setup-specific adverse data first, then product-level backtest adverse,
+        then modeled default loss.
+        """
+        setup_adverse = abs(safe_float(candidate.get("backtest_setup_avg_adverse_bps"), 0.0) or 0.0)
+        product_adverse = abs(safe_float(candidate.get("backtest_expected_adverse_bps"), 0.0) or 0.0)
+        cost_bps = abs(safe_float(candidate.get("cost_bps"), 0.0) or 0.0)
+        spread_bps = abs(safe_float(candidate.get("spread_bps"), 0.0) or 0.0)
+
+        loss_candidates = [
+            float(UTILITY_DEFAULT_EXPECTED_LOSS_BPS),
+            cost_bps + spread_bps + 45.0,
+        ]
+
+        if setup_adverse > 0:
+            loss_candidates.append(setup_adverse)
+
+        if product_adverse > 0:
+            loss_candidates.append(product_adverse)
+
+        return float(max(loss_candidates))
+
+    def _utility_expected_win_bps(self, candidate: Dict[str, Any]) -> float:
+        """
+        Estimate expected upside.
+
+        Use projected forward gain, expected edge, setup average net,
+        and product-level backtest expected net.
+        """
+        projected_forward = safe_float(candidate.get("projected_forward_gain_bps"), 0.0) or 0.0
+        expected_edge = safe_float(candidate.get("expected_net_edge_bps"), 0.0) or 0.0
+        setup_avg_net = safe_float(candidate.get("backtest_setup_avg_net_bps"), 0.0) or 0.0
+        product_avg_net = safe_float(candidate.get("backtest_expected_net_bps"), 0.0) or 0.0
+        session_target = safe_float(candidate.get("session_upside_target_bps"), 0.0) or 0.0
+
+        positive_values = [
+            float(UTILITY_MIN_EXPECTED_WIN_BPS),
+            max(0.0, projected_forward),
+            max(0.0, expected_edge),
+            max(0.0, setup_avg_net),
+            max(0.0, product_avg_net),
+        ]
+
+        if session_target > 0:
+            positive_values.append(max(0.0, min(260.0, session_target)))
+
+        # Use a blend instead of max-only so one inflated number does not dominate.
+        sorted_values = sorted(positive_values)
+        median_value = sorted_values[len(sorted_values) // 2]
+        max_value = max(positive_values)
+
+        return float(max(float(UTILITY_MIN_EXPECTED_WIN_BPS), median_value * 0.55 + max_value * 0.45))
+
+    def _utility_calibrated_p_win(self, candidate: Dict[str, Any]) -> Tuple[float, float, str]:
+        """
+        Calibrate win probability from available evidence.
+
+        Priority:
+        - setup-specific win rate when sample size exists,
+        - product-level backtest win rate,
+        - live raw estimated probability,
+        all shrunk toward 0.50 when confidence is low.
+        """
+        raw_prob = clamp_float(safe_float(candidate.get("estimated_prob_up"), 0.50) or 0.50, 0.0, 1.0)
+
+        setup_sample_count = safe_float(candidate.get("backtest_setup_sample_count"), 0.0) or 0.0
+        setup_win_rate = clamp_float(
+            safe_float(candidate.get("backtest_setup_win_rate"), 0.50) or 0.50,
+            0.0,
+            1.0,
+        )
+        setup_confidence = self._utility_sample_confidence(setup_sample_count)
+
+        product_confidence = clamp_float(
+            safe_float(candidate.get("backtest_sample_confidence"), 0.0) or 0.0,
+            0.0,
+            1.0,
+        )
+        product_win_rate = clamp_float(
+            safe_float(candidate.get("backtest_expected_win_rate"), 0.50) or 0.50,
+            0.0,
+            1.0,
+        )
+
+        raw_confidence = clamp_float(0.25 + abs(raw_prob - 0.50) * 0.70, 0.20, 0.65)
+
+        weights = [
+            (setup_win_rate, setup_confidence * 1.35),
+            (product_win_rate, product_confidence * 1.00),
+            (raw_prob, raw_confidence * 0.70),
+            (0.50, 0.85),
+        ]
+
+        total_weight = sum(w for _, w in weights) or 1.0
+        calibrated = sum(p * w for p, w in weights) / total_weight
+
+        total_confidence = clamp_float(
+            (setup_confidence * 0.50)
+            + (product_confidence * 0.25)
+            + (raw_confidence * 0.25),
+            0.0,
+            1.0,
+        )
+
+        reason = (
+            f"pwin setup_wr={setup_win_rate:.3f};setup_n={setup_sample_count:.0f};"
+            f"setup_conf={setup_confidence:.3f};product_wr={product_win_rate:.3f};"
+            f"product_conf={product_confidence:.3f};raw_prob={raw_prob:.3f};"
+            f"raw_conf={raw_confidence:.3f};calibrated={calibrated:.3f};"
+            f"total_conf={total_confidence:.3f}"
+        )
+
+        return clamp_float(calibrated, 0.0, 1.0), total_confidence, reason
+
+    def _utility_maker_fill_probability(self, candidate: Dict[str, Any]) -> Tuple[float, str]:
+        """
+        Estimate maker fill probability from spread, volatility, momentum, and execution mode.
+
+        Maker orders can reduce fees but may miss fills.
+        """
+        spread_bps = max(0.0, safe_float(candidate.get("spread_bps"), 0.0) or 0.0)
+        price_action_conf = clamp_float(safe_float(candidate.get("price_action_confidence"), 0.0) or 0.0, 0.0, 1.0)
+        session_conf = clamp_float(safe_float(candidate.get("session_liquidity_confidence"), 0.0) or 0.0, 0.0, 1.0)
+        raw_score = clamp_float((safe_float(candidate.get("score"), 0.0) or 0.0) / 100.0, 0.0, 1.0)
+
+        timing_reason = str(candidate.get("entry_timing_reason", "") or "")
+        timing_bonus = 0.0
+        if "entry_confirmed" in timing_reason:
+            timing_bonus += 0.08
+        if "realtime_upturn_ok=True" in timing_reason:
+            timing_bonus += 0.06
+        if "vwap=True" in timing_reason:
+            timing_bonus += 0.04
+
+        spread_component = clamp_float(0.45 - spread_bps / 80.0, 0.10, 0.45)
+        evidence_component = raw_score * 0.18 + price_action_conf * 0.12 + session_conf * 0.08
+
+        fill_probability = clamp_float(
+            spread_component + evidence_component + timing_bonus,
+            0.05,
+            0.85,
+        )
+
+        reason = (
+            f"maker_fill spread={spread_bps:.2f};spread_component={spread_component:.3f};"
+            f"score={raw_score:.3f};pa_conf={price_action_conf:.3f};"
+            f"session_conf={session_conf:.3f};timing_bonus={timing_bonus:.3f};"
+            f"fill_prob={fill_probability:.3f}"
+        )
+
+        return float(fill_probability), reason
+
+    def _expected_utility_for_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Expected Utility Leader."""
+        try:
+            p_win, p_confidence, p_reason = self._utility_calibrated_p_win(candidate)
+            expected_win_bps = self._utility_expected_win_bps(candidate)
+            expected_loss_bps = self._utility_expected_loss_bps(candidate)
+            cost_bps = max(0.0, safe_float(candidate.get("cost_bps"), 0.0) or 0.0)
+            spread_bps = max(0.0, safe_float(candidate.get("spread_bps"), 0.0) or 0.0)
+            payoff_ratio = float(expected_win_bps) / max(1.0, float(expected_loss_bps))
+            uncertainty_penalty_bps = float(UTILITY_BASE_UNCERTAINTY_BPS) * (1.0 - float(p_confidence))
+            expected_value_bps = (float(p_win) * float(expected_win_bps) - (1.0 - float(p_win)) * float(expected_loss_bps) - float(cost_bps) - float(spread_bps) * 0.35 - float(uncertainty_penalty_bps))
+            maker_fill_probability, maker_reason = self._utility_maker_fill_probability(candidate)
+            maker_adjusted_expected_value_bps = (float(maker_fill_probability) * float(expected_value_bps) - (1.0 - float(maker_fill_probability)) * float(UTILITY_MAKER_NO_FILL_PENALTY_BPS))
+            setup_weak = bool(candidate.get("backtest_setup_weak", False))
+            setup_strong = bool(candidate.get("backtest_setup_strong", False))
+            contradiction_penalty_bps = 35.0 if setup_weak else 0.0
+            session_agent = str(candidate.get("session_liquidity_agent", "") or "")
+            session_setup = str(candidate.get("session_liquidity_setup", "") or "")
+            if "liquidity_harvest" in session_agent or "sweep_reject_harvest" in session_setup:
+                contradiction_penalty_bps += 40.0
+            candle_exhaustion = safe_float(candidate.get("candle_exhaustion_score"), 0.0) or 0.0
+            candle_continuation = safe_float(candidate.get("candle_continuation_score"), 0.0) or 0.0
+            if candle_exhaustion > 0.62 and candle_continuation < 0.50:
+                contradiction_penalty_bps += 25.0
+            expected_utility_bps = float(maker_adjusted_expected_value_bps) - float(contradiction_penalty_bps)
+            utility_quality = clamp_float(0.50 + expected_utility_bps / 260.0 + (p_win - 0.50) * 0.50 + (payoff_ratio - 1.0) * 0.18 - max(0.0, uncertainty_penalty_bps - 45.0) / 260.0, 0.0, 1.0)
+            utility_size_multiplier = clamp_float(0.65 + expected_utility_bps / 260.0 + p_confidence * 0.22 + (0.10 if setup_strong else 0.0) - (0.18 if setup_weak else 0.0), float(UTILITY_MIN_SIZE_MULTIPLIER), float(UTILITY_MAX_SIZE_MULTIPLIER))
+            utility_rank_bonus = clamp_float(expected_utility_bps * float(UTILITY_RANK_BONUS_MULT), -float(UTILITY_MAX_RANK_PENALTY), float(UTILITY_MAX_RANK_BONUS))
+            decision_reason = (f"utility p_win={p_win:.3f};p_conf={p_confidence:.3f};expected_win={expected_win_bps:.2f};expected_loss={expected_loss_bps:.2f};payoff={payoff_ratio:.3f};cost={cost_bps:.2f};spread={spread_bps:.2f};uncertainty={uncertainty_penalty_bps:.2f};ev={expected_value_bps:.2f};maker_fill={maker_fill_probability:.3f};maker_ev={maker_adjusted_expected_value_bps:.2f};contradiction_penalty={contradiction_penalty_bps:.2f};expected_utility={expected_utility_bps:.2f};utility_quality={utility_quality:.3f};size_mult={utility_size_multiplier:.3f};rank_bonus={utility_rank_bonus:.2f};{p_reason};{maker_reason}")
+            return {"calibrated_p_win": float(p_win), "utility_probability_confidence": float(p_confidence), "expected_win_bps": float(expected_win_bps), "expected_loss_bps": float(expected_loss_bps), "payoff_ratio": float(payoff_ratio), "expected_value_bps": float(expected_value_bps), "uncertainty_penalty_bps": float(uncertainty_penalty_bps), "maker_fill_probability": float(maker_fill_probability), "maker_adjusted_expected_value_bps": float(maker_adjusted_expected_value_bps), "expected_utility_bps": float(expected_utility_bps), "utility_quality": float(utility_quality), "utility_rank_bonus": float(utility_rank_bonus), "utility_size_multiplier": float(utility_size_multiplier), "utility_decision_reason": decision_reason}
+        except Exception as exc:
+            return {"calibrated_p_win": 0.50, "utility_probability_confidence": 0.0, "expected_win_bps": 0.0, "expected_loss_bps": float(UTILITY_DEFAULT_EXPECTED_LOSS_BPS), "payoff_ratio": 0.0, "expected_value_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS), "uncertainty_penalty_bps": float(UTILITY_BASE_UNCERTAINTY_BPS), "maker_fill_probability": 0.0, "maker_adjusted_expected_value_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS), "expected_utility_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS), "utility_quality": 0.0, "utility_rank_bonus": -float(UTILITY_MAX_RANK_PENALTY), "utility_size_multiplier": 1.0, "utility_decision_reason": f"utility_failed:{exc}"}
+
     def _setup_perf_bucket(self, value: float) -> str:
         try:
             v = float(value)
@@ -9917,6 +10172,17 @@ class TradingBot:
             "decision_id": "", "truth_score": 0.0, "final_buy_score": 0.0,
             "buy_threshold": 0.0, "confidence": 0.0, "learning_score": 0.0,
             "setup_tag": "unknown", "market_regime": "unknown",
+            "calibrated_p_win": 0.50,
+            "expected_win_bps": 0.0,
+            "expected_loss_bps": 0.0,
+            "payoff_ratio": 0.0,
+            "expected_value_bps": 0.0,
+            "uncertainty_penalty_bps": 0.0,
+            "maker_fill_probability": 0.0,
+            "maker_adjusted_expected_value_bps": 0.0,
+            "expected_utility_bps": 0.0,
+            "utility_size_multiplier": 1.0,
+            "utility_decision_reason": "",
             "reason": "level8_unavailable_fail_closed",
         }
         if not ENABLE_LEVEL8_COUNCIL or self.level8_council is None:
@@ -9938,6 +10204,10 @@ class TradingBot:
         try:
             context = self._level8_market_context(product_id=product_id, candidate=candidate)
             candidate = self._apply_setup_performance_to_candidate(candidate)
+
+            utility_info = self._expected_utility_for_candidate(candidate=candidate)
+            candidate.update(utility_info)
+
             probability = clamp_float(float(candidate.get("estimated_prob_up", 0.5) or 0.5), 0.0, 1.0)
             score = clamp_float(float(candidate.get("score", 0.0) or 0.0) / 100.0, 0.0, 1.0)
             expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
@@ -10006,6 +10276,10 @@ class TradingBot:
                 "market_regime": market_regime,
                 "execution_state": execution_state,
                 "learning_score": learning_score,
+                "expected_utility_bps": float(candidate.get("expected_utility_bps", 0.0) or 0.0),
+                "expected_value_bps": float(candidate.get("expected_value_bps", 0.0) or 0.0),
+                "calibrated_p_win": float(candidate.get("calibrated_p_win", 0.50) or 0.50),
+                "payoff_ratio": float(candidate.get("payoff_ratio", 0.0) or 0.0),
             }
 
             def vote(agent: str, buy: float, hold: float, wait: float, confidence: float, reason: str) -> Dict[str, Any]:
@@ -10058,6 +10332,41 @@ class TradingBot:
                 "reason": str(candidate.get("backtest_setup_reason", "setup_performance_no_data")),
             }
 
+            expected_utility_bps = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
+            maker_adjusted_ev_bps = float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0)
+            calibrated_p_win = float(candidate.get("calibrated_p_win", 0.50) or 0.50)
+            payoff_ratio = float(candidate.get("payoff_ratio", 0.0) or 0.0)
+            utility_quality = float(candidate.get("utility_quality", 0.0) or 0.0)
+            utility_conf = float(candidate.get("utility_probability_confidence", 0.0) or 0.0)
+
+            utility_leader_buy = clamp_float(
+                0.38
+                + expected_utility_bps / 260.0
+                + (calibrated_p_win - 0.50) * 0.60
+                + (payoff_ratio - 1.0) * 0.16,
+                0.0,
+                1.0,
+            )
+
+            utility_leader_sell = clamp_float(
+                0.35
+                + max(0.0, -expected_utility_bps) / 180.0
+                + max(0.0, 1.0 - payoff_ratio) * 0.20,
+                0.0,
+                1.0,
+            )
+
+            utility_leader_vote = {
+                **common,
+                "agent": "utility_leader",
+                "buy": utility_leader_buy,
+                "sell": utility_leader_sell,
+                "hold": clamp_float(0.35 + utility_quality * 0.38, 0.0, 1.0),
+                "wait": clamp_float(0.62 - utility_leader_buy * 0.30 + utility_leader_sell * 0.22, 0.0, 1.0),
+                "confidence": clamp_float(0.25 + utility_conf * 0.55, 0.15, 0.90),
+                "reason": str(candidate.get("utility_decision_reason", "utility_no_reason")),
+            }
+
             votes = [
                 vote("trend", trend_score, clamp_float(0.40+trend_score*0.30,0.0,1.0), clamp_float(0.60-trend_score*0.35,0.0,1.0), clamp_float(0.35+abs(mom5)/180.0,0.20,0.90), f"trend mom5={mom5:.2f};mom15={mom15:.2f};regime={market_regime}"),
                 vote("mean_reversion", mean_reversion_score, 0.45, clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), clamp_float(0.35+abs(mom5)/220.0,0.20,0.85), f"mean_reversion setup={setup_tag};mom1={mom1:.2f};mom5={mom5:.2f}"),
@@ -10082,6 +10391,7 @@ class TradingBot:
                 *price_action_votes,
                 smt_vote,
                 setup_performance_vote,
+                utility_leader_vote,
                 {**common, "agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
                 vote("exploration", learning_score, 0.35, clamp_float(0.70-learning_score*0.45,0.0,1.0), clamp_float(0.30+learning_score*0.55,0.20,0.85), f"learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"),
             ]

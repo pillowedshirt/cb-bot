@@ -62,6 +62,10 @@ FEATURE_COLUMNS = [
     "previous_session_profile_hold_score",
     "previous_session_profile_wait_score",
     "previous_session_profile_confidence",
+    "previous_session_profile_poc",
+    "previous_session_profile_vah",
+    "previous_session_profile_val",
+    "previous_session_profile_utility_adjust_bps",
     "quant_buy_score",
     "quant_sell_score",
     "quant_hold_score",
@@ -71,6 +75,7 @@ FEATURE_COLUMNS = [
     "quant_forecast_return_bps",
     "quant_conditional_volatility_bps",
     "quant_peer_spread_z",
+    "quant_context_utility_adjust_bps",
 ]
 
 

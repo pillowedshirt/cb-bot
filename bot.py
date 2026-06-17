@@ -9770,12 +9770,12 @@ class TradingBot:
         profile = dict(context.get("previous_session_profile", {}) or {})
         return {
             **common,
-            "agent": "previous_session_profile_agent",
+            "agent": "previous_session_volume_profile_agent",
             "buy": clamp_float(float(profile.get("buy_score", 0.0) or 0.0), 0.0, 1.0),
             "sell": clamp_float(float(profile.get("sell_score", 0.0) or 0.0), 0.0, 1.0),
             "hold": clamp_float(float(profile.get("hold_score", 0.50) or 0.50), 0.0, 1.0),
             "wait": clamp_float(float(profile.get("wait_score", 0.50) or 0.50), 0.0, 1.0),
-            "confidence": clamp_float(float(profile.get("confidence", 0.10) or 0.10), 0.10, 0.90),
+            "confidence": clamp_float(float(profile.get("confidence", 0.10) or 0.10), 0.10, 0.92),
             "previous_session_profile_session_key": str(profile.get("session_key", "")),
             "previous_session_profile_reaction_state": str(profile.get("reaction_state", "")),
             "previous_session_profile_bias": str(profile.get("higher_timeframe_bias", "")),
@@ -11000,6 +11000,72 @@ class TradingBot:
             ),
         }
 
+    def _previous_session_profile_utility_adjustment(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        buy = float(candidate.get("previous_session_profile_buy_score", 0.0) or 0.0)
+        sell = float(candidate.get("previous_session_profile_sell_score", 0.0) or 0.0)
+        wait = float(candidate.get("previous_session_profile_wait_score", 0.50) or 0.50)
+        conf = float(candidate.get("previous_session_profile_confidence", 0.10) or 0.10)
+        reaction = str(candidate.get("previous_session_profile_reaction_state", "") or "")
+        bias = str(candidate.get("previous_session_profile_bias", "") or "")
+        adjust = 0.0
+        adjust += (buy - sell) * 70.0
+        adjust -= max(0.0, wait - 0.60) * 45.0
+        if reaction == "accepted_above_prior_vah":
+            adjust += 42.0
+        elif reaction == "reclaimed_prior_val":
+            adjust += 34.0
+        elif reaction in {"rejected_prior_vah", "accepted_below_prior_val"}:
+            adjust -= 55.0
+        elif reaction == "near_prior_poc_chop":
+            adjust -= 34.0
+        if bias == "bullish":
+            adjust += 14.0
+        elif bias == "bearish":
+            adjust -= 14.0
+        adjust *= max(0.25, min(1.0, conf)) * float(PREVIOUS_SESSION_PROFILE_UTILITY_MULT)
+        return {
+            "previous_session_profile_utility_adjust_bps": float(adjust),
+            "previous_session_profile_utility_reason": (
+                f"previous_session_profile_utility reaction={reaction};bias={bias};"
+                f"buy={buy:.3f};sell={sell:.3f};wait={wait:.3f};conf={conf:.3f};adjust={adjust:.2f}"
+            ),
+        }
+
+    def _quant_context_utility_adjustment(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        buy = float(candidate.get("quant_buy_score", 0.0) or 0.0)
+        sell = float(candidate.get("quant_sell_score", 0.0) or 0.0)
+        wait = float(candidate.get("quant_wait_score", 0.50) or 0.50)
+        conf = float(candidate.get("quant_confidence", 0.10) or 0.10)
+        forecast = float(candidate.get("quant_forecast_return_bps", 0.0) or 0.0)
+        stationarity = float(candidate.get("quant_stationarity_score", 0.0) or 0.0)
+        boundary = str(candidate.get("quant_boundary_state", "") or "")
+        vol_state = str(candidate.get("quant_volatility_cluster_state", "") or "")
+        peer_state = str(candidate.get("quant_peer_state", "") or "")
+        adjust = 0.0
+        adjust += (buy - sell) * 62.0
+        adjust += forecast * 0.30
+        adjust += max(0.0, stationarity - 0.50) * 40.0
+        adjust -= max(0.0, wait - 0.60) * 42.0
+        if boundary == "below_lower_boundary_stretched":
+            adjust += 22.0
+        elif boundary == "above_upper_boundary_stretched":
+            adjust -= 22.0
+        if vol_state == "volatility_expansion_cluster" and forecast < 0:
+            adjust -= 32.0
+        if peer_state == "product_cheap_vs_peer_snapback_possible":
+            adjust += 18.0
+        elif peer_state == "product_rich_vs_peer_snapback_risk":
+            adjust -= 18.0
+        adjust *= max(0.25, min(1.0, conf)) * float(QUANT_CONTEXT_UTILITY_MULT)
+        return {
+            "quant_context_utility_adjust_bps": float(adjust),
+            "quant_context_utility_reason": (
+                f"quant_context_utility boundary={boundary};vol={vol_state};peer={peer_state};"
+                f"buy={buy:.3f};sell={sell:.3f};wait={wait:.3f};conf={conf:.3f};"
+                f"forecast={forecast:.2f};stationarity={stationarity:.3f};adjust={adjust:.2f}"
+            ),
+        }
+
     def _expected_utility_for_candidate(
         self,
         *,
@@ -11025,6 +11091,20 @@ class TradingBot:
             volume_utility = self._volume_profile_leader_utility_adjustment(candidate)
             volume_profile_utility_adjust_bps = float(volume_utility.get("volume_profile_utility_adjust_bps", 0.0) or 0.0)
             volume_profile_utility_reason = str(volume_utility.get("volume_profile_utility_reason", ""))
+            previous_session_utility = self._previous_session_profile_utility_adjustment(candidate)
+            previous_session_profile_utility_adjust_bps = float(
+                previous_session_utility.get("previous_session_profile_utility_adjust_bps", 0.0) or 0.0
+            )
+            previous_session_profile_utility_reason = str(
+                previous_session_utility.get("previous_session_profile_utility_reason", "")
+            )
+            quant_utility = self._quant_context_utility_adjustment(candidate)
+            quant_context_utility_adjust_bps = float(
+                quant_utility.get("quant_context_utility_adjust_bps", 0.0) or 0.0
+            )
+            quant_context_utility_reason = str(
+                quant_utility.get("quant_context_utility_reason", "")
+            )
             maker_adjusted_expected_value_bps = (
                 float(maker_fill_probability) * float(expected_value_bps)
                 - (1.0 - float(maker_fill_probability)) * float(UTILITY_MAKER_NO_FILL_PENALTY_BPS)
@@ -11059,6 +11139,8 @@ class TradingBot:
             expected_utility_bps = (
                 float(maker_adjusted_expected_value_bps)
                 + float(volume_profile_utility_adjust_bps)
+                + float(previous_session_profile_utility_adjust_bps)
+                + float(quant_context_utility_adjust_bps)
                 - float(contradiction_penalty_bps)
                 - max(0.0, float(wait_utility_bps) - 8.0) * 0.35
             )
@@ -11094,6 +11176,10 @@ class TradingBot:
                 f"utility_quality={utility_quality:.3f};size_mult={utility_size_multiplier:.3f};rank_bonus={utility_rank_bonus:.2f};"
                 f"volume_profile_adjust={volume_profile_utility_adjust_bps:.2f};"
                 f"{volume_profile_utility_reason};"
+                f"previous_session_adjust={previous_session_profile_utility_adjust_bps:.2f};"
+                f"{previous_session_profile_utility_reason};"
+                f"quant_adjust={quant_context_utility_adjust_bps:.2f};"
+                f"{quant_context_utility_reason};"
                 f"wait_utility={wait_utility_bps:.2f};buy_vs_wait={buy_vs_wait_edge_bps:.2f};"
                 f"realized_vol_30m={realized_vol_bps:.2f};vol_size_mult={vol_mult:.3f};"
                 f"{vol_reason};{p_reason};{maker_reason}"
@@ -11111,6 +11197,10 @@ class TradingBot:
                 "expected_utility_bps": float(expected_utility_bps),
                 "volume_profile_utility_adjust_bps": float(volume_profile_utility_adjust_bps),
                 "volume_profile_utility_reason": str(volume_profile_utility_reason),
+                "previous_session_profile_utility_adjust_bps": float(previous_session_profile_utility_adjust_bps),
+                "previous_session_profile_utility_reason": str(previous_session_profile_utility_reason),
+                "quant_context_utility_adjust_bps": float(quant_context_utility_adjust_bps),
+                "quant_context_utility_reason": str(quant_context_utility_reason),
                 "utility_quality": float(utility_quality),
                 "utility_rank_bonus": float(utility_rank_bonus),
                 "utility_size_multiplier": float(utility_size_multiplier),
@@ -11902,6 +11992,37 @@ class TradingBot:
                         f"value_acceptance_state={value_acceptance_state};"
                         f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
                     )
+            previous_reaction = str(candidate.get("previous_session_profile_reaction_state", "") or "").lower()
+            previous_wait = float(candidate.get("previous_session_profile_wait_score", 0.50) or 0.50)
+            previous_conf = float(candidate.get("previous_session_profile_confidence", 0.10) or 0.10)
+            if (
+                bool(PREVIOUS_SESSION_PROFILE_BLOCK_NEAR_POC_CHOP)
+                and previous_reaction == "near_prior_poc_chop"
+                and previous_wait >= float(PREVIOUS_SESSION_PROFILE_NEAR_POC_WAIT_SCORE)
+                and previous_conf >= 0.30
+                and expected_utility_bps < float(VOLUME_ALLOW_INSIDE_VALUE_IF_SETUP_STRONG_AND_UTILITY_BPS)
+            ):
+                return False, (
+                    f"live_buy_shadowed:previous_session_poc_chop "
+                    f"reaction={previous_reaction};wait={previous_wait:.3f};"
+                    f"conf={previous_conf:.3f};expected_utility={expected_utility_bps:.2f}"
+                )
+
+            quant_stationarity = float(candidate.get("quant_stationarity_score", 0.0) or 0.0)
+            quant_wait = float(candidate.get("quant_wait_score", 0.50) or 0.50)
+            quant_vol_state = str(candidate.get("quant_volatility_cluster_state", "") or "").lower()
+            if (
+                bool(QUANT_CONTEXT_BLOCK_UNSTABLE_LOW_EDGE_BUY)
+                and quant_stationarity < float(QUANT_CONTEXT_MIN_STATIONARITY_FOR_LOW_EDGE_BUY)
+                and quant_wait >= 0.62
+                and expected_utility_bps < float(QUANT_CONTEXT_MIN_EXPECTED_UTILITY_EXCEPTION_BPS)
+            ):
+                return False, (
+                    f"live_buy_shadowed:quant_unstable_low_edge "
+                    f"stationarity={quant_stationarity:.3f};wait={quant_wait:.3f};"
+                    f"vol_state={quant_vol_state};expected_utility={expected_utility_bps:.2f}"
+                )
+
             if margin < float(effective_min_margin):
                 return False, (
                     f"live_buy_shadowed:council_margin_too_small "
@@ -12093,6 +12214,12 @@ class TradingBot:
                 "value_acceptance_state": str(candidate.get("value_acceptance_state", "")),
                 "volume_node_state": str(candidate.get("volume_node_state", "")),
                 "volume_profile_utility_adjust_bps": float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0),
+                "previous_session_profile_reaction_state": str(candidate.get("previous_session_profile_reaction_state", "")),
+                "previous_session_profile_utility_adjust_bps": float(candidate.get("previous_session_profile_utility_adjust_bps", 0.0) or 0.0),
+                "previous_session_profile_utility_reason": str(candidate.get("previous_session_profile_utility_reason", "")),
+                "quant_boundary_state": str(candidate.get("quant_boundary_state", "")),
+                "quant_context_utility_adjust_bps": float(candidate.get("quant_context_utility_adjust_bps", 0.0) or 0.0),
+                "quant_context_utility_reason": str(candidate.get("quant_context_utility_reason", "")),
                 "utility_decision_reason": "entry_buy_eval_skipped_because_position_is_owned",
                 "reason": (
                     f"position_aware_entry_skip product={product_id};"
@@ -12379,17 +12506,40 @@ class TradingBot:
                 1.0,
             )
 
+            previous_session_context = dict(context.get("previous_session_profile", {}) or {})
+            quant_context = dict(context.get("quant_context", {}) or {})
+            previous_session_truth_component = clamp_float(
+                0.50
+                + float(previous_session_context.get("buy_score", 0.0) or 0.0) * 0.30
+                - float(previous_session_context.get("sell_score", 0.0) or 0.0) * 0.24
+                - max(0.0, float(previous_session_context.get("wait_score", 0.50) or 0.50) - 0.55) * 0.18
+                + float(previous_session_context.get("bias_confidence", 0.0) or 0.0) * 0.10,
+                0.0,
+                1.0,
+            )
+            quant_truth_component = clamp_float(
+                0.50
+                + float(quant_context.get("quant_buy_score", 0.0) or 0.0) * 0.28
+                - float(quant_context.get("quant_sell_score", 0.0) or 0.0) * 0.24
+                - max(0.0, float(quant_context.get("quant_wait_score", 0.50) or 0.50) - 0.55) * 0.18
+                + float(quant_context.get("stationarity_score", 0.0) or 0.0) * 0.10,
+                0.0,
+                1.0,
+            )
+
             truth_buy = clamp_float(
                 spread_quality * 0.09
                 + cost_score * 0.08
-                + probability * 0.10
-                + score * 0.08
+                + probability * 0.08
+                + score * 0.07
                 + forward_score * 0.08
-                + learning_score * 0.09
+                + learning_score * 0.07
                 + session_buy_score * session_confidence * 0.06
-                + price_action_buy_weighted * price_action_conf_weighted * 0.08
+                + price_action_buy_weighted * price_action_conf_weighted * 0.06
                 + utility_truth_component * 0.10
-                + volume_leader_truth_component * float(VOLUME_PROFILE_LEADER_TRUTH_WEIGHT),
+                + volume_leader_truth_component * float(VOLUME_PROFILE_LEADER_TRUTH_WEIGHT)
+                + previous_session_truth_component * float(PREVIOUS_SESSION_PROFILE_TRUTH_WEIGHT)
+                + quant_truth_component * float(QUANT_CONTEXT_TRUTH_WEIGHT),
                 0.0,
                 1.0,
             )
@@ -12403,6 +12553,8 @@ class TradingBot:
                     f"truth evidence={truth_buy:.3f};"
                     f"utility_component={utility_truth_component:.3f};"
                     f"volume_leader_component={volume_leader_truth_component:.3f};"
+                    f"previous_session_component={previous_session_truth_component:.3f};"
+                    f"quant_component={quant_truth_component:.3f};"
                     f"expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f};"
                     f"calibrated_p_win={float(candidate.get('calibrated_p_win', 0.50) or 0.50):.3f};"
                     f"payoff={float(candidate.get('payoff_ratio', 0.0) or 0.0):.3f};"
@@ -12510,6 +12662,12 @@ class TradingBot:
                 "value_acceptance_state": str(candidate.get("value_acceptance_state", "")),
                 "volume_node_state": str(candidate.get("volume_node_state", "")),
                 "volume_profile_utility_adjust_bps": float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0),
+                "previous_session_profile_reaction_state": str(candidate.get("previous_session_profile_reaction_state", "")),
+                "previous_session_profile_utility_adjust_bps": float(candidate.get("previous_session_profile_utility_adjust_bps", 0.0) or 0.0),
+                "previous_session_profile_utility_reason": str(candidate.get("previous_session_profile_utility_reason", "")),
+                "quant_boundary_state": str(candidate.get("quant_boundary_state", "")),
+                "quant_context_utility_adjust_bps": float(candidate.get("quant_context_utility_adjust_bps", 0.0) or 0.0),
+                "quant_context_utility_reason": str(candidate.get("quant_context_utility_reason", "")),
                 "volume_profile_utility_reason": str(candidate.get("volume_profile_utility_reason", "")),
             }
             base_reason = str(decision.get("sizing_reason", decision.get("reason", "")))
@@ -12725,6 +12883,10 @@ class TradingBot:
                     maker_fill_probability=float(level8_info.get("maker_fill_probability", 0.0) or 0.0),
                     maker_adjusted_expected_value_bps=float(level8_info.get("maker_adjusted_expected_value_bps", 0.0) or 0.0),
                     expected_utility_bps=float(level8_info.get("expected_utility_bps", 0.0) or 0.0),
+                    previous_session_reaction_state=str(level8_info.get("previous_session_profile_reaction_state", "")),
+                    previous_session_profile_utility_adjust_bps=float(level8_info.get("previous_session_profile_utility_adjust_bps", 0.0) or 0.0),
+                    quant_boundary_state=str(level8_info.get("quant_boundary_state", "")),
+                    quant_context_utility_adjust_bps=float(level8_info.get("quant_context_utility_adjust_bps", 0.0) or 0.0),
                     reason=(
                         f"heartbeat_only=True;"
                         f"raw_level8_action={raw_action};"
@@ -12893,6 +13055,10 @@ class TradingBot:
         value_acceptance_state: str = "",
         volume_node_state: str = "",
         volume_profile_utility_adjust_bps: float = 0.0,
+        previous_session_reaction_state: str = "",
+        previous_session_profile_utility_adjust_bps: float = 0.0,
+        quant_boundary_state: str = "",
+        quant_context_utility_adjust_bps: float = 0.0,
     ) -> None:
         """
         Write a normalized Level 8 decision row for live and heartbeat decisions.
@@ -12931,6 +13097,10 @@ class TradingBot:
                 "value_acceptance_state",
                 "volume_node_state",
                 "volume_profile_utility_adjust_bps",
+                "previous_session_reaction_state",
+                "previous_session_profile_utility_adjust_bps",
+                "quant_boundary_state",
+                "quant_context_utility_adjust_bps",
                 "reason",
             ]
             write_header = not os.path.exists(
@@ -13004,6 +13174,10 @@ class TradingBot:
                     str(value_acceptance_state),
                     str(volume_node_state),
                     f"{float(volume_profile_utility_adjust_bps):.6f}",
+                    str(previous_session_reaction_state),
+                    f"{float(previous_session_profile_utility_adjust_bps):.6f}",
+                    str(quant_boundary_state),
+                    f"{float(quant_context_utility_adjust_bps):.6f}",
                     reason,
                 ])
         except Exception as exc:
@@ -13708,6 +13882,13 @@ class TradingBot:
                     projected_forward_gain_bps=0.0,
                 ),
                 "smt_divergence": self._smt_divergence_context_for_product(product_id=product_id),
+                "previous_session_profile": self._previous_session_profile_for_product(
+                    product_id=product_id,
+                    current_price=float(current_price),
+                ),
+                "quant_context": self._quant_context_for_product(
+                    product_id=product_id,
+                ),
                 "sell_side_expected_utility": self._sell_side_expected_utility_context(
                     product_id=product_id,
                     hold_state=hold_state,
@@ -18809,6 +18990,12 @@ class TradingBot:
                             "volatility_size_multiplier",
                             "value_acceptance_state",
                             "volume_node_state",
+                            "previous_session_profile_reaction_state",
+                            "previous_session_profile_utility_adjust_bps",
+                            "previous_session_profile_utility_reason",
+                            "quant_boundary_state",
+                            "quant_context_utility_adjust_bps",
+                            "quant_context_utility_reason",
                         ]:
                             if _level8_copy_key in level8_info:
                                 candidate[_level8_copy_key] = level8_info.get(_level8_copy_key)
@@ -18846,6 +19033,10 @@ class TradingBot:
                             value_acceptance_state=str(level8_info.get("value_acceptance_state", "")),
                             volume_node_state=str(level8_info.get("volume_node_state", "")),
                             volume_profile_utility_adjust_bps=float(level8_info.get("volume_profile_utility_adjust_bps", 0.0) or 0.0),
+                            previous_session_reaction_state=str(level8_info.get("previous_session_profile_reaction_state", "")),
+                            previous_session_profile_utility_adjust_bps=float(level8_info.get("previous_session_profile_utility_adjust_bps", 0.0) or 0.0),
+                            quant_boundary_state=str(level8_info.get("quant_boundary_state", "")),
+                            quant_context_utility_adjust_bps=float(level8_info.get("quant_context_utility_adjust_bps", 0.0) or 0.0),
                         )
 
                         try:

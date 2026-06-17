@@ -108,6 +108,22 @@ class PriceActionContext:
     fresh_zone_state: str
     reason: str
 
+    # Volume Profile Leader framework.
+    volume_profile_leader_buy_score: float = 0.0
+    volume_profile_leader_sell_score: float = 0.0
+    volume_profile_leader_hold_score: float = 0.50
+    volume_profile_leader_wait_score: float = 0.50
+    volume_profile_leader_confidence: float = 0.10
+    value_acceptance_state: str = "unknown"
+    volume_node_state: str = "unknown"
+    nearest_high_volume_node: float = 0.0
+    nearest_low_volume_node: float = 0.0
+    low_volume_path_up_bps: float = 0.0
+    low_volume_path_down_bps: float = 0.0
+    poc_distance_bps: float = 0.0
+    unfair_trade_score: float = 0.0
+    volume_profile_leader_reason: str = ""
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -371,6 +387,160 @@ def _volume_profile(candles: List[Any], bins: int = 24, lookback: int = 180) -> 
     return float(val), float(vah), float(poc), f"volume_profile;poc={poc:.8f};val={val:.8f};vah={vah:.8f};total_vol={total_vol:.4f}"
 
 
+
+def _volume_profile_leader_context(
+    *,
+    candles: List[Any],
+    current_price: float,
+    last: CandleAnatomy,
+    prior: CandleAnatomy,
+    value_area_low: float,
+    value_area_high: float,
+    point_of_control: float,
+    bins: int = 32,
+    lookback: int = 220,
+) -> Dict[str, Any]:
+    """
+    Volume Profile Leader framework.
+
+    Main model:
+    - Inside value area = fair value / chop / lower edge.
+    - POC = defended/choppy area, not automatic support/resistance.
+    - HVN = high-volume node / slower motion / defended area.
+    - LVN = low-volume node / fast-motion area.
+    - Accepted above value = continuation / buy-supportive.
+    - Rejected above value = harvest / sell-supportive.
+    - Accepted below value = avoid-buy / sell-rally supportive.
+    - Reclaim of value low = possible fakeout/reversal buy evidence.
+    """
+    source = list(candles or [])[-int(lookback):]
+    out = {
+        "volume_profile_leader_buy_score": 0.0,
+        "volume_profile_leader_sell_score": 0.0,
+        "volume_profile_leader_hold_score": 0.50,
+        "volume_profile_leader_wait_score": 0.50,
+        "volume_profile_leader_confidence": 0.10,
+        "value_acceptance_state": "volume_profile_unavailable",
+        "volume_node_state": "unknown",
+        "nearest_high_volume_node": 0.0,
+        "nearest_low_volume_node": 0.0,
+        "low_volume_path_up_bps": 0.0,
+        "low_volume_path_down_bps": 0.0,
+        "poc_distance_bps": 0.0,
+        "unfair_trade_score": 0.0,
+        "volume_profile_leader_reason": "volume_profile_leader_unavailable",
+    }
+
+    try:
+        if len(source) < 30 or current_price <= 0 or value_area_low <= 0 or value_area_high <= 0 or point_of_control <= 0:
+            return out
+
+        lows = [_get(c, "low", 0.0) for c in source if _get(c, "low", 0.0) > 0]
+        highs = [_get(c, "high", 0.0) for c in source if _get(c, "high", 0.0) > 0]
+        if not lows or not highs:
+            return out
+
+        lo = min(lows)
+        hi = max(highs)
+        if hi <= lo:
+            return out
+
+        bin_count = max(12, int(bins))
+        step = (hi - lo) / bin_count
+        volumes = [0.0 for _ in range(bin_count)]
+        centers = [lo + (i + 0.5) * step for i in range(bin_count)]
+
+        for c in source:
+            typical = (_get(c, "high", 0.0) + _get(c, "low", 0.0) + _get(c, "close", 0.0)) / 3.0
+            idx = max(0, min(bin_count - 1, int((typical - lo) / step)))
+            volumes[idx] += max(0.0, _get(c, "volume", 0.0))
+
+        nonzero = [v for v in volumes if v > 0]
+        if not nonzero:
+            return out
+
+        sorted_vol = sorted(nonzero)
+        high_cutoff = sorted_vol[int(max(0, min(len(sorted_vol) - 1, len(sorted_vol) * 0.72)))]
+        low_cutoff = sorted_vol[int(max(0, min(len(sorted_vol) - 1, len(sorted_vol) * 0.25)))]
+
+        current_idx = max(0, min(bin_count - 1, int((current_price - lo) / step)))
+        current_bin_vol = volumes[current_idx]
+
+        high_nodes = [centers[i] for i, v in enumerate(volumes) if v >= high_cutoff]
+        low_nodes = [centers[i] for i, v in enumerate(volumes) if 0 < v <= low_cutoff]
+
+        nearest_hvn = min(high_nodes, key=lambda pp: abs(pp - current_price)) if high_nodes else 0.0
+        nearest_lvn = min(low_nodes, key=lambda pp: abs(pp - current_price)) if low_nodes else 0.0
+        upside_lvns = [pp for pp in low_nodes if pp > current_price]
+        downside_lvns = [pp for pp in low_nodes if pp < current_price]
+        low_volume_path_up_bps = _bps(min(upside_lvns), current_price) if upside_lvns else 0.0
+        low_volume_path_down_bps = abs(_bps(max(downside_lvns), current_price)) if downside_lvns else 0.0
+        poc_distance_bps = abs(_bps(current_price, point_of_control))
+        near_poc = bool(poc_distance_bps <= 22.0)
+        inside_value = bool(value_area_low <= current_price <= value_area_high)
+        above_value = bool(current_price > value_area_high)
+        below_value = bool(current_price < value_area_low)
+        accepted_above_value = bool(above_value and last.close > value_area_high and (prior.close > value_area_high or last.close_location >= 0.62) and not last.is_upper_rejection)
+        rejected_above_value = bool(last.high > value_area_high and (last.close < value_area_high or last.is_upper_rejection))
+        accepted_below_value = bool(below_value and last.close < value_area_low and (prior.close < value_area_low or last.close_location <= 0.38) and not last.is_lower_rejection)
+        rejected_below_value = bool(last.low < value_area_low and (last.close > value_area_low or last.is_lower_rejection))
+        reclaimed_value_low = bool(prior.close < value_area_low and last.close > value_area_low and last.close_location >= 0.50)
+
+        if accepted_above_value:
+            value_acceptance_state = "accepted_above_value"
+        elif rejected_above_value:
+            value_acceptance_state = "rejected_above_value"
+        elif accepted_below_value:
+            value_acceptance_state = "accepted_below_value"
+        elif rejected_below_value or reclaimed_value_low:
+            value_acceptance_state = "reclaimed_value_low"
+        elif inside_value and near_poc:
+            value_acceptance_state = "inside_value_near_poc"
+        elif inside_value:
+            value_acceptance_state = "inside_fair_value"
+        elif above_value:
+            value_acceptance_state = "above_value_unconfirmed"
+        elif below_value:
+            value_acceptance_state = "below_value_unconfirmed"
+        else:
+            value_acceptance_state = "unknown"
+
+        if current_bin_vol >= high_cutoff:
+            volume_node_state = "high_volume_node"
+        elif 0 < current_bin_vol <= low_cutoff:
+            volume_node_state = "low_volume_node"
+        else:
+            volume_node_state = "normal_volume_node"
+
+        unfair_trade_score = _clamp((0.32 if not inside_value else 0.0) + (0.25 if volume_node_state == "low_volume_node" else 0.0) + min(0.25, max(low_volume_path_up_bps, low_volume_path_down_bps) / 240.0) - (0.18 if near_poc else 0.0) - (0.14 if volume_node_state == "high_volume_node" else 0.0), 0.0, 1.0)
+        buy_score = _clamp(0.18 + (0.56 if accepted_above_value else 0.0) + (0.44 if reclaimed_value_low else 0.0) + (0.12 if above_value and volume_node_state == "low_volume_node" else 0.0) + min(0.12, low_volume_path_up_bps / 300.0) + unfair_trade_score * 0.12 - (0.24 if inside_value and near_poc else 0.0) - (0.38 if accepted_below_value else 0.0) - (0.34 if rejected_above_value else 0.0), 0.0, 1.0)
+        sell_score = _clamp(0.18 + (0.56 if accepted_below_value else 0.0) + (0.48 if rejected_above_value else 0.0) + (0.18 if inside_value and near_poc else 0.0) + (0.12 if volume_node_state == "high_volume_node" else 0.0) + min(0.10, low_volume_path_down_bps / 320.0) - (0.28 if accepted_above_value else 0.0), 0.0, 1.0)
+        hold_score = _clamp(0.38 + (0.32 if accepted_above_value else 0.0) + (0.12 if above_value and low_volume_path_up_bps > 40.0 else 0.0) - (0.26 if rejected_above_value or accepted_below_value else 0.0) - (0.12 if near_poc else 0.0), 0.0, 1.0)
+        wait_score = _clamp(0.34 + (0.34 if inside_value else 0.0) + (0.26 if near_poc else 0.0) + (0.18 if volume_node_state == "high_volume_node" else 0.0) - (0.22 if accepted_above_value or reclaimed_value_low else 0.0), 0.0, 1.0)
+        confidence = _clamp(0.30 + min(0.22, len(source) / 350.0) + (0.16 if not inside_value else 0.0) + (0.14 if volume_node_state in {"high_volume_node", "low_volume_node"} else 0.0) + unfair_trade_score * 0.18, 0.10, 0.94)
+
+        out.update({
+            "volume_profile_leader_buy_score": float(buy_score),
+            "volume_profile_leader_sell_score": float(sell_score),
+            "volume_profile_leader_hold_score": float(hold_score),
+            "volume_profile_leader_wait_score": float(wait_score),
+            "volume_profile_leader_confidence": float(confidence),
+            "value_acceptance_state": value_acceptance_state,
+            "volume_node_state": volume_node_state,
+            "nearest_high_volume_node": float(nearest_hvn),
+            "nearest_low_volume_node": float(nearest_lvn),
+            "low_volume_path_up_bps": float(low_volume_path_up_bps),
+            "low_volume_path_down_bps": float(low_volume_path_down_bps),
+            "poc_distance_bps": float(poc_distance_bps),
+            "unfair_trade_score": float(unfair_trade_score),
+            "volume_profile_leader_reason": (f"volume_profile_leader;value_acceptance_state={value_acceptance_state};volume_node_state={volume_node_state};poc_distance_bps={poc_distance_bps:.2f};nearest_hvn={nearest_hvn:.8f};nearest_lvn={nearest_lvn:.8f};lvn_up_bps={low_volume_path_up_bps:.2f};lvn_down_bps={low_volume_path_down_bps:.2f};unfair_trade_score={unfair_trade_score:.3f};accepted_above={accepted_above_value};rejected_above={rejected_above_value};accepted_below={accepted_below_value};reclaimed_value_low={reclaimed_value_low};buy={buy_score:.3f};sell={sell_score:.3f};hold={hold_score:.3f};wait={wait_score:.3f};confidence={confidence:.3f}"),
+        })
+        return out
+    except Exception as exc:
+        out["volume_profile_leader_reason"] = f"volume_profile_leader_error:{exc}"
+        return out
+
+
 def _fvg_context(candles: List[Any]) -> Tuple[float, float, float, float, str]:
     source = list(candles)[-30:]
     bullish_low = bullish_high = bearish_low = bearish_high = 0.0
@@ -487,12 +657,25 @@ def build_price_action_context(*, product_id: str, candles: List[Any], current_p
     volume_profile_buy_score = _clamp(0.28 + (0.25 if accepted_above_value else 0.0) + (0.25 if reclaimed_value_low else 0.0) + (0.08 if value_area_state != "inside_value_area" else -0.06))
     volume_profile_sell_score = _clamp(0.25 + (0.30 if rejected_above_value else 0.0) + (0.20 if accepted_below_value else 0.0) + (0.10 if last.is_upper_rejection else 0.0))
     volume_profile_hold_score = _clamp(0.42 + (0.18 if accepted_above_value else 0.0) - (0.20 if rejected_above_value else 0.0))
+    vp_leader = _volume_profile_leader_context(
+        candles=candles,
+        current_price=current_price,
+        last=last,
+        prior=prior,
+        value_area_low=val,
+        value_area_high=vah,
+        point_of_control=poc,
+    )
+    volume_profile_buy_score = _clamp(volume_profile_buy_score * 0.35 + float(vp_leader.get("volume_profile_leader_buy_score", 0.0)) * 0.65)
+    volume_profile_sell_score = _clamp(volume_profile_sell_score * 0.35 + float(vp_leader.get("volume_profile_leader_sell_score", 0.0)) * 0.65)
+    volume_profile_hold_score = _clamp(volume_profile_hold_score * 0.35 + float(vp_leader.get("volume_profile_leader_hold_score", 0.50)) * 0.65)
+    volume_profile_confidence = _clamp(context_confidence * 0.35 + float(vp_leader.get("volume_profile_leader_confidence", 0.10)) * 0.65, 0.10, 0.94)
     bullish_fvg_low, bullish_fvg_high, bearish_fvg_low, bearish_fvg_high, fvg_reason = _fvg_context(candles); fvg_state = fvg_reason.split(";", 1)[0].replace("fvg_state=", "")
     fvg_buy_score = _clamp(0.24 + (0.25 if fvg_state in {"bullish_fvg_retest", "bearish_fvg_inverted_ifvg"} else 0.0) + (0.16 if swept_validated_low else 0.0) + (0.10 if last.direction == "bull" else 0.0))
     fvg_sell_score = _clamp(0.24 + (0.25 if fvg_state in {"bearish_fvg_retest", "bullish_fvg_inverted_ifvg"} else 0.0) + (0.16 if swept_validated_high else 0.0) + (0.10 if last.direction == "bear" else 0.0))
     context_confidence = _clamp(0.25 + min(0.25, len(candles) / 240.0) + min(0.20, last.range_bps / 160.0) + (0.12 if last_swing_high > 0 and last_swing_low > 0 else 0.0))
-    reason = f"price_action;last_dir={last.direction};body_ratio={last.body_ratio:.3f};upper_wick_ratio={last.upper_wick_ratio:.3f};lower_wick_ratio={last.lower_wick_ratio:.3f};close_location={last.close_location:.3f};doji={last.is_doji};upper_rejection={last.is_upper_rejection};lower_rejection={last.is_lower_rejection};advanced_block={advanced_block_exhaustion};structure={structure_state};structure_reason={structure_reason};liquidity_quality={liquidity_quality_score:.3f};validated_high_state={validated_high_state};validated_low_state={validated_low_state};{validation_reason};fresh_zone={zone.reason};value_area_state={value_area_state};value_area_width_bps={value_area_width_bps:.2f};volume_profile_quality={volume_profile_quality:.3f};{vp_reason};{fvg_reason}"
-    return PriceActionContext(product_id, float(candle_context_buy_score), float(candle_context_sell_score), float(candle_context_hold_score), float(context_confidence), float(candle_sequence_score), float(candle_exhaustion_score), float(candle_continuation_score), float(market_structure_buy_score), float(market_structure_sell_score), float(market_structure_hold_score), float(context_confidence), float(validated_liquidity_buy_score), float(validated_liquidity_sell_score), float(context_confidence), float(fresh_zone_buy_score), float(fresh_zone_sell_score), float(context_confidence), float(volume_profile_buy_score), float(volume_profile_sell_score), float(volume_profile_hold_score), float(_clamp(context_confidence * 0.65 + volume_profile_quality * 0.35, 0.10, 0.90)), float(fvg_buy_score), float(fvg_sell_score), float(context_confidence), str(structure_state), str(structure_reason), float(last_swing_high), float(last_swing_low), float(validated_high), float(validated_low), str(validated_high_state), str(validated_low_state), float(liquidity_quality_score), float(nearest_upside), float(nearest_downside), float(vah), float(val), float(poc), str(value_area_state), float(bullish_fvg_low), float(bullish_fvg_high), float(bearish_fvg_low), float(bearish_fvg_high), str(fvg_state), float(zone.zone_low), float(zone.zone_high), str(zone.reason), reason)
+    reason = f"price_action;last_dir={last.direction};body_ratio={last.body_ratio:.3f};upper_wick_ratio={last.upper_wick_ratio:.3f};lower_wick_ratio={last.lower_wick_ratio:.3f};close_location={last.close_location:.3f};doji={last.is_doji};upper_rejection={last.is_upper_rejection};lower_rejection={last.is_lower_rejection};advanced_block={advanced_block_exhaustion};structure={structure_state};structure_reason={structure_reason};liquidity_quality={liquidity_quality_score:.3f};validated_high_state={validated_high_state};validated_low_state={validated_low_state};{validation_reason};fresh_zone={zone.reason};value_area_state={value_area_state};value_area_width_bps={value_area_width_bps:.2f};volume_profile_quality={volume_profile_quality:.3f};{vp_reason};{vp_leader.get('volume_profile_leader_reason', '')};{fvg_reason}"
+    return PriceActionContext(product_id, float(candle_context_buy_score), float(candle_context_sell_score), float(candle_context_hold_score), float(context_confidence), float(candle_sequence_score), float(candle_exhaustion_score), float(candle_continuation_score), float(market_structure_buy_score), float(market_structure_sell_score), float(market_structure_hold_score), float(context_confidence), float(validated_liquidity_buy_score), float(validated_liquidity_sell_score), float(context_confidence), float(fresh_zone_buy_score), float(fresh_zone_sell_score), float(context_confidence), float(volume_profile_buy_score), float(volume_profile_sell_score), float(volume_profile_hold_score), float(volume_profile_confidence), float(fvg_buy_score), float(fvg_sell_score), float(context_confidence), str(structure_state), str(structure_reason), float(last_swing_high), float(last_swing_low), float(validated_high), float(validated_low), str(validated_high_state), str(validated_low_state), float(liquidity_quality_score), float(nearest_upside), float(nearest_downside), float(vah), float(val), float(poc), str(value_area_state), float(bullish_fvg_low), float(bullish_fvg_high), float(bearish_fvg_low), float(bearish_fvg_high), str(fvg_state), float(zone.zone_low), float(zone.zone_high), str(zone.reason), reason, float(vp_leader.get("volume_profile_leader_buy_score", 0.0)), float(vp_leader.get("volume_profile_leader_sell_score", 0.0)), float(vp_leader.get("volume_profile_leader_hold_score", 0.50)), float(vp_leader.get("volume_profile_leader_wait_score", 0.50)), float(vp_leader.get("volume_profile_leader_confidence", 0.10)), str(vp_leader.get("value_acceptance_state", "unknown")), str(vp_leader.get("volume_node_state", "unknown")), float(vp_leader.get("nearest_high_volume_node", 0.0)), float(vp_leader.get("nearest_low_volume_node", 0.0)), float(vp_leader.get("low_volume_path_up_bps", 0.0)), float(vp_leader.get("low_volume_path_down_bps", 0.0)), float(vp_leader.get("poc_distance_bps", 0.0)), float(vp_leader.get("unfair_trade_score", 0.0)), str(vp_leader.get("volume_profile_leader_reason", "")))
 
 
 def context_to_dict(context: PriceActionContext) -> Dict[str, Any]:

@@ -167,6 +167,7 @@ BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_setu
 DECISION_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "decision_audit.csv")
 SELL_QUALITY_REVIEWS_CSV_PATH: str = os.path.join(BASE_DIR, "sell_quality_reviews.csv")
 MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.csv")
+MAKER_MISS_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_miss_outcomes.csv")
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
 
 # Startup CSV-state detection.
@@ -727,6 +728,7 @@ REQUIRE_COINBASE_FEE_TIER: bool = True
 # Coinbase portfolio source-of-truth behavior.
 # In live mode, Coinbase balances and fills should be treated as authoritative.
 SOURCE_OF_TRUTH_COINBASE: bool = True
+MIN_ADOPT_POSITION_USD: float = 0.50
 
 # Startup handling for existing Coinbase crypto balances in PRODUCTS.
 # Options:
@@ -802,6 +804,13 @@ HARD_EXIT_USES_MARKET: bool = True
 MARKET_FALLBACK_BUY_MIN_FINAL_SCORE: float = 0.82
 MARKET_FALLBACK_BUY_MIN_TRUTH: float = 0.72
 MARKET_FALLBACK_BUY_MIN_PROJECTED_NET_BPS: float = 180.0
+MAKER_FIRST_RETRY_COUNT: int = 2
+MAKER_FIRST_RETRY_SLEEP_SEC: float = 1.0
+MAKER_FIRST_ALLOW_TAKER_FALLBACK: bool = True
+TAKER_FALLBACK_MIN_EXPECTED_UTILITY_BPS: float = 320.0
+TAKER_FALLBACK_MIN_TRUTH_SCORE: float = 0.72
+TAKER_FALLBACK_MAX_SPREAD_BPS: float = 8.0
+TAKER_FALLBACK_REASON_REQUIRED: str = "exceptional_net_edge"
 
 # ============================================================
 # EXPECTED UTILITY LEADER
@@ -1258,6 +1267,13 @@ MIN_LEARNED_PROB_TARGET: float = 0.05
 
 # Event loop lag diagnostics.
 EVENT_LOOP_LAG_WARN_SEC: float = 3.0
+EVENT_LOOP_LAG_CRITICAL_SEC: float = 30.0
+EVENT_LOOP_LAG_SUPPRESS_DURING_STARTUP_SEC: float = 600.0
+BACKTEST_RELOAD_EVERY_SEC: float = 900.0
+LEGACY_DIAGNOSTIC_LOG_EVERY_SEC: float = 60.0
+MIN_ORDER_RAISE_MAX_EQUITY_PCT: float = 0.10
+MIN_ORDER_RAISE_EXCEPTION_UTILITY_BPS: float = 250.0
+MIN_ORDER_RAISE_EXCEPTION_TRUTH: float = 0.72
 
 # Account snapshot cache for telemetry.
 TELEMETRY_ACCOUNT_REFRESH_TTL_SEC: float = 5.0
@@ -5500,6 +5516,13 @@ class TradingBot:
         self.level8_council = None
         self.last_level8_council_heartbeat_ts: float = 0.0
         self.last_ai_train_ts: float = 0.0
+        self._ai_training_running: bool = False
+        self._backtest_reload_running: bool = False
+        self._last_backtest_reload_ts: float = 0.0
+        self._macro_refresh_running: bool = False
+        self._last_legacy_diagnostic_log_ts: Dict[str, float] = {}
+        self._last_no_position_sell_skip_log_ts: Dict[str, float] = {}
+        self._last_viewer_snapshot_success_log_ts: float = 0.0
         self.last_agent_performance_update_ts: float = 0.0
         self.last_decision_audit_review_ts: float = 0.0
         self.last_adaptive_guardrail_write_ts: float = 0.0
@@ -6193,6 +6216,14 @@ class TradingBot:
             f"maker_bps={self.current_maker_fee_bps} "
             f"taker_bps={self.current_taker_fee_bps}"
         )
+        maker_bps = float(self._entry_fee_bps_for_mode("MAKER"))
+        taker_bps = float(self._entry_fee_bps_for_mode("MARKET"))
+        if maker_bps >= 50.0 or taker_bps >= 100.0:
+            log(
+                f"[fee-tier-warning] high fee tier active maker_bps={maker_bps:.2f};"
+                f"taker_bps={taker_bps:.2f};"
+                f"bot should prefer fewer higher-edge trades and maker-first entries"
+            )
 
     def _entry_fee_bps_for_mode(self, execution_mode: Optional[str] = None) -> float:
         if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
@@ -8784,14 +8815,14 @@ class TradingBot:
         )
         log_ts = now_ts()
         should_log_buy_gate = bool(
-            ok_to_trade or log_ts - float(last_logged) >= 15.0
+            log_ts - float(last_logged) >= float(LEGACY_DIAGNOSTIC_LOG_EVERY_SEC)
         )
         if should_log_buy_gate:
             self.last_buy_gate_log_ts_by_product[product_id] = log_ts
 
         if should_log_buy_gate and ok_to_trade:
             log(
-                f"[legacy-signal-diagnostic] {product_id} BUY_READY "
+                f"[legacy-diagnostic-not-final] {product_id} LEGACY_READY_NOT_FINAL "
                 f"mode={buy_gate_mode} "
                 f"diagnostics={diagnostic_note} "
                 f"calibrated={buy_gate_calibration_ready} "
@@ -8816,7 +8847,7 @@ class TradingBot:
             )
         elif should_log_buy_gate:
             log(
-                f"[legacy-signal-diagnostic] {product_id} BLOCKED "
+                f"[legacy-diagnostic-not-final] {product_id} BLOCKED "
                 f"mode={buy_gate_mode} "
                 f"blocker={buy_gate_blocker} "
                 f"diagnostics={diagnostic_note} "
@@ -9775,6 +9806,162 @@ class TradingBot:
 
         except Exception as exc:
             log(f"[csv] append failed path={path}: {exc}")
+
+    def _maker_miss_columns(self) -> List[str]:
+        return [
+            "ts", "dt_mst", "product_id", "side", "quote_usd",
+            "bid", "ask", "spread_bps", "expected_utility_bps",
+            "truth_score", "reason", "reviewed", "review_price",
+            "missed_move_bps", "miss_quality",
+        ]
+
+    def _append_maker_miss_outcome(
+        self,
+        *,
+        product_id: str,
+        quote_usd: float,
+        bid: float,
+        ask: float,
+        reason: str,
+    ) -> None:
+        try:
+            spread_bps = ((float(ask) / float(bid)) - 1.0) * 10000.0 if float(bid) > 0 else 999.0
+            expected_utility = 0.0
+            truth_score = 0.0
+            for token in str(reason or "").replace(";", " ").split():
+                if token.startswith("expected_utility="):
+                    expected_utility = safe_float(token.split("=", 1)[1], expected_utility)
+                elif token.startswith("truth="):
+                    truth_score = safe_float(token.split("=", 1)[1], truth_score)
+            self._append_csv_dict_row(
+                path=MAKER_MISS_OUTCOMES_CSV_PATH,
+                columns=self._maker_miss_columns(),
+                row={
+                    "ts": f"{now_ts():.6f}",
+                    "dt_mst": now_mst().strftime("%Y-%m-%d %H:%M:%S"),
+                    "product_id": product_id,
+                    "side": "BUY",
+                    "quote_usd": f"{float(quote_usd):.6f}",
+                    "bid": f"{float(bid):.10f}",
+                    "ask": f"{float(ask):.10f}",
+                    "spread_bps": f"{float(spread_bps):.6f}",
+                    "expected_utility_bps": f"{float(expected_utility):.6f}",
+                    "truth_score": f"{float(truth_score):.6f}",
+                    "reason": "maker_no_fill",
+                    "reviewed": "0",
+                    "review_price": "",
+                    "missed_move_bps": "",
+                    "miss_quality": "",
+                },
+            )
+            log(f"[maker_miss] recorded {product_id} quote_usd={float(quote_usd):.2f} spread_bps={spread_bps:.3f}")
+        except Exception as exc:
+            log(f"[maker_miss] append failed {product_id}: {exc}")
+
+    def _review_maker_miss_outcomes(self) -> None:
+        try:
+            if not os.path.exists(MAKER_MISS_OUTCOMES_CSV_PATH):
+                return
+            with open(MAKER_MISS_OUTCOMES_CSV_PATH, newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            if not rows:
+                return
+            changed = False
+            ts_now = now_ts()
+            try:
+                round_trip_cost_bps = float(self._entry_fee_bps_for_mode("MARKET")) + float(self._exit_fee_bps_for_mode())
+            except Exception:
+                round_trip_cost_bps = 0.0
+            for row in rows:
+                if str(row.get("reviewed", "0")) == "1":
+                    continue
+                event_ts = safe_float(row.get("ts"), 0.0)
+                if ts_now - event_ts < 5.0 * 60.0:
+                    continue
+                product_id = str(row.get("product_id", ""))
+                tob = self.tob.get(product_id)
+                if not tob or tob.bid <= 0:
+                    continue
+                ask = safe_float(row.get("ask"), 0.0)
+                if ask <= 0:
+                    continue
+                missed_move_bps = ((float(tob.bid) / float(ask)) - 1.0) * 10000.0
+                row["reviewed"] = "1"
+                row["review_price"] = f"{float(tob.bid):.10f}"
+                row["missed_move_bps"] = f"{float(missed_move_bps):.6f}"
+                row["miss_quality"] = (
+                    "missed_good_entry"
+                    if missed_move_bps > round_trip_cost_bps
+                    else "good_fee_avoidance"
+                )
+                changed = True
+            if changed:
+                tmp_path = MAKER_MISS_OUTCOMES_CSV_PATH + ".tmp"
+                columns = self._maker_miss_columns()
+                with open(tmp_path, "w", newline="", encoding="utf-8") as file:
+                    writer = csv.DictWriter(file, fieldnames=columns)
+                    writer.writeheader()
+                    for row in rows:
+                        writer.writerow({col: row.get(col, "") for col in columns})
+                os.replace(tmp_path, MAKER_MISS_OUTCOMES_CSV_PATH)
+                log("[maker_miss] reviewed pending maker misses")
+        except Exception as exc:
+            log(f"[maker_miss] review failed: {exc}")
+
+    def _maybe_train_ai_brain_background(self) -> None:
+        try:
+            if bool(getattr(self, "_ai_training_running", False)):
+                return
+            ts_now = now_ts()
+            last_train = float(getattr(self, "last_ai_train_ts", 0.0) or 0.0)
+            interval = float(globals().get("AI_TRAIN_EVERY_SEC", globals().get("AI_RETRAIN_EVERY_SEC", 900.0)))
+            if ts_now - last_train < interval:
+                return
+            self.last_ai_train_ts = ts_now
+            self._ai_training_running = True
+
+            async def _train_task() -> None:
+                try:
+                    def _train_now() -> Any:
+                        if not ENABLE_LOCAL_AI_BRAIN or self.ai_brain is None:
+                            return None
+                        result = self.ai_brain.train()
+                        log(f"[ai] train_result={result}")
+                        return result
+
+                    result = await asyncio.to_thread(_train_now)
+                    log(f"[ai] background_train_result={result}")
+                except Exception as exc:
+                    log(f"[ai] background training failed: {exc}")
+                finally:
+                    self._ai_training_running = False
+
+            asyncio.create_task(_train_task())
+        except Exception as exc:
+            log(f"[ai] background scheduling failed: {exc}")
+
+    def _maybe_reload_backtest_background(self) -> None:
+        try:
+            ts_now = now_ts()
+            if bool(getattr(self, "_backtest_reload_running", False)):
+                return
+            if ts_now - float(getattr(self, "_last_backtest_reload_ts", 0.0) or 0.0) < float(BACKTEST_RELOAD_EVERY_SEC):
+                return
+            self._last_backtest_reload_ts = ts_now
+            self._backtest_reload_running = True
+
+            async def _reload_task() -> None:
+                try:
+                    await asyncio.to_thread(self._load_backtest_recommendations)
+                    log("[backtest] background reload complete")
+                except Exception as exc:
+                    log(f"[backtest] background reload failed: {exc}")
+                finally:
+                    self._backtest_reload_running = False
+
+            asyncio.create_task(_reload_task())
+        except Exception as exc:
+            log(f"[backtest] background reload scheduling failed: {exc}")
 
     def _decision_audit_columns(self) -> List[str]:
         return [
@@ -12999,6 +13186,12 @@ class TradingBot:
         bot.py only applies mechanical safety checks after the council decides.
         """
         if bool(ENABLE_POSITION_AWARE_COUNCIL_MODE) and not self._has_open_position(product_id):
+            if not hasattr(self, "_last_no_position_sell_skip_log_ts"):
+                self._last_no_position_sell_skip_log_ts = {}
+            last = float(self._last_no_position_sell_skip_log_ts.get(product_id, 0.0))
+            if now_ts() - last >= 60.0:
+                log(f"[sell-council] skipped {product_id}; no position owned")
+                self._last_no_position_sell_skip_log_ts[product_id] = now_ts()
             return False, (
                 f"sell_council_skipped_no_position_owned;"
                 f"product={product_id};"
@@ -13834,12 +14027,47 @@ class TradingBot:
                         self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_filled;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
                     return fill
 
+                for retry_idx in range(int(MAKER_FIRST_RETRY_COUNT)):
+                    await asyncio.sleep(float(MAKER_FIRST_RETRY_SLEEP_SEC))
+                    retry_result = await self._live_buy_maker(
+                        product_id=product_id,
+                        quote_usd=float(quote_usd),
+                        bid=float(bid),
+                    )
+                    self.last_buy_execution_result[product_id] = dict(retry_result) if isinstance(retry_result, dict) else {}
+                    retry_fill = self._require_live_fill(retry_result, product_id=product_id, side="BUY")
+                    if retry_fill is not None:
+                        log(f"[buy] {product_id} maker retry filled retry={retry_idx + 1}")
+                        return retry_fill
+
                 allow_market_fallback = bool(ALLOW_MARKET_FALLBACK_FOR_BUYS) or bool(
                     requested_mode == "LIMIT_THEN_MARKET" and self._buy_allows_market_fallback(reason)
                 )
+                reason_values: Dict[str, float] = {}
+                for token in str(reason or "").replace(";", " ").split():
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        reason_values[key.strip()] = safe_float(value, 0.0)
+                expected_utility = float(reason_values.get("expected_utility", reason_values.get("expected_utility_bps", 0.0)))
+                truth_score = float(reason_values.get("truth", reason_values.get("level8_truth_score", 0.0)))
+                spread_bps = ((float(ask) / float(bid)) - 1.0) * 10000.0 if float(bid) > 0 else 999.0
+                exceptional_taker_fallback = bool(
+                    MAKER_FIRST_ALLOW_TAKER_FALLBACK
+                    and expected_utility >= float(TAKER_FALLBACK_MIN_EXPECTED_UTILITY_BPS)
+                    and truth_score >= float(TAKER_FALLBACK_MIN_TRUTH_SCORE)
+                    and spread_bps <= float(TAKER_FALLBACK_MAX_SPREAD_BPS)
+                )
+                allow_market_fallback = bool(allow_market_fallback or exceptional_taker_fallback)
                 if not allow_market_fallback:
                     if LOG_ORDER_ATTEMPTS:
                         self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_no_fill_skip_market;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                    self._append_maker_miss_outcome(
+                        product_id=product_id,
+                        quote_usd=float(quote_usd),
+                        bid=float(bid),
+                        ask=float(ask),
+                        reason=reason,
+                    )
                     self._append_maker_fill_outcome(
                         product_id=product_id,
                         side="BUY",
@@ -13855,10 +14083,18 @@ class TradingBot:
                         filled_size=0.0,
                         reason="maker_buy_no_fill_skip_market",
                     )
-                    log(f"[buy-skip] {product_id} maker_no_fill; skipping market fallback to avoid taker fee")
+                    log(
+                        f"[buy-skip] {product_id} maker_no_fill; skipping market fallback "
+                        f"expected_utility={expected_utility:.2f};truth={truth_score:.3f};spread={spread_bps:.3f};"
+                        f"taker_fee_bps={self._entry_fee_bps_for_mode('MARKET'):.3f}"
+                    )
                     return None
 
-                log(f"[buy-fallback] {product_id} maker_no_fill; using market fallback because setup is high-conviction")
+                log(
+                    f"[buy-fallback] {product_id} maker_no_fill; using MARKET fallback because "
+                    f"expected_utility={expected_utility:.2f};truth={truth_score:.3f};spread={spread_bps:.3f};"
+                    f"reason={TAKER_FALLBACK_REASON_REQUIRED}"
+                )
 
             mode = "MARKET"
             result = await self._live_buy_market(product_id=product_id, quote_usd=float(quote_usd))
@@ -14498,6 +14734,13 @@ class TradingBot:
                 continue
 
             qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+            usd_value = float(qty) * float(tob.mid)
+            asset = product_base_asset(product_id)
+            log(
+                f"[startup-adopt-scan] asset={asset};product_id={product_id};"
+                f"qty={float(qty):.12f};mid={float(tob.mid):.10f};usd_value={usd_value:.4f};"
+                f"adoptable={bool(usd_value >= MIN_ADOPT_POSITION_USD)}"
+            )
             if qty <= 1e-12:
                 self.positions[product_id] = []
                 self.position_start_ts[product_id] = None
@@ -14873,73 +15116,81 @@ class TradingBot:
         Uses chunked REST requests to avoid exceeding API limits.
         """
         while not self._stop_event.is_set():
+            if bool(getattr(self, "_macro_refresh_running", False)):
+                await asyncio.sleep(1.0)
+                continue
+            self._macro_refresh_running = True
             start_week = int(now_ts()) - 7 * 24 * 60 * 60
             start_day = int(now_ts_i()) - 24 * 60 * 60
             end_ts = int(now_ts_i())
             week_rows: List[Dict[str, Any]] = []
             day_rows: List[Dict[str, Any]] = []
             levels_rows: List[Dict[str, Any]] = []
-            for product in PRODUCTS:
-                # Weekly 15‑minute candles
-                candles_week = await self.fetcher.fetch_chunked(product, start_week, end_ts, "FIFTEEN_MINUTE")
-                if candles_week:
-                    levels_week = compute_macro_levels(candles_week)
-                    if levels_week:
-                        self.macro.set_levels(product, "week", levels_week)
-                        levels_rows.append({"ts": end_ts, "product_id": product, "timeframe": "week", **levels_week.__dict__})
-                    for c in candles_week:
-                        week_rows.append({
-                            "ts": c.ts,
-                            "product_id": product,
-                            "open": c.open,
-                            "high": c.high,
-                            "low": c.low,
-                            "close": c.close,
-                            "volume": c.volume,
-                        })
-                # Daily 1‑minute candles: use live_1m if enough data else REST
-                live_rows = self.live_1m[product].export_rows(product)
-                if len(live_rows) >= 120:
-                    candles_day: List[Candle] = [
-                        Candle(
-                            ts=int(r["ts"]),
-                            open=float(r["open"]),
-                            high=float(r["high"]),
-                            low=float(r["low"]),
-                            close=float(r["close"]),
-                            volume=float(r.get("volume", 0.0))
-                        ) for r in live_rows
-                    ]
-                else:
-                    candles_day = await self.fetcher.fetch_chunked(product, start_day, end_ts, "ONE_MINUTE")
-                if not candles_week:
-                    log(f"[macro] week empty for {product}")
-                if not candles_day:
-                    log(f"[macro] day empty for {product} (live_rows={len(live_rows)})")
-                if candles_day:
-                    levels_day = compute_macro_levels(candles_day)
-                    if levels_day:
-                        self.macro.set_levels(product, "day", levels_day)
-                        levels_rows.append({"ts": end_ts, "product_id": product, "timeframe": "day", **levels_day.__dict__})
-                    for c in candles_day:
-                        day_rows.append({
-                            "ts": c.ts,
-                            "product_id": product,
-                            "open": c.open,
-                            "high": c.high,
-                            "low": c.low,
-                            "close": c.close,
-                            "volume": c.volume,
-                        })
-            # Write weekly and daily candles for viewer
             try:
-                await self.week_writer.write(week_rows)
-                await self.day_writer.write(day_rows)
-                await self.levels_writer.write(levels_rows)
-            except Exception as e:
-                log_exception("[macro] write failed", e)
-            # update last macro time
-            self.last_macro_update = now_ts_i()
+                for product in PRODUCTS:
+                    # Weekly 15‑minute candles
+                    candles_week = await self.fetcher.fetch_chunked(product, start_week, end_ts, "FIFTEEN_MINUTE")
+                    if candles_week:
+                        levels_week = compute_macro_levels(candles_week)
+                        if levels_week:
+                            self.macro.set_levels(product, "week", levels_week)
+                            levels_rows.append({"ts": end_ts, "product_id": product, "timeframe": "week", **levels_week.__dict__})
+                        for c in candles_week:
+                            week_rows.append({
+                                "ts": c.ts,
+                                "product_id": product,
+                                "open": c.open,
+                                "high": c.high,
+                                "low": c.low,
+                                "close": c.close,
+                                "volume": c.volume,
+                            })
+                    # Daily 1‑minute candles: use live_1m if enough data else REST
+                    live_rows = self.live_1m[product].export_rows(product)
+                    if len(live_rows) >= 120:
+                        candles_day: List[Candle] = [
+                            Candle(
+                                ts=int(r["ts"]),
+                                open=float(r["open"]),
+                                high=float(r["high"]),
+                                low=float(r["low"]),
+                                close=float(r["close"]),
+                                volume=float(r.get("volume", 0.0))
+                            ) for r in live_rows
+                        ]
+                    else:
+                        candles_day = await self.fetcher.fetch_chunked(product, start_day, end_ts, "ONE_MINUTE")
+                    if not candles_week:
+                        log(f"[macro] week empty for {product}")
+                    if not candles_day:
+                        log(f"[macro] day empty for {product} (live_rows={len(live_rows)})")
+                    if candles_day:
+                        levels_day = compute_macro_levels(candles_day)
+                        if levels_day:
+                            self.macro.set_levels(product, "day", levels_day)
+                            levels_rows.append({"ts": end_ts, "product_id": product, "timeframe": "day", **levels_day.__dict__})
+                        for c in candles_day:
+                            day_rows.append({
+                                "ts": c.ts,
+                                "product_id": product,
+                                "open": c.open,
+                                "high": c.high,
+                                "low": c.low,
+                                "close": c.close,
+                                "volume": c.volume,
+                            })
+                    await asyncio.sleep(0.05)
+                # Write weekly and daily candles for viewer
+                try:
+                    await self.week_writer.write(week_rows)
+                    await self.day_writer.write(day_rows)
+                    await self.levels_writer.write(levels_rows)
+                except Exception as e:
+                    log_exception("[macro] write failed", e)
+                # update last macro time
+                self.last_macro_update = now_ts_i()
+            finally:
+                self._macro_refresh_running = False
             await asyncio.sleep(MACRO_REFRESH_EVERY_SEC)
 
     # --------------------------------------------------------
@@ -17276,6 +17527,13 @@ class TradingBot:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2)
             os.replace(tmp_path, VIEWER_SNAPSHOT_PATH)
+            rows = dict(snapshot.get("coins", {}) or {})
+            if now_ts() - float(getattr(self, "_last_viewer_snapshot_success_log_ts", 0.0) or 0.0) >= 30.0:
+                log(
+                    f"[viewer_snapshot] wrote coins={len(rows)} "
+                    f"positions={sum(1 for r in rows.values() if bool(r.get('owns_position', False)))}"
+                )
+                self._last_viewer_snapshot_success_log_ts = now_ts()
         except Exception as exc:
             try:
                 self._log_debug(f"[viewer_snapshot] write failed: {exc}")
@@ -17319,6 +17577,7 @@ class TradingBot:
             ts_now = now_ts()
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
                 self._review_level8_missed_opportunities()
+            self._review_maker_miss_outcomes()
             self._review_sell_quality()
             if (
                 bool(ENABLE_DECISION_AUDIT_REPLAY)
@@ -17334,11 +17593,7 @@ class TradingBot:
             ):
                 self.last_agent_performance_update_ts = ts_now
 
-                try:
-                    self._run_backtest_intelligence_if_due(force=False)
-                    self._load_backtest_recommendations()
-                except Exception as exc:
-                    log_exception("backtest intelligence periodic update failed", exc)
+                self._maybe_reload_backtest_background()
 
                 try:
                     self._classify_level8_sell_outcomes()
@@ -17355,10 +17610,21 @@ class TradingBot:
                         self.level8_council._clear_level8_memory_cache()
                 except Exception:
                     pass
-            self._maybe_train_ai_brain()
+            self._maybe_train_ai_brain_background()
             loop_gap = ts_now - float(self.last_loop_lag_check_ts or ts_now)
             if loop_gap > EVENT_LOOP_LAG_WARN_SEC:
-                log(f"[lag] eval_loop gap={loop_gap:.2f}s; possible blocking work or REST delay")
+                startup_age = ts_now - float(getattr(self, "bot_start_ts", ts_now) or ts_now)
+                severity = (
+                    "startup_warmup"
+                    if startup_age < float(EVENT_LOOP_LAG_SUPPRESS_DURING_STARTUP_SEC)
+                    else "critical"
+                )
+                log(
+                    f"[lag] eval_loop gap={loop_gap:.2f}s; severity={severity}; "
+                    f"startup_age={startup_age:.1f}s; "
+                    f"live_recalibration_running={bool(getattr(self, 'live_recalibration_running', False))}; "
+                    f"possible_blocking_work=True"
+                )
             self.last_loop_lag_check_ts = ts_now
 
             if self.pending_buy_reconciliations and isinstance(self.portfolio, LivePortfolio):
@@ -17533,7 +17799,26 @@ class TradingBot:
                 except Exception:
                     cash_usd = float("nan")
 
-                log(f"[heartbeat] running | products={len(PRODUCTS)} | cash_usd={cash_usd:.2f}")
+                try:
+                    open_positions_count = sum(
+                        1 for product_id in PRODUCTS
+                        if self._has_open_position(product_id)
+                    )
+                except Exception:
+                    open_positions_count = 0
+
+                try:
+                    snapshot_age = now_ts() - float(getattr(self, "_last_viewer_snapshot_write_ts", 0.0) or 0.0)
+                except Exception:
+                    snapshot_age = 9999.0
+
+                log(
+                    f"[heartbeat] running | products={len(PRODUCTS)} | cash_usd={cash_usd:.2f} | "
+                    f"open_positions={open_positions_count} | "
+                    f"viewer_snapshot_age={snapshot_age:.1f}s | "
+                    f"risk_pause_active={bool(getattr(self, 'risk_pause_until_ts', 0.0) > now_ts())} | "
+                    f"live_recalibration_running={bool(getattr(self, 'live_recalibration_running', False))}"
+                )
                 self.last_heartbeat_ts = ts_now
 
             warmup_done = (ts_now - self.bot_start_ts) >= FIRST_BUY_DELAY_SEC
@@ -18023,6 +18308,15 @@ class TradingBot:
                         level8_ok, level8_info = self._level8_decision_for_candidate(
                             candidate=candidate
                         )
+                        log(
+                            f"[level8-final] {product_id_l8} action={level8_info.get('action', '')};"
+                            f"bucket={level8_info.get('bucket', '')};"
+                            f"truth={float(level8_info.get('truth_score', 0.0) or 0.0):.3f};"
+                            f"buy_score={float(level8_info.get('final_buy_score', 0.0) or 0.0):.3f};"
+                            f"threshold={float(level8_info.get('buy_threshold', 0.0) or 0.0):.3f};"
+                            f"expected_utility={float(level8_info.get('expected_utility_bps', 0.0) or 0.0):.2f};"
+                            f"reason={str(level8_info.get('reason', ''))[:240]}"
+                        )
 
                         elapsed = now_ts() - float(decision_start_ts)
 
@@ -18463,10 +18757,29 @@ class TradingBot:
                         and spendable_cash >= min_order
                         and remaining_eval_budget >= min_order
                     ):
+                        min_order_pct = float(min_order) / max(float(equity_usd), 1e-9)
+                        expected_utility = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
+                        truth_score = float(candidate.get("level8_truth_score", candidate.get("truth_score", 0.0)) or 0.0)
+                        allow_min_order_exception = bool(
+                            min_order_pct <= float(MIN_ORDER_RAISE_MAX_EQUITY_PCT)
+                            or (
+                                expected_utility >= float(MIN_ORDER_RAISE_EXCEPTION_UTILITY_BPS)
+                                and truth_score >= float(MIN_ORDER_RAISE_EXCEPTION_TRUTH)
+                            )
+                        )
+                        if not allow_min_order_exception:
+                            log(
+                                f"[level8] {product_id} shadowing min-order raise; "
+                                f"old={entry_notional:.2f};min_order={float(min_order):.2f};"
+                                f"min_order_pct={min_order_pct:.3f};equity={equity_usd:.2f};"
+                                f"expected_utility={expected_utility:.2f};truth={truth_score:.3f}"
+                            )
+                            continue
                         log(
                             f"[level8] {product_id} raising ALLOW_BUY notional "
                             f"to min live order old={entry_notional:.2f} "
-                            f"new={min_order:.2f}"
+                            f"new={min_order:.2f};"
+                            f"min_order_pct={min_order_pct:.3f};exception={allow_min_order_exception}"
                         )
                         entry_notional = min_order
                     else:
@@ -18543,6 +18856,8 @@ class TradingBot:
                 candidate["entry_reason"] = (
                     str(candidate.get("entry_reason", ""))
                     + ";execution_policy=maker_first_fee_efficient"
+                    + f";expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f}"
+                    + f";truth={float(candidate.get('level8_truth_score', candidate.get('truth_score', 0.0)) or 0.0):.3f}"
                 )
 
                 log(

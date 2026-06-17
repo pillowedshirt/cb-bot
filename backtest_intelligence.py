@@ -11,11 +11,13 @@ import pandas as pd
 
 BACKTEST_RECOMMENDATIONS_COLUMNS: List[str] = [
     "ts", "dt_utc", "product_id", "sample_count", "accepted_count",
+    "sample_confidence", "replay_quality_score", "live_gate_bias_bps",
     "recommended_min_score", "recommended_min_probability",
     "recommended_min_expected_value_bps", "recommended_min_projected_net_bps",
     "recommended_forward_window_minutes", "expected_win_rate", "expected_net_bps",
     "expected_adverse_bps", "objective_score", "source", "reason",
 ]
+
 
 BACKTEST_SELL_RECOMMENDATIONS_COLUMNS: List[str] = [
     "ts", "dt_utc", "product_id", "sell_samples", "too_early_rate",
@@ -81,57 +83,224 @@ def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
 
 
 def _candidate_rows(base_dir: str, *, min_product_rows: int) -> Tuple[List[List[Any]], Dict[str, Dict[str, Any]]]:
+    """
+    Build product-level live-buy recommendations from candidate_replay.csv.
+
+    This version scores candidates by profit usefulness instead of only movement:
+    - net peak after cost,
+    - win rate after cost,
+    - adverse movement,
+    - time to profit,
+    - post-profit continuation,
+    - opportunity frequency,
+    - sample confidence.
+
+    The output is intentionally conservative for weak products and only gives
+    small relief to strong products.
+    """
     frame = _read_csv(os.path.join(base_dir, "candidate_replay.csv"))
-    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
-    rows: List[List[Any]] = []; recs: Dict[str, Dict[str, Any]] = {}
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+    rows: List[List[Any]] = []
+    recs: Dict[str, Dict[str, Any]] = {}
+
     if frame.empty or "product_id" not in frame.columns:
         return rows, recs
-    required_numeric = ["score", "probability", "expected_net_edge_bps", "cost_bps", "max_favorable_bps", "max_adverse_bps", "adverse_before_profit_bps", "time_to_min_profit_minutes", "forward_window_minutes", "post_profit_extra_gain_bps"]
+
+    # Support both older and newer column names.
+    if "probability" not in frame.columns and "estimated_prob_up" in frame.columns:
+        frame["probability"] = frame["estimated_prob_up"]
+
+    required_numeric = [
+        "score", "probability", "expected_net_edge_bps", "cost_bps",
+        "max_favorable_bps", "max_adverse_bps", "adverse_before_profit_bps",
+        "time_to_min_profit_minutes", "forward_window_minutes", "post_profit_extra_gain_bps",
+    ]
+
     for column in required_numeric:
         frame[column] = _numeric(frame, column, 0.0)
+
     frame["reached_min_profit_bool"] = _bool_series(frame, "reached_min_profit")
     frame["survived_to_profit_bool"] = _bool_series(frame, "survived_to_profit")
+
     frame["net_peak_bps"] = frame["max_favorable_bps"] - frame["cost_bps"]
-    frame["net_success"] = frame["survived_to_profit_bool"] | frame["reached_min_profit_bool"] | (frame["net_peak_bps"] >= 45.0)
+    frame["net_success"] = (
+        frame["survived_to_profit_bool"]
+        | frame["reached_min_profit_bool"]
+        | (frame["net_peak_bps"] >= 45.0)
+    )
+
     for product_id, group in frame.groupby(frame["product_id"].astype(str)):
-        group = group.copy(); sample_count = int(len(group))
+        group = group.copy()
+        sample_count = int(len(group))
+
         if sample_count < int(min_product_rows):
             continue
-        score_values = group["score"].dropna(); prob_values = group["probability"].dropna(); ev_values = group["expected_net_edge_bps"].dropna()
-        if score_values.empty or prob_values.empty:
+
+        score_values = group["score"].dropna()
+        prob_values = group["probability"].dropna()
+        ev_values = group["expected_net_edge_bps"].dropna()
+
+        if score_values.empty or prob_values.empty or ev_values.empty:
             continue
+
         best: Optional[Dict[str, Any]] = None
-        for sq in [0.45, 0.55, 0.65, 0.75, 0.85]:
+
+        for sq in [0.45, 0.55, 0.65, 0.75, 0.85, 0.90]:
             score_cut = float(score_values.quantile(sq))
-            for pq in [0.40, 0.50, 0.60, 0.70, 0.80]:
+
+            for pq in [0.40, 0.50, 0.60, 0.70, 0.80, 0.88]:
                 prob_cut = float(prob_values.quantile(pq))
-                for eq in [0.35, 0.50, 0.65, 0.80]:
+
+                for eq in [0.35, 0.50, 0.65, 0.80, 0.90]:
                     ev_cut = float(ev_values.quantile(eq))
-                    accepted = group[(group["score"] >= score_cut) & (group["probability"] >= prob_cut) & (group["expected_net_edge_bps"] >= ev_cut)].copy()
+
+                    accepted = group[
+                        (group["score"] >= score_cut)
+                        & (group["probability"] >= prob_cut)
+                        & (group["expected_net_edge_bps"] >= ev_cut)
+                    ].copy()
+
                     accepted_count = int(len(accepted))
                     if accepted_count < max(8, int(min_product_rows * 0.04)):
                         continue
+
+                    opportunity_rate = accepted_count / max(1, sample_count)
                     win_rate = float(accepted["net_success"].mean())
                     avg_net = float(accepted["net_peak_bps"].mean())
                     median_net = float(accepted["net_peak_bps"].median())
                     avg_adverse = float(accepted["adverse_before_profit_bps"].abs().mean())
                     avg_post_extra = float(accepted["post_profit_extra_gain_bps"].mean())
+
                     clean_time = accepted["time_to_min_profit_minutes"].replace([np.inf, -np.inf], np.nan).dropna()
                     median_time = float(clean_time.median()) if not clean_time.empty else 240.0
-                    sample_quality = min(1.0, accepted_count / max(25.0, min_product_rows * 0.15))
-                    objective = win_rate * 100.0 + avg_net * 0.42 + median_net * 0.20 + avg_post_extra * 0.16 - avg_adverse * 0.24 - max(0.0, median_time - 180.0) * 0.035 + sample_quality * 15.0
-                    candidate = {"score_cut": score_cut, "prob_cut": prob_cut, "ev_cut": ev_cut, "accepted_count": accepted_count, "win_rate": win_rate, "avg_net": avg_net, "median_net": median_net, "avg_adverse": avg_adverse, "median_time": median_time, "objective": objective}
+
+                    sample_confidence = min(
+                        1.0,
+                        math.sqrt(accepted_count / 60.0) * math.sqrt(sample_count / 300.0),
+                    )
+
+                    expected_trade_value_bps = (
+                        win_rate * max(0.0, avg_net)
+                        - (1.0 - win_rate) * avg_adverse * 0.55
+                    )
+
+                    monthly_compound_proxy = (
+                        expected_trade_value_bps
+                        * min(1.0, opportunity_rate * 12.0)
+                        * sample_confidence
+                    )
+
+                    objective = (
+                        win_rate * 115.0
+                        + avg_net * 0.45
+                        + median_net * 0.22
+                        + avg_post_extra * 0.16
+                        + monthly_compound_proxy * 0.35
+                        - avg_adverse * 0.30
+                        - max(0.0, median_time - 180.0) * 0.040
+                        + sample_confidence * 18.0
+                    )
+
+                    candidate = {
+                        "score_cut": score_cut, "prob_cut": prob_cut, "ev_cut": ev_cut,
+                        "accepted_count": accepted_count, "opportunity_rate": opportunity_rate,
+                        "win_rate": win_rate, "avg_net": avg_net, "median_net": median_net,
+                        "avg_adverse": avg_adverse, "avg_post_extra": avg_post_extra,
+                        "median_time": median_time, "sample_confidence": sample_confidence,
+                        "expected_trade_value_bps": expected_trade_value_bps,
+                        "monthly_compound_proxy": monthly_compound_proxy, "objective": objective,
+                    }
+
                     if best is None or objective > float(best["objective"]):
                         best = candidate
+
         if best is None:
             continue
-        recommended_min_projected_net_bps = max(45.0, min(180.0, float(best["avg_net"]) * 0.35 + 45.0))
-        recommended_forward_window_minutes = max(15.0, min(360.0, float(best["median_time"]) if math.isfinite(float(best["median_time"])) else 240.0))
-        reason = f"candidate_replay_grid_search;sample_count={sample_count};accepted_count={int(best['accepted_count'])};win_rate={float(best['win_rate']):.4f};avg_net={float(best['avg_net']):.2f};avg_adverse={float(best['avg_adverse']):.2f};objective={float(best['objective']):.4f}"
-        rows.append([f"{ts_value:.6f}", dt_value, product_id, sample_count, int(best["accepted_count"]), f"{float(best['score_cut']):.6f}", f"{float(best['prob_cut']):.6f}", f"{float(best['ev_cut']):.6f}", f"{float(recommended_min_projected_net_bps):.6f}", f"{float(recommended_forward_window_minutes):.6f}", f"{float(best['win_rate']):.6f}", f"{float(best['avg_net']):.6f}", f"{float(best['avg_adverse']):.6f}", f"{float(best['objective']):.6f}", "candidate_replay.csv", reason])
-        recs[product_id] = {"product_id": product_id, "recommended_min_score": float(best["score_cut"]), "recommended_min_probability": float(best["prob_cut"]), "recommended_min_expected_value_bps": float(best["ev_cut"]), "recommended_min_projected_net_bps": float(recommended_min_projected_net_bps), "recommended_forward_window_minutes": float(recommended_forward_window_minutes), "expected_win_rate": float(best["win_rate"]), "expected_net_bps": float(best["avg_net"]), "expected_adverse_bps": float(best["avg_adverse"]), "objective_score": float(best["objective"])}
-    return rows, recs
 
+        sample_confidence = float(best["sample_confidence"])
+        win_rate = float(best["win_rate"])
+        avg_net = float(best["avg_net"])
+        avg_adverse = float(best["avg_adverse"])
+        objective = float(best["objective"])
+
+        replay_quality_score = max(
+            0.0,
+            min(
+                1.0,
+                0.50
+                + (win_rate - 0.50) * 1.20
+                + max(-150.0, min(250.0, avg_net)) / 600.0
+                - max(0.0, avg_adverse - 120.0) / 600.0
+                + (sample_confidence - 0.50) * 0.35,
+            ),
+        )
+
+        if win_rate < 0.48 or avg_net < 0.0 or replay_quality_score < 0.45:
+            live_gate_bias_bps = min(
+                80.0,
+                25.0 + max(0.0, 0.48 - win_rate) * 120.0
+                + max(0.0, -avg_net) * 0.10
+                + max(0.0, 0.45 - replay_quality_score) * 80.0,
+            )
+        elif win_rate >= 0.58 and avg_net >= 70.0 and replay_quality_score >= 0.58 and sample_confidence >= 0.60:
+            live_gate_bias_bps = -min(
+                25.0,
+                6.0 + max(0.0, win_rate - 0.58) * 80.0 + max(0.0, avg_net - 70.0) * 0.04,
+            )
+        else:
+            live_gate_bias_bps = min(
+                35.0,
+                max(0.0, 0.52 - win_rate) * 80.0 + max(0.0, 35.0 - avg_net) * 0.15,
+            )
+
+        base_projected = 45.0 + max(0.0, avg_net) * 0.35 + max(0.0, avg_adverse) * 0.08
+        recommended_min_projected_net_bps = max(
+            45.0,
+            min(220.0, base_projected + max(0.0, live_gate_bias_bps)),
+        )
+
+        if live_gate_bias_bps < 0:
+            recommended_min_projected_net_bps = max(
+                55.0,
+                recommended_min_projected_net_bps + live_gate_bias_bps,
+            )
+
+        recommended_forward_window_minutes = max(
+            15.0,
+            min(360.0, float(best["median_time"]) if math.isfinite(float(best["median_time"])) else 240.0),
+        )
+
+        reason = (
+            f"candidate_replay_profit_grid;sample_count={sample_count};"
+            f"accepted_count={int(best['accepted_count'])};sample_confidence={sample_confidence:.4f};"
+            f"win_rate={win_rate:.4f};avg_net={avg_net:.2f};avg_adverse={avg_adverse:.2f};"
+            f"replay_quality={replay_quality_score:.4f};live_gate_bias_bps={live_gate_bias_bps:.2f};"
+            f"objective={objective:.4f}"
+        )
+
+        rows.append([
+            f"{ts_value:.6f}", dt_value, product_id, sample_count, int(best["accepted_count"]),
+            f"{sample_confidence:.6f}", f"{replay_quality_score:.6f}", f"{live_gate_bias_bps:.6f}",
+            f"{float(best['score_cut']):.6f}", f"{float(best['prob_cut']):.6f}", f"{float(best['ev_cut']):.6f}",
+            f"{float(recommended_min_projected_net_bps):.6f}", f"{float(recommended_forward_window_minutes):.6f}",
+            f"{win_rate:.6f}", f"{avg_net:.6f}", f"{avg_adverse:.6f}", f"{objective:.6f}",
+            "candidate_replay.csv", reason,
+        ])
+
+        recs[product_id] = {
+            "product_id": product_id, "sample_count": sample_count, "accepted_count": int(best["accepted_count"]),
+            "sample_confidence": sample_confidence, "replay_quality_score": replay_quality_score,
+            "live_gate_bias_bps": live_gate_bias_bps, "recommended_min_score": float(best["score_cut"]),
+            "recommended_min_probability": float(best["prob_cut"]),
+            "recommended_min_expected_value_bps": float(best["ev_cut"]),
+            "recommended_min_projected_net_bps": float(recommended_min_projected_net_bps),
+            "recommended_forward_window_minutes": float(recommended_forward_window_minutes),
+            "expected_win_rate": win_rate, "expected_net_bps": avg_net,
+            "expected_adverse_bps": avg_adverse, "objective_score": objective,
+        }
+
+    return rows, recs
 
 def _sell_recommendation_rows(base_dir: str) -> List[List[Any]]:
     frame = _read_csv(os.path.join(base_dir, "sell_outcomes.csv")); ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); rows: List[List[Any]] = []
@@ -159,27 +328,117 @@ def _sell_recommendation_rows(base_dir: str) -> List[List[Any]]:
 
 
 def _agent_prior_rows(base_dir: str) -> List[List[Any]]:
-    perf = _read_csv(os.path.join(base_dir, "agent_performance.csv")); ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); rows: List[List[Any]] = []
+    """
+    Convert agent_performance.csv into profit-weighted priors.
+
+    This creates useful Level 8 memory without allowing old replay rows to overpower
+    new live trade evidence.
+    """
+    perf = _read_csv(os.path.join(base_dir, "agent_performance.csv"))
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+    rows: List[List[Any]] = []
+
     if perf.empty or not {"product_id", "strategy", "agent"}.issubset(perf.columns):
         return rows
-    perf["weighted_agent_credit_score"] = _numeric(perf, "weighted_agent_credit_score", 0.5); perf["agent_credit_score"] = _numeric(perf, "agent_credit_score", 0.5); perf["outcome_move_bps"] = _numeric(perf, "outcome_move_bps", 0.0); perf["confidence"] = _numeric(perf, "confidence", 0.6); perf["reliability"] = _numeric(perf, "reliability", 0.5)
+
+    perf["weighted_agent_credit_score"] = _numeric(perf, "weighted_agent_credit_score", 0.5)
+    perf["agent_credit_score"] = _numeric(perf, "agent_credit_score", 0.5)
+    perf["outcome_move_bps"] = _numeric(perf, "outcome_move_bps", 0.0)
+    perf["confidence"] = _numeric(perf, "confidence", 0.6)
+    perf["reliability"] = _numeric(perf, "reliability", 0.5)
+
+    if "realized_net_pnl_usd" in perf.columns:
+        perf["realized_net_pnl_usd"] = _numeric(perf, "realized_net_pnl_usd", 0.0)
+    else:
+        perf["realized_net_pnl_usd"] = 0.0
+
+    if "realized_net_pnl_bps" in perf.columns:
+        perf["realized_net_pnl_bps"] = _numeric(perf, "realized_net_pnl_bps", 0.0)
+    else:
+        perf["realized_net_pnl_bps"] = 0.0
+
+    if "earnings_quality_score" in perf.columns:
+        perf["earnings_quality_score"] = _numeric(perf, "earnings_quality_score", 0.5)
+    else:
+        perf["earnings_quality_score"] = 0.5
+
     if "outcome_source" not in perf.columns:
         perf["outcome_source"] = "agent_performance"
-    source_weight = perf["outcome_source"].astype(str).map({"real_trade": 1.30, "trade_outcome": 1.30, "sell_outcome": 1.25, "agent_performance": 0.80, "level8_observation": 0.45, "observation_outcome": 0.35}).fillna(0.50).astype(float)
-    perf["profit_replay_credit"] = ((perf["weighted_agent_credit_score"] * source_weight) + (perf["agent_credit_score"] * 0.25) + ((perf["outcome_move_bps"].clip(-250.0, 350.0) + 250.0) / 600.0 * 0.15)) / (source_weight + 0.40)
+
+    source_weight = perf["outcome_source"].astype(str).map({
+        "real_trade": 1.35, "trade_outcome": 1.35, "sell_outcome": 1.30,
+        "agent_performance": 0.75, "level8_observation": 0.40,
+        "observation_outcome": 0.30,
+    }).fillna(0.45).astype(float)
+
+    pnl_credit = (
+        0.50
+        + perf["realized_net_pnl_usd"].clip(-1.00, 1.00) * 0.16
+        + perf["realized_net_pnl_bps"].clip(-250.0, 350.0) / 2500.0
+        + (perf["earnings_quality_score"] - 0.50) * 0.25
+    ).clip(0.0, 1.0)
+
+    move_credit = ((perf["outcome_move_bps"].clip(-250.0, 350.0) + 250.0) / 600.0).clip(0.0, 1.0)
+
+    perf["profit_replay_credit"] = (
+        perf["weighted_agent_credit_score"] * source_weight
+        + perf["agent_credit_score"] * 0.20
+        + pnl_credit * 0.25
+        + move_credit * 0.10
+    ) / (source_weight + 0.55)
+
     perf["profit_replay_credit"] = perf["profit_replay_credit"].clip(0.0, 1.0)
+
     for (product_id, strategy, agent), group in perf.groupby(["product_id", "strategy", "agent"]):
         sample_count = int(len(group))
         if sample_count < 5:
             continue
-        recent = group.tail(250).copy(); credit = float(recent["profit_replay_credit"].mean()); move = float(recent["outcome_move_bps"].mean()); confidence = float(recent["confidence"].mean()); reliability = float(recent["reliability"].mean()); success = 1 if credit >= 0.50 else 0
-        if str(strategy).upper() == "EXIT_REVIEW":
-            buy_score = 0.0; sell_score = credit; hold_score = 1.0 - max(0.0, credit - 0.50) * 0.75; wait_score = 0.25
-        else:
-            buy_score = credit; sell_score = 1.0 - credit; hold_score = 0.50; wait_score = 0.35
-        rows.append([f"{ts_value:.6f}", dt_value, f"backtest-prior-{product_id}-{strategy}-{agent}-{int(ts_value)}", str(product_id), str(strategy), str(agent), f"{buy_score:.6f}", f"{sell_score:.6f}", f"{hold_score:.6f}", f"{wait_score:.6f}", f"{max(0.50, min(0.85, confidence)):.6f}", f"{max(0.35, min(0.85, reliability)):.6f}", "1.000000", "", "", "0.000000", "0.000000", "backtest_profit_replay", "1.250000", "0", f"{move:.6f}", "profit_replay_prior", f"{credit:.6f}", f"{credit:.6f}", success, f"backtest_profit_prior;samples={sample_count};recent_samples={len(recent)};credit={credit:.6f};avg_move_bps={move:.2f};source=agent_performance.csv"])
-    return rows
 
+        recent = group.tail(250).copy()
+        recent_count = int(len(recent))
+        sample_confidence = min(1.0, math.sqrt(recent_count / 80.0))
+
+        credit = float(recent["profit_replay_credit"].mean())
+        move = float(recent["outcome_move_bps"].mean())
+        confidence = float(recent["confidence"].mean())
+        reliability = float(recent["reliability"].mean())
+
+        prior_credit = max(0.35, min(0.68, 0.50 + (credit - 0.50) * 0.75 * sample_confidence))
+        prior_weight = max(0.45, min(1.05, 0.50 + sample_confidence * 0.45))
+
+        success = 1 if prior_credit >= 0.50 else 0
+
+        if str(strategy).upper() == "EXIT_REVIEW":
+            buy_score = 0.0
+            sell_score = prior_credit
+            hold_score = 1.0 - max(0.0, prior_credit - 0.50) * 0.70
+            wait_score = 0.25
+        else:
+            buy_score = prior_credit
+            sell_score = 1.0 - prior_credit
+            hold_score = 0.50
+            wait_score = 0.35
+
+        rows.append([
+            f"{ts_value:.6f}", dt_value,
+            f"backtest-prior-{product_id}-{strategy}-{agent}-{int(ts_value)}",
+            str(product_id), str(strategy), str(agent), f"{buy_score:.6f}",
+            f"{sell_score:.6f}", f"{hold_score:.6f}", f"{wait_score:.6f}",
+            f"{max(0.50, min(0.85, confidence)):.6f}",
+            f"{max(0.35, min(0.85, reliability)):.6f}", "1.000000", "", "",
+            "0.000000", "0.000000", "backtest_profit_replay", f"{prior_weight:.6f}",
+            "0", f"{move:.6f}", "profit_replay_prior", f"{prior_credit:.6f}",
+            f"{prior_credit:.6f}", success,
+            (
+                f"backtest_profit_prior_capped;samples={sample_count};recent_samples={recent_count};"
+                f"sample_confidence={sample_confidence:.4f};raw_credit={credit:.6f};"
+                f"prior_credit={prior_credit:.6f};prior_weight={prior_weight:.6f};"
+                f"avg_move_bps={move:.2f};source=agent_performance.csv"
+            ),
+        ])
+
+    return rows
 
 def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str], None]] = None, min_product_rows: int = 80) -> Dict[str, Any]:
     """Run CSV replay intelligence and write backtest recommendation CSVs."""

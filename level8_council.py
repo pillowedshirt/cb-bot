@@ -576,10 +576,10 @@ class Level8Council:
 
         source = data["source"].astype(str) if "source" in data.columns else pd.Series("unknown", index=data.index)
         source_weight = source.map({
-            "backtest_profit_replay": 1.25,
-            "real_trade": 1.15,
-            "trade_outcome": 1.15,
-            "sell_outcome": 1.15,
+            "real_trade": 1.35,
+            "trade_outcome": 1.35,
+            "sell_outcome": 1.30,
+            "backtest_profit_replay": 0.90,
             "agent_performance": 0.80,
             "level8_observation": 0.45,
             "observation_outcome": 0.35,
@@ -597,7 +597,8 @@ class Level8Council:
             weighted_move = 0.0
             weighted_adverse = 0.0
 
-        real_trade_n = float(source.isin(["backtest_profit_replay", "real_trade", "trade_outcome", "sell_outcome"]).sum())
+        real_trade_n = float(source.isin(["real_trade", "trade_outcome", "sell_outcome"]).sum())
+        backtest_prior_n = float(source.isin(["backtest_profit_replay"]).sum())
         observation_n = float(source.isin(["level8_observation", "observation_outcome"]).sum())
 
         result = {
@@ -608,8 +609,9 @@ class Level8Council:
             "avg_credit": float(credit.mean()),
             "weighted_credit": weighted_credit,
             "real_trade_n": real_trade_n,
+            "backtest_prior_n": backtest_prior_n,
             "observation_n": observation_n,
-            "reason": "weighted_stats",
+            "reason": "weighted_stats_live_outcomes_above_priors",
         }
 
         self._outcome_stats_cache[cache_key] = (now_value, dict(result))

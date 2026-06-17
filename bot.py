@@ -52,6 +52,15 @@ except Exception:
     build_session_liquidity_signal = None
     session_liquidity_signal_to_dict = None
 
+try:
+    from price_action_context import (
+        build_price_action_context,
+        context_to_dict as price_action_context_to_dict,
+    )
+except Exception:
+    build_price_action_context = None
+    price_action_context_to_dict = None
+
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 BOT_PROCESS_LOCK_PATH: str = os.path.join(BASE_DIR, "bot_live_process.lock")
@@ -500,6 +509,15 @@ LEVEL8_ECONOMIC_SAFETY_GATE_ONLY: bool = True
 LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY: float = 0.06
 LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY: float = 0.50
 LEVEL8_MIN_NET_AFTER_COST_FOR_LIVE_BUY_BPS: float = 35.0
+
+# Price action context council.
+# These are weighted evidence modules, not rigid pass/fail gates.
+ENABLE_PRICE_ACTION_CONTEXT_COUNCIL: bool = True
+PRICE_ACTION_MIN_CONFIDENCE_FOR_STRONG_VOTE: float = 0.30
+PRICE_ACTION_SCORE_BONUS_WEIGHT: float = 4.0
+PRICE_ACTION_PROB_BONUS_WEIGHT: float = 0.018
+PRICE_ACTION_EDGE_BONUS_WEIGHT: float = 0.12
+PRICE_ACTION_TARGET_BONUS_CAP_BPS: float = 140.0
 
 # Active mode. No observe-only staged approach.
 LEVEL8_MODE: str = "FILTER_AND_SIZE"
@@ -3031,6 +3049,21 @@ class LiveSignal:
     session_upside_target_bps: float = 0.0
     session_downside_target_bps: float = 0.0
     session_stop_distance_bps: float = 0.0
+    price_action_buy_score: float = 0.0
+    price_action_sell_score: float = 0.0
+    price_action_hold_score: float = 0.0
+    price_action_confidence: float = 0.0
+    candle_sequence_score: float = 0.0
+    candle_exhaustion_score: float = 0.0
+    candle_continuation_score: float = 0.0
+    market_structure_buy_score: float = 0.0
+    validated_liquidity_buy_score: float = 0.0
+    fresh_zone_buy_score: float = 0.0
+    volume_profile_buy_score: float = 0.0
+    fvg_buy_score: float = 0.0
+    value_area_state: str = ""
+    fvg_state: str = ""
+    price_action_reason: str = ""
 
 
 @dataclass
@@ -7709,6 +7742,53 @@ class TradingBot:
 
         expected_net_edge_bps = float(expected_net_edge_bps) + float(session_edge_bonus_bps)
 
+        price_action_context = self._price_action_context_for_product(
+            product_id=product_id,
+            minute_candles=minute_candles,
+            current_price=mid,
+            spread_bps=float(spread_bps),
+            cost_bps=float(cost_bps),
+            projected_forward_gain_bps=float(calibrated_forward_gain_bps),
+        )
+
+        price_action_buy_score = float(price_action_context.get("candle_context_buy_score", 0.0) or 0.0)
+        price_action_sell_score = float(price_action_context.get("candle_context_sell_score", 0.0) or 0.0)
+        price_action_hold_score = float(price_action_context.get("candle_context_hold_score", 0.0) or 0.0)
+        price_action_confidence = float(price_action_context.get("candle_context_confidence", 0.0) or 0.0)
+
+        market_structure_buy_score = float(price_action_context.get("market_structure_buy_score", 0.0) or 0.0)
+        validated_liquidity_buy_score = float(price_action_context.get("validated_liquidity_buy_score", 0.0) or 0.0)
+        fresh_zone_buy_score = float(price_action_context.get("fresh_zone_buy_score", 0.0) or 0.0)
+        volume_profile_buy_score = float(price_action_context.get("volume_profile_buy_score", 0.0) or 0.0)
+        fvg_buy_score = float(price_action_context.get("fvg_buy_score", 0.0) or 0.0)
+
+        combined_price_action_buy = clamp_float(
+            price_action_buy_score * 0.24
+            + market_structure_buy_score * 0.18
+            + validated_liquidity_buy_score * 0.18
+            + fresh_zone_buy_score * 0.12
+            + volume_profile_buy_score * 0.14
+            + fvg_buy_score * 0.14,
+            0.0,
+            1.0,
+        )
+
+        price_action_score_bonus = combined_price_action_buy * price_action_confidence * float(PRICE_ACTION_SCORE_BONUS_WEIGHT)
+        price_action_prob_bonus = combined_price_action_buy * price_action_confidence * float(PRICE_ACTION_PROB_BONUS_WEIGHT)
+
+        pa_upside_target_bps = float(price_action_context.get("nearest_upside_liquidity", 0.0) or 0.0)
+        if pa_upside_target_bps > mid and mid > 0:
+            pa_upside_target_bps = ((pa_upside_target_bps / mid) - 1.0) * 10000.0
+        else:
+            pa_upside_target_bps = 0.0
+
+        price_action_edge_bonus_bps = min(
+            float(PRICE_ACTION_TARGET_BONUS_CAP_BPS),
+            max(0.0, pa_upside_target_bps - cost_bps),
+        ) * combined_price_action_buy * price_action_confidence * float(PRICE_ACTION_EDGE_BONUS_WEIGHT)
+
+        expected_net_edge_bps = float(expected_net_edge_bps) + float(price_action_edge_bonus_bps)
+
         raw_score = (
             support_score * 0.14
             + room_score * 0.14
@@ -7722,6 +7802,7 @@ class TradingBot:
             + higher_low_score * 0.06
             + edge_score * 0.12
             + session_score_bonus
+            + price_action_score_bonus
             - spread_penalty
             - cost_penalty
         )
@@ -7747,7 +7828,9 @@ class TradingBot:
         )
 
         estimated_prob_up = clamp_float(
-            float(estimated_prob_up) + float(session_prob_bonus),
+            float(estimated_prob_up)
+            + float(session_prob_bonus)
+            + float(price_action_prob_bonus),
             0.0,
             1.0,
         )
@@ -8051,7 +8134,8 @@ class TradingBot:
             f"time_to_min_profit={profile.calibrated_time_to_min_profit_minutes:.1f}m; "
             f"mom5={momentum_5_bps:.1f}; mom15={momentum_15_bps:.1f}; "
             f"room={room_reason}; {vwap_reason}; {higher_low_reason}; {trend_reason}; "
-            f"session_liquidity={session_liquidity.get('reason', 'none')}"
+            f"session_liquidity={session_liquidity.get('reason', 'none')}; "
+            f"price_action={price_action_context.get('reason', 'none')}"
         )
 
         return LiveSignal(
@@ -8096,6 +8180,21 @@ class TradingBot:
             session_upside_target_bps=float(session_upside_target_bps),
             session_downside_target_bps=float(session_liquidity.get("downside_target_bps", 0.0) or 0.0),
             session_stop_distance_bps=float(session_stop_distance_bps),
+            price_action_buy_score=float(combined_price_action_buy),
+            price_action_sell_score=float(price_action_sell_score),
+            price_action_hold_score=float(price_action_hold_score),
+            price_action_confidence=float(price_action_confidence),
+            candle_sequence_score=float(price_action_context.get("candle_sequence_score", 0.0) or 0.0),
+            candle_exhaustion_score=float(price_action_context.get("candle_exhaustion_score", 0.0) or 0.0),
+            candle_continuation_score=float(price_action_context.get("candle_continuation_score", 0.0) or 0.0),
+            market_structure_buy_score=float(market_structure_buy_score),
+            validated_liquidity_buy_score=float(validated_liquidity_buy_score),
+            fresh_zone_buy_score=float(fresh_zone_buy_score),
+            volume_profile_buy_score=float(volume_profile_buy_score),
+            fvg_buy_score=float(fvg_buy_score),
+            value_area_state=str(price_action_context.get("value_area_state", "")),
+            fvg_state=str(price_action_context.get("fvg_state", "")),
+            price_action_reason=str(price_action_context.get("reason", "")),
         )
 
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
@@ -8215,6 +8314,118 @@ class TradingBot:
             return all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
         except Exception:
             return False
+
+
+    def _price_action_context_for_product(
+        self,
+        *,
+        product_id: str,
+        minute_candles: Optional[List['MinuteCandle']] = None,
+        current_price: Optional[float] = None,
+        spread_bps: float = 0.0,
+        cost_bps: float = 0.0,
+        projected_forward_gain_bps: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Build candle/context/structure/volume/FVG evidence for one product.
+
+        This is weighted Level 8 evidence. It is not a hard trade trigger.
+        """
+        if not bool(ENABLE_PRICE_ACTION_CONTEXT_COUNCIL):
+            return {}
+
+        if build_price_action_context is None or price_action_context_to_dict is None:
+            return {}
+
+        try:
+            candles = minute_candles
+            if candles is None:
+                candles = list(self.minute_candles.get(product_id, []))
+
+            if not candles:
+                return {}
+
+            price = float(current_price or 0.0)
+            if price <= 0:
+                tob = self.tob.get(product_id)
+                if tob and tob.mid > 0:
+                    price = float(tob.mid)
+
+            if price <= 0:
+                return {}
+
+            context = build_price_action_context(
+                product_id=product_id,
+                candles=list(candles),
+                current_price=float(price),
+                spread_bps=float(spread_bps),
+                cost_bps=float(cost_bps),
+                projected_forward_gain_bps=float(projected_forward_gain_bps),
+            )
+
+            return dict(price_action_context_to_dict(context))
+
+        except Exception as exc:
+            log(f"[price-action] failed {product_id}: {exc}")
+            return {}
+
+    def _price_action_vote(
+        self,
+        *,
+        common: Dict[str, Any],
+        agent: str,
+        buy: float,
+        sell: float,
+        hold: float,
+        wait: float,
+        confidence: float,
+        reason: str,
+    ) -> Dict[str, Any]:
+        confidence = clamp_float(float(confidence), 0.10, 0.90)
+
+        if confidence < float(PRICE_ACTION_MIN_CONFIDENCE_FOR_STRONG_VOTE):
+            buy = clamp_float(float(buy) * 0.75, 0.0, 1.0)
+            sell = clamp_float(float(sell) * 0.75, 0.0, 1.0)
+            hold = clamp_float(0.50 + (float(hold) - 0.50) * 0.75, 0.0, 1.0)
+
+        return {
+            **common,
+            "agent": str(agent),
+            "buy": clamp_float(float(buy), 0.0, 1.0),
+            "sell": clamp_float(float(sell), 0.0, 1.0),
+            "hold": clamp_float(float(hold), 0.0, 1.0),
+            "wait": clamp_float(float(wait), 0.0, 1.0),
+            "confidence": confidence,
+            "reason": str(reason),
+        }
+
+    def _price_action_votes_from_context(
+        self,
+        *,
+        context: Dict[str, Any],
+        common: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        pa = dict(context.get("price_action_context", {}) or {})
+        if not pa:
+            return []
+
+        confidence = float(pa.get("candle_context_confidence", 0.10) or 0.10)
+        structure_confidence = float(pa.get("market_structure_confidence", confidence) or confidence)
+        liquidity_confidence = float(pa.get("validated_liquidity_confidence", confidence) or confidence)
+        fresh_zone_confidence = float(pa.get("fresh_zone_confidence", confidence) or confidence)
+        volume_confidence = float(pa.get("volume_profile_confidence", confidence) or confidence)
+        fvg_confidence = float(pa.get("fvg_confidence", confidence) or confidence)
+
+        return [
+            self._price_action_vote(common=common, agent="candle_context_agent", buy=float(pa.get("candle_context_buy_score", 0.0) or 0.0), sell=float(pa.get("candle_context_sell_score", 0.0) or 0.0), hold=float(pa.get("candle_context_hold_score", 0.50) or 0.50), wait=0.45, confidence=confidence, reason=str(pa.get("reason", "candle_context_no_reason"))),
+            self._price_action_vote(common=common, agent="candle_sequence_agent", buy=float(pa.get("candle_sequence_score", 0.0) or 0.0), sell=float(pa.get("candle_exhaustion_score", 0.0) or 0.0), hold=float(pa.get("candle_continuation_score", 0.50) or 0.50), wait=0.42, confidence=confidence, reason=str(pa.get("reason", "candle_sequence_no_reason"))),
+            self._price_action_vote(common=common, agent="candle_exhaustion_agent", buy=0.20, sell=float(pa.get("candle_exhaustion_score", 0.0) or 0.0), hold=float(pa.get("candle_continuation_score", 0.50) or 0.50), wait=0.35, confidence=confidence, reason=str(pa.get("reason", "candle_exhaustion_no_reason"))),
+            self._price_action_vote(common=common, agent="market_structure_agent", buy=float(pa.get("market_structure_buy_score", 0.0) or 0.0), sell=float(pa.get("market_structure_sell_score", 0.0) or 0.0), hold=float(pa.get("market_structure_hold_score", 0.50) or 0.50), wait=0.38, confidence=structure_confidence, reason=f"structure={pa.get('structure_state', '')};trend={pa.get('trend_state', '')};{pa.get('reason', '')}"),
+            self._price_action_vote(common=common, agent="validated_liquidity_agent", buy=float(pa.get("validated_liquidity_buy_score", 0.0) or 0.0), sell=float(pa.get("validated_liquidity_sell_score", 0.0) or 0.0), hold=0.48, wait=0.42, confidence=liquidity_confidence, reason=f"validated_high={pa.get('validated_high', 0.0)};validated_low={pa.get('validated_low', 0.0)};{pa.get('reason', '')}"),
+            self._price_action_vote(common=common, agent="fresh_zone_retest_agent", buy=float(pa.get("fresh_zone_buy_score", 0.0) or 0.0), sell=float(pa.get("fresh_zone_sell_score", 0.0) or 0.0), hold=0.48, wait=0.42, confidence=fresh_zone_confidence, reason=f"fresh_zone_state={pa.get('fresh_zone_state', '')};zone={pa.get('fresh_zone_low', 0.0)}-{pa.get('fresh_zone_high', 0.0)}"),
+            self._price_action_vote(common=common, agent="fair_value_gap_agent", buy=float(pa.get("fvg_buy_score", 0.0) or 0.0), sell=float(pa.get("fvg_sell_score", 0.0) or 0.0), hold=0.48, wait=0.42, confidence=fvg_confidence, reason=f"fvg_state={pa.get('fvg_state', '')};bullish={pa.get('bullish_fvg_low', 0.0)}-{pa.get('bullish_fvg_high', 0.0)};bearish={pa.get('bearish_fvg_low', 0.0)}-{pa.get('bearish_fvg_high', 0.0)}"),
+            self._price_action_vote(common=common, agent="volume_profile_agent", buy=float(pa.get("volume_profile_buy_score", 0.0) or 0.0), sell=float(pa.get("volume_profile_sell_score", 0.0) or 0.0), hold=float(pa.get("volume_profile_hold_score", 0.50) or 0.50), wait=0.40, confidence=volume_confidence, reason=f"value_area_state={pa.get('value_area_state', '')};val={pa.get('value_area_low', 0.0)};vah={pa.get('value_area_high', 0.0)};poc={pa.get('point_of_control', 0.0)}"),
+        ]
 
     def _session_liquidity_for_product(
         self,
@@ -8378,6 +8589,13 @@ class TradingBot:
         else:
             setup_tag = "mixed_structure"
 
+        price = float(
+            candidate.get("price", 0.0)
+            or candidate.get("mid", 0.0)
+            or candidate.get("current_price", 0.0)
+            or 0.0
+        )
+
         if spread_bps > 120:
             execution_state = "spread_extreme"
         elif spread_bps > 60:
@@ -8411,12 +8629,15 @@ class TradingBot:
         )
         session_liquidity = self._session_liquidity_for_product(
             product_id=product_id,
-            current_price=float(
-                candidate.get("price", 0.0)
-                or candidate.get("mid", 0.0)
-                or candidate.get("current_price", 0.0)
-                or 0.0
-            ),
+            current_price=price,
+            spread_bps=float(candidate.get("spread_bps", 0.0) or 0.0),
+            cost_bps=float(candidate.get("cost_bps", 0.0) or 0.0),
+            projected_forward_gain_bps=float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0),
+        )
+
+        price_action_context = self._price_action_context_for_product(
+            product_id=product_id,
+            current_price=price,
             spread_bps=float(candidate.get("spread_bps", 0.0) or 0.0),
             cost_bps=float(candidate.get("cost_bps", 0.0) or 0.0),
             projected_forward_gain_bps=float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0),
@@ -8433,6 +8654,7 @@ class TradingBot:
             "execution_state": execution_state,
             "learning_score": learning_score,
             "session_liquidity": session_liquidity,
+            "price_action_context": price_action_context,
         }
 
     def _max_buy_spread_for_product(self, product_id: str) -> float:
@@ -8901,6 +9123,11 @@ class TradingBot:
                 common=common,
             )
 
+            price_action_votes = self._price_action_votes_from_context(
+                context=context,
+                common=common,
+            )
+
             votes = [
                 vote("trend", trend_score, clamp_float(0.40+trend_score*0.30,0.0,1.0), clamp_float(0.60-trend_score*0.35,0.0,1.0), clamp_float(0.35+abs(mom5)/180.0,0.20,0.90), f"trend mom5={mom5:.2f};mom15={mom15:.2f};regime={market_regime}"),
                 vote("mean_reversion", mean_reversion_score, 0.45, clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), clamp_float(0.35+abs(mom5)/220.0,0.20,0.85), f"mean_reversion setup={setup_tag};mom1={mom1:.2f};mom5={mom5:.2f}"),
@@ -8922,6 +9149,7 @@ class TradingBot:
                 vote("execution", clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), 0.45, clamp_float(1.0-spread_quality,0.0,1.0), clamp_float(0.30+spread_quality*0.55,0.20,0.95), f"execution spread={spread_bps:.2f};cost={cost_bps:.2f};state={execution_state}"),
                 vote("product_health", clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), clamp_float(0.40+forward_score*0.30,0.0,1.0), clamp_float(0.65-forward_score*0.35,0.0,1.0), clamp_float(0.30+score*0.50,0.20,0.85), f"product score={score:.3f};edge={expected_edge:.2f};forward={projected_forward:.2f}"),
                 session_liquidity_vote,
+                *price_action_votes,
                 {**common, "agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
                 vote("exploration", learning_score, 0.35, clamp_float(0.70-learning_score*0.45,0.0,1.0), clamp_float(0.30+learning_score*0.55,0.20,0.85), f"learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"),
             ]
@@ -9699,6 +9927,13 @@ class TradingBot:
                     sell_backtest_rec.get("reason", "no_backtest_sell_recommendation")
                 ),
                 "session_liquidity": self._session_liquidity_for_product(
+                    product_id=product_id,
+                    current_price=float(current_price),
+                    spread_bps=float(spread_bps),
+                    cost_bps=float(cost_bps),
+                    projected_forward_gain_bps=0.0,
+                ),
+                "price_action_context": self._price_action_context_for_product(
                     product_id=product_id,
                     current_price=float(current_price),
                     spread_bps=float(spread_bps),
@@ -14144,6 +14379,21 @@ class TradingBot:
                     "session_upside_target_bps": float(live_signal.session_upside_target_bps),
                     "session_downside_target_bps": float(live_signal.session_downside_target_bps),
                     "session_stop_distance_bps": float(live_signal.session_stop_distance_bps),
+                    "price_action_buy_score": float(live_signal.price_action_buy_score),
+                    "price_action_sell_score": float(live_signal.price_action_sell_score),
+                    "price_action_hold_score": float(live_signal.price_action_hold_score),
+                    "price_action_confidence": float(live_signal.price_action_confidence),
+                    "candle_sequence_score": float(live_signal.candle_sequence_score),
+                    "candle_exhaustion_score": float(live_signal.candle_exhaustion_score),
+                    "candle_continuation_score": float(live_signal.candle_continuation_score),
+                    "market_structure_buy_score": float(live_signal.market_structure_buy_score),
+                    "validated_liquidity_buy_score": float(live_signal.validated_liquidity_buy_score),
+                    "fresh_zone_buy_score": float(live_signal.fresh_zone_buy_score),
+                    "volume_profile_buy_score": float(live_signal.volume_profile_buy_score),
+                    "fvg_buy_score": float(live_signal.fvg_buy_score),
+                    "value_area_state": str(live_signal.value_area_state),
+                    "fvg_state": str(live_signal.fvg_state),
+                    "price_action_reason": str(live_signal.price_action_reason),
                     "signal": live_signal,
                     "entry_timing_ok": False,
                     "entry_timing_reason": "heartbeat_market_watch",

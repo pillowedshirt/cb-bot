@@ -24,6 +24,57 @@ SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
 AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
+# Initial council reliability priors.
+# These are starting weights only. Live outcomes, sell outcomes, SHADOW outcomes,
+# and backtest priors still adapt these over time.
+INITIAL_AGENT_RELIABILITY_PRIORS = {
+    "truth": 1.25,
+    "setup_performance_agent": 1.22,
+    "product_health": 1.12,
+    "execution": 1.12,
+    "risk": 1.10,
+    "market_structure_agent": 1.14,
+    "validated_liquidity_agent": 1.12,
+    "candle_context_agent": 1.10,
+    "candle_sequence_agent": 1.08,
+    "volume_profile_agent": 1.04,
+    "fair_value_gap_agent": 1.02,
+    "fresh_zone_retest_agent": 1.02,
+    "trend": 1.00,
+    "mean_reversion": 0.94,
+    "breakout": 0.94,
+    "ai_outcome": 0.92,
+    "smt_divergence_agent": 0.88,
+    "exploration": 0.35,
+    "profit_capture": 1.16,
+    "peak_capture": 1.18,
+    "momentum_fade": 1.12,
+    "continuation_hold": 1.10,
+    "harvest_sizing": 1.12,
+    "fee_recovery": 1.16,
+    "drawdown_exit": 1.18,
+    "exit_truth": 1.22,
+    "candle_exhaustion_sell": 1.12,
+    "volume_profile_harvest": 1.08,
+    "fvg_reclaim_rejection_exit": 1.04,
+    "smt_divergence_exit": 0.92,
+}
+
+
+def initial_agent_reliability_prior(agent: str) -> float:
+    agent_text = str(agent or "")
+    if agent_text in INITIAL_AGENT_RELIABILITY_PRIORS:
+        return float(INITIAL_AGENT_RELIABILITY_PRIORS[agent_text])
+    if agent_text.endswith("_sweep_reversal"):
+        return 1.04
+    if agent_text.endswith("_breakout_continuation"):
+        return 0.98
+    if agent_text.endswith("_liquidity_harvest"):
+        return 0.88
+    if agent_text.endswith("_sell_context"):
+        return 1.06
+    return 1.00
+
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     """Clamp ``value`` to the inclusive range bounded by minimum and maximum."""
@@ -184,19 +235,19 @@ class Level8Council:
         self.min_agent_reliability = 0.20
         self.max_agent_reliability = 1.65
 
-        self.min_truth_to_trade = 0.05
-        self.min_truth_to_core_trade = 0.16
+        self.min_truth_to_trade = 0.42
+        self.min_truth_to_core_trade = 0.62
 
         # Portfolio allocation model.
         # The only hard spending ceiling is 80% deployed / 20% reserve.
         self.reserve_bucket_pct = 0.20
-        self.max_single_asset_pct = 0.80
-        self.max_total_exposure_pct = 0.80
+        self.max_single_asset_pct = 0.20
+        self.max_total_exposure_pct = 0.45
 
         # Council-controlled sizing.
-        self.test_bucket_trade_pct = 0.08
-        self.min_core_trade_pct = 0.14
-        self.max_core_trade_pct = 0.80
+        self.test_bucket_trade_pct = 0.05
+        self.min_core_trade_pct = 0.08
+        self.max_core_trade_pct = 0.20
 
         # These are descriptive only now; they do not hard-block spending.
         self.test_bucket_pct = 0.10
@@ -847,7 +898,12 @@ class Level8Council:
         strategy_adj = clamp(strategy_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         recent_adj = clamp(recent_adj, -self.max_agent_adjustment, self.max_agent_adjustment)
         directional = clamp(product_adj + strategy_adj + recent_adj + leader_bonus - leader_penalty, -self.max_agent_adjustment, self.max_agent_adjustment)
-        base_reliability = 0.80 + (agent_credit - 0.5) * 1.35 * sample_factor
+        initial_prior = initial_agent_reliability_prior(agent)
+        base_reliability = (
+            0.80
+            * float(initial_prior)
+            + (agent_credit - 0.5) * 1.35 * sample_factor
+        )
         reliability = clamp(base_reliability + leader_bonus - leader_penalty, self.min_agent_reliability, self.max_agent_reliability)
 
         try:
@@ -856,7 +912,7 @@ class Level8Council:
                 AGENT_ADJUSTMENTS_CSV,
                 [
                     "ts", "dt_utc", "agent", "product_id", "strategy",
-                    "base_reliability", "product_adjustment", "strategy_adjustment",
+                    "initial_prior", "base_reliability", "product_adjustment", "strategy_adjustment",
                     "recent_performance_adjustment", "directional_adjustment",
                     "final_reliability", "sample_size", "agent_credit",
                     "product_win_rate", "strategy_win_rate", "recent_win_rate",
@@ -866,6 +922,7 @@ class Level8Council:
                 {
                     "ts": f"{ts:.6f}", "dt_utc": utc_dt(ts), "agent": agent,
                     "product_id": product_id, "strategy": strategy,
+                    "initial_prior": f"{initial_prior:.6f}",
                     "base_reliability": f"{base_reliability:.6f}",
                     "product_adjustment": f"{product_adj:.6f}",
                     "strategy_adjustment": f"{strategy_adj:.6f}",
@@ -882,7 +939,7 @@ class Level8Council:
                     "leader_bonus": f"{leader_bonus:.6f}",
                     "leader_penalty": f"{leader_penalty:.6f}",
                     "reason": (
-                        f"agent={agent};competitive_goal=highest_weight;credit={agent_credit:.3f};"
+                        f"agent={agent};competitive_goal=highest_weight;initial_prior={initial_prior:.3f};credit={agent_credit:.3f};"
                         f"leader_rank={float(competition.get('leaderboard_rank', 999.0)):.0f};"
                         f"leader_score={float(competition.get('leaderboard_score', 0.5)):.3f};"
                         f"bonus={leader_bonus:.3f};penalty={leader_penalty:.3f}"
@@ -1086,8 +1143,11 @@ class Level8Council:
         )
 
         experience_n = float(self._outcome_stats(product_id=product_id).get("n", 0.0))
-        exploration_decay = clamp(experience_n / 120.0, 0.0, 1.0)
-        exploration_weight = 0.38 * (1.0 - exploration_decay) + 0.08 * exploration_decay
+        exploration_decay = clamp(experience_n / 160.0, 0.0, 1.0)
+
+        # Keep SHADOW learning active while preventing exploration from pushing
+        # weak overnight setups into live money before enough outcomes exist.
+        exploration_weight = 0.14 * (1.0 - exploration_decay) + 0.05 * exploration_decay
 
         truth_score = clamp(
             (
@@ -1106,14 +1166,24 @@ class Level8Council:
             1.0,
         )
 
-        final_buy = clamp(
-            base_final_buy * (1.0 - exploration_weight)
-            + learning_score * exploration_weight,
+        final_sell = clamp(
+            combined["adj_sell"] * (0.65 + truth_score * 0.35),
             0.0,
             1.0,
         )
-        final_sell = clamp(
-            combined["adj_sell"] * (0.65 + truth_score * 0.35),
+
+        contradiction_penalty = 0.0
+
+        if final_sell > base_final_buy:
+            contradiction_penalty += min(0.18, (final_sell - base_final_buy) * 0.40)
+
+        if truth_score < 0.58:
+            contradiction_penalty += min(0.10, (0.58 - truth_score) * 0.25)
+
+        final_buy = clamp(
+            base_final_buy * (1.0 - exploration_weight)
+            + learning_score * exploration_weight
+            - contradiction_penalty,
             0.0,
             1.0,
         )
@@ -1172,6 +1242,8 @@ class Level8Council:
             "sizing_reason": sizing_reason,
             "learning_score": learning_score,
             "exploration_weight": exploration_weight,
+            "contradiction_penalty": contradiction_penalty,
+            "base_final_buy": base_final_buy,
             "confidence": combined["confidence"],
             **thresholds,
             "votes": [asdict(vote) for vote in adjusted],

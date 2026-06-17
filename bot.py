@@ -504,10 +504,10 @@ BACKTEST_MIN_PROJECTED_NET_FLOOR_BPS: float = 35.0
 # Setup-specific backtest performance feedback.
 # This lets product/session/setup/candle/FVG/SMT combinations influence live ranking and sizing.
 ENABLE_BACKTEST_SETUP_PERFORMANCE_FEEDBACK: bool = True
-BACKTEST_SETUP_MIN_SAMPLES_FOR_LIVE: int = 12
-BACKTEST_SETUP_STRONG_WIN_RATE: float = 0.56
-BACKTEST_SETUP_WEAK_WIN_RATE: float = 0.44
-BACKTEST_SETUP_STRONG_AVG_NET_BPS: float = 45.0
+BACKTEST_SETUP_MIN_SAMPLES_FOR_LIVE: int = 10
+BACKTEST_SETUP_STRONG_WIN_RATE: float = 0.58
+BACKTEST_SETUP_WEAK_WIN_RATE: float = 0.46
+BACKTEST_SETUP_STRONG_AVG_NET_BPS: float = 75.0
 BACKTEST_SETUP_WEAK_AVG_NET_BPS: float = 0.0
 BACKTEST_SETUP_MAX_RANK_BONUS: float = 55.0
 BACKTEST_SETUP_MAX_RANK_PENALTY: float = 45.0
@@ -528,9 +528,13 @@ SESSION_LIQUIDITY_STOP_DISTANCE_MAX_BPS: float = 240.0
 # Keep hard live-buy rails focused on economics and safety.
 # Strategy quality should mostly be weighed by Level 8 council votes.
 LEVEL8_ECONOMIC_SAFETY_GATE_ONLY: bool = True
-LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY: float = 0.06
-LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY: float = 0.50
-LEVEL8_MIN_NET_AFTER_COST_FOR_LIVE_BUY_BPS: float = 35.0
+LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY: float = 0.12
+LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY: float = 0.62
+LEVEL8_MIN_NET_AFTER_COST_FOR_LIVE_BUY_BPS: float = 110.0
+
+# Overnight anti-churn / anti-stacking.
+LEVEL8_MIN_SECONDS_BETWEEN_BUYS_SAME_PRODUCT: float = 20 * 60
+LEVEL8_BLOCK_AVERAGING_DOWN_UNLESS_STRONG: bool = True
 
 # Price action context council.
 # These are weighted evidence modules, not rigid pass/fail gates.
@@ -767,22 +771,35 @@ TARGET_UTIL_MAX: float = 0.90
 HIGH_SCORE_UTIL_THRESHOLD: float = 78.0
 MID_SCORE_UTIL_THRESHOLD: float = 60.0
 
-# Execution mode
-# MARKET = more reliable fills, higher taker fee/spread cost.
-# MAKER = cheaper if filled, but can fail/no-fill often.
-# LIMIT_THEN_MARKET = try maker briefly, then fall back to market.
-ENTRY_EXECUTION_MODE: str = "MARKET"
-EXIT_EXECUTION_MODE: str = "MARKET"
+# Execution mode.
+# MAKER_FIRST = try Coinbase Advanced post-only maker execution first.
+# MARKET = immediate taker execution.
+# LIMIT_THEN_MARKET = try maker briefly, then allow taker fallback only when urgent.
+ENTRY_EXECUTION_MODE: str = "MAKER_FIRST"
+EXIT_EXECUTION_MODE: str = "MAKER_FIRST"
+
+# Fee-efficient execution policy.
+ENABLE_MAKER_FIRST_EXECUTION: bool = True
+MAKER_FIRST_BUY_TIMEOUT_SEC: float = 7.0
+MAKER_FIRST_SELL_TIMEOUT_SEC: float = 8.0
+MAKER_FIRST_REPRICE_SEC: float = 2.0
+ALLOW_MARKET_FALLBACK_FOR_BUYS: bool = False
+ALLOW_MARKET_FALLBACK_FOR_PROFIT_SELLS: bool = True
+HARD_EXIT_USES_MARKET: bool = True
+MARKET_FALLBACK_BUY_MIN_FINAL_SCORE: float = 0.82
+MARKET_FALLBACK_BUY_MIN_TRUTH: float = 0.72
+MARKET_FALLBACK_BUY_MIN_PROJECTED_NET_BPS: float = 180.0
 
 # Execution friction
 MAX_SPREAD_BPS: float = 18.0
 SCALP_MAX_SPREAD_BPS: float = 10.0
-EST_SLIPPAGE_BPS: float = 6.0
-EST_ADVERSE_FILL_BPS: float = 6.0
+# Maker-first reduces taker spread/fee drag when filled, but no-fill/missed-move risk remains.
+EST_SLIPPAGE_BPS: float = 4.0
+EST_ADVERSE_FILL_BPS: float = 8.0
 
 # Fee-aware edge requirements
-MIN_REQUIRED_NET_EDGE_BPS: float = 35.0
-MIN_TARGET_TO_COST_MULT: float = 2.75
+MIN_REQUIRED_NET_EDGE_BPS: float = 75.0
+MIN_TARGET_TO_COST_MULT: float = 3.25
 ROUND_TRIP_SAFETY_BPS: float = 8.0
 
 # Minimum realized net gain required for discretionary profit exits and the
@@ -956,9 +973,8 @@ LOW_EDGE_MIN_PROJECTED_NET_BPS: float = 35.0
 MEDIUM_EDGE_MIN_PROJECTED_NET_BPS: float = 75.0
 HIGH_EDGE_MIN_PROJECTED_NET_BPS: float = 120.0
 
-# Maker orders may save fees but can fail/no-fill.
-# For launch reliability, do not use maker-only entries.
-MAKER_ENTRY_TIMEOUT_SEC: float = 4.0
+# Maker-first orders may save fees; normal entries skip market fallback on no-fill.
+MAKER_ENTRY_TIMEOUT_SEC: float = MAKER_FIRST_BUY_TIMEOUT_SEC
 
 # Keep entry timing enabled, but make it permissive.
 # This aims for "moderately bad learning buys," not catastrophic falling-knife buys.
@@ -9107,6 +9123,11 @@ class TradingBot:
             buy_score = clamp_float(buy_score * 0.75, 0.0, 1.0)
             sell_score = clamp_float(sell_score * 0.75, 0.0, 1.0)
 
+        if setup == "sweep_reject_harvest" or "liquidity_harvest" in agent:
+            buy_score = clamp_float(min(buy_score, 0.18), 0.0, 1.0)
+            hold_score = clamp_float(min(hold_score, 0.42), 0.0, 1.0)
+            sell_score = clamp_float(max(sell_score, 0.62), 0.0, 1.0)
+
         return {
             **common,
             "agent": agent,
@@ -9638,6 +9659,69 @@ class TradingBot:
         )
         return float(req.get("min_projected_net_bps", base_min_projected_net_bps)), str(req.get("reason", ""))
 
+    def _seconds_since_last_buy_for_product(self, product_id: str) -> float:
+        try:
+            if not os.path.exists(TRADES_CSV_PATH):
+                return 999999.0
+
+            frame = pd.read_csv(TRADES_CSV_PATH)
+            if frame.empty:
+                return 999999.0
+
+            product_rows = frame[
+                (frame.get("product_id", "").astype(str) == str(product_id))
+                & (frame.get("side", "").astype(str).str.upper() == "BUY")
+            ]
+
+            if product_rows.empty or "ts" not in product_rows.columns:
+                return 999999.0
+
+            last_ts = pd.to_numeric(product_rows["ts"], errors="coerce").dropna().max()
+            return max(0.0, time.time() - float(last_ts))
+
+        except Exception:
+            return 999999.0
+
+    def _open_product_unrealized_bps_estimate(self, product_id: str, current_price: float) -> float:
+        try:
+            lots = list(
+                getattr(self, "open_lots", {}).get(product_id, [])
+                or getattr(self, "positions", {}).get(product_id, [])
+                or []
+            )
+            if not lots or current_price <= 0:
+                return 0.0
+
+            entry_values = []
+            for lot in lots:
+                if isinstance(lot, dict):
+                    entry = float(
+                        lot.get("effective_entry_price", 0.0)
+                        or lot.get("entry_price", 0.0)
+                        or lot.get("price", 0.0)
+                        or 0.0
+                    )
+                    qty = float(lot.get("qty", 0.0) or 0.0)
+                else:
+                    entry = float(
+                        getattr(lot, "price", 0.0)
+                        or getattr(lot, "entry_price", 0.0)
+                        or 0.0
+                    )
+                    qty = float(getattr(lot, "qty", 0.0) or 0.0)
+                if entry > 0 and qty > 0:
+                    entry_values.append((entry, qty))
+
+            if not entry_values:
+                return 0.0
+
+            total_qty = sum(qty for _, qty in entry_values)
+            avg_entry = sum(entry * qty for entry, qty in entry_values) / max(total_qty, 1e-9)
+            return ((float(current_price) / avg_entry) - 1.0) * 10000.0
+
+        except Exception:
+            return 0.0
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -9660,6 +9744,37 @@ class TradingBot:
         """
         try:
             product_id = str(candidate.get("product_id", ""))
+            current_price_for_stack_check = float(
+                candidate.get("price", 0.0)
+                or candidate.get("mid", 0.0)
+                or candidate.get("current_price", 0.0)
+                or 0.0
+            )
+
+            seconds_since_last_buy = self._seconds_since_last_buy_for_product(product_id)
+
+            if seconds_since_last_buy < float(LEVEL8_MIN_SECONDS_BETWEEN_BUYS_SAME_PRODUCT):
+                return False, (
+                    f"live_buy_shadowed:product_buy_cooldown "
+                    f"seconds_since_last_buy={seconds_since_last_buy:.1f};"
+                    f"min={float(LEVEL8_MIN_SECONDS_BETWEEN_BUYS_SAME_PRODUCT):.1f}"
+                )
+
+            open_unrealized_bps = self._open_product_unrealized_bps_estimate(
+                product_id=product_id,
+                current_price=current_price_for_stack_check,
+            )
+
+            if (
+                bool(LEVEL8_BLOCK_AVERAGING_DOWN_UNLESS_STRONG)
+                and open_unrealized_bps < -120.0
+                and not bool(candidate.get("backtest_setup_strong", False))
+            ):
+                return False, (
+                    f"live_buy_shadowed:no_averaging_down_without_strong_setup "
+                    f"open_unrealized_bps={open_unrealized_bps:.2f};"
+                    f"setup_strong={bool(candidate.get('backtest_setup_strong', False))}"
+                )
 
             final_buy = float(level8_info.get("final_buy_score", 0.0) or 0.0)
             threshold = float(level8_info.get("buy_threshold", 0.0) or 0.0)
@@ -9672,6 +9787,15 @@ class TradingBot:
             expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
             raw_prob = float(candidate.get("estimated_prob_up", 0.0) or 0.0)
             raw_score = float(candidate.get("score", 0.0) or 0.0)
+            setup_tag_text = str(
+                candidate.get("setup_tag", "")
+                or candidate.get("setup", "")
+                or candidate.get("entry_setup", "")
+                or ""
+            ).lower()
+
+            setup_perf_strong = bool(candidate.get("backtest_setup_strong", False))
+            setup_perf_quality = float(candidate.get("backtest_setup_quality", 0.50) or 0.50)
 
             projected_net_after_cost = float(projected_forward) - float(cost_bps)
 
@@ -9706,6 +9830,33 @@ class TradingBot:
                     f"live_buy_shadowed:council_truth_too_low "
                     f"truth={truth:.3f};"
                     f"min={float(LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY):.3f};"
+                    f"{backtest_reason}"
+                )
+
+            if raw_prob < 0.42:
+                return False, (
+                    f"live_buy_shadowed:raw_probability_too_low_for_overnight "
+                    f"prob={raw_prob:.3f};min=0.420;"
+                    f"final={final_buy:.3f};truth={truth:.3f};"
+                    f"{backtest_reason}"
+                )
+
+            if raw_score < 28.0:
+                return False, (
+                    f"live_buy_shadowed:raw_score_too_low_for_overnight "
+                    f"score={raw_score:.2f};min=28.00;"
+                    f"final={final_buy:.3f};truth={truth:.3f};"
+                    f"{backtest_reason}"
+                )
+
+            if "falling_knife" in setup_tag_text and not (
+                setup_perf_strong and setup_perf_quality >= 0.66
+            ):
+                return False, (
+                    f"live_buy_shadowed:falling_knife_requires_strong_setup_proof "
+                    f"setup={setup_tag_text};"
+                    f"setup_perf_strong={setup_perf_strong};"
+                    f"setup_quality={setup_perf_quality:.3f};"
                     f"{backtest_reason}"
                 )
 
@@ -11391,7 +11542,7 @@ class TradingBot:
             quote_usd=float(quote_usd),
             start_price=float(bid),
             max_wait_sec=MAKER_ENTRY_TIMEOUT_SEC,
-            reprice_every_sec=2.0,
+            reprice_every_sec=MAKER_FIRST_REPRICE_SEC,
         )
 
 
@@ -11405,8 +11556,8 @@ class TradingBot:
             product_id=product_id,
             base_qty=float(base_qty),
             start_price=float(ask),
-            max_wait_sec=6.0,
-            reprice_every_sec=2.0,
+            max_wait_sec=MAKER_FIRST_SELL_TIMEOUT_SEC,
+            reprice_every_sec=MAKER_FIRST_REPRICE_SEC,
         )
 
     async def _live_sell_market(self, *, product_id: str, base_qty: float) -> Any:
@@ -11418,6 +11569,52 @@ class TradingBot:
             float(base_qty),
         )
 
+    def _sell_reason_requires_market(self, reason: str, mode_override: Optional[str] = None) -> bool:
+        text = str(reason or "").lower()
+        override = str(mode_override or "").upper()
+
+        if override == "MARKET":
+            return True
+
+        urgent_terms = [
+            "hard_stop",
+            "stop_loss",
+            "emergency",
+            "force_sell",
+            "startup_liquidate",
+            "startup_liquidation",
+            "liquidate_existing",
+            "risk_pause",
+            "risk_exit",
+            "drawdown_exit",
+        ]
+
+        return any(term in text for term in urgent_terms)
+
+    def _buy_allows_market_fallback(self, reason: str) -> bool:
+        text = str(reason or "").lower()
+
+        try:
+            final_score = 0.0
+            truth = 0.0
+            projected_net = 0.0
+
+            for token in text.replace(";", " ").split():
+                if token.startswith("final_buy=") or token.startswith("final="):
+                    final_score = max(final_score, safe_float(token.split("=", 1)[1], 0.0))
+                if token.startswith("truth="):
+                    truth = max(truth, safe_float(token.split("=", 1)[1], 0.0))
+                if token.startswith("projected_net_after_cost="):
+                    projected_net = max(projected_net, safe_float(token.split("=", 1)[1], 0.0))
+
+            return bool(
+                final_score >= float(MARKET_FALLBACK_BUY_MIN_FINAL_SCORE)
+                and truth >= float(MARKET_FALLBACK_BUY_MIN_TRUTH)
+                and projected_net >= float(MARKET_FALLBACK_BUY_MIN_PROJECTED_NET_BPS)
+            )
+        except Exception:
+            return False
+
     async def _execute_live_buy(
         self,
         *,
@@ -11428,74 +11625,46 @@ class TradingBot:
         reason: str,
         execution_mode: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
-        """
-        Execute a live MARKET buy and return only a Coinbase-confirmed fill.
-
-        Market-only rule:
-        - Level 8 decides whether the timing is good enough.
-        - This function only submits an immediate Coinbase MARKET buy.
-        - Logs must distinguish raw market fill price from all-in fee-adjusted entry basis.
-        """
-        mode = "MARKET"
+        """Execute a live buy using the fee-efficient maker-first policy."""
+        requested_mode = str(execution_mode or ENTRY_EXECUTION_MODE or "MAKER_FIRST").upper()
+        mode = requested_mode
         result = None
 
         try:
-            result = await self._live_buy_market(
-                product_id=product_id,
-                quote_usd=float(quote_usd),
-            )
+            if bool(ENABLE_MAKER_FIRST_EXECUTION) and requested_mode in {"MAKER", "MAKER_FIRST", "LIMIT_THEN_MARKET"}:
+                mode = "MAKER_FIRST"
+                result = await self._live_buy_maker(product_id=product_id, quote_usd=float(quote_usd), bid=float(bid))
+                self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
+                fill = self._require_live_fill(result, product_id=product_id, side="BUY")
+                if fill is not None:
+                    if LOG_ORDER_ATTEMPTS:
+                        self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_filled;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                    return fill
 
-            self.last_buy_execution_result[product_id] = (
-                dict(result) if isinstance(result, dict) else {}
-            )
-
-            fill = self._require_live_fill(
-                result,
-                product_id=product_id,
-                side="BUY",
-            )
-
-            if LOG_ORDER_ATTEMPTS:
-                self.olog.log_order(
-                    event="BUY_ATTEMPT",
-                    product_id=product_id,
-                    side="BUY",
-                    mode=mode,
-                    requested_quote_usd=float(quote_usd),
-                    result=result,
-                    reason=(
-                        f"market_only_live_buy;"
-                        f"requested_quote_usd={float(quote_usd):.6f};"
-                        f"bid_snapshot={float(bid):.8f};"
-                        f"ask_snapshot={float(ask):.8f};"
-                        f"{reason}"
-                    ),
+                allow_market_fallback = bool(ALLOW_MARKET_FALLBACK_FOR_BUYS) or bool(
+                    requested_mode == "LIMIT_THEN_MARKET" and self._buy_allows_market_fallback(reason)
                 )
+                if not allow_market_fallback:
+                    if LOG_ORDER_ATTEMPTS:
+                        self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_no_fill_skip_market;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                    log(f"[buy-skip] {product_id} maker_no_fill; skipping market fallback to avoid taker fee")
+                    return None
 
+                log(f"[buy-fallback] {product_id} maker_no_fill; using market fallback because setup is high-conviction")
+
+            mode = "MARKET"
+            result = await self._live_buy_market(product_id=product_id, quote_usd=float(quote_usd))
+            self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
+            fill = self._require_live_fill(result, product_id=product_id, side="BUY")
+            if LOG_ORDER_ATTEMPTS:
+                self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"market_buy_after_fee_policy;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
             return fill
 
         except Exception as e:
-            self.last_buy_execution_result[product_id] = {
-                "error": str(e),
-                "status": "EXCEPTION",
-            }
-
+            self.last_buy_execution_result[product_id] = {"error": str(e), "status": "EXCEPTION"}
             if LOG_ORDER_ATTEMPTS:
-                self.olog.log_order(
-                    event="BUY_ATTEMPT",
-                    product_id=product_id,
-                    side="BUY",
-                    mode=mode,
-                    requested_quote_usd=float(quote_usd),
-                    result=result,
-                    reason=reason,
-                    raw_error=str(e),
-                )
-
-            log(
-                f"[buy-error] {product_id} mode={mode} "
-                f"quote=${float(quote_usd):.2f}: {e}"
-            )
+                self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=reason, raw_error=str(e))
+            log(f"[buy-error] {product_id} mode={mode} quote=${float(quote_usd):.2f}: {e}")
             return None
 
     async def _execute_live_sell(
@@ -11508,72 +11677,43 @@ class TradingBot:
         reason: str,
         mode_override: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
-        """
-        Execute a live MARKET sell and return only a Coinbase-confirmed fill.
-
-        Market-only rule:
-        - Level 8 decides whether selling is allowed.
-        - This function only submits an immediate Coinbase MARKET sell.
-        """
-        mode = "MARKET"
+        """Execute a live sell using maker-first unless the reason requires market urgency."""
+        requested_mode = str(mode_override or EXIT_EXECUTION_MODE or "MAKER_FIRST").upper()
+        urgent_market = self._sell_reason_requires_market(reason, mode_override=mode_override)
+        if urgent_market and bool(HARD_EXIT_USES_MARKET):
+            requested_mode = "MARKET"
+        mode = requested_mode
         result = None
-
-        log(
-            f"[sell-attempt] {product_id} mode={mode} "
-            f"qty={float(base_qty):.12f} "
-            f"bid_snapshot={float(bid):.8f} "
-            f"ask_snapshot={float(ask):.8f} "
-            f"reason={reason}"
-        )
+        log(f"[sell-attempt] {product_id} requested_mode={requested_mode} qty={float(base_qty):.12f} bid_snapshot={float(bid):.8f} ask_snapshot={float(ask):.8f} urgent_market={urgent_market} reason={reason}")
 
         try:
-            result = await self._live_sell_market(
-                product_id=product_id,
-                base_qty=float(base_qty),
-            )
+            if bool(ENABLE_MAKER_FIRST_EXECUTION) and requested_mode in {"MAKER", "MAKER_FIRST", "LIMIT_THEN_MARKET"}:
+                mode = "MAKER_FIRST"
+                result = await self._live_sell_maker(product_id=product_id, base_qty=float(base_qty), ask=float(ask))
+                fill = self._require_live_fill(result, product_id=product_id, side="SELL")
+                if fill is not None:
+                    if LOG_ORDER_ATTEMPTS:
+                        self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"fee_efficient_maker_sell_filled;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                    return fill
 
-            fill = self._require_live_fill(
-                result,
-                product_id=product_id,
-                side="SELL",
-            )
+                if not bool(ALLOW_MARKET_FALLBACK_FOR_PROFIT_SELLS):
+                    if LOG_ORDER_ATTEMPTS:
+                        self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"fee_efficient_maker_sell_no_fill_skip_market;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                    log(f"[sell-skip] {product_id} maker_no_fill; skipping market fallback to avoid taker fee")
+                    return None
+                log(f"[sell-fallback] {product_id} maker_no_fill; using market fallback for exit")
 
+            mode = "MARKET"
+            result = await self._live_sell_market(product_id=product_id, base_qty=float(base_qty))
+            fill = self._require_live_fill(result, product_id=product_id, side="SELL")
             if LOG_ORDER_ATTEMPTS:
-                self.olog.log_order(
-                    event="SELL_ATTEMPT",
-                    product_id=product_id,
-                    side="SELL",
-                    mode=mode,
-                    requested_base_qty=float(base_qty),
-                    result=result,
-                    reason=(
-                        f"market_only_live_sell;"
-                        f"requested_base_qty={float(base_qty):.12f};"
-                        f"bid_snapshot={float(bid):.8f};"
-                        f"ask_snapshot={float(ask):.8f};"
-                        f"{reason}"
-                    ),
-                )
-
+                self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"market_sell_after_fee_policy;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
             return fill
 
         except Exception as e:
             if LOG_ORDER_ATTEMPTS:
-                self.olog.log_order(
-                    event="SELL_ATTEMPT",
-                    product_id=product_id,
-                    side="SELL",
-                    mode=mode,
-                    requested_base_qty=float(base_qty),
-                    result=result,
-                    reason=reason,
-                    raw_error=str(e),
-                )
-
-            log(
-                f"[sell-error] {product_id} mode={mode} "
-                f"qty={float(base_qty):.12f}: {e}"
-            )
+                self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=reason, raw_error=str(e))
+            log(f"[sell-error] {product_id} mode={mode} qty={float(base_qty):.12f}: {e}")
             return None
 
 
@@ -13246,7 +13386,7 @@ class TradingBot:
             quote_usd=float(quote_usd),
             bid=float(tob.bid),
             ask=float(tob.ask),
-            reason=reason,
+            reason=f"{reason};execution_policy=maker_first_fee_efficient",
             execution_mode=ENTRY_EXECUTION_MODE,
         )
         if fill is None:
@@ -13264,7 +13404,7 @@ class TradingBot:
             "order_id": order_id,
             "strategy_mode": "inverted_stoploss_cycle",
             "cycle_index": int(marker.get("cycle_index", 0)),
-            "entry_reason": reason,
+            "entry_reason": f"{reason};execution_policy=maker_first_fee_efficient",
             "old_buy_marker_price": float(marker.get("sell_marker_price", 0.0)),
             "inverted_buy_trigger_price": float(marker.get("buy_trigger_price", 0.0)),
             "is_rebuy": bool(is_rebuy),
@@ -13329,7 +13469,7 @@ class TradingBot:
             exit_price=None,
             weekly_bias=None,
             note=(
-                f"inverted_stoploss_buy reason={reason} "
+                f"inverted_stoploss_buy reason={reason} execution_policy=maker_first_fee_efficient "
                 f"marker={float(marker.get('sell_marker_price', 0.0)):.8f} "
                 f"trigger={float(marker.get('buy_trigger_price', 0.0)):.8f} "
                 f"is_rebuy={is_rebuy}"
@@ -15123,7 +15263,16 @@ class TradingBot:
                             f"bid={bid:.8f} ask={ask:.8f} avg_entry={avg_entry_price:.8f}"
                         )
                         notional_usd, exec_price, fee, filled_notional = sell_qty * bid, bid, 0.0, None
-                        fill = await self._execute_live_sell(product_id=product_id, base_qty=sell_qty, bid=bid, ask=ask, reason=exit_reason or "level8_direct_exit")
+                        fill = await self._execute_live_sell(
+                            product_id=product_id,
+                            base_qty=sell_qty,
+                            bid=bid,
+                            ask=ask,
+                            reason=(
+                                f"{exit_reason or 'level8_direct_exit'};"
+                                "execution_policy=maker_first_unless_urgent_market"
+                            ),
+                        )
                         if fill is not None:
                             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
                             self.signal_events_log.log_event(
@@ -15160,6 +15309,7 @@ class TradingBot:
                                 weekly_bias=weekly_bias,
                                 note=(
                                     f"{exit_reason or 'level8_direct_exit'} "
+                                    f"execution_policy=maker_first_unless_urgent_market "
                                     f"executed_sell_fraction={executed_sell_fraction:.6f} "
                                     f"position_qty_before_sell={float(position_qty):.12f} "
                                     f"gross_pnl_usd={float(pnl_gross):.8f} "
@@ -15822,6 +15972,10 @@ class TradingBot:
                     entry_timing_ok=candidate.get("entry_timing_ok", ""),
                     entry_timing_reason=candidate.get("entry_timing_reason", ""),
                     action="attempt_buy", reason="selected_after_rank_and_timing",
+                )
+                candidate["entry_reason"] = (
+                    str(candidate.get("entry_reason", ""))
+                    + ";execution_policy=maker_first_fee_efficient"
                 )
 
                 log(

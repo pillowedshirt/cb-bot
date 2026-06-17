@@ -511,6 +511,11 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "volume_node_state",
         "fvg_state",
         "smt_state",
+        "previous_session_profile_reaction_state",
+        "previous_session_profile_bias",
+        "quant_boundary_state",
+        "quant_volatility_cluster_state",
+        "quant_peer_state",
         "price_action_buy_score",
         "candle_exhaustion_score",
         "volume_profile_buy_score",
@@ -521,6 +526,13 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "validated_liquidity_buy_score",
         "fresh_zone_buy_score",
         "fvg_buy_score",
+        "previous_session_profile_buy_score",
+        "previous_session_profile_sell_score",
+        "previous_session_profile_wait_score",
+        "quant_buy_score",
+        "quant_sell_score",
+        "quant_wait_score",
+        "quant_stationarity_score",
     ]
 
     for col in setup_columns:
@@ -538,6 +550,13 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         "validated_liquidity_buy_score",
         "fresh_zone_buy_score",
         "fvg_buy_score",
+        "previous_session_profile_buy_score",
+        "previous_session_profile_sell_score",
+        "previous_session_profile_wait_score",
+        "quant_buy_score",
+        "quant_sell_score",
+        "quant_wait_score",
+        "quant_stationarity_score",
     ]:
         frame[numeric_col] = _numeric(frame, numeric_col, 0.0)
 
@@ -563,6 +582,11 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         + "|volume_node=" + frame["volume_node_state"].astype(str)
         + "|fvg=" + frame["fvg_state"].astype(str)
         + "|smt=" + frame["smt_state"].astype(str)
+        + "|prev_session=" + frame["previous_session_profile_reaction_state"].astype(str)
+        + "|prev_bias=" + frame["previous_session_profile_bias"].astype(str)
+        + "|quant_boundary=" + frame["quant_boundary_state"].astype(str)
+        + "|quant_vol=" + frame["quant_volatility_cluster_state"].astype(str)
+        + "|quant_peer=" + frame["quant_peer_state"].astype(str)
         + "|pa=" + frame["price_action_buy_score"].map(_bucket).astype(str)
         + "|exhaust=" + frame["candle_exhaustion_score"].map(_bucket).astype(str)
         + "|volume=" + frame["volume_profile_buy_score"].map(_bucket).astype(str)
@@ -573,6 +597,11 @@ def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
         + "|validated_liq=" + frame["validated_liquidity_buy_score"].map(_bucket).astype(str)
         + "|fresh_zone=" + frame["fresh_zone_buy_score"].map(_bucket).astype(str)
         + "|fvg_score=" + frame["fvg_buy_score"].map(_bucket).astype(str)
+        + "|prev_buy=" + frame["previous_session_profile_buy_score"].map(_bucket).astype(str)
+        + "|prev_wait=" + frame["previous_session_profile_wait_score"].map(_bucket).astype(str)
+        + "|quant_buy=" + frame["quant_buy_score"].map(_bucket).astype(str)
+        + "|quant_wait=" + frame["quant_wait_score"].map(_bucket).astype(str)
+        + "|quant_stationarity=" + frame["quant_stationarity_score"].map(_bucket).astype(str)
     )
 
     for (product_id, setup_key), group in frame.groupby(["product_id", "setup_key"]):

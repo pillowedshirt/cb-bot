@@ -62,6 +62,24 @@ except Exception:
     build_price_action_context = None
     price_action_context_to_dict = None
 
+try:
+    from previous_session_volume_profile import (
+        build_previous_session_volume_profile_signal,
+        signal_to_dict as previous_session_volume_profile_to_dict,
+    )
+except Exception:
+    build_previous_session_volume_profile_signal = None
+    previous_session_volume_profile_to_dict = None
+
+try:
+    from quant_context import (
+        build_quant_context_signal,
+        signal_to_dict as quant_context_to_dict,
+    )
+except Exception:
+    build_quant_context_signal = None
+    quant_context_to_dict = None
+
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 BOT_PROCESS_LOCK_PATH: str = os.path.join(BASE_DIR, "bot_live_process.lock")
@@ -162,6 +180,8 @@ BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_s
 BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
 BACKTEST_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_summary.csv")
 BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_setup_performance.csv")
+PREVIOUS_SESSION_PROFILE_CSV_PATH: str = os.path.join(BASE_DIR, "previous_session_profile.csv")
+QUANT_CONTEXT_CSV_PATH: str = os.path.join(BASE_DIR, "quant_context.csv")
 
 # Decision-engine completion logs.
 DECISION_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "decision_audit.csv")
@@ -942,6 +962,24 @@ ENABLE_VOLUME_PROFILE_LEADER: bool = True
 
 VOLUME_PROFILE_LEADER_TRUTH_WEIGHT: float = 0.24
 VOLUME_PROFILE_LEADER_EXPECTED_UTILITY_MULT: float = 1.00
+ENABLE_PREVIOUS_SESSION_VOLUME_PROFILE: bool = True
+ENABLE_QUANT_CONTEXT_COUNCIL: bool = True
+PREVIOUS_SESSION_PROFILE_SESSION_KEYS: List[str] = [
+    "daily_utc",
+    "tokyo",
+    "london",
+    "new_york",
+    "london_new_york_overlap",
+]
+PREVIOUS_SESSION_PROFILE_TRUTH_WEIGHT: float = 0.12
+QUANT_CONTEXT_TRUTH_WEIGHT: float = 0.11
+PREVIOUS_SESSION_PROFILE_UTILITY_MULT: float = 0.85
+QUANT_CONTEXT_UTILITY_MULT: float = 0.75
+PREVIOUS_SESSION_PROFILE_BLOCK_NEAR_POC_CHOP: bool = True
+PREVIOUS_SESSION_PROFILE_NEAR_POC_WAIT_SCORE: float = 0.66
+QUANT_CONTEXT_BLOCK_UNSTABLE_LOW_EDGE_BUY: bool = True
+QUANT_CONTEXT_MIN_STATIONARITY_FOR_LOW_EDGE_BUY: float = 0.36
+QUANT_CONTEXT_MIN_EXPECTED_UTILITY_EXCEPTION_BPS: float = 180.0
 
 VOLUME_ACCEPTED_ABOVE_VALUE_BONUS_BPS: float = 70.0
 VOLUME_RECLAIMED_VALUE_LOW_BONUS_BPS: float = 52.0
@@ -3381,6 +3419,32 @@ class LiveSignal:
     smt_state: str = ""
     smt_peer: str = ""
     smt_reason: str = ""
+    previous_session_profile_buy_score: float = 0.0
+    previous_session_profile_sell_score: float = 0.0
+    previous_session_profile_hold_score: float = 0.50
+    previous_session_profile_wait_score: float = 0.50
+    previous_session_profile_confidence: float = 0.10
+    previous_session_profile_session_key: str = ""
+    previous_session_profile_reaction_state: str = ""
+    previous_session_profile_bias: str = ""
+    previous_session_profile_poc: float = 0.0
+    previous_session_profile_vah: float = 0.0
+    previous_session_profile_val: float = 0.0
+    previous_session_profile_reason: str = ""
+    quant_buy_score: float = 0.0
+    quant_sell_score: float = 0.0
+    quant_hold_score: float = 0.50
+    quant_wait_score: float = 0.50
+    quant_confidence: float = 0.10
+    quant_boundary_state: str = ""
+    quant_volatility_cluster_state: str = ""
+    quant_stationarity_score: float = 0.0
+    quant_forecast_return_bps: float = 0.0
+    quant_conditional_volatility_bps: float = 0.0
+    quant_peer_product: str = ""
+    quant_peer_state: str = ""
+    quant_peer_spread_z: float = 0.0
+    quant_reason: str = ""
     realized_volatility_bps_30m: float = 0.0
     volatility_size_multiplier: float = 1.0
 
@@ -3455,6 +3519,32 @@ class CalibrationObservation:
     smt_state: str = ""
     smt_peer: str = ""
     smt_reason: str = ""
+    previous_session_profile_buy_score: float = 0.0
+    previous_session_profile_sell_score: float = 0.0
+    previous_session_profile_hold_score: float = 0.50
+    previous_session_profile_wait_score: float = 0.50
+    previous_session_profile_confidence: float = 0.10
+    previous_session_profile_session_key: str = ""
+    previous_session_profile_reaction_state: str = ""
+    previous_session_profile_bias: str = ""
+    previous_session_profile_poc: float = 0.0
+    previous_session_profile_vah: float = 0.0
+    previous_session_profile_val: float = 0.0
+    previous_session_profile_reason: str = ""
+    quant_buy_score: float = 0.0
+    quant_sell_score: float = 0.0
+    quant_hold_score: float = 0.50
+    quant_wait_score: float = 0.50
+    quant_confidence: float = 0.10
+    quant_boundary_state: str = ""
+    quant_volatility_cluster_state: str = ""
+    quant_stationarity_score: float = 0.0
+    quant_forecast_return_bps: float = 0.0
+    quant_conditional_volatility_bps: float = 0.0
+    quant_peer_product: str = ""
+    quant_peer_state: str = ""
+    quant_peer_spread_z: float = 0.0
+    quant_reason: str = ""
 
 
 @dataclass
@@ -3533,6 +3623,32 @@ class CandidateReplayLogger:
         "price_action_reason",
 
         "smt_state", "smt_peer", "smt_reason",
+        "previous_session_profile_buy_score",
+        "previous_session_profile_sell_score",
+        "previous_session_profile_hold_score",
+        "previous_session_profile_wait_score",
+        "previous_session_profile_confidence",
+        "previous_session_profile_session_key",
+        "previous_session_profile_reaction_state",
+        "previous_session_profile_bias",
+        "previous_session_profile_poc",
+        "previous_session_profile_vah",
+        "previous_session_profile_val",
+        "previous_session_profile_reason",
+        "quant_buy_score",
+        "quant_sell_score",
+        "quant_hold_score",
+        "quant_wait_score",
+        "quant_confidence",
+        "quant_boundary_state",
+        "quant_volatility_cluster_state",
+        "quant_stationarity_score",
+        "quant_forecast_return_bps",
+        "quant_conditional_volatility_bps",
+        "quant_peer_product",
+        "quant_peer_state",
+        "quant_peer_spread_z",
+        "quant_reason",
     ]
 
     def __init__(self, path: str) -> None:
@@ -3639,6 +3755,32 @@ class CandidateReplayLogger:
                     str(o.smt_state),
                     str(o.smt_peer),
                     str(o.smt_reason),
+                    f"{float(o.previous_session_profile_buy_score):.6f}",
+                    f"{float(o.previous_session_profile_sell_score):.6f}",
+                    f"{float(o.previous_session_profile_hold_score):.6f}",
+                    f"{float(o.previous_session_profile_wait_score):.6f}",
+                    f"{float(o.previous_session_profile_confidence):.6f}",
+                    str(o.previous_session_profile_session_key),
+                    str(o.previous_session_profile_reaction_state),
+                    str(o.previous_session_profile_bias),
+                    f"{float(o.previous_session_profile_poc):.10f}",
+                    f"{float(o.previous_session_profile_vah):.10f}",
+                    f"{float(o.previous_session_profile_val):.10f}",
+                    str(o.previous_session_profile_reason),
+                    f"{float(o.quant_buy_score):.6f}",
+                    f"{float(o.quant_sell_score):.6f}",
+                    f"{float(o.quant_hold_score):.6f}",
+                    f"{float(o.quant_wait_score):.6f}",
+                    f"{float(o.quant_confidence):.6f}",
+                    str(o.quant_boundary_state),
+                    str(o.quant_volatility_cluster_state),
+                    f"{float(o.quant_stationarity_score):.6f}",
+                    f"{float(o.quant_forecast_return_bps):.6f}",
+                    f"{float(o.quant_conditional_volatility_bps):.6f}",
+                    str(o.quant_peer_product),
+                    str(o.quant_peer_state),
+                    f"{float(o.quant_peer_spread_z):.6f}",
+                    str(o.quant_reason),
                 ])
 
 
@@ -6853,6 +6995,30 @@ class TradingBot:
             f"price_action={price_action_context.get('reason', 'none')}"
         )
         smt_context = self._smt_divergence_context_for_product(product_id=product_id)
+        previous_session_profile: Dict[str, Any] = {}
+        if bool(ENABLE_PREVIOUS_SESSION_VOLUME_PROFILE) and build_previous_session_volume_profile_signal is not None and previous_session_volume_profile_to_dict is not None:
+            best_conf = -1.0
+            for session_key in PREVIOUS_SESSION_PROFILE_SESSION_KEYS:
+                try:
+                    signal = build_previous_session_volume_profile_signal(
+                        product_id=product_id,
+                        candles=candles,
+                        current_price=float(mid),
+                        session_key=str(session_key),
+                    )
+                    data = previous_session_volume_profile_to_dict(signal)
+                    conf = float(data.get("confidence", 0.0) or 0.0)
+                    if conf > best_conf:
+                        previous_session_profile = dict(data)
+                        best_conf = conf
+                except Exception:
+                    pass
+        quant_context: Dict[str, Any] = {}
+        if bool(ENABLE_QUANT_CONTEXT_COUNCIL) and build_quant_context_signal is not None and quant_context_to_dict is not None:
+            try:
+                quant_context = dict(quant_context_to_dict(build_quant_context_signal(product_id=product_id, candles=candles)))
+            except Exception:
+                quant_context = {}
 
         return LiveSignal(
             ok_to_trade=False,
@@ -6918,6 +7084,32 @@ class TradingBot:
             smt_state=str(smt_context.get("smt_state", "")),
             smt_peer=str(smt_context.get("peer", "")),
             smt_reason=str(smt_context.get("reason", "")),
+            previous_session_profile_buy_score=float(previous_session_profile.get("buy_score", 0.0) or 0.0),
+            previous_session_profile_sell_score=float(previous_session_profile.get("sell_score", 0.0) or 0.0),
+            previous_session_profile_hold_score=float(previous_session_profile.get("hold_score", 0.50) or 0.50),
+            previous_session_profile_wait_score=float(previous_session_profile.get("wait_score", 0.50) or 0.50),
+            previous_session_profile_confidence=float(previous_session_profile.get("confidence", 0.10) or 0.10),
+            previous_session_profile_session_key=str(previous_session_profile.get("session_key", "")),
+            previous_session_profile_reaction_state=str(previous_session_profile.get("reaction_state", "")),
+            previous_session_profile_bias=str(previous_session_profile.get("higher_timeframe_bias", "")),
+            previous_session_profile_poc=float(previous_session_profile.get("previous_session_poc", 0.0) or 0.0),
+            previous_session_profile_vah=float(previous_session_profile.get("previous_session_vah", 0.0) or 0.0),
+            previous_session_profile_val=float(previous_session_profile.get("previous_session_val", 0.0) or 0.0),
+            previous_session_profile_reason=str(previous_session_profile.get("reason", "")),
+            quant_buy_score=float(quant_context.get("quant_buy_score", 0.0) or 0.0),
+            quant_sell_score=float(quant_context.get("quant_sell_score", 0.0) or 0.0),
+            quant_hold_score=float(quant_context.get("quant_hold_score", 0.50) or 0.50),
+            quant_wait_score=float(quant_context.get("quant_wait_score", 0.50) or 0.50),
+            quant_confidence=float(quant_context.get("confidence", 0.10) or 0.10),
+            quant_boundary_state=str(quant_context.get("boundary_state", "")),
+            quant_volatility_cluster_state=str(quant_context.get("volatility_cluster_state", "")),
+            quant_stationarity_score=float(quant_context.get("stationarity_score", 0.0) or 0.0),
+            quant_forecast_return_bps=float(quant_context.get("forecast_return_bps", 0.0) or 0.0),
+            quant_conditional_volatility_bps=float(quant_context.get("conditional_volatility_bps", 0.0) or 0.0),
+            quant_peer_product=str(quant_context.get("peer_product", "")),
+            quant_peer_state=str(quant_context.get("peer_state", "")),
+            quant_peer_spread_z=float(quant_context.get("peer_spread_z", 0.0) or 0.0),
+            quant_reason=str(quant_context.get("reason", "")),
         )
 
     def _evaluate_forward_outcome(
@@ -7105,6 +7297,32 @@ class TradingBot:
             "smt_state": str(getattr(signal, "smt_state", "") or smt_context.get("smt_state", "")),
             "smt_peer": str(getattr(signal, "smt_peer", "") or smt_context.get("peer", "")),
             "smt_reason": str(getattr(signal, "smt_reason", "") or smt_context.get("reason", "")),
+            "previous_session_profile_buy_score": float(getattr(signal, "previous_session_profile_buy_score", 0.0) or 0.0),
+            "previous_session_profile_sell_score": float(getattr(signal, "previous_session_profile_sell_score", 0.0) or 0.0),
+            "previous_session_profile_hold_score": float(getattr(signal, "previous_session_profile_hold_score", 0.50) or 0.50),
+            "previous_session_profile_wait_score": float(getattr(signal, "previous_session_profile_wait_score", 0.50) or 0.50),
+            "previous_session_profile_confidence": float(getattr(signal, "previous_session_profile_confidence", 0.10) or 0.10),
+            "previous_session_profile_session_key": str(getattr(signal, "previous_session_profile_session_key", "")),
+            "previous_session_profile_reaction_state": str(getattr(signal, "previous_session_profile_reaction_state", "")),
+            "previous_session_profile_bias": str(getattr(signal, "previous_session_profile_bias", "")),
+            "previous_session_profile_poc": float(getattr(signal, "previous_session_profile_poc", 0.0) or 0.0),
+            "previous_session_profile_vah": float(getattr(signal, "previous_session_profile_vah", 0.0) or 0.0),
+            "previous_session_profile_val": float(getattr(signal, "previous_session_profile_val", 0.0) or 0.0),
+            "previous_session_profile_reason": str(getattr(signal, "previous_session_profile_reason", "")),
+            "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0),
+            "quant_sell_score": float(getattr(signal, "quant_sell_score", 0.0) or 0.0),
+            "quant_hold_score": float(getattr(signal, "quant_hold_score", 0.50) or 0.50),
+            "quant_wait_score": float(getattr(signal, "quant_wait_score", 0.50) or 0.50),
+            "quant_confidence": float(getattr(signal, "quant_confidence", 0.10) or 0.10),
+            "quant_boundary_state": str(getattr(signal, "quant_boundary_state", "")),
+            "quant_volatility_cluster_state": str(getattr(signal, "quant_volatility_cluster_state", "")),
+            "quant_stationarity_score": float(getattr(signal, "quant_stationarity_score", 0.0) or 0.0),
+            "quant_forecast_return_bps": float(getattr(signal, "quant_forecast_return_bps", 0.0) or 0.0),
+            "quant_conditional_volatility_bps": float(getattr(signal, "quant_conditional_volatility_bps", 0.0) or 0.0),
+            "quant_peer_product": str(getattr(signal, "quant_peer_product", "")),
+            "quant_peer_state": str(getattr(signal, "quant_peer_state", "")),
+            "quant_peer_spread_z": float(getattr(signal, "quant_peer_spread_z", 0.0) or 0.0),
+            "quant_reason": str(getattr(signal, "quant_reason", "")),
         }
 
     def _walk_forward_observations(
@@ -8895,6 +9113,12 @@ class TradingBot:
             f"price_action={price_action_context.get('reason', 'none')}"
         )
 
+        previous_session_profile = self._previous_session_profile_for_product(
+            product_id=product_id,
+            current_price=float(mid),
+        )
+        quant_context = self._quant_context_for_product(product_id=product_id)
+
         return LiveSignal(
             ok_to_trade=bool(ok_to_trade),
             score=float(score),
@@ -8967,6 +9191,32 @@ class TradingBot:
             smt_state=str(smt_context.get("smt_state", "")),
             smt_peer=str(smt_context.get("peer", "")),
             smt_reason=str(smt_context.get("reason", "")),
+            previous_session_profile_buy_score=float(previous_session_profile.get("buy_score", 0.0) or 0.0),
+            previous_session_profile_sell_score=float(previous_session_profile.get("sell_score", 0.0) or 0.0),
+            previous_session_profile_hold_score=float(previous_session_profile.get("hold_score", 0.50) or 0.50),
+            previous_session_profile_wait_score=float(previous_session_profile.get("wait_score", 0.50) or 0.50),
+            previous_session_profile_confidence=float(previous_session_profile.get("confidence", 0.10) or 0.10),
+            previous_session_profile_session_key=str(previous_session_profile.get("session_key", "")),
+            previous_session_profile_reaction_state=str(previous_session_profile.get("reaction_state", "")),
+            previous_session_profile_bias=str(previous_session_profile.get("higher_timeframe_bias", "")),
+            previous_session_profile_poc=float(previous_session_profile.get("previous_session_poc", 0.0) or 0.0),
+            previous_session_profile_vah=float(previous_session_profile.get("previous_session_vah", 0.0) or 0.0),
+            previous_session_profile_val=float(previous_session_profile.get("previous_session_val", 0.0) or 0.0),
+            previous_session_profile_reason=str(previous_session_profile.get("reason", "")),
+            quant_buy_score=float(quant_context.get("quant_buy_score", 0.0) or 0.0),
+            quant_sell_score=float(quant_context.get("quant_sell_score", 0.0) or 0.0),
+            quant_hold_score=float(quant_context.get("quant_hold_score", 0.50) or 0.50),
+            quant_wait_score=float(quant_context.get("quant_wait_score", 0.50) or 0.50),
+            quant_confidence=float(quant_context.get("confidence", 0.10) or 0.10),
+            quant_boundary_state=str(quant_context.get("boundary_state", "")),
+            quant_volatility_cluster_state=str(quant_context.get("volatility_cluster_state", "")),
+            quant_stationarity_score=float(quant_context.get("stationarity_score", 0.0) or 0.0),
+            quant_forecast_return_bps=float(quant_context.get("forecast_return_bps", 0.0) or 0.0),
+            quant_conditional_volatility_bps=float(quant_context.get("conditional_volatility_bps", 0.0) or 0.0),
+            quant_peer_product=str(quant_context.get("peer_product", "")),
+            quant_peer_state=str(quant_context.get("peer_state", "")),
+            quant_peer_spread_z=float(quant_context.get("peer_spread_z", 0.0) or 0.0),
+            quant_reason=str(quant_context.get("reason", "")),
         )
 
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
@@ -9342,6 +9592,99 @@ class TradingBot:
             log(f"[price-action] failed {product_id}: {exc}")
             return {}
 
+    def _peer_returns_by_product(self, *, exclude_product_id: str = "") -> Dict[str, List[float]]:
+        out: Dict[str, List[float]] = {}
+        try:
+            for product_id in PRODUCTS:
+                if product_id == exclude_product_id:
+                    continue
+                candles = self._live_minute_candles_for_product(product_id)
+                closes = [float(getattr(c, "close", 0.0) or 0.0) for c in candles if float(getattr(c, "close", 0.0) or 0.0) > 0]
+                returns: List[float] = []
+                for a, b in zip(closes[:-1], closes[1:]):
+                    if a > 0 and b > 0:
+                        returns.append(math.log(b / a) * 10000.0)
+                if len(returns) >= 30:
+                    out[product_id] = returns[-240:]
+        except Exception:
+            pass
+        return out
+
+    def _previous_session_profile_for_product(
+        self,
+        *,
+        product_id: str,
+        current_price: float,
+    ) -> Dict[str, Any]:
+        if not bool(ENABLE_PREVIOUS_SESSION_VOLUME_PROFILE):
+            return {}
+        if build_previous_session_volume_profile_signal is None or previous_session_volume_profile_to_dict is None:
+            return {}
+        candles = self._live_minute_candles_for_product(product_id)
+        if not candles:
+            return {}
+        best: Dict[str, Any] = {}
+        best_conf = -1.0
+        for session_key in PREVIOUS_SESSION_PROFILE_SESSION_KEYS:
+            try:
+                signal = build_previous_session_volume_profile_signal(
+                    product_id=product_id,
+                    candles=candles,
+                    current_price=float(current_price),
+                    session_key=str(session_key),
+                )
+                data = previous_session_volume_profile_to_dict(signal)
+                conf = float(data.get("confidence", 0.0) or 0.0)
+                if conf > best_conf:
+                    best = dict(data)
+                    best_conf = conf
+            except Exception as exc:
+                best = {
+                    "product_id": product_id,
+                    "session_key": str(session_key),
+                    "buy_score": 0.0,
+                    "sell_score": 0.0,
+                    "hold_score": 0.50,
+                    "wait_score": 0.65,
+                    "confidence": 0.10,
+                    "reaction_state": "error",
+                    "reason": f"previous_session_profile_error:{exc}",
+                }
+        return best
+
+    def _quant_context_for_product(
+        self,
+        *,
+        product_id: str,
+    ) -> Dict[str, Any]:
+        if not bool(ENABLE_QUANT_CONTEXT_COUNCIL):
+            return {}
+        if build_quant_context_signal is None or quant_context_to_dict is None:
+            return {}
+        try:
+            candles = self._live_minute_candles_for_product(product_id)
+            peers = self._peer_returns_by_product(exclude_product_id=product_id)
+            signal = build_quant_context_signal(
+                product_id=product_id,
+                candles=candles,
+                peer_returns_by_product=peers,
+            )
+            return dict(quant_context_to_dict(signal))
+        except Exception as exc:
+            return {
+                "product_id": product_id,
+                "quant_buy_score": 0.0,
+                "quant_sell_score": 0.0,
+                "quant_hold_score": 0.50,
+                "quant_wait_score": 0.70,
+                "confidence": 0.10,
+                "boundary_state": "error",
+                "volatility_cluster_state": "error",
+                "stationarity_score": 0.0,
+                "forecast_return_bps": 0.0,
+                "reason": f"quant_context_error:{exc}",
+            }
+
     def _price_action_vote(
         self,
         *,
@@ -9417,6 +9760,55 @@ class TradingBot:
             ),
             self._price_action_vote(common=common, agent="volume_profile_agent", buy=float(pa.get("volume_profile_buy_score", 0.0) or 0.0), sell=float(pa.get("volume_profile_sell_score", 0.0) or 0.0), hold=float(pa.get("volume_profile_hold_score", 0.50) or 0.50), wait=0.40, confidence=volume_confidence, reason=f"value_area_state={pa.get('value_area_state', '')};val={pa.get('value_area_low', 0.0)};vah={pa.get('value_area_high', 0.0)};poc={pa.get('point_of_control', 0.0)}"),
         ]
+
+    def _previous_session_profile_vote_from_context(
+        self,
+        *,
+        context: Dict[str, Any],
+        common: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        profile = dict(context.get("previous_session_profile", {}) or {})
+        return {
+            **common,
+            "agent": "previous_session_profile_agent",
+            "buy": clamp_float(float(profile.get("buy_score", 0.0) or 0.0), 0.0, 1.0),
+            "sell": clamp_float(float(profile.get("sell_score", 0.0) or 0.0), 0.0, 1.0),
+            "hold": clamp_float(float(profile.get("hold_score", 0.50) or 0.50), 0.0, 1.0),
+            "wait": clamp_float(float(profile.get("wait_score", 0.50) or 0.50), 0.0, 1.0),
+            "confidence": clamp_float(float(profile.get("confidence", 0.10) or 0.10), 0.10, 0.90),
+            "previous_session_profile_session_key": str(profile.get("session_key", "")),
+            "previous_session_profile_reaction_state": str(profile.get("reaction_state", "")),
+            "previous_session_profile_bias": str(profile.get("higher_timeframe_bias", "")),
+            "previous_session_profile_poc": float(profile.get("previous_session_poc", 0.0) or 0.0),
+            "previous_session_profile_vah": float(profile.get("previous_session_vah", 0.0) or 0.0),
+            "previous_session_profile_val": float(profile.get("previous_session_val", 0.0) or 0.0),
+            "reason": str(profile.get("reason", "previous_session_profile_no_context")),
+        }
+
+    def _quant_context_vote_from_context(
+        self,
+        *,
+        context: Dict[str, Any],
+        common: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        quant = dict(context.get("quant_context", {}) or {})
+        return {
+            **common,
+            "agent": "quant_boundary_agent",
+            "buy": clamp_float(float(quant.get("quant_buy_score", 0.0) or 0.0), 0.0, 1.0),
+            "sell": clamp_float(float(quant.get("quant_sell_score", 0.0) or 0.0), 0.0, 1.0),
+            "hold": clamp_float(float(quant.get("quant_hold_score", 0.50) or 0.50), 0.0, 1.0),
+            "wait": clamp_float(float(quant.get("quant_wait_score", 0.50) or 0.50), 0.0, 1.0),
+            "confidence": clamp_float(float(quant.get("confidence", 0.10) or 0.10), 0.10, 0.90),
+            "quant_boundary_state": str(quant.get("boundary_state", "")),
+            "quant_volatility_cluster_state": str(quant.get("volatility_cluster_state", "")),
+            "quant_stationarity_score": float(quant.get("stationarity_score", 0.0) or 0.0),
+            "quant_forecast_return_bps": float(quant.get("forecast_return_bps", 0.0) or 0.0),
+            "quant_peer_product": str(quant.get("peer_product", "")),
+            "quant_peer_state": str(quant.get("peer_state", "")),
+            "quant_peer_spread_z": float(quant.get("peer_spread_z", 0.0) or 0.0),
+            "reason": str(quant.get("reason", "quant_context_no_context")),
+        }
 
     def _session_liquidity_for_product(
         self,
@@ -9639,6 +10031,14 @@ class TradingBot:
             projected_forward_gain_bps=float(candidate.get("projected_forward_gain_bps", 0.0) or 0.0),
         )
 
+        previous_session_profile = self._previous_session_profile_for_product(
+            product_id=product_id,
+            current_price=price,
+        )
+        quant_context = self._quant_context_for_product(
+            product_id=product_id,
+        )
+
         return {
             "mom1": mom1,
             "mom3": mom3,
@@ -9651,6 +10051,8 @@ class TradingBot:
             "learning_score": learning_score,
             "session_liquidity": session_liquidity,
             "price_action_context": price_action_context,
+            "previous_session_profile": previous_session_profile,
+            "quant_context": quant_context,
             "smt_divergence": self._smt_divergence_context_for_product(product_id=product_id),
         }
 
@@ -11838,6 +12240,15 @@ class TradingBot:
                 common=common,
             )
 
+            previous_session_profile_vote = self._previous_session_profile_vote_from_context(
+                context=context,
+                common=common,
+            )
+            quant_context_vote = self._quant_context_vote_from_context(
+                context=context,
+                common=common,
+            )
+
             smt_context = dict(context.get("smt_divergence", {}) or {})
             smt_vote = {
                 **common,
@@ -11921,6 +12332,8 @@ class TradingBot:
                 vote("execution", clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), 0.45, clamp_float(1.0-spread_quality,0.0,1.0), clamp_float(0.30+spread_quality*0.55,0.20,0.95), f"execution spread={spread_bps:.2f};cost={cost_bps:.2f};state={execution_state}"),
                 vote("product_health", clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), clamp_float(0.40+forward_score*0.30,0.0,1.0), clamp_float(0.65-forward_score*0.35,0.0,1.0), clamp_float(0.30+score*0.50,0.20,0.85), f"product score={score:.3f};edge={expected_edge:.2f};forward={projected_forward:.2f}"),
                 session_liquidity_vote,
+                previous_session_profile_vote,
+                quant_context_vote,
                 *price_action_votes,
                 smt_vote,
                 setup_performance_vote,
@@ -18164,6 +18577,32 @@ class TradingBot:
                     "smt_state": str(getattr(live_signal, "smt_state", "")),
                     "smt_peer": str(getattr(live_signal, "smt_peer", "")),
                     "smt_reason": str(getattr(live_signal, "smt_reason", "")),
+                    "previous_session_profile_buy_score": float(getattr(live_signal, "previous_session_profile_buy_score", 0.0)),
+                    "previous_session_profile_sell_score": float(getattr(live_signal, "previous_session_profile_sell_score", 0.0)),
+                    "previous_session_profile_hold_score": float(getattr(live_signal, "previous_session_profile_hold_score", 0.50)),
+                    "previous_session_profile_wait_score": float(getattr(live_signal, "previous_session_profile_wait_score", 0.50)),
+                    "previous_session_profile_confidence": float(getattr(live_signal, "previous_session_profile_confidence", 0.10)),
+                    "previous_session_profile_session_key": str(getattr(live_signal, "previous_session_profile_session_key", "")),
+                    "previous_session_profile_reaction_state": str(getattr(live_signal, "previous_session_profile_reaction_state", "")),
+                    "previous_session_profile_bias": str(getattr(live_signal, "previous_session_profile_bias", "")),
+                    "previous_session_profile_poc": float(getattr(live_signal, "previous_session_profile_poc", 0.0)),
+                    "previous_session_profile_vah": float(getattr(live_signal, "previous_session_profile_vah", 0.0)),
+                    "previous_session_profile_val": float(getattr(live_signal, "previous_session_profile_val", 0.0)),
+                    "previous_session_profile_reason": str(getattr(live_signal, "previous_session_profile_reason", "")),
+                    "quant_buy_score": float(getattr(live_signal, "quant_buy_score", 0.0)),
+                    "quant_sell_score": float(getattr(live_signal, "quant_sell_score", 0.0)),
+                    "quant_hold_score": float(getattr(live_signal, "quant_hold_score", 0.50)),
+                    "quant_wait_score": float(getattr(live_signal, "quant_wait_score", 0.50)),
+                    "quant_confidence": float(getattr(live_signal, "quant_confidence", 0.10)),
+                    "quant_boundary_state": str(getattr(live_signal, "quant_boundary_state", "")),
+                    "quant_volatility_cluster_state": str(getattr(live_signal, "quant_volatility_cluster_state", "")),
+                    "quant_stationarity_score": float(getattr(live_signal, "quant_stationarity_score", 0.0)),
+                    "quant_forecast_return_bps": float(getattr(live_signal, "quant_forecast_return_bps", 0.0)),
+                    "quant_conditional_volatility_bps": float(getattr(live_signal, "quant_conditional_volatility_bps", 0.0)),
+                    "quant_peer_product": str(getattr(live_signal, "quant_peer_product", "")),
+                    "quant_peer_state": str(getattr(live_signal, "quant_peer_state", "")),
+                    "quant_peer_spread_z": float(getattr(live_signal, "quant_peer_spread_z", 0.0)),
+                    "quant_reason": str(getattr(live_signal, "quant_reason", "")),
                     "calibrated_p_win": 0.50,
                     "expected_win_bps": 0.0,
                     "expected_loss_bps": 0.0,

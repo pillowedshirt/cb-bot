@@ -47,6 +47,8 @@ INITIAL_AGENT_RELIABILITY_PRIORS = {
     "breakout": 0.94,
     "ai_outcome": 0.92,
     "smt_divergence_agent": 0.88,
+    "previous_session_profile_agent": 1.08,
+    "quant_boundary_agent": 1.06,
     "exploration": 0.35,
     "profit_capture": 1.16,
     "peak_capture": 1.18,

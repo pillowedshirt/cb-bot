@@ -251,7 +251,14 @@ def render_leader_and_council(snapshot: Dict[str, Any], selected_coin: str) -> N
 <div class="metric-card"><div class="metric-label">Leader Sell Score</div><div class="metric-value">{_safe_float(coin.get('volume_profile_leader_sell_score', coin.get('leader_sell_score'))):.3f}</div></div>
 <div class="metric-card"><div class="metric-label">Leader Hold Score</div><div class="metric-value">{_safe_float(coin.get('volume_profile_leader_hold_score', coin.get('leader_hold_score'))):.3f}</div></div>
 <div class="metric-card"><div class="metric-label">Council Mode</div><div class="metric-value">{coin.get('council_mode', '')}</div></div>
-</div><div style="margin-top:0.75rem;" class="muted"><b>Decision:</b> {coin.get('decision_action', '')}<br/><b>Volume State:</b> {coin.get('value_acceptance_state', '')} / {coin.get('volume_node_state', '')}<br/><b>Leader Reason:</b> {str(coin.get('volume_profile_utility_reason', coin.get('leader_reason', '')))[:500]}</div></div>
+</div>
+<div style="margin-top:0.6rem;" class="metric-grid">
+<div class="metric-card"><div class="metric-label">Prev Session Reaction</div><div class="metric-value" style="font-size:1rem;">{coin.get('previous_session_profile_reaction_state', '')}</div></div>
+<div class="metric-card"><div class="metric-label">Prev Session Bias</div><div class="metric-value">{coin.get('previous_session_profile_bias', '')}</div></div>
+<div class="metric-card"><div class="metric-label">Quant Boundary</div><div class="metric-value" style="font-size:1rem;">{coin.get('quant_boundary_state', '')}</div></div>
+<div class="metric-card"><div class="metric-label">Stationarity</div><div class="metric-value">{_safe_float(coin.get('quant_stationarity_score')):.3f}</div></div>
+</div>
+<div style="margin-top:0.75rem;" class="muted"><b>Decision:</b> {coin.get('decision_action', '')}<br/><b>Volume State:</b> {coin.get('value_acceptance_state', '')} / {coin.get('volume_node_state', '')}<br/><b>Prev Session Levels:</b> POC {_safe_float(coin.get('previous_session_profile_poc')):.8f} / VAH {_safe_float(coin.get('previous_session_profile_vah')):.8f} / VAL {_safe_float(coin.get('previous_session_profile_val')):.8f}<br/><b>Quant:</b> forecast {_safe_float(coin.get('quant_forecast_return_bps')):.2f} bps; peer {coin.get('quant_peer_product', '')} {coin.get('quant_peer_state', '')}<br/><b>Leader Reason:</b> {str(coin.get('volume_profile_utility_reason', coin.get('leader_reason', '')))[:500]}</div></div>
 """, unsafe_allow_html=True)
     cols = st.columns(4)
     for col, (label, key, desc) in zip(cols, [("Truth", "truth_score", "How strongly the chamber believes the setup."), ("Final Buy", "final_buy_score", "Final buy score for this specific coin."), ("Expected Utility", "expected_utility_bps", "Net expected value after costs."), ("Buy vs Wait", "buy_vs_wait_edge_bps", "Whether action beats waiting.")]):
@@ -319,7 +326,7 @@ def render_agent_statements(votes_df: pd.DataFrame, selected_coin: str) -> None:
         df["ts_num"] = pd.to_numeric(df["ts"], errors="coerce")
         latest_decision_ts = df["ts_num"].max()
         df = df[df["ts_num"] == latest_decision_ts].copy()
-    important_order = {"volume_profile_leader": 0, "utility_leader": 1, "setup_performance_agent": 2, "session_liquidity": 3, "candle_context_agent": 4, "candle_sequence_agent": 5, "candle_exhaustion_agent": 6, "market_structure_agent": 7, "validated_liquidity_agent": 8, "fresh_zone_retest_agent": 9, "fair_value_gap_agent": 10, "volume_profile_agent": 11, "smt_divergence_agent": 12, "risk": 13, "truth": 14, "volume_profile_leader_exit": 15, "spike_profit_protection": 16}
+    important_order = {"volume_profile_leader": 0, "previous_session_profile_agent": 1, "quant_boundary_agent": 2, "utility_leader": 3, "setup_performance_agent": 4, "session_liquidity": 5, "candle_context_agent": 6, "candle_sequence_agent": 7, "candle_exhaustion_agent": 8, "market_structure_agent": 9, "validated_liquidity_agent": 10, "fresh_zone_retest_agent": 11, "fair_value_gap_agent": 12, "volume_profile_agent": 13, "smt_divergence_agent": 14, "risk": 15, "truth": 16, "volume_profile_leader_exit": 17, "spike_profit_protection": 18}
 
     def sort_key(agent: str) -> int:
         a = str(agent)

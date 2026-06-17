@@ -894,6 +894,29 @@ ADAPTIVE_GOOD_LIVE_WIN_RATE: float = 0.56
 ADAPTIVE_BAD_LIVE_WIN_RATE: float = 0.42
 ADAPTIVE_MIN_REVIEWED_DECISIONS: int = 12
 
+# ============================================================
+# VOLUME PROFILE LEADER
+# ============================================================
+
+ENABLE_VOLUME_PROFILE_LEADER: bool = True
+
+VOLUME_PROFILE_LEADER_TRUTH_WEIGHT: float = 0.24
+VOLUME_PROFILE_LEADER_EXPECTED_UTILITY_MULT: float = 1.00
+
+VOLUME_ACCEPTED_ABOVE_VALUE_BONUS_BPS: float = 70.0
+VOLUME_RECLAIMED_VALUE_LOW_BONUS_BPS: float = 52.0
+VOLUME_LOW_VOLUME_NODE_BONUS_BPS: float = 28.0
+VOLUME_INSIDE_FAIR_VALUE_PENALTY_BPS: float = 42.0
+VOLUME_NEAR_POC_PENALTY_BPS: float = 55.0
+VOLUME_HIGH_VOLUME_NODE_PENALTY_BPS: float = 34.0
+VOLUME_REJECTED_ABOVE_VALUE_PENALTY_BPS: float = 82.0
+VOLUME_ACCEPTED_BELOW_VALUE_PENALTY_BPS: float = 95.0
+
+VOLUME_BLOCK_BUY_INSIDE_VALUE_NEAR_POC: bool = True
+VOLUME_BLOCK_BUY_ACCEPTED_BELOW_VALUE: bool = True
+VOLUME_BLOCK_BUY_REJECTED_ABOVE_VALUE: bool = True
+VOLUME_ALLOW_INSIDE_VALUE_IF_SETUP_STRONG_AND_UTILITY_BPS: float = 140.0
+
 # Execution friction
 MAX_SPREAD_BPS: float = 18.0
 SCALP_MAX_SPREAD_BPS: float = 10.0
@@ -1493,6 +1516,13 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     validated_liquidity_buy_score = f("validated_liquidity_buy_score", 0.0)
     fresh_zone_buy_score = f("fresh_zone_buy_score", 0.0)
     volume_profile_buy_score = f("volume_profile_buy_score", 0.0)
+    volume_profile_leader_buy_score = f("volume_profile_leader_buy_score", 0.0)
+    volume_profile_leader_sell_score = f("volume_profile_leader_sell_score", 0.0)
+    volume_profile_leader_wait_score = f("volume_profile_leader_wait_score", 0.50)
+    volume_profile_leader_confidence = f("volume_profile_leader_confidence", 0.10)
+    low_volume_path_up_bps = f("low_volume_path_up_bps", 0.0)
+    poc_distance_bps = f("poc_distance_bps", 0.0)
+    unfair_trade_score = f("unfair_trade_score", 0.0)
     fvg_buy_score = f("fvg_buy_score", 0.0)
     backtest_setup_rank_bonus = f("backtest_setup_rank_bonus", 0.0)
     backtest_setup_quality = f("backtest_setup_quality", 0.50)
@@ -1514,7 +1544,13 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + market_structure_buy_score * price_action_confidence * 12.0
         + validated_liquidity_buy_score * price_action_confidence * 12.0
         + fresh_zone_buy_score * price_action_confidence * 8.0
-        + volume_profile_buy_score * price_action_confidence * 8.0
+        + volume_profile_buy_score * price_action_confidence * 6.0
+        + volume_profile_leader_buy_score * volume_profile_leader_confidence * 36.0
+        - volume_profile_leader_sell_score * volume_profile_leader_confidence * 28.0
+        - max(0.0, volume_profile_leader_wait_score - 0.55) * volume_profile_leader_confidence * 20.0
+        + min(220.0, max(0.0, low_volume_path_up_bps)) * 0.08
+        + unfair_trade_score * 18.0
+        - max(0.0, 24.0 - poc_distance_bps) * 0.45
         + fvg_buy_score * price_action_confidence * 8.0
     )
 
@@ -3258,6 +3294,17 @@ class LiveSignal:
     validated_liquidity_buy_score: float = 0.0
     fresh_zone_buy_score: float = 0.0
     volume_profile_buy_score: float = 0.0
+    volume_profile_leader_buy_score: float = 0.0
+    volume_profile_leader_sell_score: float = 0.0
+    volume_profile_leader_hold_score: float = 0.50
+    volume_profile_leader_wait_score: float = 0.50
+    volume_profile_leader_confidence: float = 0.10
+    value_acceptance_state: str = ""
+    volume_node_state: str = ""
+    low_volume_path_up_bps: float = 0.0
+    low_volume_path_down_bps: float = 0.0
+    poc_distance_bps: float = 0.0
+    unfair_trade_score: float = 0.0
     fvg_buy_score: float = 0.0
     structure_state: str = ""
     value_area_state: str = ""
@@ -3320,6 +3367,17 @@ class CalibrationObservation:
     validated_liquidity_buy_score: float = 0.0
     fresh_zone_buy_score: float = 0.0
     volume_profile_buy_score: float = 0.0
+    volume_profile_leader_buy_score: float = 0.0
+    volume_profile_leader_sell_score: float = 0.0
+    volume_profile_leader_hold_score: float = 0.50
+    volume_profile_leader_wait_score: float = 0.50
+    volume_profile_leader_confidence: float = 0.10
+    value_acceptance_state: str = ""
+    volume_node_state: str = ""
+    low_volume_path_up_bps: float = 0.0
+    low_volume_path_down_bps: float = 0.0
+    poc_distance_bps: float = 0.0
+    unfair_trade_score: float = 0.0
     fvg_buy_score: float = 0.0
     structure_state: str = ""
     value_area_state: str = ""
@@ -3390,7 +3448,19 @@ class CandidateReplayLogger:
         "candle_sequence_score", "candle_exhaustion_score",
         "candle_continuation_score", "market_structure_buy_score",
         "validated_liquidity_buy_score", "fresh_zone_buy_score",
-        "volume_profile_buy_score", "fvg_buy_score",
+        "volume_profile_buy_score",
+        "volume_profile_leader_buy_score",
+        "volume_profile_leader_sell_score",
+        "volume_profile_leader_hold_score",
+        "volume_profile_leader_wait_score",
+        "volume_profile_leader_confidence",
+        "value_acceptance_state",
+        "volume_node_state",
+        "low_volume_path_up_bps",
+        "low_volume_path_down_bps",
+        "poc_distance_bps",
+        "unfair_trade_score",
+        "fvg_buy_score",
         "structure_state", "value_area_state", "fvg_state",
         "price_action_reason",
 
@@ -3481,6 +3551,17 @@ class CandidateReplayLogger:
                     f"{float(o.validated_liquidity_buy_score):.6f}",
                     f"{float(o.fresh_zone_buy_score):.6f}",
                     f"{float(o.volume_profile_buy_score):.6f}",
+                    f"{float(o.volume_profile_leader_buy_score):.6f}",
+                    f"{float(o.volume_profile_leader_sell_score):.6f}",
+                    f"{float(o.volume_profile_leader_hold_score):.6f}",
+                    f"{float(o.volume_profile_leader_wait_score):.6f}",
+                    f"{float(o.volume_profile_leader_confidence):.6f}",
+                    str(o.value_acceptance_state),
+                    str(o.volume_node_state),
+                    f"{float(o.low_volume_path_up_bps):.6f}",
+                    f"{float(o.low_volume_path_down_bps):.6f}",
+                    f"{float(o.poc_distance_bps):.6f}",
+                    f"{float(o.unfair_trade_score):.6f}",
                     f"{float(o.fvg_buy_score):.6f}",
                     str(o.structure_state),
                     str(o.value_area_state),
@@ -6604,6 +6685,17 @@ class TradingBot:
         validated_liquidity_buy_score = float(price_action_context.get("validated_liquidity_buy_score", 0.0) or 0.0)
         fresh_zone_buy_score = float(price_action_context.get("fresh_zone_buy_score", 0.0) or 0.0)
         volume_profile_buy_score = float(price_action_context.get("volume_profile_buy_score", 0.0) or 0.0)
+        volume_profile_leader_buy_score = float(price_action_context.get("volume_profile_leader_buy_score", volume_profile_buy_score) or 0.0)
+        volume_profile_leader_sell_score = float(price_action_context.get("volume_profile_leader_sell_score", 0.0) or 0.0)
+        volume_profile_leader_hold_score = float(price_action_context.get("volume_profile_leader_hold_score", 0.50) or 0.50)
+        volume_profile_leader_wait_score = float(price_action_context.get("volume_profile_leader_wait_score", 0.50) or 0.50)
+        volume_profile_leader_confidence = float(price_action_context.get("volume_profile_leader_confidence", 0.10) or 0.10)
+        value_acceptance_state = str(price_action_context.get("value_acceptance_state", ""))
+        volume_node_state = str(price_action_context.get("volume_node_state", ""))
+        low_volume_path_up_bps = float(price_action_context.get("low_volume_path_up_bps", 0.0) or 0.0)
+        low_volume_path_down_bps = float(price_action_context.get("low_volume_path_down_bps", 0.0) or 0.0)
+        poc_distance_bps = float(price_action_context.get("poc_distance_bps", 0.0) or 0.0)
+        unfair_trade_score = float(price_action_context.get("unfair_trade_score", 0.0) or 0.0)
         fvg_buy_score = float(price_action_context.get("fvg_buy_score", 0.0) or 0.0)
 
         combined_price_action_buy = clamp_float(
@@ -6722,6 +6814,17 @@ class TradingBot:
             validated_liquidity_buy_score=float(validated_liquidity_buy_score),
             fresh_zone_buy_score=float(fresh_zone_buy_score),
             volume_profile_buy_score=float(volume_profile_buy_score),
+            volume_profile_leader_buy_score=float(volume_profile_leader_buy_score),
+            volume_profile_leader_sell_score=float(volume_profile_leader_sell_score),
+            volume_profile_leader_hold_score=float(volume_profile_leader_hold_score),
+            volume_profile_leader_wait_score=float(volume_profile_leader_wait_score),
+            volume_profile_leader_confidence=float(volume_profile_leader_confidence),
+            value_acceptance_state=str(value_acceptance_state),
+            volume_node_state=str(volume_node_state),
+            low_volume_path_up_bps=float(low_volume_path_up_bps),
+            low_volume_path_down_bps=float(low_volume_path_down_bps),
+            poc_distance_bps=float(poc_distance_bps),
+            unfair_trade_score=float(unfair_trade_score),
             fvg_buy_score=float(fvg_buy_score),
             structure_state=str(price_action_context.get("structure_state", "")),
             value_area_state=str(price_action_context.get("value_area_state", "")),
@@ -6897,6 +7000,17 @@ class TradingBot:
             "validated_liquidity_buy_score": float(getattr(signal, "validated_liquidity_buy_score", 0.0) or 0.0),
             "fresh_zone_buy_score": float(getattr(signal, "fresh_zone_buy_score", 0.0) or 0.0),
             "volume_profile_buy_score": float(getattr(signal, "volume_profile_buy_score", 0.0) or 0.0),
+            "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0),
+            "volume_profile_leader_sell_score": float(getattr(signal, "volume_profile_leader_sell_score", 0.0) or 0.0),
+            "volume_profile_leader_hold_score": float(getattr(signal, "volume_profile_leader_hold_score", 0.50) or 0.50),
+            "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.50) or 0.50),
+            "volume_profile_leader_confidence": float(getattr(signal, "volume_profile_leader_confidence", 0.10) or 0.10),
+            "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")),
+            "volume_node_state": str(getattr(signal, "volume_node_state", "")),
+            "low_volume_path_up_bps": float(getattr(signal, "low_volume_path_up_bps", 0.0) or 0.0),
+            "low_volume_path_down_bps": float(getattr(signal, "low_volume_path_down_bps", 0.0) or 0.0),
+            "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0),
+            "unfair_trade_score": float(getattr(signal, "unfair_trade_score", 0.0) or 0.0),
             "fvg_buy_score": float(getattr(signal, "fvg_buy_score", 0.0) or 0.0),
             "structure_state": str(getattr(signal, "structure_state", "")),
             "value_area_state": str(getattr(signal, "value_area_state", "")),
@@ -8306,6 +8420,17 @@ class TradingBot:
         validated_liquidity_buy_score = float(price_action_context.get("validated_liquidity_buy_score", 0.0) or 0.0)
         fresh_zone_buy_score = float(price_action_context.get("fresh_zone_buy_score", 0.0) or 0.0)
         volume_profile_buy_score = float(price_action_context.get("volume_profile_buy_score", 0.0) or 0.0)
+        volume_profile_leader_buy_score = float(price_action_context.get("volume_profile_leader_buy_score", volume_profile_buy_score) or 0.0)
+        volume_profile_leader_sell_score = float(price_action_context.get("volume_profile_leader_sell_score", 0.0) or 0.0)
+        volume_profile_leader_hold_score = float(price_action_context.get("volume_profile_leader_hold_score", 0.50) or 0.50)
+        volume_profile_leader_wait_score = float(price_action_context.get("volume_profile_leader_wait_score", 0.50) or 0.50)
+        volume_profile_leader_confidence = float(price_action_context.get("volume_profile_leader_confidence", 0.10) or 0.10)
+        value_acceptance_state = str(price_action_context.get("value_acceptance_state", ""))
+        volume_node_state = str(price_action_context.get("volume_node_state", ""))
+        low_volume_path_up_bps = float(price_action_context.get("low_volume_path_up_bps", 0.0) or 0.0)
+        low_volume_path_down_bps = float(price_action_context.get("low_volume_path_down_bps", 0.0) or 0.0)
+        poc_distance_bps = float(price_action_context.get("poc_distance_bps", 0.0) or 0.0)
+        unfair_trade_score = float(price_action_context.get("unfair_trade_score", 0.0) or 0.0)
         fvg_buy_score = float(price_action_context.get("fvg_buy_score", 0.0) or 0.0)
 
         combined_price_action_buy = clamp_float(
@@ -8738,6 +8863,17 @@ class TradingBot:
             validated_liquidity_buy_score=float(validated_liquidity_buy_score),
             fresh_zone_buy_score=float(fresh_zone_buy_score),
             volume_profile_buy_score=float(volume_profile_buy_score),
+            volume_profile_leader_buy_score=float(volume_profile_leader_buy_score),
+            volume_profile_leader_sell_score=float(volume_profile_leader_sell_score),
+            volume_profile_leader_hold_score=float(volume_profile_leader_hold_score),
+            volume_profile_leader_wait_score=float(volume_profile_leader_wait_score),
+            volume_profile_leader_confidence=float(volume_profile_leader_confidence),
+            value_acceptance_state=str(value_acceptance_state),
+            volume_node_state=str(volume_node_state),
+            low_volume_path_up_bps=float(low_volume_path_up_bps),
+            low_volume_path_down_bps=float(low_volume_path_down_bps),
+            poc_distance_bps=float(poc_distance_bps),
+            unfair_trade_score=float(unfair_trade_score),
             fvg_buy_score=float(fvg_buy_score),
             structure_state=str(price_action_context.get("structure_state", "")),
             value_area_state=str(price_action_context.get("value_area_state", "")),
@@ -10066,6 +10202,73 @@ class TradingBot:
 
         return float(fill_probability), reason
 
+
+    def _volume_profile_leader_utility_adjustment(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert the volume profile framework into expected-utility bps.
+        """
+        if not bool(ENABLE_VOLUME_PROFILE_LEADER):
+            return {
+                "volume_profile_utility_adjust_bps": 0.0,
+                "volume_profile_utility_reason": "volume_profile_leader_disabled",
+            }
+
+        state = str(candidate.get("value_acceptance_state", "") or "").lower()
+        node = str(candidate.get("volume_node_state", "") or "").lower()
+
+        buy_score = float(candidate.get("volume_profile_leader_buy_score", 0.0) or 0.0)
+        sell_score = float(candidate.get("volume_profile_leader_sell_score", 0.0) or 0.0)
+        wait_score = float(candidate.get("volume_profile_leader_wait_score", 0.50) or 0.50)
+        confidence = float(candidate.get("volume_profile_leader_confidence", 0.10) or 0.10)
+        lvn_up = float(candidate.get("low_volume_path_up_bps", 0.0) or 0.0)
+        poc_distance = float(candidate.get("poc_distance_bps", 0.0) or 0.0)
+        unfair = float(candidate.get("unfair_trade_score", 0.0) or 0.0)
+
+        adjust = 0.0
+        reasons = []
+
+        if state == "accepted_above_value":
+            adjust += float(VOLUME_ACCEPTED_ABOVE_VALUE_BONUS_BPS)
+            reasons.append("accepted_above_value_bonus")
+        if state == "reclaimed_value_low":
+            adjust += float(VOLUME_RECLAIMED_VALUE_LOW_BONUS_BPS)
+            reasons.append("reclaimed_value_low_bonus")
+        if node == "low_volume_node":
+            adjust += float(VOLUME_LOW_VOLUME_NODE_BONUS_BPS)
+            reasons.append("low_volume_node_fast_motion_bonus")
+        if state in {"inside_fair_value", "inside_value_near_poc"}:
+            adjust -= float(VOLUME_INSIDE_FAIR_VALUE_PENALTY_BPS)
+            reasons.append("inside_fair_value_penalty")
+        if poc_distance <= 24.0:
+            adjust -= float(VOLUME_NEAR_POC_PENALTY_BPS)
+            reasons.append("near_poc_chop_penalty")
+        if node == "high_volume_node":
+            adjust -= float(VOLUME_HIGH_VOLUME_NODE_PENALTY_BPS)
+            reasons.append("high_volume_node_defense_penalty")
+        if state == "rejected_above_value":
+            adjust -= float(VOLUME_REJECTED_ABOVE_VALUE_PENALTY_BPS)
+            reasons.append("rejected_above_value_penalty")
+        if state == "accepted_below_value":
+            adjust -= float(VOLUME_ACCEPTED_BELOW_VALUE_PENALTY_BPS)
+            reasons.append("accepted_below_value_penalty")
+
+        adjust += min(36.0, max(0.0, lvn_up) * 0.10)
+        adjust += unfair * 28.0
+        adjust += (buy_score - sell_score) * 55.0
+        adjust -= max(0.0, wait_score - 0.58) * 42.0
+        adjust *= max(0.25, min(1.0, confidence)) * float(VOLUME_PROFILE_LEADER_EXPECTED_UTILITY_MULT)
+
+        return {
+            "volume_profile_utility_adjust_bps": float(adjust),
+            "volume_profile_utility_reason": (
+                f"volume_profile_utility state={state};node={node};"
+                f"buy={buy_score:.3f};sell={sell_score:.3f};wait={wait_score:.3f};"
+                f"conf={confidence:.3f};lvn_up={lvn_up:.2f};poc_distance={poc_distance:.2f};"
+                f"unfair={unfair:.3f};adjust={adjust:.2f};"
+                f"reasons={','.join(reasons) or 'neutral'}"
+            ),
+        }
+
     def _expected_utility_for_candidate(
         self,
         *,
@@ -10088,6 +10291,9 @@ class TradingBot:
                 - float(uncertainty_penalty_bps)
             )
             maker_fill_probability, maker_reason = self._utility_maker_fill_probability(candidate)
+            volume_utility = self._volume_profile_leader_utility_adjustment(candidate)
+            volume_profile_utility_adjust_bps = float(volume_utility.get("volume_profile_utility_adjust_bps", 0.0) or 0.0)
+            volume_profile_utility_reason = str(volume_utility.get("volume_profile_utility_reason", ""))
             maker_adjusted_expected_value_bps = (
                 float(maker_fill_probability) * float(expected_value_bps)
                 - (1.0 - float(maker_fill_probability)) * float(UTILITY_MAKER_NO_FILL_PENALTY_BPS)
@@ -10117,6 +10323,7 @@ class TradingBot:
                 contradiction_penalty_bps += 25.0
             expected_utility_bps = (
                 float(maker_adjusted_expected_value_bps)
+                + float(volume_profile_utility_adjust_bps)
                 - float(contradiction_penalty_bps)
                 - max(0.0, float(wait_utility_bps) - 8.0) * 0.35
             )
@@ -10149,6 +10356,8 @@ class TradingBot:
                 f"maker_fill={maker_fill_probability:.3f};maker_ev={maker_adjusted_expected_value_bps:.2f};"
                 f"contradiction_penalty={contradiction_penalty_bps:.2f};expected_utility={expected_utility_bps:.2f};"
                 f"utility_quality={utility_quality:.3f};size_mult={utility_size_multiplier:.3f};rank_bonus={utility_rank_bonus:.2f};"
+                f"volume_profile_adjust={volume_profile_utility_adjust_bps:.2f};"
+                f"{volume_profile_utility_reason};"
                 f"wait_utility={wait_utility_bps:.2f};buy_vs_wait={buy_vs_wait_edge_bps:.2f};"
                 f"realized_vol_30m={realized_vol_bps:.2f};vol_size_mult={vol_mult:.3f};"
                 f"{vol_reason};{p_reason};{maker_reason}"
@@ -10164,6 +10373,8 @@ class TradingBot:
                 "maker_fill_probability": float(maker_fill_probability),
                 "maker_adjusted_expected_value_bps": float(maker_adjusted_expected_value_bps),
                 "expected_utility_bps": float(expected_utility_bps),
+                "volume_profile_utility_adjust_bps": float(volume_profile_utility_adjust_bps),
+                "volume_profile_utility_reason": str(volume_profile_utility_reason),
                 "utility_quality": float(utility_quality),
                 "utility_rank_bonus": float(utility_rank_bonus),
                 "utility_size_multiplier": float(utility_size_multiplier),
@@ -10185,6 +10396,8 @@ class TradingBot:
                 "maker_fill_probability": 0.0,
                 "maker_adjusted_expected_value_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS),
                 "expected_utility_bps": -float(UTILITY_BASE_UNCERTAINTY_BPS),
+                "volume_profile_utility_adjust_bps": 0.0,
+                "volume_profile_utility_reason": "volume_profile_utility_unavailable",
                 "utility_quality": 0.0,
                 "utility_rank_bonus": -float(UTILITY_MAX_RANK_PENALTY),
                 "utility_size_multiplier": 1.0,
@@ -16808,6 +17021,17 @@ class TradingBot:
                     "validated_liquidity_buy_score": float(live_signal.validated_liquidity_buy_score),
                     "fresh_zone_buy_score": float(live_signal.fresh_zone_buy_score),
                     "volume_profile_buy_score": float(live_signal.volume_profile_buy_score),
+                    "volume_profile_leader_buy_score": float(live_signal.volume_profile_leader_buy_score),
+                    "volume_profile_leader_sell_score": float(live_signal.volume_profile_leader_sell_score),
+                    "volume_profile_leader_hold_score": float(live_signal.volume_profile_leader_hold_score),
+                    "volume_profile_leader_wait_score": float(live_signal.volume_profile_leader_wait_score),
+                    "volume_profile_leader_confidence": float(live_signal.volume_profile_leader_confidence),
+                    "value_acceptance_state": str(live_signal.value_acceptance_state),
+                    "volume_node_state": str(live_signal.volume_node_state),
+                    "low_volume_path_up_bps": float(live_signal.low_volume_path_up_bps),
+                    "low_volume_path_down_bps": float(live_signal.low_volume_path_down_bps),
+                    "poc_distance_bps": float(live_signal.poc_distance_bps),
+                    "unfair_trade_score": float(live_signal.unfair_trade_score),
                     "fvg_buy_score": float(live_signal.fvg_buy_score),
                     "value_area_state": str(live_signal.value_area_state),
                     "fvg_state": str(live_signal.fvg_state),

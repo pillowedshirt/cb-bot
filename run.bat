@@ -125,11 +125,11 @@ REM Warn if another bot.py already appears to be running
 REM ------------------------------------------------------------
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
- "$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'bot.py' -and $_.CommandLine -match 'python' }; if ($procs) { exit 2 } else { exit 0 }"
+ "$self = $PID; $procs = Get-CimInstance Win32_Process | Where-Object { ($_.ProcessId -ne $self) -and ($_.Name -in @('python.exe','pythonw.exe')) -and ($_.CommandLine -match '(^|[\\s])bot\.py($|[\s])') }; if ($procs) { $procs | ForEach-Object { Write-Host ('[lock-check] Existing bot.py PID=' + $_.ProcessId + ' CMD=' + $_.CommandLine) }; exit 2 } else { exit 0 }"
 
 if errorlevel 2 (
     echo.
-    echo [ERROR] Another bot.py process appears to be running.
+    echo [ERROR] Another Python bot.py process appears to be running.
     echo Close the existing bot window before launching a new live trading instance.
     echo.
     pause

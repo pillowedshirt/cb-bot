@@ -1215,6 +1215,14 @@ class Level8Council:
         momentum_5_bps = float(context.get("momentum_5_bps", 0.0) or 0.0)
         green_candles = int(float(context.get("green_candles", 0) or 0))
 
+        session_liquidity = dict(context.get("session_liquidity", {}) or {})
+        session_sell_score = float(session_liquidity.get("best_sell_score", 0.0) or 0.0)
+        session_buy_score = float(session_liquidity.get("best_buy_score", 0.0) or 0.0)
+        session_hold_score = float(session_liquidity.get("best_hold_score", 0.50) or 0.50)
+        session_confidence = float(session_liquidity.get("confidence", 0.0) or 0.0)
+        session_agent = str(session_liquidity.get("strongest_agent", "session_liquidity"))
+        session_reason = str(session_liquidity.get("reason", "no_session_liquidity_sell_context"))
+
         min_partial_fraction = float(context.get("min_partial_sell_fraction", 0.25) or 0.25)
         max_partial_fraction = float(context.get("max_partial_sell_fraction", 1.0) or 1.0)
         peak_capture_trigger_bps = float(context.get("peak_capture_trigger_bps", 45.0) or 45.0)
@@ -1247,6 +1255,21 @@ class Level8Council:
             {"agent": "execution", "buy": 0.0, "sell": execution_sell_quality, "hold": 0.40, "wait": 1.0 - execution_sell_quality, "confidence": 0.65, "reason": "avoid selling into poor spread conditions unless necessary"},
             {"agent": "fee_recovery", "buy": 0.0, "sell": fee_recovery, "hold": clamp(0.85 - fee_recovery * 0.35, 0.0, 1.0), "wait": 0.30, "confidence": 0.67, "reason": "protect all-in fee-adjusted breakeven"},
             {"agent": "harvest_sizing", "buy": 0.0, "sell": harvest_pressure, "hold": 1.0 - harvest_pressure * 0.55, "wait": 0.25, "confidence": 0.64, "reason": "choose partial vs full sell pressure"},
+            {
+                "agent": f"{session_agent}_sell_context",
+                "buy": 0.0,
+                "sell": clamp(session_sell_score * session_confidence, 0.0, 1.0),
+                "hold": clamp(
+                    session_hold_score * 0.60
+                    + session_buy_score * session_confidence * 0.25
+                    + 0.15,
+                    0.0,
+                    1.0,
+                ),
+                "wait": clamp(0.55 - session_sell_score * session_confidence * 0.25, 0.0, 1.0),
+                "confidence": clamp(0.25 + session_confidence * 0.55, 0.15, 0.85),
+                "reason": f"session_liquidity_sell_context;{session_reason}",
+            },
         ]
 
         truth_vote = {"agent": "exit_truth", "buy": 0.0, "sell": clamp(profit_capture * 0.18 + loss_exit * 0.18 + peak_capture * 0.20 + momentum_fade_sell * 0.14 + execution_sell_quality * 0.10 + fee_recovery * 0.12 + harvest_pressure * 0.08, 0.0, 1.0), "hold": continuation_hold, "wait": 1.0 - execution_sell_quality, "confidence": 0.72, "reason": "exit truth weighs profit, peak capture, continuation, cost, and execution"}
@@ -1289,14 +1312,52 @@ class Level8Council:
             recommended_sell_fraction = clamp(fraction, min_partial_fraction, max_partial_fraction)
             sell_fraction_reason = f"fraction_from_profit_peak_momentum;net_after_exit_bps={net_after_exit_bps:.2f};peak_unrealized_bps={peak_unrealized_bps:.2f};pullback_from_peak_bps={pullback_from_peak_bps:.2f};mom1={momentum_1_bps:.2f};mom3={momentum_3_bps:.2f};mom5={momentum_5_bps:.2f};harvest_pressure={harvest_pressure:.3f};continuation_quality={continuation_quality:.3f}"
 
+        harvest_confirmation = bool(
+            pullback_from_peak_bps >= peak_capture_trigger_bps
+            or momentum_1_bps < 0.0
+            or momentum_3_bps < 0.0
+            or max_hold_elapsed
+            or target_hold_elapsed
+            or peak_capture >= 0.62
+            or momentum_fade_sell >= 0.62
+            or (session_sell_score * session_confidence) >= 0.38
+        )
+
+        strong_profit_exception = bool(
+            net_after_exit_bps >= min_net_after_exit_bps + 140.0
+            and final_sell >= sell_threshold + 0.08
+            and recommended_sell_fraction > 0.0
+        )
+
         if hard_stop_hit:
             action = "ALLOW_SELL"
+
         elif strong_continuation:
             action = "HOLD"
-        elif early_profit_ok and final_sell >= sell_threshold and net_after_exit_bps >= min_net_after_exit_bps and recommended_sell_fraction > 0.0:
+
+        elif (
+            early_profit_ok
+            and harvest_confirmation
+            and final_sell >= sell_threshold
+            and net_after_exit_bps >= min_net_after_exit_bps
+            and recommended_sell_fraction > 0.0
+        ):
             action = "ALLOW_SELL"
-        elif max_hold_elapsed and final_sell >= sell_threshold and net_after_exit_bps >= min_net_after_exit_bps and recommended_sell_fraction > 0.0:
+
+        elif (
+            strong_profit_exception
+            and recommended_sell_fraction > 0.0
+        ):
             action = "ALLOW_SELL"
+
+        elif (
+            max_hold_elapsed
+            and final_sell >= sell_threshold
+            and net_after_exit_bps >= min_net_after_exit_bps
+            and recommended_sell_fraction > 0.0
+        ):
+            action = "ALLOW_SELL"
+
         else:
             action = "HOLD"
 
@@ -1319,8 +1380,17 @@ class Level8Council:
                 f"hold_seconds={hold_seconds:.1f};min_hold_elapsed={min_hold_elapsed};target_hold_elapsed={target_hold_elapsed};max_hold_elapsed={max_hold_elapsed};"
                 f"net_after_exit_bps={net_after_exit_bps:.2f};min_net_after_exit_bps={min_net_after_exit_bps:.2f};peak_unrealized_bps={peak_unrealized_bps:.2f};"
                 f"pullback_from_peak_bps={pullback_from_peak_bps:.2f};mom1={momentum_1_bps:.2f};mom3={momentum_3_bps:.2f};mom5={momentum_5_bps:.2f};"
-                f"green={green_candles};strong_continuation={strong_continuation};recommended_sell_fraction={recommended_sell_fraction:.3f};"
-                f"sell_fraction_reason={sell_fraction_reason};hard_stop_hit={hard_stop_hit}"
+                f"green={green_candles};"
+                f"strong_continuation={strong_continuation};"
+                f"harvest_confirmation={harvest_confirmation};"
+                f"strong_profit_exception={strong_profit_exception};"
+                f"session_sell_score={session_sell_score:.3f};"
+                f"session_buy_score={session_buy_score:.3f};"
+                f"session_confidence={session_confidence:.3f};"
+                f"session_agent={session_agent};"
+                f"recommended_sell_fraction={recommended_sell_fraction:.3f};"
+                f"sell_fraction_reason={sell_fraction_reason};"
+                f"hard_stop_hit={hard_stop_hit}"
             ),
         }
 

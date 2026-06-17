@@ -54,6 +54,7 @@ except Exception:
 
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+BOT_PROCESS_LOCK_PATH: str = os.path.join(BASE_DIR, "bot_live_process.lock")
 TZ_NAME: str = "America/Phoenix"
 TZ = ZoneInfo(TZ_NAME)
 
@@ -9697,6 +9698,13 @@ class TradingBot:
                 "backtest_sell_recommendation_reason": str(
                     sell_backtest_rec.get("reason", "no_backtest_sell_recommendation")
                 ),
+                "session_liquidity": self._session_liquidity_for_product(
+                    product_id=product_id,
+                    current_price=float(current_price),
+                    spread_bps=float(spread_bps),
+                    cost_bps=float(cost_bps),
+                    projected_forward_gain_bps=0.0,
+                ),
             }
 
             if hasattr(self.level8_council, "decide_exit"):
@@ -15446,60 +15454,135 @@ def validate_configured_products_with_coinbase(
 
 
 # ------------------------------------------------------------
+# Live bot process lock
+# ------------------------------------------------------------
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        if int(pid) <= 0:
+            return False
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def acquire_bot_process_lock() -> int:
+    """
+    Prevent multiple live bot.py instances from running at the same time.
+
+    This is a live-trading safety rail. Shadow learning can continue in the single
+    active bot process, but multiple live processes can duplicate orders.
+    """
+    lock_path = BOT_PROCESS_LOCK_PATH
+    current_pid = os.getpid()
+
+    if os.path.exists(lock_path):
+        try:
+            with open(lock_path, "r", encoding="utf-8") as file:
+                existing_pid_text = file.read().strip()
+            existing_pid = int(existing_pid_text or "0")
+        except Exception:
+            existing_pid = 0
+
+        if existing_pid and _pid_is_running(existing_pid):
+            raise RuntimeError(
+                f"Another live bot.py process appears to be running "
+                f"(pid={existing_pid}). Close it before starting a new one."
+            )
+
+        try:
+            os.remove(lock_path)
+            log(f"[process-lock] removed stale bot lock pid={existing_pid}")
+        except Exception:
+            pass
+
+    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(str(current_pid))
+
+    log(f"[process-lock] acquired {lock_path} pid={current_pid}")
+    return current_pid
+
+
+def release_bot_process_lock() -> None:
+    try:
+        if os.path.exists(BOT_PROCESS_LOCK_PATH):
+            with open(BOT_PROCESS_LOCK_PATH, "r", encoding="utf-8") as file:
+                existing_pid = file.read().strip()
+            if existing_pid == str(os.getpid()):
+                os.remove(BOT_PROCESS_LOCK_PATH)
+                log("[process-lock] released")
+    except Exception as exc:
+        log(f"[process-lock] release failed: {exc}")
+
+
+# ------------------------------------------------------------
 # Main entry point
 # ------------------------------------------------------------
 
 async def main() -> None:
     global PRODUCTS
 
-    log(f"[debug] writing debug log to {DEBUG_LOG_PATH}")
-    log("[startup] bot.py launching")
-    log(f"[startup] file={os.path.abspath(__file__)}")
-    log("[startup] loading Coinbase client")
-    rest = load_coinbase_client()
+    process_lock_pid = acquire_bot_process_lock()
 
-    log("[startup] loading environment")
-    load_dotenv()
-    api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
-    pem = load_pem_secret_from_env()
+    try:
+        log(f"[debug] writing debug log to {DEBUG_LOG_PATH}")
+        log("[startup] bot.py launching")
+        log(f"[startup] process_lock_pid={process_lock_pid}")
+        log(f"[startup] file={os.path.abspath(__file__)}")
+        log("[startup] loading Coinbase client")
+        rest = load_coinbase_client()
 
-    log("[startup] selecting products")
-    if AUTO_SELECT_PRODUCTS:
-        try:
-            PRODUCTS = await asyncio.to_thread(select_diversified_products)
-            if not PRODUCTS:
-                log("[select] auto-selection returned no products; using defaults")
+        log("[startup] loading environment")
+        load_dotenv()
+        api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
+        pem = load_pem_secret_from_env()
+
+        log("[startup] selecting products")
+        if AUTO_SELECT_PRODUCTS:
+            try:
+                PRODUCTS = await asyncio.to_thread(select_diversified_products)
+                if not PRODUCTS:
+                    log("[select] auto-selection returned no products; using defaults")
+                    PRODUCTS = list(PRODUCTS_DEFAULT)
+            except Exception as e:
+                log(f"[select] failed, using default products: {e}")
                 PRODUCTS = list(PRODUCTS_DEFAULT)
-        except Exception as e:
-            log(f"[select] failed, using default products: {e}")
+        else:
             PRODUCTS = list(PRODUCTS_DEFAULT)
-    else:
-        PRODUCTS = list(PRODUCTS_DEFAULT)
 
-    # Currency safety: enforce USD quote pairs, then confirm Coinbase currently
-    # permits them before creating subscriptions or evaluating orders.
-    PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
-    PRODUCTS = await asyncio.to_thread(
-        validate_configured_products_with_coinbase,
-        PRODUCTS,
-        rest,
-    )
-
-    log(f"[config] product_count={len(PRODUCTS)} products={PRODUCTS}")
-    if len(PRODUCTS) < 15:
-        log(
-            "[config] warning: fewer than 15 products active after Coinbase "
-            f"validation; active_count={len(PRODUCTS)}"
+        # Currency safety: enforce USD quote pairs, then confirm Coinbase currently
+        # permits them before creating subscriptions or evaluating orders.
+        PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
+        PRODUCTS = await asyncio.to_thread(
+            validate_configured_products_with_coinbase,
+            PRODUCTS,
+            rest,
         )
-    log("[startup] creating TradingBot instance")
-    bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
-    log("[startup] LIVE-ONLY MODE: this bot can place real Coinbase orders.")
 
-    if not hasattr(bot, "run"):
-        raise RuntimeError("TradingBot instance has no run(); ensure you are running the updated bot.py file.")
+        log(f"[config] product_count={len(PRODUCTS)} products={PRODUCTS}")
+        if len(PRODUCTS) < 15:
+            log(
+                "[config] warning: fewer than 15 products active after Coinbase "
+                f"validation; active_count={len(PRODUCTS)}"
+            )
+        log("[startup] creating TradingBot instance")
+        bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
+        log("[startup] LIVE-ONLY MODE: this bot can place real Coinbase orders.")
 
-    log("[startup] entering TradingBot.run()")
-    await bot.run()
+        if not hasattr(bot, "run"):
+            raise RuntimeError("TradingBot instance has no run(); ensure you are running the updated bot.py file.")
+
+        log("[startup] entering TradingBot.run()")
+        await bot.run()
+
+    finally:
+        release_bot_process_lock()
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())

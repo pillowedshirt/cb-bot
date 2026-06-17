@@ -43,6 +43,15 @@ try:
 except Exception:
     run_backtest_intelligence = None
 
+try:
+    from session_liquidity import (
+        build_session_liquidity_signal,
+        signal_to_dict as session_liquidity_signal_to_dict,
+    )
+except Exception:
+    build_session_liquidity_signal = None
+    session_liquidity_signal_to_dict = None
+
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
 TZ_NAME: str = "America/Phoenix"
@@ -473,6 +482,23 @@ BACKTEST_MAX_SCORE_FLOOR_LIFT: float = 18.0
 BACKTEST_MAX_PROB_FLOOR_LIFT: float = 0.08
 BACKTEST_MAX_EDGE_FLOOR_LIFT_BPS: float = 60.0
 BACKTEST_MIN_PROJECTED_NET_FLOOR_BPS: float = 35.0
+
+# Global session liquidity council.
+# These agents are weighted evidence contributors, not hard pass/fail rules.
+ENABLE_SESSION_LIQUIDITY_COUNCIL: bool = True
+SESSION_LIQUIDITY_MIN_CONFIDENCE_FOR_STRONG_VOTE: float = 0.35
+SESSION_LIQUIDITY_BUY_SCORE_BONUS_WEIGHT: float = 6.0
+SESSION_LIQUIDITY_PROB_BONUS_WEIGHT: float = 0.025
+SESSION_LIQUIDITY_EDGE_BONUS_WEIGHT: float = 0.18
+SESSION_LIQUIDITY_TARGET_BONUS_CAP_BPS: float = 160.0
+SESSION_LIQUIDITY_STOP_DISTANCE_MAX_BPS: float = 240.0
+
+# Keep hard live-buy rails focused on economics and safety.
+# Strategy quality should mostly be weighed by Level 8 council votes.
+LEVEL8_ECONOMIC_SAFETY_GATE_ONLY: bool = True
+LEVEL8_MIN_COUNCIL_MARGIN_FOR_LIVE_BUY: float = 0.06
+LEVEL8_MIN_COUNCIL_TRUTH_FOR_LIVE_BUY: float = 0.50
+LEVEL8_MIN_NET_AFTER_COST_FOR_LIVE_BUY_BPS: float = 35.0
 
 # Active mode. No observe-only staged approach.
 LEVEL8_MODE: str = "FILTER_AND_SIZE"
@@ -2976,6 +3002,14 @@ class LiveSignal:
     buy_gate_calibrated_ok: bool = False
     buy_gate_tradeable: bool = False
     buy_gate_blocker: str = ""
+    session_liquidity_score: float = 0.0
+    session_liquidity_confidence: float = 0.0
+    session_liquidity_agent: str = ""
+    session_liquidity_setup: str = ""
+    session_liquidity_reason: str = ""
+    session_upside_target_bps: float = 0.0
+    session_downside_target_bps: float = 0.0
+    session_stop_distance_bps: float = 0.0
 
 
 @dataclass
@@ -7621,6 +7655,39 @@ class TradingBot:
             width_bps=max(35.0, MIN_REQUIRED_NET_EDGE_BPS),
         )
 
+        session_liquidity = self._session_liquidity_for_product(
+            product_id=product_id,
+            minute_candles=minute_candles,
+            current_price=mid,
+            spread_bps=float(spread_bps),
+            cost_bps=float(cost_bps),
+            projected_forward_gain_bps=float(calibrated_forward_gain_bps),
+        )
+
+        session_liquidity_score = float(session_liquidity.get("best_buy_score", 0.0) or 0.0)
+        session_liquidity_confidence = float(session_liquidity.get("confidence", 0.0) or 0.0)
+        session_upside_target_bps = float(session_liquidity.get("upside_target_bps", 0.0) or 0.0)
+        session_stop_distance_bps = float(session_liquidity.get("stop_distance_bps", 0.0) or 0.0)
+
+        session_score_bonus = (
+            session_liquidity_score
+            * session_liquidity_confidence
+            * float(SESSION_LIQUIDITY_BUY_SCORE_BONUS_WEIGHT)
+        )
+
+        session_prob_bonus = (
+            session_liquidity_score
+            * session_liquidity_confidence
+            * float(SESSION_LIQUIDITY_PROB_BONUS_WEIGHT)
+        )
+
+        session_edge_bonus_bps = min(
+            float(SESSION_LIQUIDITY_TARGET_BONUS_CAP_BPS),
+            max(0.0, session_upside_target_bps - cost_bps),
+        ) * session_liquidity_score * session_liquidity_confidence * float(SESSION_LIQUIDITY_EDGE_BONUS_WEIGHT)
+
+        expected_net_edge_bps = float(expected_net_edge_bps) + float(session_edge_bonus_bps)
+
         raw_score = (
             support_score * 0.14
             + room_score * 0.14
@@ -7633,6 +7700,7 @@ class TradingBot:
             + vwap_score * 0.07
             + higher_low_score * 0.06
             + edge_score * 0.12
+            + session_score_bonus
             - spread_penalty
             - cost_penalty
         )
@@ -7655,6 +7723,12 @@ class TradingBot:
             expected_net_edge_bps=expected_net_edge_bps,
             cost_bps=cost_bps,
             fee_available=fee_available,
+        )
+
+        estimated_prob_up = clamp_float(
+            float(estimated_prob_up) + float(session_prob_bonus),
+            0.0,
+            1.0,
         )
 
         position_pct = self._position_pct_from_probability(estimated_prob_up)
@@ -7955,7 +8029,8 @@ class TradingBot:
             f"cost={cost_bps:.1f}; projected_net={expected_net_edge_bps:.1f}; "
             f"time_to_min_profit={profile.calibrated_time_to_min_profit_minutes:.1f}m; "
             f"mom5={momentum_5_bps:.1f}; mom15={momentum_15_bps:.1f}; "
-            f"room={room_reason}; {vwap_reason}; {higher_low_reason}; {trend_reason}"
+            f"room={room_reason}; {vwap_reason}; {higher_low_reason}; {trend_reason}; "
+            f"session_liquidity={session_liquidity.get('reason', 'none')}"
         )
 
         return LiveSignal(
@@ -7992,6 +8067,14 @@ class TradingBot:
             buy_gate_calibrated_ok=buy_gate_calibrated_ok,
             buy_gate_tradeable=bool(ok_to_trade),
             buy_gate_blocker=buy_gate_blocker,
+            session_liquidity_score=float(session_liquidity_score),
+            session_liquidity_confidence=float(session_liquidity_confidence),
+            session_liquidity_agent=str(session_liquidity.get("strongest_agent", "")),
+            session_liquidity_setup=str(session_liquidity.get("strongest_setup", "")),
+            session_liquidity_reason=str(session_liquidity.get("reason", "")),
+            session_upside_target_bps=float(session_upside_target_bps),
+            session_downside_target_bps=float(session_liquidity.get("downside_target_bps", 0.0) or 0.0),
+            session_stop_distance_bps=float(session_stop_distance_bps),
         )
 
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
@@ -8111,6 +8194,105 @@ class TradingBot:
             return all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
         except Exception:
             return False
+
+    def _session_liquidity_for_product(
+        self,
+        *,
+        product_id: str,
+        minute_candles: Optional[List['MinuteCandle']] = None,
+        current_price: Optional[float] = None,
+        spread_bps: float = 0.0,
+        cost_bps: float = 0.0,
+        projected_forward_gain_bps: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Build session liquidity evidence for one product.
+
+        This is evidence for the Level 8 conversation. It is not a hard trade trigger.
+        """
+        if not bool(ENABLE_SESSION_LIQUIDITY_COUNCIL):
+            return {}
+
+        if build_session_liquidity_signal is None or session_liquidity_signal_to_dict is None:
+            return {}
+
+        try:
+            candles = minute_candles
+            if candles is None:
+                candles = list(self.minute_candles.get(product_id, []))
+
+            if not candles:
+                return {}
+
+            price = float(current_price or 0.0)
+            if price <= 0:
+                tob = self.tob.get(product_id)
+                if tob and tob.mid > 0:
+                    price = float(tob.mid)
+
+            if price <= 0:
+                return {}
+
+            signal = build_session_liquidity_signal(
+                product_id=product_id,
+                candles=list(candles),
+                current_price=float(price),
+                spread_bps=float(spread_bps),
+                cost_bps=float(cost_bps),
+                projected_forward_gain_bps=float(projected_forward_gain_bps),
+            )
+
+            return dict(session_liquidity_signal_to_dict(signal))
+
+        except Exception as exc:
+            log(f"[session-liquidity] failed {product_id}: {exc}")
+            return {}
+
+    def _session_liquidity_vote_from_context(
+        self,
+        *,
+        product_id: str,
+        context: Dict[str, Any],
+        common: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Convert session liquidity evidence into a Level 8 vote.
+
+        The agent name is market/session specific, so it can earn or lose weight:
+        - tokyo_sweep_reversal
+        - london_sweep_reversal
+        - new_york_sweep_reversal
+        - london_new_york_overlap_breakout_continuation
+        - etc.
+        """
+        session = dict(context.get("session_liquidity", {}) or {})
+
+        agent = str(session.get("strongest_agent", "session_liquidity"))
+        setup = str(session.get("strongest_setup", "none"))
+        buy_score = clamp_float(float(session.get("best_buy_score", 0.0) or 0.0), 0.0, 1.0)
+        sell_score = clamp_float(float(session.get("best_sell_score", 0.0) or 0.0), 0.0, 1.0)
+        hold_score = clamp_float(float(session.get("best_hold_score", 0.50) or 0.50), 0.0, 1.0)
+        confidence = clamp_float(float(session.get("confidence", 0.10) or 0.10), 0.10, 0.90)
+
+        if confidence < float(SESSION_LIQUIDITY_MIN_CONFIDENCE_FOR_STRONG_VOTE):
+            buy_score = clamp_float(buy_score * 0.75, 0.0, 1.0)
+            sell_score = clamp_float(sell_score * 0.75, 0.0, 1.0)
+
+        return {
+            **common,
+            "agent": agent,
+            "buy": buy_score,
+            "sell": sell_score,
+            "hold": hold_score,
+            "wait": clamp_float(0.70 - buy_score * 0.35, 0.0, 1.0),
+            "confidence": confidence,
+            "session_liquidity_setup": setup,
+            "session_liquidity_active_session": str(session.get("active_session", "")),
+            "session_liquidity_upside_target_bps": float(session.get("upside_target_bps", 0.0) or 0.0),
+            "session_liquidity_stop_distance_bps": float(session.get("stop_distance_bps", 0.0) or 0.0),
+            "reason": str(session.get("reason", "session_liquidity_no_reason")),
+        }
+
 
     def _entry_momentum_snapshot(self, product_id: str) -> Dict[str, float]:
         return {
@@ -13861,6 +14043,14 @@ class TradingBot:
                     "tier": int(scored.tier),
                     "entry_reason": str(scored.reason),
                     "entry_score_obj": scored,
+                    "session_liquidity_score": float(live_signal.session_liquidity_score),
+                    "session_liquidity_confidence": float(live_signal.session_liquidity_confidence),
+                    "session_liquidity_agent": str(live_signal.session_liquidity_agent),
+                    "session_liquidity_setup": str(live_signal.session_liquidity_setup),
+                    "session_liquidity_reason": str(live_signal.session_liquidity_reason),
+                    "session_upside_target_bps": float(live_signal.session_upside_target_bps),
+                    "session_downside_target_bps": float(live_signal.session_downside_target_bps),
+                    "session_stop_distance_bps": float(live_signal.session_stop_distance_bps),
                     "signal": live_signal,
                     "entry_timing_ok": False,
                     "entry_timing_reason": "heartbeat_market_watch",

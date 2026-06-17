@@ -495,6 +495,20 @@ BACKTEST_MAX_PROB_FLOOR_LIFT: float = 0.08
 BACKTEST_MAX_EDGE_FLOOR_LIFT_BPS: float = 60.0
 BACKTEST_MIN_PROJECTED_NET_FLOOR_BPS: float = 35.0
 
+# Setup-specific backtest performance feedback.
+# This lets product/session/setup/candle/FVG/SMT combinations influence live ranking and sizing.
+ENABLE_BACKTEST_SETUP_PERFORMANCE_FEEDBACK: bool = True
+BACKTEST_SETUP_MIN_SAMPLES_FOR_LIVE: int = 12
+BACKTEST_SETUP_STRONG_WIN_RATE: float = 0.56
+BACKTEST_SETUP_WEAK_WIN_RATE: float = 0.44
+BACKTEST_SETUP_STRONG_AVG_NET_BPS: float = 45.0
+BACKTEST_SETUP_WEAK_AVG_NET_BPS: float = 0.0
+BACKTEST_SETUP_MAX_RANK_BONUS: float = 55.0
+BACKTEST_SETUP_MAX_RANK_PENALTY: float = 45.0
+BACKTEST_SETUP_MAX_SIZE_BOOST: float = 1.25
+BACKTEST_SETUP_MIN_SIZE_MULTIPLIER: float = 0.55
+BACKTEST_SETUP_SHADOW_BELOW_OBJECTIVE: float = -15.0
+
 # Global session liquidity council.
 # These agents are weighted evidence contributors, not hard pass/fail rules.
 ENABLE_SESSION_LIQUIDITY_COUNCIL: bool = True
@@ -1354,6 +1368,9 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
     fresh_zone_buy_score = f("fresh_zone_buy_score", 0.0)
     volume_profile_buy_score = f("volume_profile_buy_score", 0.0)
     fvg_buy_score = f("fvg_buy_score", 0.0)
+    backtest_setup_rank_bonus = f("backtest_setup_rank_bonus", 0.0)
+    backtest_setup_quality = f("backtest_setup_quality", 0.50)
+    backtest_setup_confidence = f("backtest_setup_confidence", 0.0)
 
     price_action_bonus = (
         price_action_buy_score * price_action_confidence * 28.0
@@ -1406,6 +1423,8 @@ def candidate_rank_score(candidate: Dict[str, Any]) -> float:
         + backtest_bonus
         + session_bonus
         + price_action_bonus
+        + backtest_setup_rank_bonus
+        + (backtest_setup_quality - 0.50) * backtest_setup_confidence * 35.0
         - spread_bps * float(SPREAD_RANK_PENALTY_MULT)
         - max(0.0, cost_bps - 260.0) * 0.08
     )
@@ -5189,6 +5208,11 @@ class TradingBot:
         self.last_backtest_intelligence_ts: float = 0.0
         self.backtest_recommendations_by_product: Dict[str, Dict[str, Any]] = {}
         self.backtest_sell_recommendations_by_product: Dict[str, Dict[str, Any]] = {}
+
+        # setup_key -> row and product -> rows from backtest_setup_performance.csv
+        # Used to promote/deprioritize product/session/setup combinations by net replay results.
+        self.backtest_setup_performance_by_key: Dict[str, Dict[str, Any]] = {}
+        self.backtest_setup_performance_by_product: Dict[str, List[Dict[str, Any]]] = {}
         if ENABLE_LOCAL_AI_BRAIN and LocalAIBrain is not None:
             try:
                 self.ai_brain = LocalAIBrain(
@@ -9116,6 +9140,8 @@ class TradingBot:
         """Load latest backtest recommendations into memory."""
         self.backtest_recommendations_by_product = {}
         self.backtest_sell_recommendations_by_product = {}
+        self.backtest_setup_performance_by_key = {}
+        self.backtest_setup_performance_by_product = {}
         try:
             if os.path.exists(BACKTEST_RECOMMENDATIONS_CSV_PATH) and os.path.getsize(BACKTEST_RECOMMENDATIONS_CSV_PATH) > 0:
                 recs = pd.read_csv(BACKTEST_RECOMMENDATIONS_CSV_PATH)
@@ -9136,11 +9162,162 @@ class TradingBot:
                             self.backtest_sell_recommendations_by_product[product_id] = row.to_dict()
         except Exception as exc:
             log(f"[backtest] failed to load sell recommendations: {exc}")
+        try:
+            if (
+                bool(ENABLE_BACKTEST_SETUP_PERFORMANCE_FEEDBACK)
+                and os.path.exists(BACKTEST_SETUP_PERFORMANCE_CSV_PATH)
+                and os.path.getsize(BACKTEST_SETUP_PERFORMANCE_CSV_PATH) > 0
+            ):
+                setup_frame = pd.read_csv(BACKTEST_SETUP_PERFORMANCE_CSV_PATH)
+                if not setup_frame.empty and {"product_id", "setup_key"}.issubset(setup_frame.columns):
+                    for _, row in setup_frame.iterrows():
+                        row_dict = row.to_dict()
+                        product_id = str(row_dict.get("product_id", "")).strip()
+                        setup_key = str(row_dict.get("setup_key", "")).strip()
+                        if not product_id or not setup_key:
+                            continue
+                        full_key = f"{product_id}|{setup_key}"
+                        self.backtest_setup_performance_by_key[full_key] = row_dict
+                        self.backtest_setup_performance_by_product.setdefault(product_id, []).append(row_dict)
+
+                    for product_id, rows in self.backtest_setup_performance_by_product.items():
+                        rows.sort(
+                            key=lambda r: safe_float(r.get("objective_score"), 0.0),
+                            reverse=True,
+                        )
+        except Exception as exc:
+            log(f"[backtest] failed to load setup performance: {exc}")
+
         log(
             f"[backtest] loaded recommendations "
             f"buy_products={len(self.backtest_recommendations_by_product)} "
-            f"sell_products={len(self.backtest_sell_recommendations_by_product)}"
+            f"sell_products={len(self.backtest_sell_recommendations_by_product)} "
+            f"setup_keys={len(self.backtest_setup_performance_by_key)}"
         )
+
+    def _setup_perf_bucket(self, value: float) -> str:
+        try:
+            v = float(value)
+        except Exception:
+            v = 0.0
+        if v >= 0.70:
+            return "high"
+        if v >= 0.45:
+            return "medium"
+        if v > 0.0:
+            return "low"
+        return "none"
+
+    def _setup_key_from_candidate(self, candidate: Dict[str, Any]) -> str:
+        """Build a setup key compatible with backtest setup-performance rows."""
+        session_agent = str(candidate.get("session_liquidity_agent", "") or "")
+        session_setup = str(candidate.get("session_liquidity_setup", "") or "")
+        structure_state = str(candidate.get("structure_state", "") or "")
+        value_area_state = str(candidate.get("value_area_state", "") or "")
+        fvg_state = str(candidate.get("fvg_state", "") or "")
+        smt_state = str(candidate.get("smt_state", "") or "")
+
+        return (
+            str(session_agent)
+            + "|session_setup=" + str(session_setup)
+            + "|structure=" + str(structure_state)
+            + "|value=" + str(value_area_state)
+            + "|fvg=" + str(fvg_state)
+            + "|smt=" + str(smt_state)
+            + "|pa=" + self._setup_perf_bucket(safe_float(candidate.get("price_action_buy_score"), 0.0))
+            + "|exhaust=" + self._setup_perf_bucket(safe_float(candidate.get("candle_exhaustion_score"), 0.0))
+            + "|volume=" + self._setup_perf_bucket(safe_float(candidate.get("volume_profile_buy_score"), 0.0))
+            + "|validated_liq=" + self._setup_perf_bucket(safe_float(candidate.get("validated_liquidity_buy_score"), 0.0))
+            + "|fresh_zone=" + self._setup_perf_bucket(safe_float(candidate.get("fresh_zone_buy_score"), 0.0))
+            + "|fvg_score=" + self._setup_perf_bucket(safe_float(candidate.get("fvg_buy_score"), 0.0))
+        )
+
+    def _backtest_setup_performance_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Return exact setup replay performance or a product-level fallback."""
+        if not bool(ENABLE_BACKTEST_SETUP_PERFORMANCE_FEEDBACK):
+            return {}
+
+        product_id = str(candidate.get("product_id", "") or "")
+        if not product_id:
+            return {}
+
+        setup_key = self._setup_key_from_candidate(candidate)
+        full_key = f"{product_id}|{setup_key}"
+
+        exact = dict(self.backtest_setup_performance_by_key.get(full_key, {}) or {})
+        if exact:
+            exact["setup_match_type"] = "exact"
+            exact["live_setup_key"] = setup_key
+            return exact
+
+        rows = list(self.backtest_setup_performance_by_product.get(product_id, []) or [])
+        if rows:
+            best = dict(rows[0])
+            best["setup_match_type"] = "product_best_fallback"
+            best["live_setup_key"] = setup_key
+            return best
+
+        return {"setup_match_type": "none", "live_setup_key": setup_key}
+
+    def _apply_setup_performance_to_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach setup-specific replay metrics to a live candidate."""
+        rec = self._backtest_setup_performance_for_candidate(candidate)
+
+        sample_count = safe_float(rec.get("sample_count"), 0.0)
+        win_rate = safe_float(rec.get("win_rate"), 0.50)
+        avg_net_bps = safe_float(rec.get("avg_net_bps"), 0.0)
+        avg_adverse_bps = safe_float(rec.get("avg_adverse_bps"), 0.0)
+        objective_score = safe_float(rec.get("objective_score"), 0.0)
+        match_type = str(rec.get("setup_match_type", "none"))
+        setup_key = str(rec.get("live_setup_key", ""))
+
+        confidence = clamp_float(math.sqrt(max(0.0, sample_count) / 80.0), 0.0, 1.0)
+        quality = clamp_float(
+            0.50
+            + (win_rate - 0.50) * 1.20
+            + max(-150.0, min(250.0, avg_net_bps)) / 500.0
+            - max(0.0, avg_adverse_bps - 120.0) / 500.0,
+            0.0,
+            1.0,
+        )
+
+        strong = bool(sample_count >= float(BACKTEST_SETUP_MIN_SAMPLES_FOR_LIVE) and win_rate >= float(BACKTEST_SETUP_STRONG_WIN_RATE) and avg_net_bps >= float(BACKTEST_SETUP_STRONG_AVG_NET_BPS) and quality >= 0.58)
+        weak = bool(sample_count >= float(BACKTEST_SETUP_MIN_SAMPLES_FOR_LIVE) and (win_rate <= float(BACKTEST_SETUP_WEAK_WIN_RATE) or avg_net_bps <= float(BACKTEST_SETUP_WEAK_AVG_NET_BPS) or objective_score <= float(BACKTEST_SETUP_SHADOW_BELOW_OBJECTIVE)))
+
+        rank_bonus = 0.0
+        if strong:
+            rank_bonus = min(float(BACKTEST_SETUP_MAX_RANK_BONUS), 8.0 + (win_rate - 0.50) * 80.0 + max(0.0, avg_net_bps) * 0.18) * confidence
+        elif weak:
+            rank_bonus = -min(float(BACKTEST_SETUP_MAX_RANK_PENALTY), 8.0 + max(0.0, 0.50 - win_rate) * 80.0 + max(0.0, -avg_net_bps) * 0.18) * max(0.35, confidence)
+
+        size_multiplier = 1.0
+        if strong:
+            size_multiplier = min(float(BACKTEST_SETUP_MAX_SIZE_BOOST), 1.0 + confidence * 0.25)
+        elif weak:
+            size_multiplier = max(float(BACKTEST_SETUP_MIN_SIZE_MULTIPLIER), 1.0 - max(0.25, confidence * 0.45))
+
+        candidate["backtest_setup_key"] = setup_key
+        candidate["backtest_setup_match_type"] = match_type
+        candidate["backtest_setup_sample_count"] = float(sample_count)
+        candidate["backtest_setup_win_rate"] = float(win_rate)
+        candidate["backtest_setup_avg_net_bps"] = float(avg_net_bps)
+        candidate["backtest_setup_avg_adverse_bps"] = float(avg_adverse_bps)
+        candidate["backtest_setup_objective_score"] = float(objective_score)
+        candidate["backtest_setup_confidence"] = float(confidence)
+        candidate["backtest_setup_quality"] = float(quality)
+        candidate["backtest_setup_rank_bonus"] = float(rank_bonus)
+        candidate["backtest_setup_size_multiplier"] = float(size_multiplier)
+        candidate["backtest_setup_strong"] = bool(strong)
+        candidate["backtest_setup_weak"] = bool(weak)
+        candidate["backtest_setup_reason"] = (
+            f"setup_perf match={match_type};samples={sample_count:.0f};"
+            f"win_rate={win_rate:.3f};avg_net={avg_net_bps:.2f};"
+            f"avg_adverse={avg_adverse_bps:.2f};objective={objective_score:.2f};"
+            f"confidence={confidence:.3f};quality={quality:.3f};"
+            f"rank_bonus={rank_bonus:.2f};size_mult={size_multiplier:.3f};"
+            f"strong={strong};weak={weak};key={setup_key}"
+        )
+        return candidate
 
     def _backtest_buy_recommendation_for_product(self, product_id: str) -> Dict[str, Any]:
         try:
@@ -9446,6 +9623,7 @@ class TradingBot:
 
         try:
             context = self._level8_market_context(product_id=product_id, candidate=candidate)
+            candidate = self._apply_setup_performance_to_candidate(candidate)
             probability = clamp_float(float(candidate.get("estimated_prob_up", 0.5) or 0.5), 0.0, 1.0)
             score = clamp_float(float(candidate.get("score", 0.0) or 0.0) / 100.0, 0.0, 1.0)
             expected_edge = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0)
@@ -9551,6 +9729,21 @@ class TradingBot:
                 "reason": str(smt_context.get("reason", "smt_no_reason")),
             }
 
+            setup_perf_quality = clamp_float(float(candidate.get("backtest_setup_quality", 0.50) or 0.50), 0.0, 1.0)
+            setup_perf_conf = clamp_float(float(candidate.get("backtest_setup_confidence", 0.0) or 0.0), 0.0, 1.0)
+            setup_perf_weak = bool(candidate.get("backtest_setup_weak", False))
+
+            setup_performance_vote = {
+                **common,
+                "agent": "setup_performance_agent",
+                "buy": clamp_float(setup_perf_quality, 0.0, 1.0),
+                "sell": clamp_float(1.0 - setup_perf_quality if setup_perf_weak else 0.20, 0.0, 1.0),
+                "hold": clamp_float(0.42 + setup_perf_quality * 0.28, 0.0, 1.0),
+                "wait": clamp_float(0.62 - setup_perf_quality * 0.28 + (0.20 if setup_perf_weak else 0.0), 0.0, 1.0),
+                "confidence": clamp_float(0.15 + setup_perf_conf * 0.65, 0.10, 0.85),
+                "reason": str(candidate.get("backtest_setup_reason", "setup_performance_no_data")),
+            }
+
             votes = [
                 vote("trend", trend_score, clamp_float(0.40+trend_score*0.30,0.0,1.0), clamp_float(0.60-trend_score*0.35,0.0,1.0), clamp_float(0.35+abs(mom5)/180.0,0.20,0.90), f"trend mom5={mom5:.2f};mom15={mom15:.2f};regime={market_regime}"),
                 vote("mean_reversion", mean_reversion_score, 0.45, clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), clamp_float(0.35+abs(mom5)/220.0,0.20,0.85), f"mean_reversion setup={setup_tag};mom1={mom1:.2f};mom5={mom5:.2f}"),
@@ -9574,6 +9767,7 @@ class TradingBot:
                 session_liquidity_vote,
                 *price_action_votes,
                 smt_vote,
+                setup_performance_vote,
                 {**common, "agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
                 vote("exploration", learning_score, 0.35, clamp_float(0.70-learning_score*0.45,0.0,1.0), clamp_float(0.30+learning_score*0.55,0.20,0.85), f"learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"),
             ]
@@ -9635,9 +9829,21 @@ class TradingBot:
         try:
             action = str(decision.get("action", "WAIT"))
             strategy = str(decision.get("strategy", strategy))
+            setup_size_multiplier = clamp_float(
+                float(candidate.get("backtest_setup_size_multiplier", 1.0) or 1.0),
+                float(BACKTEST_SETUP_MIN_SIZE_MULTIPLIER),
+                float(BACKTEST_SETUP_MAX_SIZE_BOOST),
+            )
+            raw_position_pct = float(decision.get("position_pct", 0.0) or 0.0)
+            adjusted_position_pct = clamp_float(
+                raw_position_pct * setup_size_multiplier,
+                0.0,
+                float(LEVEL8_MAX_SINGLE_POSITION_PCT),
+            )
+
             info = {
                 "action": action, "strategy": strategy, "bucket": str(decision.get("bucket", "SHADOW")),
-                "risk_mode": str(decision.get("risk_mode", "NORMAL")), "recommended_position_pct": float(decision.get("position_pct", 0.0) or 0.0),
+                "risk_mode": str(decision.get("risk_mode", "NORMAL")), "recommended_position_pct": float(adjusted_position_pct),
                 "decision_id": str(decision.get("decision_id", str(uuid.uuid4()))), "truth_score": float(decision.get("truth_score", 0.0) or 0.0),
                 "final_buy_score": float(decision.get("final_buy", 0.0) or 0.0), "buy_threshold": float(decision.get("buy_threshold", 0.0) or 0.0),
                 "confidence": float(decision.get("confidence", decision.get("truth_score", 0.0)) or 0.0),
@@ -9656,7 +9862,8 @@ class TradingBot:
                 f"session_setup={session_context.get('strongest_setup', '')};"
                 f"session_reason={session_context.get('reason', '')};"
                 f"price_action_reason={price_context.get('reason', '')};"
-                f"smt_reason={dict(context.get('smt_divergence', {}) or {}).get('reason', '')}"
+                f"smt_reason={dict(context.get('smt_divergence', {}) or {}).get('reason', '')};"
+                f"setup_performance={candidate.get('backtest_setup_reason', '')}"
             )
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")
@@ -9669,6 +9876,30 @@ class TradingBot:
             truth_vote=decision.get("truth_vote", truth_vote) if isinstance(decision, dict) else truth_vote,
             reason=info["reason"],
         )
+        if (
+            bool(ENABLE_BACKTEST_SETUP_PERFORMANCE_FEEDBACK)
+            and str(action).upper() == "ALLOW_BUY"
+            and bool(candidate.get("backtest_setup_weak", False))
+            and safe_float(candidate.get("backtest_setup_sample_count"), 0.0) >= float(BACKTEST_SETUP_MIN_SAMPLES_FOR_LIVE)
+        ):
+            action = "SHADOW"
+            info["action"] = "SHADOW"
+            info["bucket"] = "SHADOW"
+            info["recommended_position_pct"] = 0.0
+            weak_reason = (
+                "setup_performance_shadowed:"
+                f"{candidate.get('backtest_setup_reason', '')}"
+            )
+            info["reason"] = f"{info.get('reason', '')};{weak_reason}"
+
+            self._append_level8_shadow_trade(
+                candidate=candidate,
+                level8_info=info,
+                reason=weak_reason,
+            )
+
+            log(f"[setup-performance] shadowed weak setup {product_id}: {weak_reason}")
+
         if (
             ENABLE_LEVEL8_COUNCIL
             and bool(LEVEL8_ENABLE_LIVE_BUY_QUALITY_GATE)

@@ -353,6 +353,7 @@ class LocalAIBrain:
         """Write a lightweight feature-importance proxy for AI training inputs."""
         try:
             if frame.empty:
+                pd.DataFrame(columns=["ts", "dt_utc", "feature", "importance", "rank", "model_ready", "reason"]).to_csv(AI_FEATURE_IMPORTANCE_CSV, index=False)
                 return
             rows = []
             y_move = pd.to_numeric(frame["y_move_30m_bps"], errors="coerce").fillna(0.0)
@@ -371,18 +372,18 @@ class LocalAIBrain:
                 loser_mean = float(pd.to_numeric(losers[column], errors="coerce").fillna(0.0).mean()) if not losers.empty else 0.0
                 rows.append({
                     "feature": column,
-                    "abs_corr_to_move": abs(float(corr or 0.0)),
-                    "corr_to_move": float(corr or 0.0),
-                    "winner_mean": winner_mean,
-                    "loser_mean": loser_mean,
+                    "importance": abs(float(corr or 0.0)),
                     "winner_minus_loser": winner_mean - loser_mean,
-                    "sample_count": int(len(frame)),
                 })
-            out = pd.DataFrame(rows).sort_values(
-                ["abs_corr_to_move", "winner_minus_loser"],
-                ascending=[False, False],
-            )
-            out.to_csv(AI_FEATURE_IMPORTANCE_CSV, index=False)
+            import time
+            from datetime import datetime, timezone
+            out = pd.DataFrame(rows).sort_values(["importance", "winner_minus_loser"], ascending=[False, False])
+            out["rank"] = range(1, len(out) + 1)
+            out["ts"] = f"{time.time():.6f}"
+            out["dt_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            out["model_ready"] = True
+            out["reason"] = "trained"
+            out[["ts", "dt_utc", "feature", "importance", "rank", "model_ready", "reason"]].to_csv(AI_FEATURE_IMPORTANCE_CSV, index=False)
         except Exception:
             pass
 
@@ -405,13 +406,14 @@ class LocalAIBrain:
                 "ai_train_skipped_not_enough_rows",
                 data={
                     "rows": int(len(frame)),
-                    "required": int(self.min_training_rows),
+                    "required_rows": int(self.min_training_rows),
                     "state": "normal_early_learning",
                     "message": "AI training starts after enough reviewed rows exist.",
                 },
                 level="INFO",
                 also_overall=False,
             )
+            self._write_feature_importance_report(pd.DataFrame())
             return {
                 "ok": False,
                 "sample_count": int(len(frame)),

@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from debug_tools import (
@@ -48,6 +49,10 @@ MICRO_HISTORY_CSV_PATH = os.path.join(BASE_DIR, "micro_history.csv")
 MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
 MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
 SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
+CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
+CHART_15M_30D_CSV_PATH = os.path.join(BASE_DIR, "chart_15m_30d.csv")
+CHART_1H_90D_CSV_PATH = os.path.join(BASE_DIR, "chart_1h_90d.csv")
+CHART_1D_2Y_CSV_PATH = os.path.join(BASE_DIR, "chart_1d_2y.csv")
 CANDIDATE_REPLAY_PATH = os.path.join(BASE_DIR, "candidate_replay.csv")
 AGENT_ADJUSTMENTS_PATH = os.path.join(BASE_DIR, "agent_adjustments.csv")
 AGENT_PERFORMANCE_PATH = os.path.join(BASE_DIR, "agent_performance.csv")
@@ -115,6 +120,19 @@ def inject_crypto_game_css() -> None:
 .codex-panel { border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; padding: 1rem; background: rgba(5, 13, 24, 0.92); }
 .good { color: #39f5a3; font-weight: 800; } .warn { color: #ffd166; font-weight: 800; } .danger { color: #ff5c7a; font-weight: 800; } .muted { color: #8db7c8; }
 div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid rgba(80,220,255,.15); padding: 8px 10px; border-radius: 12px; }
+.screen-section { min-height: 100vh; width: 100%; display: flex; flex-direction: column; justify-content: flex-start; padding: 1.2rem 0 2rem 0; border-bottom: 1px solid rgba(80, 220, 255, 0.12); }
+.screen-card { border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 22px; padding: 1rem; background: linear-gradient(180deg, rgba(7, 22, 39, 0.94), rgba(4, 9, 18, 0.97)); box-shadow: 0 0 28px rgba(0, 180, 255, 0.08); margin-bottom: 1rem; }
+.overview-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; }
+.coin-overview-card { border: 1px solid rgba(80, 220, 255, 0.20); border-radius: 18px; padding: 0.8rem; background: rgba(6, 18, 32, 0.90); }
+.coin-overview-card.buy { border-color: rgba(0, 255, 160, 0.48); }
+.coin-overview-card.shadow { border-color: rgba(255, 214, 102, 0.45); }
+.coin-overview-card.wait { border-color: rgba(135, 159, 180, 0.38); }
+.coin-overview-card.blocked { border-color: rgba(255, 92, 122, 0.45); }
+.live-pulse { display: inline-block; width: 0.65rem; height: 0.65rem; border-radius: 50%; background: #39f5a3; box-shadow: 0 0 14px rgba(57, 245, 163, 0.9); margin-right: 0.4rem; }
+.agent-ticker { border: 1px solid rgba(0, 255, 194, 0.24); border-radius: 18px; padding: 0.9rem; background: rgba(3, 22, 30, 0.88); margin: 0.75rem 0; }
+.agent-row { border-left: 3px solid rgba(80, 220, 255, 0.35); padding: 0.55rem 0.75rem; margin: 0.45rem 0; background: rgba(6, 20, 34, 0.55); border-radius: 12px; }
+.agent-row.active { border-left-color: #39f5a3; box-shadow: 0 0 18px rgba(57, 245, 163, 0.12); }
+@media (max-width: 900px) { .overview-grid { grid-template-columns: 1fr; } }
 </style>
     """, unsafe_allow_html=True)
 
@@ -147,17 +165,24 @@ def load_csv(path: str, usecols: list[str] | None = None) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def _load_viewer_snapshot_cached(path: str, exists: bool, size_bytes: int, mtime_ns: int) -> Dict[str, Any]:
+    if not exists:
+        return {"updated_ts": 0.0, "coins": {}, "top_products": [], "live_positions": [], "readiness": {"startup_state": "waiting_for_first_bot_snapshot"}, "_startup_waiting": True}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_viewer_snapshot() -> Dict[str, Any]:
+    sig = file_signature(VIEWER_SNAPSHOT_PATH)
     try:
-        sig = file_signature(VIEWER_SNAPSHOT_CSV_SAFE_PATH)
+        snapshot = _load_viewer_snapshot_cached(sig[0], sig[1], sig[2], sig[3])
         if not sig[1]:
-            module_debug(MODULE_NAME, "viewer_snapshot_missing", data={"path": VIEWER_SNAPSHOT_CSV_SAFE_PATH}, level="INFO", also_overall=False)
-            return {"updated_ts": 0.0, "coins": {}, "top_products": [], "live_positions": [], "readiness": {"startup_state": "waiting_for_first_bot_snapshot"}, "_startup_waiting": True}
-        with open(VIEWER_SNAPSHOT_CSV_SAFE_PATH, "r", encoding="utf-8") as f: snapshot = json.load(f)
-        module_debug(MODULE_NAME, "viewer_snapshot_loaded", data=viewer_snapshot_summary(snapshot), level="INFO", also_overall=False)
+            module_debug(MODULE_NAME, "viewer_snapshot_missing_startup_wait", data={"path": VIEWER_SNAPSHOT_PATH}, level="INFO", also_overall=False)
+        else:
+            module_debug(MODULE_NAME, "viewer_snapshot_loaded", data={"path": VIEWER_SNAPSHOT_PATH, "size_bytes": sig[2], "mtime_ns": sig[3], "coin_count": len((snapshot.get("coins") or {})), "updated_ts": snapshot.get("updated_ts")}, level="DEBUG", also_overall=False)
         return snapshot
     except Exception as exc:
-        module_exception(MODULE_NAME, "viewer_snapshot_corrupt", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+        module_exception(MODULE_NAME, "viewer_snapshot_load_failed", exc, data={"path": VIEWER_SNAPSHOT_PATH, "signature": sig, "traceback": traceback.format_exc()}, also_overall=True)
         return {"updated_ts": 0.0, "coins": {}, "top_products": [], "live_positions": [], "readiness": {}, "_viewer_snapshot_error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -183,7 +208,7 @@ def get_refresh_config() -> dict:
     with st.sidebar:
         st.markdown("### Live Data")
         live_enabled = st.toggle("Live update data", value=True)
-        interval_label = st.selectbox("Update interval", ["2s", "3s", "5s", "10s", "15s", "30s"], index=2)
+        interval_label = st.selectbox("Update interval", ["1s", "2s", "3s", "5s", "10s", "15s", "30s"], index=1)
         if st.button("Refresh data now"):
             st.cache_data.clear()
             st.session_state["_manual_refresh_tick"] = int(st.session_state.get("_manual_refresh_tick", 0)) + 1
@@ -210,14 +235,25 @@ def render_crypto_header() -> None:
     st.markdown('<div class="hud-header"><div class="hud-title">🛰️ Crypto Strategy HUD</div><div class="hud-subtitle">Strategy Arena for live crypto learning, agent consensus, and Coinbase-style chart context.</div></div>', unsafe_allow_html=True)
 
 
-def pick_selected_coin(snapshot: Dict[str, Any]) -> str | None:
-    coins = snapshot.get("coins", {}) or {}; top = snapshot.get("top_products", []) or []
+def get_available_products(snapshot: Dict[str, Any]) -> list[str]:
+    coins = snapshot.get("coins", {}) or {}
+    top = snapshot.get("top_products", []) or []
     available = [c for c in list(top) + [c for c in coins.keys() if c not in top] if str(c).strip()]
-    if not available: return None
-    if st.session_state.get("selected_coin") not in available: st.session_state.selected_coin = available[0]
-    selected = st.selectbox("Select Coin", options=available, index=available.index(st.session_state.selected_coin), key="selected_coin_selectbox")
-    st.session_state.selected_coin = selected
-    return selected
+    return available
+
+
+def pick_selected_coin(snapshot: Dict[str, Any]) -> str | None:
+    available = get_available_products(snapshot)
+    if not available:
+        return None
+    if st.session_state.get("selected_coin") not in available:
+        st.session_state["selected_coin"] = available[0]
+    return st.session_state["selected_coin"]
+
+
+def normalize_timeframe_label(label: str) -> str:
+    mapping = {"1D · 1m": "1d_1m", "7D · 1m": "7d_1m", "30D · 15m": "30d_15m", "90D · 1h": "90d_1h", "2Y · 1d": "2y_1d"}
+    return mapping.get(str(label), "1d_1m")
 
 
 def render_overlay_controls():
@@ -258,21 +294,31 @@ def confirmed_trades_only(df: pd.DataFrame, product_id: str) -> pd.DataFrame:
 
 
 def load_chart_history(product_id: str, timeframe: str) -> tuple[pd.DataFrame, dict]:
-    timeframe = str(timeframe or "day").lower()
-    source_path, source_name = (MACRO_WEEK_CSV_PATH, "macro_week.csv") if timeframe == "week" else (MICRO_HISTORY_CSV_PATH, "micro_history.csv")
-    required = ["ts", "product_id", "open", "high", "low", "close", "volume"]
+    tf = str(timeframe or "1d_1m").lower()
+    if tf == "7d_1m":
+        source_path, source_name, fallback_path, fallback_name, max_rows = CHART_1M_7D_CSV_PATH, "chart_1m_7d.csv", MICRO_HISTORY_CSV_PATH, "micro_history.csv", 7 * 24 * 60 + 100
+    elif tf == "30d_15m":
+        source_path, source_name, fallback_path, fallback_name, max_rows = CHART_15M_30D_CSV_PATH, "chart_15m_30d.csv", MACRO_WEEK_CSV_PATH, "macro_week.csv", 30 * 24 * 4 + 100
+    elif tf == "90d_1h":
+        source_path, source_name, fallback_path, fallback_name, max_rows = CHART_1H_90D_CSV_PATH, "chart_1h_90d.csv", MACRO_WEEK_CSV_PATH, "macro_week.csv", 90 * 24 + 100
+    elif tf == "2y_1d":
+        source_path, source_name, fallback_path, fallback_name, max_rows = CHART_1D_2Y_CSV_PATH, "chart_1d_2y.csv", MACRO_WEEK_CSV_PATH, "macro_week.csv", 2 * 365 + 30
+    else:
+        source_path, source_name, fallback_path, fallback_name, max_rows = MICRO_HISTORY_CSV_PATH, "micro_history.csv", MACRO_DAY_CSV_PATH, "macro_day.csv", 24 * 60 + 100
     frame = load_csv(source_path)
-    if timeframe == "day" and frame.empty:
-        source_path, source_name = MACRO_DAY_CSV_PATH, "macro_day.csv"; frame = load_csv(source_path)
-    meta = {"product_id": product_id, "timeframe": timeframe, "source": source_name, "path": source_path, "rows_before_filter": int(len(frame)) if hasattr(frame, "__len__") else 0, "rows": 0, "has_volume": False, "age_sec": 999999.0, "missing_columns": []}
+    if frame.empty and fallback_path:
+        frame = load_csv(fallback_path); source_path = fallback_path; source_name = fallback_name
+    required = ["ts", "product_id", "open", "high", "low", "close", "volume"]
+    meta = {"product_id": product_id, "timeframe": tf, "source": source_name, "path": source_path, "rows_before_filter": int(len(frame)) if hasattr(frame, "__len__") else 0, "rows": 0, "has_volume": False, "age_sec": 999999.0, "missing_columns": []}
     if frame.empty: return pd.DataFrame(), meta
     missing = [c for c in required if c not in frame.columns]; meta["missing_columns"] = missing
-    if missing: module_debug(MODULE_NAME, "chart_history_missing_columns", data=meta, level="WARN", also_overall=True); return pd.DataFrame(), meta
+    if missing:
+        module_debug(MODULE_NAME, "chart_history_missing_columns", data=meta, level="WARN", also_overall=True); return pd.DataFrame(), meta
     out = frame[frame["product_id"].astype(str) == str(product_id)].copy()
     for col in ["ts", "open", "high", "low", "close", "volume"]: out[col] = pd.to_numeric(out[col], errors="coerce")
     out = out.dropna(subset=["ts", "open", "high", "low", "close"]).sort_values("ts")
     out["dt"] = pd.to_datetime(out["ts"], unit="s", errors="coerce", utc=True)
-    out = out.tail(7 * 24 * 4 + 50 if timeframe == "week" else 24 * 60 + 200)
+    out = out.tail(max_rows)
     meta.update({"rows": int(len(out)), "has_volume": bool(pd.to_numeric(out.get("volume", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() > 0), "age_sec": dataframe_latest_age_sec(out)})
     module_debug(MODULE_NAME, "chart_history_selected", data=meta, level="INFO", also_overall=False)
     return out, meta
@@ -402,36 +448,6 @@ def render_agent_disagreement_summary(votes: pd.DataFrame) -> Dict[str, Any]:
     return summary
 
 
-def render_strategy_arena(council_votes_df, decisions_df, selected_coin: str):
-    latest_decision_id, drow, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected_coin)
-    action = drow.get("action", drow.get("final_action", "—")) if isinstance(drow, dict) else "—"
-    st.markdown(f'<div class="hud-header"><div class="hud-title">Strategy Arena</div><div class="hud-subtitle">{_html(selected_coin)} · Latest Level 8 action: <b>{_html(action)}</b> · decision_id: <b>{_html(latest_decision_id or "—")}</b></div></div>', unsafe_allow_html=True)
-    if votes.empty:
-        st.info("No Strategy Arena vote statements found for this selected coin yet."); return latest_decision_id, votes
-    chief = votes[votes.get("agent", pd.Series(dtype=str)).astype(str)=="volume_profile_leader"] if "agent" in votes.columns else pd.DataFrame()
-    chief_row = chief.iloc[-1].to_dict() if not chief.empty else votes.iloc[0].to_dict()
-    col1, col2 = st.columns([1.05,1.95])
-    with col1:
-        st.markdown(f'<div class="chief-card"><b>{agent_title_icon("volume_profile_leader")}</b><br>Leaning: <b>{vote_leaning(chief_row)}</b><br>Confidence: <b>{_safe_float(chief_row.get("confidence")):.3f}</b><br>Strongest score: <b>{strongest_vote_score(chief_row):.3f}</b><br><span class="muted">{_html(plain_reason(chief_row.get("reason", "")))}</span></div>', unsafe_allow_html=True)
-        if st.button("Ask", key=f"ask_agent_{selected_coin}_{latest_decision_id}_volume_profile_leader"):
-            st.session_state["inquiry_agent"] = "volume_profile_leader"; st.session_state["inquiry_decision_id"] = latest_decision_id
-    with col2:
-        st.markdown(f'<div class="codex-panel"><b>⚖️ Level 8 Arbiter</b><br>decision_id: <b>{_html(latest_decision_id or "—")}</b> · action: <b>{_html(action)}</b><br>Final buy score: <b>{_safe_float(drow.get("final_buy_score")):.3f}</b> · Expected utility: <b>{_safe_float(drow.get("expected_utility_bps")):.2f} bps</b><br><span class="muted">{_html(plain_reason(drow.get("reason", drow.get("main_reason", ""))))}</span></div>', unsafe_allow_html=True)
-        if st.button("Ask Level 8 Arbiter", key=f"ask_agent_{selected_coin}_{latest_decision_id}_level8"):
-            st.session_state["inquiry_agent"] = "level8_arbiter"; st.session_state["inquiry_decision_id"] = latest_decision_id
-        render_agent_disagreement_summary(votes)
-    cards=[r for r in votes.to_dict("records") if str(r.get("agent")) != "volume_profile_leader"]
-    for i in range(0, len(cards), 4):
-        cols=st.columns(4)
-        for col,row in zip(cols,cards[i:i+4]):
-            agent=str(row.get("agent","fallback")); lean=vote_leaning(row).lower()
-            with col:
-                st.markdown(f'<div class="agent-card agent-card-{lean}"><b>{_html(agent_title_icon(agent))}</b><br>Leaning: <b>{lean.upper()}</b><br>Confidence: <b>{_safe_float(row.get("confidence")):.3f}</b><br>Strongest: <b>{strongest_vote_score(row):.3f}</b><br><span class="muted">{_html(plain_reason(row.get("reason", "")))}</span></div>', unsafe_allow_html=True)
-                if st.button("Ask", key=f"ask_agent_{selected_coin}_{latest_decision_id}_{agent}"):
-                    st.session_state["inquiry_agent"] = agent; st.session_state["inquiry_decision_id"] = latest_decision_id
-    return latest_decision_id, votes
-
-
 def render_status_strip(snapshot, selected, coin, chart_meta, votes, drow, market_df, refresh_config):
     now=time.time(); snapshot_age=max(0.0, now-_safe_float(snapshot.get("updated_ts"))) if _safe_float(snapshot.get("updated_ts"))>0 else 999999.0
     chart_age=float(chart_meta.get("age_sec",999999.0)); council_age=dataframe_latest_age_sec(votes); readiness=snapshot.get("readiness",{}) or {}
@@ -445,40 +461,6 @@ def render_status_strip(snapshot, selected, coin, chart_meta, votes, drow, marke
     st.markdown(html, unsafe_allow_html=True)
     if coin.get("high_fee_tier_active"): st.warning("Strict mode: Coinbase fees are high, so the bot needs stronger edge before live entry.")
     return snapshot_age, chart_age, council_age, refresh_mode
-
-
-def render_inquiry_panel(selected_coin, votes, decisions_df, market_df, snapshot):
-    st.markdown('<div class="inquiry-panel"><b>Ask the Bot</b><div class="muted">Deterministic explanations from current Strategy Arena rows, market telemetry, and the viewer snapshot.</div></div>', unsafe_allow_html=True)
-    buttons=[("Ask Chief Market Strategist","volume_profile_leader"),("Ask Level 8 Arbiter","level8_arbiter"),("Explain why no live buy","why_no_live_buy"),("Explain what would need to change","what_change"),("Explain chart levels","chart_levels"),("Explain fee impact","fee_impact"),("Explain agent disagreement","agent_disagreement")]
-    cols=st.columns(4)
-    for i,(label,key) in enumerate(buttons):
-        if cols[i%4].button(label, key=f"inquiry_{selected_coin}_{key}"): st.session_state["inquiry_agent"] = key
-    choice=st.session_state.get("inquiry_agent", "volume_profile_leader")
-    coin=dict((snapshot.get("coins",{}) or {}).get(selected_coin,{}) or {})
-    if choice == "level8_arbiter":
-        _, drow, _ = latest_council_votes_for_coin(votes, decisions_df, selected_coin)
-        st.info(f"Level 8 action: {drow.get('action', '—')}. Reason: {plain_reason(drow.get('reason', drow.get('main_reason', '')))}")
-        return
-    if choice in {"why_no_live_buy","what_change","chart_levels","fee_impact","agent_disagreement"}:
-        text={"why_no_live_buy": plain_reason(coin.get("main_blocker", coin.get("buy_blocker", "expected_utility_too_low"))), "what_change":"The current rows suggest the bot needs fresher data, stronger expected utility, lower spread/fees, or stronger agent confidence when those blockers appear in the published reasons.", "chart_levels":f"Published levels: POC {_safe_float(coin.get('point_of_control')):.8f}, VAH {_safe_float(coin.get('value_area_high')):.8f}, VAL {_safe_float(coin.get('value_area_low')):.8f}.", "fee_impact":plain_reason("fee spread") if coin.get("high_fee_tier_active") or _safe_float(coin.get("taker_fee_rate", coin.get("taker_fee_bps"))) else "No explicit fee blocker is present in the selected snapshot row.", "agent_disagreement":"Review the Agent Consensus box for BUY/SELL/HOLD/WAIT counts and highest-confidence blocker."}[choice]
-        st.info(text); return
-    agent=choice
-    row={}
-    if not votes.empty and "agent" in votes.columns:
-        m=votes[votes["agent"].astype(str)==str(agent)]
-        if not m.empty: row=m.iloc[-1].to_dict()
-    if not row and not votes.empty: row=votes.iloc[0].to_dict()
-    reason=row.get("reason", "")
-    st.markdown(f"""
-<div class="codex-panel"><b>{_html(agent_title_icon(row.get('agent', agent)))}</b><br>
-<b>What this analyst is watching:</b> {_html(row.get('agent', agent))}<br>
-<b>Current leaning:</b> {vote_leaning(row) if row else '—'}<br>
-<b>Confidence:</b> {_safe_float(row.get('confidence')):.3f}<br>
-<b>Strongest score:</b> {strongest_vote_score(row) if row else 0:.3f}<br>
-<b>Reason in plain English:</b> {_html(plain_reason(reason))}<br>
-<b>Raw reason:</b> <span class="muted">{_html(reason)}</span><br>
-<b>What would change its mind:</b> <span class="muted">A new row with stronger scores or a reason no longer mentioning the current blocker.</span></div>
-""", unsafe_allow_html=True)
 
 
 def render_targets_panel(coin: Dict[str, Any], target: Dict[str, Any]) -> None:
@@ -515,40 +497,159 @@ def viewer_runtime_audit(*, snapshot, selected, market_df, trades_df, targets_df
     return health
 
 
+
+def latest_row_for_product(df: pd.DataFrame, product_id: str) -> dict:
+    if df.empty or "product_id" not in df.columns:
+        return {}
+    sub = df[df["product_id"].astype(str) == str(product_id)].copy()
+    if sub.empty:
+        return {}
+    if "ts" in sub.columns:
+        sub["ts_num"] = pd.to_numeric(sub["ts"], errors="coerce")
+        sub = sub.sort_values("ts_num")
+    return sub.iloc[-1].to_dict()
+
+
+def build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, targets_df) -> list[dict]:
+    coins = snapshot.get("coins", {}) or {}
+    products = list(snapshot.get("top_products") or [])
+    products += [p for p in coins.keys() if p not in products]
+    rows = []
+    for product in products:
+        coin = dict(coins.get(product, {}) or {})
+        market = latest_row_for_product(market_df, product); decision = latest_row_for_product(decisions_df, product); target = latest_row_for_product(targets_df, product)
+        latest_decision_id, _, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, product)
+        if not votes.empty:
+            leanings = [vote_leaning(r) for r in votes.to_dict("records")]
+            consensus = max(["BUY", "SELL", "HOLD", "WAIT"], key=lambda x: leanings.count(x)); buy_votes = leanings.count("BUY"); wait_votes = leanings.count("WAIT")
+        else:
+            consensus = "WAIT"; buy_votes = 0; wait_votes = 0
+        action = str(decision.get("action") or coin.get("decision_action") or "WAIT").upper()
+        owns = bool(coin.get("owns_position") or target.get("has_position"))
+        blocker = str(coin.get("main_blocker") or coin.get("buy_blocker") or decision.get("reason") or decision.get("main_reason") or "")
+        rows.append({"product_id": product, "price": _safe_float(market.get("mid") or coin.get("price")), "spread_bps": _safe_float(market.get("spread_bps") or coin.get("spread_bps")), "action": action, "consensus": consensus, "buy_votes": buy_votes, "wait_votes": wait_votes, "owns_position": owns, "final_buy_score": _safe_float(decision.get("final_buy_score") or coin.get("final_buy_score")), "buy_threshold": _safe_float(decision.get("buy_threshold") or coin.get("buy_threshold")), "expected_utility_bps": _safe_float(decision.get("expected_utility_bps") or coin.get("expected_utility_bps")), "recommended_position_pct": _safe_float(decision.get("recommended_position_pct") or coin.get("recommended_position_pct")), "blocker": plain_reason(blocker), "decision_id": latest_decision_id})
+    rows.sort(key=lambda r: (r["owns_position"], r["action"] == "BUY", r["expected_utility_bps"], r["final_buy_score"], r["buy_votes"]), reverse=True)
+    return rows
+
+
+def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config):
+    rows = build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, targets_df)
+    readiness = snapshot.get("readiness", {}) or {}; updated_ts = _safe_float(snapshot.get("updated_ts")); age = max(0.0, time.time() - updated_ts) if updated_ts > 0 else 999999.0
+    st.markdown('<div class="hud-header"><div class="hud-title"><span class="live-pulse"></span>All-Coin Command Deck</div><div class="hud-subtitle">One-glance live stance across every tracked Coinbase product.</div></div>', unsafe_allow_html=True)
+    cols = st.columns(5); cols[0].metric("Tracked Coins", len(rows)); cols[1].metric("Held Positions", sum(1 for r in rows if r["owns_position"])); cols[2].metric("BUY Actions", sum(1 for r in rows if r["action"] == "BUY")); cols[3].metric("Snapshot Age", format_age(age)); cols[4].metric("Refresh", refresh_config.get("interval_label", "manual"))
+    if readiness.get("high_fee_tier_active"):
+        st.warning("Strict mode is active: Coinbase fees are high, so the bot needs stronger edge before live entries.")
+    html = ['<div class="overview-grid">']
+    for row in rows:
+        card_state = "buy" if row["action"] == "BUY" else "shadow" if "SHADOW" in row["action"] else "blocked" if row["blocker"] else "wait"
+        html.append(f'''<div class="coin-overview-card {card_state}"><div style="font-size:1.25rem;font-weight:900;">{_html(row["product_id"])}</div><div class="muted">Action: <b>{_html(row["action"])}</b> · Consensus: <b>{_html(row["consensus"])}</b></div><div>Price: <b>{row["price"]:.8f}</b></div><div>Spread: <b>{row["spread_bps"]:.2f} bps</b></div><div>Buy score: <b>{row["final_buy_score"]:.3f}</b> / threshold <b>{row["buy_threshold"]:.3f}</b></div><div>Utility: <b>{row["expected_utility_bps"]:.2f} bps</b></div><div>Size: <b>{row["recommended_position_pct"]:.1%}</b></div><div class="muted">Blocker: {_html(row["blocker"][:180] or "No blocker published.")}</div></div>''')
+    html.append('</div>'); st.markdown("".join(html), unsafe_allow_html=True)
+    with st.expander("All-coin sortable table", expanded=False): st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def tradingview_symbol(product_id: str) -> str:
+    return f"COINBASE:{str(product_id or '').replace('-', '')}"
+
+
+def render_tradingview_chart(product_id: str) -> None:
+    symbol = tradingview_symbol(product_id)
+    html = f'''<div class="tradingview-widget-container" style="height:860px;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>{{"autosize": true, "symbol": "{symbol}", "interval": "15", "timezone": "Etc/UTC", "theme": "dark", "style": "1", "locale": "en", "allow_symbol_change": false, "hide_side_toolbar": false, "hide_top_toolbar": false, "hide_legend": false, "hide_volume": false, "calendar": false, "support_host": "https://www.tradingview.com"}}</script></div>'''
+    components.html(html, height=900, scrolling=False)
+
+
+def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, decision_row: dict, votes: pd.DataFrame):
+    st.markdown('<div class="agent-ticker"><b>Live Agent Debate</b><div class="muted">The highlighted analyst rotates automatically as the viewer refreshes.</div></div>', unsafe_allow_html=True)
+    if votes.empty: st.info("No agent debate rows yet."); return
+    rows = votes.to_dict("records"); tick = int(time.time() // 2); active_index = tick % len(rows); highlighted = []
+    for offset in range(min(4, len(rows))):
+        row = rows[(active_index + offset) % len(rows)]; active = "active" if offset == 0 else ""; agent = str(row.get("agent", "fallback")); leaning = vote_leaning(row); confidence = _safe_float(row.get("confidence")); reason = plain_reason(row.get("reason", ""))
+        highlighted.append(f'''<div class="agent-row {active}"><b>{_html(agent_title_icon(agent))}</b><span class="muted"> · leaning <b>{_html(leaning)}</b> · confidence <b>{confidence:.3f}</b></span><br>{_html(reason)}</div>''')
+    st.markdown("".join(highlighted), unsafe_allow_html=True)
+    with st.expander("Full debate transcript for this decision", expanded=False):
+        display_cols = [c for c in ["agent", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reason"] if c in votes.columns]
+        st.dataframe(votes[display_cols] if display_cols else votes, use_container_width=True, hide_index=True)
+
+
+def render_agent_detail_panel(agent_name: str, votes: pd.DataFrame):
+    sub = votes[votes["agent"].astype(str) == str(agent_name)] if not votes.empty and "agent" in votes.columns else pd.DataFrame()
+    if sub.empty: return
+    row = sub.iloc[-1].to_dict(); reason = str(row.get("reason", ""))
+    st.markdown(f'''<div class="screen-card"><h3>{_html(agent_title_icon(agent_name))}</h3><b>Leaning:</b> {vote_leaning(row)}<br><b>Confidence:</b> {_safe_float(row.get("confidence")):.3f}<br><b>Strongest score:</b> {strongest_vote_score(row):.3f}<br><b>Plain-English reason:</b> {_html(plain_reason(reason))}<br></div>''', unsafe_allow_html=True)
+    with st.expander("Raw analyst reason", expanded=False): st.text(reason)
+
+
+def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
+    st.markdown("### Analyst Roster")
+    if votes.empty: st.info("No analyst rows yet."); return
+    focus_options = votes["agent"].dropna().astype(str).unique().tolist() if "agent" in votes.columns else []
+    focused = st.selectbox("Focus analyst", focus_options, format_func=agent_title_icon, key=f"focus_analyst_{selected_coin}") if focus_options else ""
+    rows = votes.to_dict("records")
+    for i in range(0, len(rows), 3):
+        cols = st.columns(3)
+        for col, row in zip(cols, rows[i:i + 3]):
+            agent = str(row.get("agent", "fallback")); leaning = vote_leaning(row).lower()
+            with col: st.markdown(f'''<div class="agent-card agent-card-{leaning}"><b>{_html(agent_title_icon(agent))}</b><br>Leaning: <b>{leaning.upper()}</b><br>Confidence: <b>{_safe_float(row.get("confidence")):.3f}</b><br>Strongest score: <b>{strongest_vote_score(row):.3f}</b><br><span class="muted">{_html(plain_reason(row.get("reason", "")))}</span></div>''', unsafe_allow_html=True)
+    if focused: render_agent_detail_panel(focused, votes)
+
+
+def render_topic_explanation(topic, selected_coin, votes, decisions_df, market_df, snapshot):
+    coin = dict((snapshot.get("coins", {}) or {}).get(selected_coin, {}) or {}); _, drow, _ = latest_council_votes_for_coin(votes, decisions_df, selected_coin)
+    if topic == "Why the bot is not buying live": st.info(plain_reason(coin.get("main_blocker") or coin.get("buy_blocker") or drow.get("reason", "No live-buy blocker is currently published.")))
+    elif topic == "What would need to change": st.info("The bot needs fresher data, stronger expected utility, lower spread/fees, stronger agent confidence, or removal of the currently published blocker.")
+    elif topic == "Chart levels": st.info(f"Published levels: POC {_safe_float(coin.get('point_of_control')):.8f}, VAH {_safe_float(coin.get('value_area_high')):.8f}, VAL {_safe_float(coin.get('value_area_low')):.8f}.")
+    elif topic == "Fee impact": st.info("Strict high-fee mode is active, so entries need more edge." if coin.get("high_fee_tier_active") else "No explicit fee blocker is present in the selected snapshot row.")
+    elif topic == "Agent disagreement": render_agent_disagreement_summary(votes)
+
+
+def render_learning_console(selected_coin, votes, decisions_df, market_df, snapshot):
+    st.markdown('<div class="screen-card"><h2>Learning Console</h2><div class="muted">Read what the bot is watching without clicking Ask buttons.</div></div>', unsafe_allow_html=True)
+    topic = st.selectbox("Learning topic", ["Why the bot is not buying live", "What would need to change", "Chart levels", "Fee impact", "Agent disagreement", "Selected analyst details"], key=f"learning_topic_{selected_coin}")
+    agent_options = [str(a) for a in votes["agent"].dropna().astype(str).unique().tolist()] if not votes.empty and "agent" in votes.columns else []
+    if topic == "Selected analyst details" and agent_options:
+        selected_agent = st.selectbox("Focus analyst", agent_options, format_func=agent_title_icon, key=f"focus_agent_{selected_coin}"); render_agent_detail_panel(selected_agent, votes); return
+    render_topic_explanation(topic, selected_coin, votes, decisions_df, market_df, snapshot)
+
+
+def render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
+    available = get_available_products(snapshot)
+    if available:
+        current = st.session_state.get("selected_coin", available[0]); idx = available.index(current) if current in available else 0
+        selected = st.selectbox("Strategy Arena Coin", available, index=idx, key="strategy_arena_coin"); st.session_state["selected_coin"] = selected
+    st.markdown(f'<div class="hud-header"><div class="hud-title">Strategy Arena</div><div class="hud-subtitle">{_html(selected)} · chart first, analyst debate below.</div></div>', unsafe_allow_html=True)
+    chart_choice = st.radio("Chart source", ["Bot overlay chart", "TradingView visual chart"], horizontal=True, key=f"chart_source_{selected}")
+    if chart_choice == "TradingView visual chart":
+        render_tradingview_chart(selected); st.info("TradingView is visual-only. The bot still learns from Coinbase API data and internal CSV history.")
+    else:
+        chart_df, chart_meta = load_chart_history(selected, timeframe); confirmed = confirmed_trades_only(trades_df, selected); target = latest_targets_for_coin(targets_df, selected)
+        fig = build_coin_chart(chart_df, chart_meta, dict((snapshot.get("coins") or {}).get(selected, {}) or {}), market_df, confirmed, shadow_df, decisions_df, target, overlays, full_chart=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{selected}_{timeframe}", config={"displayModeBar": True, "scrollZoom": True, "responsive": True})
+    latest_decision_id, drow, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected)
+    render_agent_debate_stream(selected, latest_decision_id, drow, votes); render_agent_roster_no_buttons(selected, votes); render_learning_console(selected, votes, decisions_df, market_df, snapshot)
+
+
+def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df):
+    st.markdown('<div class="hud-header"><div class="hud-title">Deep Learning Context</div><div class="hud-subtitle">What the bot is watching across chart, order-book, council, and target context.</div></div>', unsafe_allow_html=True)
+    coin = dict((snapshot.get("coins", {}) or {}).get(st.session_state.get("selected_coin", selected), {}) or {}); render_coin_analytics(coin)
+    with st.expander("Context Panels", expanded=True): st.json({k: coin.get(k) for k in ["value_acceptance_state", "volume_node_state", "previous_session_profile_reaction_state", "quant_boundary_state", "order_book_reason", "product_calibration_ready", "extended_chart_cache_running", "last_extended_chart_refresh_ts"]})
+    for name, df in [("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df), ("order_book_snapshots", order_book_df), ("position_targets", targets_df)]:
+        with st.expander(name, expanded=False): st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
+
+
+def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df):
+    st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
+    st.json(snapshot.get("readiness", {}) or {})
+    for name, df in [("trades", trades_df), ("orders", orders_df), ("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df)]:
+        with st.expander(name, expanded=False): st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
+
+
 def render_live_dashboard(selected, timeframe, overlays, full_chart, refresh_config):
-    snapshot=load_viewer_snapshot(); coin=dict((snapshot.get("coins",{}) or {}).get(selected,{}) or {})
-    market_df=load_csv(MARKET_CSV_PATH); trades_df=load_csv(TRADES_CSV_PATH); shadow_df=load_csv(SHADOW_TRADES_CSV_PATH); targets_df=load_csv(POSITION_TARGETS_PATH); decisions_df=load_csv(COUNCIL_DECISIONS_PATH); council_votes_df=load_csv(COUNCIL_VOTES_CSV_PATH); order_book_df=load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
-    chart_df, chart_meta=load_chart_history(selected, timeframe); confirmed=confirmed_trades_only(trades_df, selected); target=latest_targets_for_coin(targets_df, selected)
-    latest_decision_id, drow, latest_votes=latest_council_votes_for_coin(council_votes_df, decisions_df, selected)
-    snapshot_age, chart_age, council_age, _ = render_status_strip(snapshot, selected, coin, chart_meta, latest_votes, drow, market_df, refresh_config)
-    render_held_positions(snapshot)
-    latest_decision_id, latest_votes=render_strategy_arena(council_votes_df, decisions_df, selected)
-    st.markdown('<div class="codex-panel"><b>Coinbase-style Chart</b><div class="muted">Day mode uses micro_history.csv with macro_day.csv fallback. Week mode uses macro_week.csv. market.csv is telemetry only.</div></div>', unsafe_allow_html=True)
-    fig=build_coin_chart(chart_df, chart_meta, coin, market_df, confirmed, shadow_df, decisions_df, target, overlays, full_chart=full_chart)
-    trace_count=len(fig.data)
-    st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{selected}_{timeframe}", config={"displayModeBar": True, "scrollZoom": True, "responsive": True})
-    render_inquiry_panel(selected, latest_votes, decisions_df, market_df, snapshot)
-    with st.expander("Learning Panels", expanded=False):
-        st.markdown("### Agent Statements"); st.dataframe(latest_votes, use_container_width=True, hide_index=True) if not latest_votes.empty else st.info("Agent statements are pending.")
-    with st.expander("Context Panels", expanded=False):
-        st.json({k: coin.get(k) for k in ["value_acceptance_state","volume_node_state","previous_session_profile_reaction_state","quant_boundary_state","order_book_reason"]})
-    render_confirmed_trades(confirmed); render_targets_panel(coin, target); render_coin_analytics(coin)
-    orders_df=load_csv(ORDERS_CSV_PATH); walk_forward_df=load_csv(WALK_FORWARD_VALIDATION_PATH); agent_ablation_df=load_csv(AGENT_ABLATION_PATH); ai_importance_df=load_csv(AI_FEATURE_IMPORTANCE_PATH)
-    viewer_health=viewer_runtime_audit(snapshot=snapshot, selected=selected, market_df=market_df, trades_df=trades_df, targets_df=targets_df, decisions_df=decisions_df, council_votes_df=council_votes_df, orders_df=orders_df, walk_forward_df=walk_forward_df, agent_ablation_df=agent_ablation_df, ai_importance_df=ai_importance_df, chart_meta=chart_meta, latest_votes=latest_votes, refresh_config=refresh_config)
-    with st.expander("Debug Health", expanded=False): st.json(viewer_health)
-    with st.expander("Validation / Overfitting", expanded=False):
-        st.info("Walk-forward validation is waiting for enough reviewed outcomes.") if walk_forward_df.empty else st.dataframe(walk_forward_df.tail(50), use_container_width=True, hide_index=True)
-        st.info("Agent ablation is waiting for enough reviewed outcomes.") if agent_ablation_df.empty else st.dataframe(agent_ablation_df.tail(50), use_container_width=True, hide_index=True)
-        st.info("AI feature importance pending until enough labeled training rows exist.") if ai_importance_df.empty else st.dataframe(ai_importance_df.head(40), use_container_width=True, hide_index=True)
-    with st.expander("Raw Tables", expanded=False):
-        for name,df in [("council_decisions",decisions_df),("council_votes",council_votes_df),("market",market_df),("order_book_snapshots",order_book_df),("shadow_trades",shadow_df)]:
-            st.markdown(f"### {name}"); st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
-        if st.checkbox("Load heavy raw tables", value=False):
-            candidate_df=load_csv(CANDIDATE_REPLAY_PATH); agent_adjustments_df=load_csv(AGENT_ADJUSTMENTS_PATH); agent_performance_df=load_csv(AGENT_PERFORMANCE_PATH); decision_audit_df=load_csv(DECISION_AUDIT_PATH)
-            for name,df in [("candidate_replay",candidate_df),("agent_adjustments",agent_adjustments_df),("agent_performance",agent_performance_df),("decision_audit",decision_audit_df)]:
-                st.markdown(f"### {name}"); st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
-    with st.expander("Backend Order Attempts", expanded=False): st.info("No backend order attempts yet.") if orders_df.empty else st.dataframe(orders_df.tail(100), use_container_width=True, hide_index=True)
-    module_debug(MODULE_NAME, "viewer_fragment_refresh", data={"selected_coin": selected, "refresh_mode": "fragment", "interval_label": refresh_config.get("interval_label"), "snapshot_age_sec": snapshot_age, "chart_age_sec": chart_age, "council_age_sec": council_age, "chart_rows": chart_meta.get("rows"), "council_rows": int(len(latest_votes)), "decision_id": latest_decision_id, "trace_count": trace_count}, level="DEBUG", also_overall=False)
+    now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
+    module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": timeframe, "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
+    snapshot = load_viewer_snapshot(); market_df = load_csv(MARKET_CSV_PATH); decisions_df = load_csv(COUNCIL_DECISIONS_PATH); council_votes_df = load_csv(COUNCIL_VOTES_CSV_PATH); targets_df = load_csv(POSITION_TARGETS_PATH); trades_df = load_csv(TRADES_CSV_PATH); orders_df = load_csv(ORDERS_CSV_PATH); shadow_df = load_csv(SHADOW_TRADES_CSV_PATH); order_book_df = load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
+    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
 def main() -> None:
@@ -560,7 +661,8 @@ def main() -> None:
     if not selected:
         st.info("Waiting for bot data. Start the bot and wait for viewer_snapshot.json to update.")
         return
-    timeframe = st.radio("Chart Mode", ["day", "week"], horizontal=True, key="chart_timeframe", format_func=lambda x: x.title())
+    timeframe_label = st.radio("Chart Mode", ["1D · 1m", "7D · 1m", "30D · 15m", "90D · 1h", "2Y · 1d"], horizontal=True, key="chart_timeframe")
+    timeframe = normalize_timeframe_label(timeframe_label)
     full_chart = st.toggle("Full chart mode", value=False)
     overlays = render_overlay_controls()
     run_every = run_every_value(refresh_config)

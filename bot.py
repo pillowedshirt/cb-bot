@@ -200,6 +200,8 @@ CHART_1H_90D_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1h_90d.csv")
 CHART_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1d_2y.csv")
 EXTENDED_CHART_REFRESH_EVERY_SEC: int = 30 * 60
 EXTENDED_CHART_FETCH_CONCURRENCY: int = 1
+EXTENDED_CHART_PRODUCTS_PER_PASS: int = 2
+EXTENDED_CHART_JOBS_PER_PASS: int = 1
 COINBASE_CANDLE_REQUEST_PAUSE_SEC: float = 0.45
 COINBASE_CANDLE_429_BACKOFF_SEC: float = 6.0
 POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
@@ -5839,6 +5841,16 @@ class TradingBot:
         self._product_calibration_ready: Dict[str, bool] = {p: False for p in PRODUCTS}
         self._extended_chart_cache_running: bool = False
         self._last_extended_chart_refresh_ts: float = 0.0
+        self._extended_chart_job_index = 0
+        self._extended_chart_product_index = 0
+        self._top_of_book_keeper_running = False
+        self._last_tob_keeper_cycle_ts = 0.0
+        self._missed_opportunity_review_running = False
+        self._decision_audit_review_running = False
+        self._agent_performance_update_running = False
+        self._sell_outcome_classification_running = False
+        self._maker_miss_review_running = False
+        self._sell_quality_review_running = False
         self._extended_chart_fetch_semaphore = asyncio.Semaphore(EXTENDED_CHART_FETCH_CONCURRENCY)
         self._last_legacy_diagnostic_log_ts: Dict[str, float] = {}
         self._last_no_position_sell_skip_log_ts: Dict[str, float] = {}
@@ -12116,15 +12128,6 @@ class TradingBot:
         """
         try:
             product_id = str(candidate.get("product_id", ""))
-            if bool(ENABLE_STALE_DATA_LIVE_BUY_GATE):
-                market_age_sec = self._market_data_age_for_product(product_id)
-                candidate["market_data_age_sec"] = float(market_age_sec)
-                if market_age_sec > float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):
-                    return False, (
-                        f"live_buy_blocked:stale_market_data "
-                        f"market_data_age_sec={market_age_sec:.2f};"
-                        f"max_allowed={float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):.2f}"
-                    )
             current_price_for_stack_check = float(
                 candidate.get("price", 0.0)
                 or candidate.get("mid", 0.0)
@@ -12462,6 +12465,17 @@ class TradingBot:
                     f"session_setup={candidate.get('session_liquidity_setup', '')};"
                     f"{backtest_reason}"
                 )
+
+
+            if bool(ENABLE_STALE_DATA_LIVE_BUY_GATE):
+                market_age_sec = self._market_data_age_for_product(product_id)
+                candidate["market_data_age_sec"] = float(market_age_sec)
+                if market_age_sec > float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):
+                    return False, (
+                        f"live_buy_blocked:stale_market_data "
+                        f"market_data_age_sec={market_age_sec:.2f};"
+                        f"max_allowed={float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):.2f}"
+                    )
 
             return True, (
                 f"live_buy_economic_safety_ok "
@@ -13996,7 +14010,7 @@ class TradingBot:
             status["sqlite_writable"] = True
         except Exception:
             pass
-        status.update({"extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)), "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0), "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v), "product_count": len(PRODUCTS), "micro_history_ready": bool(getattr(self, "_micro_history_ready", False)), "macro_ready": bool(getattr(self, "_macro_ready", False)), "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False))})
+        status.update({"extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)), "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0), "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v), "product_count": len(PRODUCTS), "micro_history_ready": bool(getattr(self, "_micro_history_ready", False)), "macro_ready": bool(getattr(self, "_macro_ready", False)), "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False)), "top_of_book_keeper_running": bool(getattr(self, "_top_of_book_keeper_running", False)), "last_tob_keeper_cycle_ts": float(getattr(self, "_last_tob_keeper_cycle_ts", 0.0) or 0.0)})
         status["safe_to_run_overnight"] = bool(status["viewer_snapshot_recent"] and not status["risk_pause_active"] and not status["drawdown_brake_active"] and status["learning_files_writable"] and status["no_duplicate_process"])
         return status
 
@@ -16077,6 +16091,60 @@ class TradingBot:
             candles = await self.fetcher.fetch_chunked(product, start_ts, end_ts, granularity, max_candles_per_req=300)
         return [{"ts": int(c.ts), "product_id": product, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(c.volume or 0.0)} for c in candles or []]
 
+    def _schedule_background_work(self, name: str, flag_name: str, fn) -> None:
+        try:
+            if bool(getattr(self, flag_name, False)):
+                return
+            setattr(self, flag_name, True)
+
+            async def _task():
+                started = time.perf_counter()
+                try:
+                    await asyncio.to_thread(fn)
+                    elapsed = time.perf_counter() - started
+                    module_debug(
+                        MODULE_NAME,
+                        "background_work_completed",
+                        data={"name": name, "elapsed_sec": round(elapsed, 4)},
+                        level="INFO" if elapsed >= 1.0 else "DEBUG",
+                        also_overall=elapsed >= 5.0,
+                    )
+                except Exception as exc:
+                    module_exception(MODULE_NAME, f"background_work_failed:{name}", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+                finally:
+                    setattr(self, flag_name, False)
+
+            asyncio.create_task(_task())
+        except Exception as exc:
+            module_exception(MODULE_NAME, f"background_work_schedule_failed:{name}", exc, also_overall=True)
+
+    async def top_of_book_keeper_loop(self) -> None:
+        """Keep bid/ask fresh enough for live gates without relying only on websocket updates."""
+        await asyncio.sleep(3.0)
+        while not self._stop_event.is_set():
+            cycle_started = time.perf_counter()
+            self._top_of_book_keeper_running = True
+            try:
+                refreshed = 0
+                stale_before = 0
+                for product_id in PRODUCTS:
+                    age = self._market_data_age_for_product(product_id)
+                    if age > 5.0:
+                        stale_before += 1
+                        try:
+                            await asyncio.to_thread(self._rest_backfill_top_of_book, [product_id])
+                            refreshed += 1
+                        except Exception as exc:
+                            module_exception(MODULE_NAME, "top_of_book_keeper_product_failed", exc, data={"product_id": product_id, "age_sec": age}, also_overall=False)
+                    await asyncio.sleep(0.35)
+                self._last_tob_keeper_cycle_ts = now_ts()
+                module_debug(MODULE_NAME, "top_of_book_keeper_cycle", data={"products": len(PRODUCTS), "stale_before": stale_before, "refreshed": refreshed, "elapsed_sec": round(time.perf_counter() - cycle_started, 3)}, level="DEBUG", also_overall=False)
+            except Exception as exc:
+                module_exception(MODULE_NAME, "top_of_book_keeper_loop_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+            finally:
+                self._top_of_book_keeper_running = False
+            await asyncio.sleep(1.0)
+
     async def refresh_extended_chart_caches(self) -> None:
         if self._extended_chart_cache_running:
             return
@@ -16090,38 +16158,51 @@ class TradingBot:
                 {"path": CHART_1H_90D_CSV_PATH, "granularity": "ONE_HOUR", "lookback_sec": 90 * 24 * 60 * 60, "max_rows_per_product": 90 * 24 + 50},
                 {"path": CHART_1D_2Y_CSV_PATH, "granularity": "ONE_DAY", "lookback_sec": 2 * 365 * 24 * 60 * 60, "max_rows_per_product": 2 * 365 + 20},
             ]
-            for job in jobs:
-                path = job["path"]; granularity = job["granularity"]; start_ts = now_i - int(job["lookback_sec"])
-                existing_by_product = self._read_candle_csv_rows(path, min_ts=start_ts)
-                existing_rows = [r for rows in existing_by_product.values() for r in rows]
-                new_rows: List[Dict[str, Any]] = []
-                for product in PRODUCTS:
-                    rows = existing_by_product.get(product, [])
-                    latest_ts = int(rows[-1]["ts"]) if rows else 0
-                    if granularity == "ONE_MINUTE": freshness_sec, step_sec = 15 * 60, 60
-                    elif granularity == "FIFTEEN_MINUTE": freshness_sec, step_sec = 45 * 60, 15 * 60
-                    elif granularity == "ONE_HOUR": freshness_sec, step_sec = 3 * 60 * 60, 60 * 60
-                    else: freshness_sec, step_sec = 36 * 60 * 60, 24 * 60 * 60
-                    if latest_ts > 0 and now_i - latest_ts < freshness_sec and len(rows) >= min(50, int(job["max_rows_per_product"])):
-                        continue
-                    fetch_start = max(start_ts, latest_ts + step_sec) if latest_ts else start_ts
-                    if fetch_start >= now_i:
-                        continue
-                    fetched = await self._fetch_extended_candles_for_product(product, fetch_start, now_i, granularity)
-                    new_rows.extend(fetched)
-                    await asyncio.sleep(float(COINBASE_CANDLE_REQUEST_PAUSE_SEC))
-                merged = merge_candle_csv_rows(existing_rows, new_rows, int(job["max_rows_per_product"]))
-                write_candle_csv_atomic(path, merged)
-                module_debug(MODULE_NAME, "extended_chart_cache_written", data={"path": path, "granularity": granularity, "existing_rows": len(existing_rows), "new_rows": len(new_rows), "written_rows": len(merged)}, level="INFO", also_overall=False)
+            job_idx = int(getattr(self, "_extended_chart_job_index", 0)) % len(jobs)
+            product_idx = int(getattr(self, "_extended_chart_product_index", 0)) % len(PRODUCTS)
+            job = jobs[job_idx]
+            path = job["path"]
+            granularity = job["granularity"]
+            start_ts = now_i - int(job["lookback_sec"])
+            product_batch = PRODUCTS[product_idx:product_idx + int(EXTENDED_CHART_PRODUCTS_PER_PASS)]
+            if not product_batch:
+                product_batch = PRODUCTS[:int(EXTENDED_CHART_PRODUCTS_PER_PASS)]
+                product_idx = 0
+            existing_by_product = self._read_candle_csv_rows(path, min_ts=start_ts)
+            existing_rows = [r for rows in existing_by_product.values() for r in rows]
+            new_rows: List[Dict[str, Any]] = []
+            for product in product_batch:
+                rows = existing_by_product.get(product, [])
+                latest_ts = int(rows[-1]["ts"]) if rows else 0
+                if granularity == "ONE_MINUTE": freshness_sec, step_sec = 15 * 60, 60
+                elif granularity == "FIFTEEN_MINUTE": freshness_sec, step_sec = 45 * 60, 15 * 60
+                elif granularity == "ONE_HOUR": freshness_sec, step_sec = 3 * 60 * 60, 60 * 60
+                else: freshness_sec, step_sec = 36 * 60 * 60, 24 * 60 * 60
+                if latest_ts > 0 and now_i - latest_ts < freshness_sec and len(rows) >= min(50, int(job["max_rows_per_product"])):
+                    continue
+                fetch_start = max(start_ts, latest_ts + step_sec) if latest_ts else start_ts
+                if fetch_start >= now_i:
+                    continue
+                fetched = await self._fetch_extended_candles_for_product(product, fetch_start, now_i, granularity)
+                new_rows.extend(fetched)
+                await asyncio.sleep(float(COINBASE_CANDLE_REQUEST_PAUSE_SEC))
+            merged = merge_candle_csv_rows(existing_rows, new_rows, int(job["max_rows_per_product"]))
+            write_candle_csv_atomic(path, merged)
+            next_product_idx = product_idx + int(EXTENDED_CHART_PRODUCTS_PER_PASS)
+            if next_product_idx >= len(PRODUCTS):
+                next_product_idx = 0
+                job_idx = (job_idx + int(EXTENDED_CHART_JOBS_PER_PASS)) % len(jobs)
+            self._extended_chart_product_index = next_product_idx
+            self._extended_chart_job_index = job_idx
             self._last_extended_chart_refresh_ts = now_ts()
+            module_debug(MODULE_NAME, "extended_chart_cache_partial_pass_written", data={"path": path, "granularity": granularity, "product_batch": product_batch, "new_rows": len(new_rows), "written_rows": len(merged), "next_job_index": self._extended_chart_job_index, "next_product_index": self._extended_chart_product_index, "elapsed_sec": round(time.perf_counter() - started, 3)}, level="INFO", also_overall=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "extended_chart_cache_refresh_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
         finally:
             self._extended_chart_cache_running = False
-            module_debug(MODULE_NAME, "extended_chart_cache_refresh_finished", data={"elapsed_sec": round(time.perf_counter() - started, 3)}, level="INFO", also_overall=False)
 
     async def extended_chart_cache_loop(self) -> None:
-        await asyncio.sleep(10.0)
+        await asyncio.sleep(45.0)
         while not self._stop_event.is_set():
             try:
                 age = now_ts() - float(getattr(self, "_last_extended_chart_refresh_ts", 0.0))
@@ -16129,7 +16210,7 @@ class TradingBot:
                     await self.refresh_extended_chart_caches()
             except Exception as exc:
                 module_exception(MODULE_NAME, "extended_chart_cache_loop_failed", exc, also_overall=True)
-            await asyncio.sleep(30.0)
+            await asyncio.sleep(90.0)
 
     async def run(self) -> None:
         """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
@@ -16169,6 +16250,7 @@ class TradingBot:
             asyncio.create_task(self.eval_loop()),
             asyncio.create_task(self.telemetry_loop()),
             asyncio.create_task(self.extended_chart_cache_loop()),
+            asyncio.create_task(self.top_of_book_keeper_loop()),
         ]
         await asyncio.gather(*tasks)
 
@@ -18733,6 +18815,8 @@ class TradingBot:
             "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False)),
             "extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)),
             "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0),
+            "top_of_book_keeper_running": bool(getattr(self, "_top_of_book_keeper_running", False)),
+            "last_tob_keeper_cycle_ts": float(getattr(self, "_last_tob_keeper_cycle_ts", 0.0) or 0.0),
             "volume_profile_leader_buy_score": _json_safe_float(
                 candidate.get("volume_profile_leader_buy_score", row.get("leader_buy_score", 0.0))
             ),
@@ -18851,6 +18935,8 @@ class TradingBot:
                 "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0),
                 "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v),
                 "product_count": len(PRODUCTS),
+                "top_of_book_keeper_running": bool(getattr(self, "_top_of_book_keeper_running", False)),
+                "last_tob_keeper_cycle_ts": float(getattr(self, "_last_tob_keeper_cycle_ts", 0.0) or 0.0),
             },
         }
         self._write_viewer_snapshot(snapshot)
@@ -18901,16 +18987,16 @@ class TradingBot:
             ts_now = now_ts()
             self._last_eval_loop_section_timings = {}
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
-                _t = time.perf_counter(); self._review_level8_missed_opportunities(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["missed_opportunity_review"] = round(_e, 4); self._log_hot_loop_timing("missed_opportunity_review", _e)
-            _t = time.perf_counter(); self._review_maker_miss_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["maker_miss_review"] = round(_e, 4); self._log_hot_loop_timing("maker_miss_review", _e)
-            _t = time.perf_counter(); self._review_sell_quality(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_quality_review"] = round(_e, 4); self._log_hot_loop_timing("sell_quality_review", _e)
+                _t = time.perf_counter(); self._schedule_background_work("missed_opportunity_review", "_missed_opportunity_review_running", self._review_level8_missed_opportunities); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["missed_opportunity_review"] = round(_e, 4); self._log_hot_loop_timing("missed_opportunity_review", _e)
+            _t = time.perf_counter(); self._schedule_background_work("maker_miss_review", "_maker_miss_review_running", self._review_maker_miss_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["maker_miss_review"] = round(_e, 4); self._log_hot_loop_timing("maker_miss_review", _e)
+            _t = time.perf_counter(); self._schedule_background_work("sell_quality_review", "_sell_quality_review_running", self._review_sell_quality); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_quality_review"] = round(_e, 4); self._log_hot_loop_timing("sell_quality_review", _e)
             if (
                 bool(ENABLE_DECISION_AUDIT_REPLAY)
                 and ts_now - float(getattr(self, "last_decision_audit_review_ts", 0.0))
                 >= float(DECISION_AUDIT_REVIEW_EVERY_SEC)
             ):
                 self.last_decision_audit_review_ts = ts_now
-                _t = time.perf_counter(); self._review_decision_audits(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["decision_audit_review"] = round(_e, 4); self._log_hot_loop_timing("decision_audit_review", _e)
+                _t = time.perf_counter(); self._schedule_background_work("decision_audit_review", "_decision_audit_review_running", self._review_decision_audits); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["decision_audit_review"] = round(_e, 4); self._log_hot_loop_timing("decision_audit_review", _e)
             if (
                 ENABLE_LEVEL8_COUNCIL
                 and ts_now - float(self.last_agent_performance_update_ts)
@@ -18921,12 +19007,12 @@ class TradingBot:
                 _t = time.perf_counter(); self._maybe_reload_backtest_background(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["backtest_reload_scheduling"] = round(_e, 4); self._log_hot_loop_timing("backtest_reload_scheduling", _e)
 
                 try:
-                    _t = time.perf_counter(); self._classify_level8_sell_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_outcome_classification"] = round(_e, 4); self._log_hot_loop_timing("sell_outcome_classification", _e)
+                    _t = time.perf_counter(); self._schedule_background_work("sell_outcome_classification", "_sell_outcome_classification_running", self._classify_level8_sell_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_outcome_classification"] = round(_e, 4); self._log_hot_loop_timing("sell_outcome_classification", _e)
                 except Exception as exc:
                     log_exception("level8 sell outcome classification failed", exc)
 
                 try:
-                    _t = time.perf_counter(); self._append_agent_performance_from_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["agent_performance_update"] = round(_e, 4); self._log_hot_loop_timing("agent_performance_update", _e)
+                    _t = time.perf_counter(); self._schedule_background_work("agent_performance_update", "_agent_performance_update_running", self._append_agent_performance_from_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["agent_performance_update"] = round(_e, 4); self._log_hot_loop_timing("agent_performance_update", _e)
                 except Exception as exc:
                     log_exception("level8 agent performance update failed", exc)
 

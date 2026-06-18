@@ -120,7 +120,11 @@ def inject_crypto_game_css() -> None:
 .codex-panel { border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; padding: 1rem; background: rgba(5, 13, 24, 0.92); }
 .good { color: #39f5a3; font-weight: 800; } .warn { color: #ffd166; font-weight: 800; } .danger { color: #ff5c7a; font-weight: 800; } .muted { color: #8db7c8; }
 div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid rgba(80,220,255,.15); padding: 8px 10px; border-radius: 12px; }
-.screen-section { min-height: 100vh; width: 100%; display: flex; flex-direction: column; justify-content: flex-start; padding: 1.2rem 0 2rem 0; border-bottom: 1px solid rgba(80, 220, 255, 0.12); }
+.screen-section { width: 100%; display: block; padding: 0.35rem 0 0.75rem 0; margin: 0; border-bottom: 1px solid rgba(80, 220, 255, 0.08); }
+.screen-section.command-deck { min-height: auto; }
+.screen-section.strategy-arena { min-height: auto; }
+.screen-section.deep-learning { min-height: auto; }
+.screen-section.debug-health { min-height: auto; }
 .screen-card { border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 22px; padding: 1rem; background: linear-gradient(180deg, rgba(7, 22, 39, 0.94), rgba(4, 9, 18, 0.97)); box-shadow: 0 0 28px rgba(0, 180, 255, 0.08); margin-bottom: 1rem; }
 .overview-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; }
 .coin-overview-card { border: 1px solid rgba(80, 220, 255, 0.20); border-radius: 18px; padding: 0.8rem; background: rgba(6, 18, 32, 0.90); }
@@ -128,11 +132,18 @@ div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid r
 .coin-overview-card.shadow { border-color: rgba(255, 214, 102, 0.45); }
 .coin-overview-card.wait { border-color: rgba(135, 159, 180, 0.38); }
 .coin-overview-card.blocked { border-color: rgba(255, 92, 122, 0.45); }
+.rank-badge { display: inline-block; border: 1px solid rgba(57, 245, 163, 0.45); border-radius: 999px; padding: 0.18rem 0.5rem; font-size: 0.78rem; color: #39f5a3; background: rgba(57, 245, 163, 0.08); margin-right: 0.35rem; }
+.viability-score { font-size: 1.35rem; font-weight: 900; color: #e8fbff; }
+.viability-reason { color: #8db7c8; font-size: 0.86rem; line-height: 1.25rem; }
+.context-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.8rem; }
+.context-card { border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; padding: 0.9rem; background: rgba(6, 18, 32, 0.86); }
+.context-card h3 { margin-top: 0; margin-bottom: 0.45rem; }
+.watch-list { border-left: 3px solid rgba(57, 245, 163, 0.75); padding: 0.65rem 0.8rem; background: rgba(57, 245, 163, 0.06); border-radius: 12px; margin-top: 0.6rem; }
 .live-pulse { display: inline-block; width: 0.65rem; height: 0.65rem; border-radius: 50%; background: #39f5a3; box-shadow: 0 0 14px rgba(57, 245, 163, 0.9); margin-right: 0.4rem; }
 .agent-ticker { border: 1px solid rgba(0, 255, 194, 0.24); border-radius: 18px; padding: 0.9rem; background: rgba(3, 22, 30, 0.88); margin: 0.75rem 0; }
 .agent-row { border-left: 3px solid rgba(80, 220, 255, 0.35); padding: 0.55rem 0.75rem; margin: 0.45rem 0; background: rgba(6, 20, 34, 0.55); border-radius: 12px; }
 .agent-row.active { border-left-color: #39f5a3; box-shadow: 0 0 18px rgba(57, 245, 163, 0.12); }
-@media (max-width: 900px) { .overview-grid { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { .overview-grid { grid-template-columns: 1fr; } .context-grid { grid-template-columns: 1fr; } }
 </style>
     """, unsafe_allow_html=True)
 
@@ -510,42 +521,94 @@ def latest_row_for_product(df: pd.DataFrame, product_id: str) -> dict:
     return sub.iloc[-1].to_dict()
 
 
-def build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, targets_df) -> list[dict]:
-    coins = snapshot.get("coins", {}) or {}
-    products = list(snapshot.get("top_products") or [])
-    products += [p for p in coins.keys() if p not in products]
-    rows = []
-    for product in products:
-        coin = dict(coins.get(product, {}) or {})
-        market = latest_row_for_product(market_df, product); decision = latest_row_for_product(decisions_df, product); target = latest_row_for_product(targets_df, product)
-        latest_decision_id, _, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, product)
-        if not votes.empty:
-            leanings = [vote_leaning(r) for r in votes.to_dict("records")]
-            consensus = max(["BUY", "SELL", "HOLD", "WAIT"], key=lambda x: leanings.count(x)); buy_votes = leanings.count("BUY"); wait_votes = leanings.count("WAIT")
-        else:
-            consensus = "WAIT"; buy_votes = 0; wait_votes = 0
-        action = str(decision.get("action") or coin.get("decision_action") or "WAIT").upper()
-        owns = bool(coin.get("owns_position") or target.get("has_position"))
-        blocker = str(coin.get("main_blocker") or coin.get("buy_blocker") or decision.get("reason") or decision.get("main_reason") or "")
-        rows.append({"product_id": product, "price": _safe_float(market.get("mid") or coin.get("price")), "spread_bps": _safe_float(market.get("spread_bps") or coin.get("spread_bps")), "action": action, "consensus": consensus, "buy_votes": buy_votes, "wait_votes": wait_votes, "owns_position": owns, "final_buy_score": _safe_float(decision.get("final_buy_score") or coin.get("final_buy_score")), "buy_threshold": _safe_float(decision.get("buy_threshold") or coin.get("buy_threshold")), "expected_utility_bps": _safe_float(decision.get("expected_utility_bps") or coin.get("expected_utility_bps")), "recommended_position_pct": _safe_float(decision.get("recommended_position_pct") or coin.get("recommended_position_pct")), "blocker": plain_reason(blocker), "decision_id": latest_decision_id})
-    rows.sort(key=lambda r: (r["owns_position"], r["action"] == "BUY", r["expected_utility_bps"], r["final_buy_score"], r["buy_votes"]), reverse=True)
-    return rows
+def boolish(value: Any) -> bool:
+    if isinstance(value, bool): return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "ready", "buy_ready"}
 
+
+def calculate_coin_viability(row: dict) -> tuple[float, str]:
+    action = str(row.get("action") or "").upper(); consensus = str(row.get("consensus") or "").upper()
+    final_buy_score = _safe_float(row.get("final_buy_score")); buy_threshold = _safe_float(row.get("buy_threshold")); expected_utility_bps = _safe_float(row.get("expected_utility_bps")); buy_votes = _safe_float(row.get("buy_votes")); wait_votes = _safe_float(row.get("wait_votes")); spread_bps = _safe_float(row.get("spread_bps")); recommended_position_pct = _safe_float(row.get("recommended_position_pct"))
+    buy_gate_tradeable = boolish(row.get("buy_gate_tradeable")); buy_gate_strict_ok = boolish(row.get("buy_gate_strict_ok")); buy_gate_spread_ok = boolish(row.get("buy_gate_spread_ok")); buy_gate_ev_ok = boolish(row.get("buy_gate_ev_ok")); buy_gate_score_ok = boolish(row.get("buy_gate_score_ok")); buy_gate_prob_ok = boolish(row.get("buy_gate_prob_ok"))
+    viability = 0.0; reasons = []; score_margin = final_buy_score - buy_threshold
+    if action == "BUY": viability += 25.0; reasons.append("final action is BUY")
+    elif action == "SHADOW": viability += 12.0; reasons.append("shadow-buy candidate")
+    elif action == "COMMENTARY": viability -= 5.0; reasons.append("commentary only")
+    if consensus == "BUY": viability += 10.0; reasons.append("agent consensus leans BUY")
+    elif consensus == "WAIT": viability -= 4.0; reasons.append("agent consensus leans WAIT")
+    elif consensus == "SELL": viability -= 8.0; reasons.append("agent consensus leans SELL")
+    viability += max(-15.0, min(25.0, score_margin * 45.0)) + max(-20.0, min(30.0, expected_utility_bps / 10.0)) + max(0.0, min(10.0, buy_votes * 0.8)) - max(0.0, min(10.0, wait_votes * 0.25)) + max(0.0, min(8.0, recommended_position_pct * 40.0))
+    if buy_gate_tradeable: viability += 14.0; reasons.append("market telemetry says tradeable")
+    if buy_gate_strict_ok: viability += 6.0
+    if buy_gate_score_ok: viability += 4.0
+    if buy_gate_prob_ok: viability += 4.0
+    if buy_gate_ev_ok: viability += 6.0
+    if buy_gate_spread_ok: viability += 4.0
+    else: viability -= 8.0; reasons.append("spread gate is not clean")
+    if spread_bps > 20: viability -= 10.0; reasons.append("wide spread")
+    elif spread_bps > 10: viability -= 5.0; reasons.append("moderate spread")
+    blocker = str(row.get("blocker") or "").lower()
+    if "stale_market_data" in blocker: viability -= 18.0; reasons.append("stale top-of-book")
+    if "expected_utility_too_low" in blocker: viability -= 16.0; reasons.append("utility too low")
+    if "probability_too_low" in blocker or "probability_below" in blocker: viability -= 10.0; reasons.append("probability not high enough")
+    if "score_below" in blocker: viability -= 8.0; reasons.append("score below calibrated target")
+    if boolish(row.get("owns_position")): viability += 6.0; reasons.append("already held")
+    return round(float(viability), 3), "; ".join(reasons[:4]) or "ranked by score, utility, gates, spread, and consensus"
+
+
+def build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, targets_df) -> list[dict]:
+    coins = snapshot.get("coins", {}) or {}; products = list(snapshot.get("top_products") or []); products += [p for p in coins.keys() if p not in products]; rows = []
+    for product in products:
+        coin = dict(coins.get(product, {}) or {}); market = latest_row_for_product(market_df, product); decision = latest_row_for_product(decisions_df, product); target = latest_row_for_product(targets_df, product); latest_decision_id, _, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, product)
+        if not votes.empty:
+            leanings = [vote_leaning(r) for r in votes.to_dict("records")]; consensus = max(["BUY", "SELL", "HOLD", "WAIT"], key=lambda x: leanings.count(x)); buy_votes = leanings.count("BUY"); wait_votes = leanings.count("WAIT"); sell_votes = leanings.count("SELL"); hold_votes = leanings.count("HOLD")
+        else: consensus = "WAIT"; buy_votes = wait_votes = sell_votes = hold_votes = 0
+        action = str(decision.get("action") or coin.get("decision_action") or market.get("buy_gate_tradeable") or "WAIT").upper()
+        blocker = str(market.get("buy_gate_blocker") or coin.get("main_blocker") or coin.get("buy_blocker") or decision.get("reason") or decision.get("main_reason") or "")
+        row = {"product_id": product, "price": _safe_float(market.get("mid") or coin.get("price")), "spread_bps": _safe_float(market.get("spread_bps") or coin.get("spread_bps")), "action": action, "consensus": consensus, "buy_votes": buy_votes, "sell_votes": sell_votes, "hold_votes": hold_votes, "wait_votes": wait_votes, "owns_position": boolish(coin.get("owns_position") or target.get("has_position")), "final_buy_score": _safe_float(decision.get("final_buy_score") or coin.get("final_buy_score")), "buy_threshold": _safe_float(decision.get("buy_threshold") or coin.get("buy_threshold")), "expected_utility_bps": _safe_float(decision.get("expected_utility_bps") or coin.get("expected_utility_bps")), "recommended_position_pct": _safe_float(decision.get("recommended_position_pct") or coin.get("recommended_position_pct")), "buy_gate_tradeable": market.get("buy_gate_tradeable"), "buy_gate_strict_ok": market.get("buy_gate_strict_ok"), "buy_gate_spread_ok": market.get("buy_gate_spread_ok"), "buy_gate_ev_ok": market.get("buy_gate_ev_ok"), "buy_gate_score_ok": market.get("buy_gate_score_ok"), "buy_gate_prob_ok": market.get("buy_gate_prob_ok"), "blocker": plain_reason(blocker), "decision_id": latest_decision_id}
+        row["viability_score"], row["viability_reason"] = calculate_coin_viability(row); rows.append(row)
+    rows.sort(key=lambda r: (_safe_float(r.get("viability_score")), boolish(r.get("buy_gate_tradeable")), _safe_float(r.get("expected_utility_bps")), _safe_float(r.get("final_buy_score")) - _safe_float(r.get("buy_threshold")), _safe_float(r.get("buy_votes"))), reverse=True)
+    for idx, row in enumerate(rows, start=1): row["rank"] = idx
+    return rows
 
 def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config):
     rows = build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, targets_df)
-    readiness = snapshot.get("readiness", {}) or {}; updated_ts = _safe_float(snapshot.get("updated_ts")); age = max(0.0, time.time() - updated_ts) if updated_ts > 0 else 999999.0
+    readiness = snapshot.get("readiness", {}) or {}
+    updated_ts = _safe_float(snapshot.get("updated_ts"))
+    age = max(0.0, time.time() - updated_ts) if updated_ts > 0 else 999999.0
     st.markdown('<div class="hud-header"><div class="hud-title"><span class="live-pulse"></span>All-Coin Command Deck</div><div class="hud-subtitle">One-glance live stance across every tracked Coinbase product.</div></div>', unsafe_allow_html=True)
-    cols = st.columns(5); cols[0].metric("Tracked Coins", len(rows)); cols[1].metric("Held Positions", sum(1 for r in rows if r["owns_position"])); cols[2].metric("BUY Actions", sum(1 for r in rows if r["action"] == "BUY")); cols[3].metric("Snapshot Age", format_age(age)); cols[4].metric("Refresh", refresh_config.get("interval_label", "manual"))
+    cols = st.columns(5)
+    cols[0].metric("Tracked Coins", len(rows))
+    cols[1].metric("Top Candidate", rows[0]["product_id"] if rows else "None")
+    cols[2].metric("Top Viability", f'{rows[0]["viability_score"]:.1f}' if rows else "0.0")
+    cols[3].metric("BUY Actions", sum(1 for r in rows if r["action"] == "BUY"))
+    cols[4].metric("Snapshot Age", format_age(age))
+    if rows:
+        st.caption(f'Continuously sorted by viability score. Current leader: {rows[0]["product_id"]} — {rows[0]["viability_reason"]}')
     if readiness.get("high_fee_tier_active"):
         st.warning("Strict mode is active: Coinbase fees are high, so the bot needs stronger edge before live entries.")
     html = ['<div class="overview-grid">']
     for row in rows:
         card_state = "buy" if row["action"] == "BUY" else "shadow" if "SHADOW" in row["action"] else "blocked" if row["blocker"] else "wait"
-        html.append(f'''<div class="coin-overview-card {card_state}"><div style="font-size:1.25rem;font-weight:900;">{_html(row["product_id"])}</div><div class="muted">Action: <b>{_html(row["action"])}</b> · Consensus: <b>{_html(row["consensus"])}</b></div><div>Price: <b>{row["price"]:.8f}</b></div><div>Spread: <b>{row["spread_bps"]:.2f} bps</b></div><div>Buy score: <b>{row["final_buy_score"]:.3f}</b> / threshold <b>{row["buy_threshold"]:.3f}</b></div><div>Utility: <b>{row["expected_utility_bps"]:.2f} bps</b></div><div>Size: <b>{row["recommended_position_pct"]:.1%}</b></div><div class="muted">Blocker: {_html(row["blocker"][:180] or "No blocker published.")}</div></div>''')
-    html.append('</div>'); st.markdown("".join(html), unsafe_allow_html=True)
-    with st.expander("All-coin sortable table", expanded=False): st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
+        html.append(f'''
+<div class="coin-overview-card {card_state}">
+    <div style="font-size:1.25rem;font-weight:900;"><span class="rank-badge">#{row["rank"]}</span>{_html(row["product_id"])}</div>
+    <div class="viability-score">Viability {row["viability_score"]:.1f}</div>
+    <div class="viability-reason">{_html(row["viability_reason"])}</div>
+    <div class="muted">Action: <b>{_html(row["action"])}</b> · Consensus: <b>{_html(row["consensus"])}</b></div>
+    <div>Votes: BUY <b>{row["buy_votes"]}</b> · WAIT <b>{row["wait_votes"]}</b> · SELL <b>{row["sell_votes"]}</b> · HOLD <b>{row["hold_votes"]}</b></div>
+    <div>Price: <b>{row["price"]:.8f}</b></div>
+    <div>Spread: <b>{row["spread_bps"]:.2f} bps</b></div>
+    <div>Buy score: <b>{row["final_buy_score"]:.3f}</b> / threshold <b>{row["buy_threshold"]:.3f}</b></div>
+    <div>Utility: <b>{row["expected_utility_bps"]:.2f} bps</b></div>
+    <div>Size: <b>{row["recommended_position_pct"]:.1%}</b></div>
+    <div class="muted">Blocker: {_html(row["blocker"][:180] or "No blocker published.")}</div>
+</div>
+''')
+    html.append('</div>')
+    st.markdown("".join(html), unsafe_allow_html=True)
+    with st.expander("All-coin sortable table", expanded=False):
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 def tradingview_symbol(product_id: str) -> str:
     return f"COINBASE:{str(product_id or '').replace('-', '')}"
@@ -627,29 +690,122 @@ def render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, 
     render_agent_debate_stream(selected, latest_decision_id, drow, votes); render_agent_roster_no_buttons(selected, votes); render_learning_console(selected, votes, decisions_df, market_df, snapshot)
 
 
+def explain_current_trade_state(blocker: str, decision: dict, market: dict) -> str:
+    text = str(blocker or "").lower()
+    if "stale_market_data" in text:
+        return "The setup may look interesting, but the bot does not trust the latest top-of-book quote age enough to place live money."
+    if "expected_utility_too_low" in text:
+        return "The bot sees the trade idea, but the reward after spread and fees is not strong enough."
+    if "probability" in text and "too_low" in text:
+        return "The bot wants a better probability edge before risking live money."
+    if "score_below" in text:
+        return "The setup score is below the calibrated threshold for this product."
+    if boolish(market.get("buy_gate_tradeable")):
+        return "The market telemetry says the coin is currently tradeable, but Level 8 still controls whether this becomes a live entry."
+    if str(decision.get("action") or "").upper() == "SHADOW":
+        return "The bot is shadow-trading this idea for learning, but at least one live-money safety rule is still blocking execution."
+    return "No specific blocker was published. Use the score, utility, spread, and agent disagreement panels to inspect the setup."
+
+
+def build_watch_items(selected_coin: str, coin: dict, market: dict, decision: dict, order_book: dict, target: dict, votes: pd.DataFrame) -> dict:
+    blocker = str(market.get("buy_gate_blocker") or decision.get("reason") or "").lower()
+    spread = _safe_float(market.get("spread_bps"))
+    utility = _safe_float(decision.get("expected_utility_bps") or coin.get("expected_utility_bps"))
+    score = _safe_float(decision.get("final_buy_score") or coin.get("final_buy_score"))
+    threshold = _safe_float(decision.get("buy_threshold") or coin.get("buy_threshold"))
+    main_watch = "Watch for the coin to improve score, utility, spread, and quote freshness at the same time."
+    if "stale_market_data" in blocker:
+        main_watch = "Top-of-book quote freshness is the immediate issue. Patch the keeper loop so the bot can trust live bid/ask."
+    elif utility < 35:
+        main_watch = "Utility is the main weakness. The bot needs more upside after Coinbase fees and spread."
+    elif score < threshold:
+        main_watch = "Score is the main weakness. Wait for stronger alignment across agents."
+    elif boolish(market.get("buy_gate_tradeable")):
+        main_watch = "Telemetry says BUY_READY. Watch whether Level 8 also confirms action."
+    chart_watch = "Watch whether price is accepted above VAH, rejected at POC, or loses VAL."
+    value_state = str(coin.get("value_acceptance_state") or "").lower()
+    if "inside" in value_state:
+        chart_watch = "Price appears inside value. Expect chop unless it accepts above VAH or rejects below VAL."
+    elif "above" in value_state:
+        chart_watch = "Price is above value. Watch whether it holds acceptance or rejects back inside."
+    elif "below" in value_state:
+        chart_watch = "Price is below value. Watch whether it reclaims VAL or continues weakness."
+    order_book_watch = "Watch spread, imbalance, and liquidity risk before trusting live execution."
+    if spread > 20:
+        order_book_watch = "Spread is wide. Live entries need either tighter spread or much stronger projected edge."
+    elif _safe_float(order_book.get("imbalance")) > 0.2:
+        order_book_watch = "Bid-side imbalance is supportive. Watch whether it persists while score and utility improve."
+    elif _safe_float(order_book.get("imbalance")) < -0.2:
+        order_book_watch = "Ask-side imbalance is a headwind. The bot may wait for selling pressure to fade."
+    target_watch = "No live position yet, so target plan is waiting for an entry."
+    if boolish(target.get("has_position")):
+        target_watch = "Position is open. Watch min profitable exit, scalp/core arming, and pullback trigger prices."
+    return {"main_watch": main_watch, "chart_watch": chart_watch, "order_book_watch": order_book_watch, "target_watch": target_watch}
+
+
 def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df):
-    st.markdown('<div class="hud-header"><div class="hud-title">Deep Learning Context</div><div class="hud-subtitle">What the bot is watching across chart, order-book, council, and target context.</div></div>', unsafe_allow_html=True)
-    coin = dict((snapshot.get("coins", {}) or {}).get(st.session_state.get("selected_coin", selected), {}) or {}); render_coin_analytics(coin)
-    with st.expander("Context Panels", expanded=True): st.json({k: coin.get(k) for k in ["value_acceptance_state", "volume_node_state", "previous_session_profile_reaction_state", "quant_boundary_state", "order_book_reason", "product_calibration_ready", "extended_chart_cache_running", "last_extended_chart_refresh_ts"]})
-    for name, df in [("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df), ("order_book_snapshots", order_book_df), ("position_targets", targets_df)]:
-        with st.expander(name, expanded=False): st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
+    selected_coin = st.session_state.get("selected_coin", selected)
+    coin = dict((snapshot.get("coins", {}) or {}).get(selected_coin, {}) or {})
+    market = latest_row_for_product(market_df, selected_coin)
+    decision = latest_row_for_product(decisions_df, selected_coin)
+    order_book = latest_row_for_product(order_book_df, selected_coin)
+    target = latest_row_for_product(targets_df, selected_coin)
+    _, _, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected_coin)
+    st.markdown(f'<div class="hud-header"><div class="hud-title">Deep Learning Context</div><div class="hud-subtitle">{_html(selected_coin)} · what the bot is watching, why it is waiting, and what would need to change.</div></div>', unsafe_allow_html=True)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Decision", str(decision.get("action") or coin.get("decision_action") or "WAIT"))
+    col2.metric("Buy Score", f'{_safe_float(decision.get("final_buy_score") or coin.get("final_buy_score")):.3f}')
+    col3.metric("Threshold", f'{_safe_float(decision.get("buy_threshold") or coin.get("buy_threshold")):.3f}')
+    col4.metric("Expected Utility", f'{_safe_float(decision.get("expected_utility_bps") or coin.get("expected_utility_bps")):.2f} bps')
+    blocker = str(market.get("buy_gate_blocker") or coin.get("main_blocker") or coin.get("buy_blocker") or decision.get("reason") or "")
+    watch_items = build_watch_items(selected_coin, coin, market, decision, order_book, target, votes)
+    st.markdown('<div class="context-grid">', unsafe_allow_html=True)
+    st.markdown(f'''<div class="context-card"><h3>1. Current Trade Lesson</h3><b>Plain-English state:</b><br>{_html(explain_current_trade_state(blocker, decision, market))}<div class="watch-list"><b>Watch next:</b><br>{_html(watch_items.get("main_watch", "Wait for a cleaner published setup."))}</div></div>''', unsafe_allow_html=True)
+    st.markdown(f'''<div class="context-card"><h3>2. Chart + Volume Profile</h3><b>POC:</b> {_safe_float(coin.get("point_of_control")):.8f}<br><b>VAH:</b> {_safe_float(coin.get("value_area_high")):.8f}<br><b>VAL:</b> {_safe_float(coin.get("value_area_low")):.8f}<br><b>Value state:</b> {_html(coin.get("value_acceptance_state") or "not published")}<br><b>Volume node:</b> {_html(coin.get("volume_node_state") or "not published")}<div class="watch-list"><b>Watch next:</b><br>{_html(watch_items.get("chart_watch", "Look for price accepting above value or rejecting below value."))}</div></div>''', unsafe_allow_html=True)
+    st.markdown(f'''<div class="context-card"><h3>3. Order Book + Fees</h3><b>Spread:</b> {_safe_float(market.get("spread_bps")):.2f} bps<br><b>Bid depth:</b> {_safe_float(order_book.get("bid_depth_usd")):.2f}<br><b>Ask depth:</b> {_safe_float(order_book.get("ask_depth_usd")):.2f}<br><b>Imbalance:</b> {_safe_float(order_book.get("imbalance")):.3f}<br><b>Liquidity risk:</b> {_safe_float(order_book.get("liquidity_risk_score")):.3f}<div class="watch-list"><b>Watch next:</b><br>{_html(watch_items.get("order_book_watch", "Wait for tighter spread and healthier bid/ask depth."))}</div></div>''', unsafe_allow_html=True)
+    st.markdown(f'''<div class="context-card"><h3>4. Targets + Sell Plan</h3><b>Has position:</b> {_html(target.get("has_position", False))}<br><b>Average entry:</b> {_safe_float(target.get("avg_entry_price")):.8f}<br><b>Min profitable exit:</b> {_safe_float(target.get("min_profitable_exit_price")):.8f}<br><b>Scalp target:</b> {_safe_float(target.get("scalp_target_price")):.8f}<br><b>Core target:</b> {_safe_float(target.get("core_target_price")):.8f}<div class="watch-list"><b>Watch next:</b><br>{_html(watch_items.get("target_watch", "No live position yet, so target plan is waiting for entry."))}</div></div>''', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    with st.expander("Agent disagreement behind this context", expanded=False):
+        render_agent_disagreement_summary(votes)
+        display_cols = [c for c in ["agent", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reason"] if c in votes.columns]
+        if display_cols and not votes.empty:
+            st.dataframe(votes[display_cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("No council vote rows yet for this coin.")
+    with st.expander("Raw context rows", expanded=False):
+        st.write("Latest market row"); st.json(market); st.write("Latest decision row"); st.json(decision); st.write("Latest order-book row"); st.json(order_book); st.write("Latest target row"); st.json(target)
 
 
 def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
-    st.json(snapshot.get("readiness", {}) or {})
+    readiness = snapshot.get("readiness", {}) or {}
+    cols = st.columns(6)
+    cols[0].metric("WebSocket Recent", str(readiness.get("websocket_recent")))
+    cols[1].metric("Safe Overnight", str(readiness.get("safe_to_run_overnight")))
+    cols[2].metric("Micro Ready", str(readiness.get("micro_history_ready")))
+    cols[3].metric("Macro Ready", str(readiness.get("macro_ready")))
+    cols[4].metric("Calibrated", f'{readiness.get("product_calibration_ready_count", 0)}/{readiness.get("product_count", 0)}')
+    cols[5].metric("TOB Keeper", str(readiness.get("top_of_book_keeper_running")))
+    last_tob_keeper = _safe_float(readiness.get("last_tob_keeper_cycle_ts"))
+    if last_tob_keeper > 0:
+        st.caption(f"Last top-of-book keeper cycle age: {format_age(max(0.0, time.time() - last_tob_keeper))}")
+    if readiness.get("websocket_recent") is False:
+        st.warning("WebSocket/top-of-book freshness is not healthy. The bot may shadow valid setups as stale_market_data until top-of-book refresh is repaired.")
+    if readiness.get("safe_to_run_overnight") is False:
+        st.warning("safe_to_run_overnight is false. Check websocket freshness, duplicate process status, writable logs, and risk pause status before unattended running.")
+    st.json(readiness)
     for name, df in [("trades", trades_df), ("orders", orders_df), ("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df)]:
-        with st.expander(name, expanded=False): st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
-
+        with st.expander(name, expanded=False):
+            st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
 
 def render_live_dashboard(selected, timeframe, overlays, full_chart, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": timeframe, "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
     snapshot = load_viewer_snapshot(); market_df = load_csv(MARKET_CSV_PATH); decisions_df = load_csv(COUNCIL_DECISIONS_PATH); council_votes_df = load_csv(COUNCIL_VOTES_CSV_PATH); targets_df = load_csv(POSITION_TARGETS_PATH); trades_df = load_csv(TRADES_CSV_PATH); orders_df = load_csv(ORDERS_CSV_PATH); shadow_df = load_csv(SHADOW_TRADES_CSV_PATH); order_book_df = load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
-    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<section class="screen-section">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
 def main() -> None:

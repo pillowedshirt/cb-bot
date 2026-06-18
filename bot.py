@@ -19,6 +19,7 @@ import uuid
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass, field
 from collections import deque
+from io import StringIO
 from typing import Dict, Deque, List, Optional, Set, Tuple, Any
 
 import numpy as np
@@ -206,6 +207,7 @@ EXTENDED_CHART_JOBS_PER_PASS: int = 1
 COINBASE_CANDLE_REQUEST_PAUSE_SEC: float = 0.45
 COINBASE_CANDLE_429_BACKOFF_SEC: float = 6.0
 POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
+SHADOW_SELL_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
@@ -253,7 +255,20 @@ RUNTIME_CSV_ROW_LIMITS = {
     "decision_audit.csv": 50000,
     "order_book_snapshots.csv": 15000,
     "signal_events.csv": 30000,
+    "shadow_sell_replay.csv": 50000,
 }
+
+SHADOW_SELL_REPLAY_COLUMNS: List[str] = [
+    "ts", "dt_mst", "replay_key", "decision_id", "product_id", "decision_ts",
+    "entry_price", "entry_fee_bps", "exit_fee_bps", "synthetic_notional_usd",
+    "synthetic_qty", "all_in_entry_price", "min_profitable_exit_price",
+    "hard_stop_price", "exit_ts", "exit_price", "exit_reason", "held_seconds",
+    "max_favorable_bps", "max_adverse_bps", "peak_price", "trough_price",
+    "gross_pnl_usd", "exit_fee_usd", "net_pnl_usd", "net_pnl_bps",
+    "would_have_won", "would_have_hit_stop", "would_have_hit_min_profit",
+    "decision_action", "decision_bucket", "decision_strategy", "final_buy_score",
+    "buy_threshold", "truth_score", "recommended_position_pct", "reason",
+]
 
 RUNTIME_CSV_COMPACT_EVERY_SEC = 15 * 60
 
@@ -289,6 +304,7 @@ STARTUP_STATE_CSV_PATHS: List[str] = [
     MAKER_FILL_OUTCOMES_CSV_PATH,
     ADAPTIVE_GUARDRAILS_CSV_PATH,
     BACKTEST_SUMMARY_CSV_PATH,
+    SHADOW_SELL_REPLAY_CSV_PATH,
 ]
 
 
@@ -802,6 +818,14 @@ LEVEL8_MISSED_REVIEW_EVERY_SEC: float = 60.0
 LEVEL8_MISSED_MOVE_THRESHOLD_RELIEF: float = 0.04
 LEVEL8_MISSED_MOVE_MAX_RELIEF: float = 0.12
 
+ENABLE_SHADOW_SELL_REPLAY: bool = True
+SHADOW_SELL_REPLAY_EVERY_SEC: float = 60.0
+SHADOW_SELL_REPLAY_MAX_ROWS_PER_PASS: int = 250
+SHADOW_SELL_REPLAY_MAX_DECISION_AGE_HOURS: float = 24.0
+SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES: int = 5
+SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES: int = 120
+SHADOW_SELL_REPLAY_SYNTHETIC_NOTIONAL_USD: float = 5.0
+
 # Max total exposure per product can reach 80% of total equity through scale-ins.
 MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.80
 
@@ -902,6 +926,8 @@ MAKER_FIRST_BUY_TIMEOUT_SEC: float = 7.0
 MAKER_FIRST_SELL_TIMEOUT_SEC: float = 8.0
 MAKER_FIRST_REPRICE_SEC: float = 2.0
 ALLOW_MARKET_FALLBACK_FOR_BUYS: bool = False
+MIN_BUY_FILL_RATIO_TO_ACCEPT_AS_POSITION: float = 0.98
+ALLOW_PARTIAL_MAKER_BUY_POSITION: bool = True
 ALLOW_MARKET_FALLBACK_FOR_PROFIT_SELLS: bool = True
 HARD_EXIT_USES_MARKET: bool = True
 MARKET_FALLBACK_BUY_MIN_FINAL_SCORE: float = 0.82
@@ -5750,6 +5776,17 @@ class LivePortfolio:
                     except Exception:
                         pass
 
+                    partial_fill_ratio = 1.0
+                    try:
+                        if side_u == "BUY" and quote_usd and float(quote_usd) > 0 and notional_f is not None:
+                            partial_fill_ratio = float(notional_f) / max(float(quote_usd), 1e-9)
+                    except Exception:
+                        partial_fill_ratio = 1.0
+
+                    status_label = "FILLED"
+                    if side_u == "BUY" and partial_fill_ratio < 0.98:
+                        status_label = "PARTIAL_FILLED_REPORTED"
+
                     return ExecutionResult(
                         ok=True,
                         order_id=order_id,
@@ -5760,7 +5797,7 @@ class LivePortfolio:
                         avg_price=(float(avg_px_f) if avg_px_f else None),
                         fee_usd=float(fee_f or 0.0),
                         filled_notional_usd=(float(notional_f) if notional_f else None),
-                        status="FILLED",
+                        status=status_label,
                         error=None,
                     ).to_dict()
 
@@ -5823,6 +5860,9 @@ class TradingBot:
         self.week_writer = CandleCSVWriter(MACRO_WEEK_CSV)
         self.day_writer = CandleCSVWriter(MACRO_DAY_CSV)
         self.levels_writer = MacroLevelsCSVWriter(MACRO_LEVELS_CSV)
+        self._ensure_shadow_sell_replay_header()
+        self._last_shadow_sell_replay_ts = 0.0
+        self._shadow_sell_replay_running = False
 
         log(
             f"[startup-state] existing_runtime_csv_state="
@@ -14958,6 +14998,8 @@ class TradingBot:
                 note=(
                     f"adopted_after_uncertain_buy "
                     f"requested_quote_usd={requested_quote:.6f} "
+                    f"filled_notional_usd={raw_notional:.6f} "
+                    f"fill_status=adopted_balance_delta "
                     f"raw_fill_price={raw_fill_price:.8f} "
                     f"all_in_entry_price={all_in_entry_price:.8f} "
                     f"estimated_buy_fee_usd={estimated_buy_fee:.6f} "
@@ -15595,6 +15637,171 @@ class TradingBot:
             f"required={required_ready} missing={missing}; "
             f"trading will skip products without fresh bid/ask"
         )
+
+    def _ensure_shadow_sell_replay_header(self) -> None:
+        try:
+            if os.path.exists(SHADOW_SELL_REPLAY_CSV_PATH) and os.path.getsize(SHADOW_SELL_REPLAY_CSV_PATH) > 0:
+                return
+            with open(SHADOW_SELL_REPLAY_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(SHADOW_SELL_REPLAY_COLUMNS)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "ensure_shadow_sell_replay_header_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+
+    def _read_csv_tail_for_bot(self, path: str, max_lines: int = 50000) -> pd.DataFrame:
+        try:
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                return pd.DataFrame()
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                header = f.readline()
+                rows = deque(f, maxlen=max(1, int(max_lines)))
+            if not header:
+                return pd.DataFrame()
+            return pd.read_csv(StringIO(header + "".join(rows)))
+        except Exception as exc:
+            module_exception(MODULE_NAME, "bot_csv_tail_read_failed", exc, data={"path": path, "max_lines": max_lines, "traceback": traceback.format_exc()}, also_overall=False)
+            return pd.DataFrame()
+
+    def _micro_candles_for_replay_window(self, *, product_id: str, start_ts: float, end_ts: float) -> pd.DataFrame:
+        try:
+            live_series = self.live_1m.get(product_id)
+            if live_series is not None and getattr(live_series, "candles", None):
+                rows = []
+                for c in list(live_series.candles):
+                    ts_val = float(getattr(c, "ts", 0.0))
+                    if float(start_ts) <= ts_val <= float(end_ts):
+                        rows.append({"ts": ts_val, "open": float(getattr(c, "open", 0.0)), "high": float(getattr(c, "high", 0.0)), "low": float(getattr(c, "low", 0.0)), "close": float(getattr(c, "close", 0.0)), "volume": float(getattr(c, "volume", 0.0) or 0.0)})
+                if rows:
+                    return pd.DataFrame(rows).sort_values("ts")
+            frame = self._read_csv_tail_for_bot(MICRO_HISTORY_CSV_PATH, max_lines=50000)
+            if frame.empty or "product_id" not in frame.columns:
+                return pd.DataFrame()
+            frame = frame[frame["product_id"].astype(str).eq(str(product_id))].copy()
+            if frame.empty:
+                return pd.DataFrame()
+            frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce")
+            frame = frame.dropna(subset=["ts"])
+            frame = frame[(frame["ts"] >= float(start_ts)) & (frame["ts"] <= float(end_ts))].copy()
+            for col in ["open", "high", "low", "close", "volume"]:
+                if col in frame.columns:
+                    frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            return frame.dropna(subset=["open", "high", "low", "close"]).sort_values("ts")
+        except Exception as exc:
+            module_exception(MODULE_NAME, "micro_candles_for_replay_window_failed", exc, data={"product_id": product_id, "start_ts": start_ts, "end_ts": end_ts, "traceback": traceback.format_exc()}, also_overall=False)
+            return pd.DataFrame()
+
+    def _simulate_shadow_sell_for_decision(self, *, decision_row: Dict[str, Any], candles: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        try:
+            product_id = str(decision_row.get("product_id") or "")
+            decision_id = str(decision_row.get("decision_id") or "")
+            decision_ts = float(decision_row.get("ts") or 0.0)
+            if not product_id or not decision_id or decision_ts <= 0 or candles.empty:
+                return None
+            entry_price = self._market_price_near_ts(product_id=product_id, target_ts=decision_ts, max_age_sec=180.0)
+            if entry_price is None or float(entry_price) <= 0:
+                first = candles.iloc[0].to_dict()
+                entry_price = float(first.get("open") or first.get("close") or 0.0)
+            if not entry_price or float(entry_price) <= 0:
+                return None
+            entry_fee_bps = float(self._entry_fee_bps_for_mode(execution_mode=ENTRY_EXECUTION_MODE))
+            exit_fee_bps = float(self._exit_fee_bps_for_mode())
+            synthetic_notional = float(SHADOW_SELL_REPLAY_SYNTHETIC_NOTIONAL_USD)
+            entry_fee_usd = fee_usd(synthetic_notional, entry_fee_bps)
+            synthetic_qty = synthetic_notional / float(entry_price)
+            all_in_entry_price = (synthetic_notional + entry_fee_usd) / max(synthetic_qty, 1e-12)
+            min_profitable_exit_price = float(required_exit_price_for_net_gain(effective_entry_price=float(all_in_entry_price), exit_fee_bps=float(exit_fee_bps), est_slippage_bps=EST_SLIPPAGE_BPS, est_adverse_fill_bps=EST_ADVERSE_FILL_BPS, min_net_gain_bps=max(MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT, MIN_NET_GAIN_AFTER_FEES_BPS)))
+            hard_stop_price = float(all_in_entry_price) * (1.0 - float(MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT))
+            profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
+            scalp_pullback_pct = float(getattr(profile, "scalp_pullback_pct", 0.0025) or 0.0025)
+            max_hold_sec = float(LEVEL8_MAX_HOLD_SEC)
+            min_hold_sec = float(LEVEL8_MIN_HOLD_SEC)
+            peak_price = float(entry_price); trough_price = float(entry_price); profit_armed = False
+            exit_ts = None; exit_price = None; exit_reason = ""
+            for _, candle in candles.iterrows():
+                ts_val = float(candle.get("ts") or 0.0)
+                if ts_val < decision_ts:
+                    continue
+                age_sec = ts_val - decision_ts
+                high = float(candle.get("high") or 0.0); low = float(candle.get("low") or 0.0); close = float(candle.get("close") or 0.0)
+                if high > 0: peak_price = max(peak_price, high)
+                if low > 0: trough_price = min(trough_price, low)
+                if low > 0 and low <= hard_stop_price:
+                    exit_ts = ts_val; exit_price = hard_stop_price; exit_reason = "shadow_hard_stop"; break
+                if age_sec >= min_hold_sec and high >= min_profitable_exit_price:
+                    profit_armed = True
+                if profit_armed:
+                    pullback_trigger = float(peak_price) * (1.0 - float(scalp_pullback_pct))
+                    if close > 0 and close <= pullback_trigger:
+                        exit_ts = ts_val; exit_price = close; exit_reason = "shadow_profit_pullback"; break
+                if age_sec >= max_hold_sec:
+                    exit_ts = ts_val; exit_price = close if close > 0 else peak_price; exit_reason = "shadow_max_hold_exit"; break
+            if exit_ts is None:
+                last = candles.iloc[-1].to_dict()
+                exit_ts = float(last.get("ts") or decision_ts); exit_price = float(last.get("close") or entry_price); exit_reason = "shadow_latest_available_exit"
+            gross_proceeds = synthetic_qty * float(exit_price)
+            exit_fee = fee_usd(gross_proceeds, exit_fee_bps)
+            net_pnl = gross_proceeds - synthetic_notional - entry_fee_usd - exit_fee
+            gross_pnl = gross_proceeds - synthetic_notional
+            net_pnl_bps = (net_pnl / max(synthetic_notional, 1e-12)) * 10000.0
+            max_favorable_bps = ((peak_price / float(entry_price)) - 1.0) * 10000.0
+            max_adverse_bps = ((trough_price / float(entry_price)) - 1.0) * 10000.0
+            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": f"{decision_id}|{int(SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES)}", "decision_id": decision_id, "product_id": product_id, "decision_ts": decision_ts, "entry_price": float(entry_price), "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(decision_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "shadow_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "decision_action": str(decision_row.get("action") or ""), "decision_bucket": str(decision_row.get("bucket") or ""), "decision_strategy": str(decision_row.get("strategy") or ""), "final_buy_score": float(decision_row.get("final_buy_score") or 0.0), "buy_threshold": float(decision_row.get("buy_threshold") or 0.0), "truth_score": float(decision_row.get("truth_score") or 0.0), "recommended_position_pct": float(decision_row.get("recommended_position_pct") or 0.0), "reason": f"shadow_sell_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};min_profit_px={min_profitable_exit_price:.8f}"}
+        except Exception as exc:
+            module_exception(MODULE_NAME, "simulate_shadow_sell_for_decision_failed", exc, data={"decision_id": decision_row.get("decision_id", ""), "product_id": decision_row.get("product_id", ""), "traceback": traceback.format_exc()}, also_overall=False)
+            return None
+
+    def _review_shadow_sell_replay(self) -> None:
+        if not bool(ENABLE_SHADOW_SELL_REPLAY):
+            return
+        now_value = now_ts()
+        if now_value - float(getattr(self, "_last_shadow_sell_replay_ts", 0.0) or 0.0) < float(SHADOW_SELL_REPLAY_EVERY_SEC):
+            return
+        self._last_shadow_sell_replay_ts = now_value
+        self._ensure_shadow_sell_replay_header()
+        try:
+            decisions = self._read_csv_tail_for_bot(LEVEL8_COUNCIL_DECISIONS_CSV_PATH, max_lines=20000)
+            if decisions.empty:
+                return
+            required = {"ts", "decision_id", "product_id", "action"}
+            if not required.issubset(set(decisions.columns)):
+                return
+            decisions["ts"] = pd.to_numeric(decisions["ts"], errors="coerce")
+            decisions = decisions.dropna(subset=["ts"])
+            min_age_sec = float(SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES) * 60.0
+            max_age_sec = float(SHADOW_SELL_REPLAY_MAX_DECISION_AGE_HOURS) * 3600.0
+            reviewable = decisions[(decisions["ts"] <= now_value - min_age_sec) & (decisions["ts"] >= now_value - max_age_sec) & (decisions["action"].astype(str).str.upper().isin(["SHADOW", "COMMENTARY", "WAIT"]))].copy()
+            if reviewable.empty:
+                return
+            existing_keys = set()
+            if os.path.exists(SHADOW_SELL_REPLAY_CSV_PATH):
+                existing = self._read_csv_tail_for_bot(SHADOW_SELL_REPLAY_CSV_PATH, max_lines=50000)
+                if not existing.empty and "replay_key" in existing.columns:
+                    existing_keys = set(existing["replay_key"].astype(str).tolist())
+            rows_to_write = []
+            for _, decision in reviewable.tail(int(SHADOW_SELL_REPLAY_MAX_ROWS_PER_PASS)).iterrows():
+                decision_row = decision.to_dict()
+                decision_id = str(decision_row.get("decision_id") or "")
+                product_id = str(decision_row.get("product_id") or "")
+                decision_ts = float(decision_row.get("ts") or 0.0)
+                if not decision_id or not product_id or decision_ts <= 0:
+                    continue
+                replay_key = f"{decision_id}|{int(SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES)}"
+                if replay_key in existing_keys:
+                    continue
+                candles = self._micro_candles_for_replay_window(product_id=product_id, start_ts=decision_ts, end_ts=decision_ts + float(SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES) * 60.0)
+                if candles.empty:
+                    continue
+                replay_row = self._simulate_shadow_sell_for_decision(decision_row=decision_row, candles=candles)
+                if replay_row:
+                    rows_to_write.append(replay_row); existing_keys.add(replay_key)
+            if not rows_to_write:
+                return
+            with open(SHADOW_SELL_REPLAY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=SHADOW_SELL_REPLAY_COLUMNS)
+                for row in rows_to_write:
+                    writer.writerow({col: row.get(col, "") for col in SHADOW_SELL_REPLAY_COLUMNS})
+            module_debug(MODULE_NAME, "shadow_sell_replay_rows_written", data={"rows": len(rows_to_write), "reviewable": int(len(reviewable))}, level="INFO", also_overall=False)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "review_shadow_sell_replay_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
 
     def _parse_trade_note_float(self, note: Any, key: str) -> Optional[float]:
         """
@@ -19143,27 +19350,16 @@ class TradingBot:
         if spread_bps <= 0:
             spread_bps = _viewer_safe_float(candidate.get("spread_bps", 0.0))
 
-        owns_position = bool(self._has_open_position(product_id)) if hasattr(self, "_has_open_position") else False
-        position_qty = 0.0
-        avg_entry = 0.0
+        lots = self.positions.get(product_id, []) if hasattr(self, "positions") else []
+        position_qty = sum(float(lot.qty) for lot in lots)
+        owns_position = position_qty > 1e-12
+        avg_entry = (
+            sum(float(lot.qty) * float(lot.price) for lot in lots) / max(float(position_qty), 1e-12)
+            if owns_position
+            else 0.0
+        )
         net_after_exit_bps = 0.0
         peak_unrealized_bps = 0.0
-
-        try:
-            lots = list(getattr(self, "open_lots", {}).get(product_id, []) or [])
-            total_qty = 0.0
-            weighted_cost = 0.0
-            for lot in lots:
-                q = _viewer_safe_float(lot.get("qty", 0.0) or lot.get("base_qty", 0.0))
-                e = _viewer_safe_float(lot.get("entry_price", 0.0) or lot.get("all_in_entry_price", 0.0))
-                if q > 0:
-                    total_qty += q
-                    weighted_cost += q * e
-            if total_qty > 0:
-                position_qty = total_qty
-                avg_entry = weighted_cost / total_qty
-        except Exception:
-            pass
 
         try:
             hold_state = self._build_hold_state_for_product(product_id) if hasattr(self, "_build_hold_state_for_product") else {}
@@ -19522,6 +19718,8 @@ class TradingBot:
                 self._log_hot_loop_timing("runtime_csv_compaction", _e)
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
                 _t = time.perf_counter(); self._schedule_background_work("missed_opportunity_review", "_missed_opportunity_review_running", self._review_level8_missed_opportunities); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["missed_opportunity_review"] = round(_e, 4); self._log_hot_loop_timing("missed_opportunity_review", _e)
+            if bool(ENABLE_SHADOW_SELL_REPLAY):
+                _t = time.perf_counter(); self._schedule_background_work("shadow_sell_replay", "_shadow_sell_replay_running", self._review_shadow_sell_replay); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["shadow_sell_replay"] = round(_e, 4); self._log_hot_loop_timing("shadow_sell_replay", _e)
             _t = time.perf_counter(); self._schedule_background_work("maker_miss_review", "_maker_miss_review_running", self._review_maker_miss_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["maker_miss_review"] = round(_e, 4); self._log_hot_loop_timing("maker_miss_review", _e)
             _t = time.perf_counter(); self._schedule_background_work("sell_quality_review", "_sell_quality_review_running", self._review_sell_quality); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_quality_review"] = round(_e, 4); self._log_hot_loop_timing("sell_quality_review", _e)
             if (
@@ -20935,6 +21133,37 @@ class TradingBot:
                     continue
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
+                requested_quote_for_fill = float(entry_notional)
+                actual_filled_notional = float(filled_notional or 0.0)
+                fill_ratio = (
+                    actual_filled_notional / max(requested_quote_for_fill, 1e-9)
+                    if requested_quote_for_fill > 0
+                    else 1.0
+                )
+                candidate["requested_quote_usd"] = requested_quote_for_fill
+                candidate["filled_notional_usd"] = actual_filled_notional
+                candidate["fill_ratio"] = fill_ratio
+                if fill_ratio < float(MIN_BUY_FILL_RATIO_TO_ACCEPT_AS_POSITION) and not bool(ALLOW_PARTIAL_MAKER_BUY_POSITION):
+                    log(
+                        f"[buy-partial] {product_id} partial fill below acceptance threshold; "
+                        f"requested_quote={requested_quote_for_fill:.6f};"
+                        f"filled_notional={actual_filled_notional:.6f};"
+                        f"fill_ratio={fill_ratio:.6f};"
+                        f"queuing reconciliation instead of adopting as full managed position"
+                    )
+                    self.pending_buy_reconciliations[product_id] = {
+                        "ts": now_ts(),
+                        "product_id": product_id,
+                        "requested_quote_usd": requested_quote_for_fill,
+                        "raw_notional_usd": actual_filled_notional,
+                        "raw_fill_price": float(avg_px),
+                        "estimated_buy_fee_usd": float(fee_val),
+                        "candidate": dict(candidate),
+                        "trade_id": trade_id,
+                        "reason": "partial_fill_below_acceptance_threshold",
+                    }
+                    break
+
                 actual_deployment = float(filled_notional or entry_notional)
                 deployed_this_eval += actual_deployment
                 cash_usd = max(0.0, float(cash_usd) - actual_deployment - float(fee_val))
@@ -21054,12 +21283,30 @@ class TradingBot:
                     self.last_buy_price[product_id] = ask
                     self.anchor_ts[product_id] = ts_now
                     self.peak_bid[product_id] = bid
+                    requested_quote_for_note = float(entry_notional)
+                    filled_notional_for_note = float(filled_notional or 0.0)
+                    partial_fill_ratio = (
+                        filled_notional_for_note / max(requested_quote_for_note, 1e-9)
+                        if requested_quote_for_note > 0
+                        else 0.0
+                    )
+                    fill_status_note = (
+                        "full_or_near_full_fill"
+                        if partial_fill_ratio >= 0.98
+                        else "partial_fill_or_reconciliation_gap"
+                    )
+
                     self.tlog.log_trade(
                         event="BUY", product_id=product_id, side="BUY", qty=qty1, price=buy_px1,
                         fee_usd_val=fee1, gross_pnl_usd=0.0, net_pnl_usd=-fee1,
                         entry_price=buy_px1, exit_price=None, weekly_bias=candidate.get("weekly_bias"),
                         note=(
                             f"{candidate.get('entry_reason', 'score_entry')} "
+                            f"requested_quote_usd={requested_quote_for_note:.6f} "
+                            f"filled_notional_usd={filled_notional_for_note:.6f} "
+                            f"partial_fill_ratio={partial_fill_ratio:.6f} "
+                            f"fill_status={fill_status_note} "
+                            f"sizing_reason={candidate.get('entry_notional_sizing_reason', '')} "
                             f"prob={float(candidate.get('estimated_prob_up', 0.0)):.3f} "
                             f"raw_fill_price={float(buy_px1):.8f} "
                             f"all_in_entry_price={float(eff_price1):.8f} "
@@ -21070,6 +21317,16 @@ class TradingBot:
                         entry_score=float(candidate["score"]), entry_tier=int(candidate["tier"]),
                         expected_net_edge_bps=float(candidate.get("expected_net_edge_bps", 0.0)),
                     )
+                    try:
+                        self._write_position_targets_snapshot()
+                    except Exception as exc:
+                        module_exception(
+                            MODULE_NAME,
+                            "position_targets_write_after_buy_failed",
+                            exc,
+                            data={"product_id": product_id, "traceback": traceback.format_exc()},
+                            also_overall=False,
+                        )
                     self._record_trade_timestamp(product_id)
                     # With small account sizes, one Level 8 buy can consume most of the allowed
                     # deployment. Stop this buy cycle once exposure is near the cap so we do not

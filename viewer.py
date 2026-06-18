@@ -53,6 +53,7 @@ MICRO_HISTORY_CSV_PATH = os.path.join(BASE_DIR, "micro_history.csv")
 MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
 MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
 SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
+SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
 MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
 CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
 CHART_15M_30D_CSV_PATH = os.path.join(BASE_DIR, "chart_15m_30d.csv")
@@ -579,15 +580,24 @@ def build_open_position_lots_from_trades(trades_df: pd.DataFrame, market_df: pd.
             if event == "BUY" or side == "BUY":
                 raw_price = _safe_float(row.get("price"), 0.0)
                 entry_price = _safe_float(row.get("entry_price"), 0.0)
-                all_in_price = parse_note_float(row.get("note", ""), "all_in_entry_price", 0.0)
+                note_text = str(row.get("note", ""))
+                requested_quote = parse_note_float(note_text, "requested_quote_usd", 0.0)
+                filled_notional_note = parse_note_float(note_text, "filled_notional_usd", 0.0)
+                partial_fill_ratio = parse_note_float(note_text, "partial_fill_ratio", 0.0)
+                all_in_price = parse_note_float(note_text, "all_in_entry_price", 0.0)
                 if all_in_price > 0:
                     entry_price = all_in_price
                 elif entry_price <= 0:
                     entry_price = raw_price
                 open_lots_by_product.setdefault(product_id, []).append({
                     "source": "trades_csv", "product_id": product_id, "entry_ts": _safe_float(row.get("ts"), 0.0),
-                    "qty": qty, "entry_price": entry_price, "notional_usd": _safe_float(row.get("notional_usd"), qty * entry_price),
-                    "fee_usd": _safe_float(row.get("fee_usd"), 0.0), "note": str(row.get("note", "")),
+                    "qty": qty, "entry_price": entry_price,
+                    "requested_quote_usd": requested_quote,
+                    "filled_notional_usd": filled_notional_note or _safe_float(row.get("notional_usd"), qty * raw_price),
+                    "notional_usd": _safe_float(row.get("notional_usd"), qty * entry_price),
+                    "fee_usd": _safe_float(row.get("fee_usd"), 0.0),
+                    "partial_fill_ratio": partial_fill_ratio,
+                    "note": note_text,
                 })
             elif event == "SELL" or side == "SELL" or event == "STARTUP_LIQUIDATION":
                 remaining_sell_qty = qty
@@ -669,13 +679,17 @@ def render_held_positions(snapshot: Dict[str, Any], market_df: pd.DataFrame, tra
             entry_price = _safe_float(lot.get("entry_price"), 0.0)
             current_price = _safe_float(lot.get("current_price"), 0.0)
             notional = _safe_float(lot.get("notional_usd") or lot.get("cost_basis"), 0.0)
+            requested_quote = _safe_float(lot.get("requested_quote_usd"), 0.0)
+            filled_notional = _safe_float(lot.get("filled_notional_usd"), 0.0)
+            partial_fill_ratio = _safe_float(lot.get("partial_fill_ratio"), 0.0)
+            partial_fill_html = f'<div class="muted">Partial fill: <b>{partial_fill_ratio * 100.0:.1f}%</b></div>' if partial_fill_ratio > 0 and partial_fill_ratio < 0.98 else ''
             current_value = _safe_float(lot.get("current_value"), 0.0)
             unrealized = _safe_float(lot.get("unrealized_pnl_usd"), 0.0)
             unrealized_pct = _safe_float(lot.get("unrealized_pnl_pct"), 0.0)
             entry_ts = _safe_float(lot.get("entry_ts"), 0.0)
             held_seconds = _safe_float(lot.get("held_seconds"), 0.0)
             pnl_class = "positive" if unrealized >= 0 else "negative"
-            html.append(f'''<div class="held-position-card"><div style="font-size:1.25rem;font-weight:900;">{_html(product_id)}</div><div class="muted">Open position</div><div>Quantity: <b>{qty:.12f}</b></div><div>Bought: <b>{signed_usd(notional)}</b></div><div>Entry price: <b>{entry_price:.8f}</b></div><div>Current price: <b>{current_price:.8f}</b></div><div>Current value: <b>{signed_usd(current_value)}</b></div><div>Purchased: <b>{_html(format_local_datetime(entry_ts))}</b></div><div>Held: <b>{_html(format_hold_duration(held_seconds))}</b></div><div class="position-pnl-banner {pnl_class}">Currently {signed_usd(unrealized)} · {signed_pct(unrealized_pct)}</div></div>''')
+            html.append(f'''<div class="held-position-card"><div style="font-size:1.25rem;font-weight:900;">{_html(product_id)}</div><div class="muted">Open position</div><div>Quantity: <b>{qty:.12f}</b></div><div>Requested order: <b>{signed_usd(requested_quote if requested_quote > 0 else notional)}</b></div><div>Filled amount: <b>{signed_usd(filled_notional if filled_notional > 0 else notional)}</b></div>{partial_fill_html}<div>Entry price: <b>{entry_price:.8f}</b></div><div>Current price: <b>{current_price:.8f}</b></div><div>Current value: <b>{signed_usd(current_value)}</b></div><div>Purchased: <b>{_html(format_local_datetime(entry_ts))}</b></div><div>Held: <b>{_html(format_hold_duration(held_seconds))}</b></div><div class="position-pnl-banner {pnl_class}">Currently {signed_usd(unrealized)} · {signed_pct(unrealized_pct)}</div></div>''')
         html.append('</div>')
         st.markdown("".join(html), unsafe_allow_html=True)
     if recent_sales:
@@ -1584,7 +1598,7 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
         st.write("Latest market row"); st.json(market); st.write("Latest decision row"); st.json(decision); st.write("Latest order-book row"); st.json(order_book); st.write("Latest target row"); st.json(target)
 
 
-def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None):
+def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
     st.metric("Trading Mode", readiness.get("live_trading_mode_label", readiness.get("trading_aggression_mode", "unknown")))
@@ -1640,6 +1654,31 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         if counts["expected_utility_too_low"] > 0:
             st.warning("The main reason no trades are firing is expected_utility_too_low. That means Level 8 thinks the setup does not make enough net profit after Coinbase fees, spread, uncertainty, wait utility, and context penalties.")
             st.info("This is not a viewer failure. It means the bot is finding activity, but Level 8 does not believe the setups are net-profitable enough yet after Coinbase costs and context penalties.")
+
+
+    st.markdown("### Shadow Sell Replay")
+    if shadow_sell_replay_df is None or shadow_sell_replay_df.empty:
+        st.info("No shadow sell replay rows yet. The bot will start filling shadow_sell_replay.csv after shadow decisions have enough future candles to replay exits.")
+    else:
+        replay = shadow_sell_replay_df.copy()
+        wins = pd.to_numeric(replay.get("would_have_won", pd.Series(dtype=float)), errors="coerce").fillna(0)
+        net = pd.to_numeric(replay.get("net_pnl_bps", pd.Series(dtype=float)), errors="coerce").dropna()
+        stops = pd.to_numeric(replay.get("would_have_hit_stop", pd.Series(dtype=float)), errors="coerce").fillna(0)
+        min_profit = pd.to_numeric(replay.get("would_have_hit_min_profit", pd.Series(dtype=float)), errors="coerce").fillna(0)
+        cols = st.columns(5)
+        cols[0].metric("Replay Rows", len(replay))
+        cols[1].metric("Win Rate", f"{wins.mean() * 100.0:.1f}%" if len(wins) else "0.0%")
+        cols[2].metric("Median Net", f"{net.median():.2f} bps" if not net.empty else "0.00 bps")
+        cols[3].metric("Stop Hit Rate", f"{stops.mean() * 100.0:.1f}%" if len(stops) else "0.0%")
+        cols[4].metric("Min Profit Hit", f"{min_profit.mean() * 100.0:.1f}%" if len(min_profit) else "0.0%")
+        if not net.empty:
+            if net.median() > 0:
+                st.success("The shadow sell replay is currently net-positive at the median. This suggests the sell model may be able to turn some shadow entries into profitable exits.")
+            else:
+                st.warning("The shadow sell replay is currently net-negative at the median. This means buying all shadow entries would still likely lose money with the current sell model.")
+        with st.expander("Latest shadow sell replay rows", expanded=False):
+            show_cols = [c for c in ["product_id", "decision_id", "entry_price", "exit_price", "exit_reason", "net_pnl_bps", "max_favorable_bps", "max_adverse_bps", "would_have_won", "would_have_hit_stop", "would_have_hit_min_profit"] if c in replay.columns]
+            st.dataframe(replay.tail(200)[show_cols], width="stretch", hide_index=True)
 
     st.markdown("### Overnight Run Summary")
     try:
@@ -1707,10 +1746,11 @@ def render_live_dashboard(selected, refresh_config):
     shadow_df = load_csv_tail(SHADOW_TRADES_CSV_PATH, max_lines=6000)
     order_book_df = load_csv_tail(ORDER_BOOK_SNAPSHOTS_PATH, max_lines=6000)
     missed_df = load_csv_tail(MISSED_OPPORTUNITIES_CSV_PATH, max_lines=5000)
+    shadow_sell_replay_df = load_csv_tail(SHADOW_SELL_REPLAY_CSV_PATH, max_lines=20000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
 def main() -> None:

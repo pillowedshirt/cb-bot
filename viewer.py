@@ -102,6 +102,74 @@ def _html(value: Any) -> str:
     return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+
+def local_tzinfo():
+    try:
+        return datetime.now().astimezone().tzinfo
+    except Exception:
+        return timezone.utc
+
+
+def local_timezone_label() -> str:
+    try:
+        dt = datetime.now().astimezone()
+        return dt.tzname() or str(dt.tzinfo) or "local time"
+    except Exception:
+        return "local time"
+
+
+def format_local_datetime(ts_value: Any) -> str:
+    try:
+        ts_float = _safe_float(ts_value, 0.0)
+        if ts_float <= 0:
+            return "unknown"
+        dt = datetime.fromtimestamp(ts_float, tz=local_tzinfo())
+        return dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    except Exception:
+        return "unknown"
+
+
+def format_hold_duration(seconds_value: Any) -> str:
+    try:
+        seconds = max(0, int(float(seconds_value or 0)))
+    except Exception:
+        seconds = 0
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes > 0:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def signed_usd(value: Any) -> str:
+    amount = _safe_float(value, 0.0)
+    sign = "+" if amount >= 0 else "-"
+    return f"{sign}${abs(amount):.2f}"
+
+
+def signed_pct(value: Any) -> str:
+    amount = _safe_float(value, 0.0)
+    sign = "+" if amount >= 0 else "-"
+    return f"{sign}{abs(amount):.2f}%"
+
+
+def parse_note_float(note: Any, key: str, default: float = 0.0) -> float:
+    try:
+        text = str(note or "")
+        marker = f"{key}="
+        if marker not in text:
+            return float(default)
+        raw = text.split(marker, 1)[1].split()[0].split(";")[0].strip()
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 def inject_crypto_game_css() -> None:
     st.markdown("""
 <style>
@@ -138,6 +206,30 @@ def inject_crypto_game_css() -> None:
 .good { color: #39f5a3; font-weight: 800; } .warn { color: #ffd166; font-weight: 800; } .danger { color: #ff5c7a; font-weight: 800; } .muted { color: #8db7c8; }
 div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid rgba(80,220,255,.15); padding: 8px 10px; border-radius: 12px; }
 .screen-section { width: 100%; display: block; padding: 0.35rem 0 0.75rem 0; margin: 0; border-bottom: 1px solid rgba(80, 220, 255, 0.08); }
+.held-banner {
+    max-width: 760px;
+    margin: 0.9rem auto 1rem auto;
+    border: 1px solid rgba(255, 214, 102, 0.55);
+    border-radius: 18px;
+    padding: 0.85rem 1rem;
+    background: rgba(255, 214, 102, 0.12);
+    color: #ffd166;
+    text-align: center;
+    font-weight: 900;
+    letter-spacing: 0.02em;
+}
+.held-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+.held-position-card { position: relative; border: 1px solid rgba(255, 214, 102, 0.32); border-radius: 18px; padding: 0.9rem 0.9rem 3.2rem 0.9rem; background: rgba(6, 18, 32, 0.90); min-height: 270px; overflow: hidden; }
+.held-position-card.sold-profit { border-color: rgba(57, 245, 163, 0.55); background: linear-gradient(180deg, rgba(7, 42, 30, 0.92), rgba(6, 18, 32, 0.94)); }
+.held-position-card.sold-loss { border-color: rgba(255, 92, 122, 0.60); background: linear-gradient(180deg, rgba(56, 12, 22, 0.92), rgba(6, 18, 32, 0.94)); }
+.position-pnl-banner { position: absolute; left: 0; right: 0; bottom: 0; padding: 0.65rem; font-weight: 900; text-align: center; }
+.position-pnl-banner.positive { background: rgba(57, 245, 163, 0.18); color: #39f5a3; border-top: 1px solid rgba(57, 245, 163, 0.45); }
+.position-pnl-banner.negative { background: rgba(255, 92, 122, 0.18); color: #ff5c7a; border-top: 1px solid rgba(255, 92, 122, 0.45); }
+.sale-result-overlay { position: absolute; top: 0.75rem; right: 0.75rem; border-radius: 999px; padding: 0.25rem 0.6rem; font-size: 0.78rem; font-weight: 900; }
+.sale-result-overlay.profit { background: rgba(57, 245, 163, 0.20); color: #39f5a3; border: 1px solid rgba(57, 245, 163, 0.50); }
+.sale-result-overlay.loss { background: rgba(255, 92, 122, 0.20); color: #ff5c7a; border: 1px solid rgba(255, 92, 122, 0.50); }
+@media (max-width: 900px) { .held-grid { grid-template-columns: 1fr; } }
+
 .screen-section.command-deck { min-height: auto; }
 .screen-section.strategy-arena { min-height: auto; }
 .screen-section.deep-learning { min-height: auto; }
@@ -403,7 +495,7 @@ def render_overlay_controls():
         "level8_markers": "Level 8 action markers",
     }
 
-    with st.expander("Chart overlays", expanded=True):
+    with st.expander("Chart overlays", expanded=False):
         st.caption("Toggle every line or marker the bot can display on the chart.")
         cols = st.columns(2)
         toggles = {}
@@ -413,15 +505,137 @@ def render_overlay_controls():
         return toggles
 
 
-def render_held_positions(snapshot: Dict[str, Any]) -> None:
-    coins = snapshot.get("coins", {}) or {}; held = [(p, dict(c or {})) for p,c in coins.items() if bool((c or {}).get("owns_position", False))]
-    st.markdown('<div class="codex-panel"><b>Held Positions</b><div class="muted">Owned coins appear here before the selected chart.</div></div>', unsafe_allow_html=True)
-    if not held: st.info("No currently held positions."); return
-    cols = st.columns(min(4, max(1, len(held))))
-    for idx, (product_id, coin) in enumerate(held):
-        with cols[idx % len(cols)]:
-            st.metric(product_id, f"{_safe_float(coin.get('price')):.8f}", f"exit {_safe_float(coin.get('net_after_exit_bps')):.2f} bps")
 
+def build_open_position_lots_from_trades(trades_df: pd.DataFrame, market_df: pd.DataFrame, targets_df: pd.DataFrame) -> list[dict]:
+    '''Reconstruct currently open lots from trades.csv using FIFO.'''
+    open_lots_by_product: dict[str, list[dict]] = {}
+    if trades_df is not None and not trades_df.empty and "product_id" in trades_df.columns:
+        trades = trades_df.copy()
+        trades["ts_num"] = pd.to_numeric(trades.get("ts"), errors="coerce")
+        trades = trades.dropna(subset=["ts_num"]).sort_values("ts_num")
+        for _, row in trades.iterrows():
+            product_id = str(row.get("product_id") or "").strip()
+            if not product_id:
+                continue
+            event = str(row.get("event") or "").upper().strip()
+            side = str(row.get("side") or "").upper().strip()
+            qty = _safe_float(row.get("qty"), 0.0)
+            if qty <= 0:
+                continue
+            if event == "BUY" or side == "BUY":
+                raw_price = _safe_float(row.get("price"), 0.0)
+                entry_price = _safe_float(row.get("entry_price"), 0.0)
+                all_in_price = parse_note_float(row.get("note", ""), "all_in_entry_price", 0.0)
+                if all_in_price > 0:
+                    entry_price = all_in_price
+                elif entry_price <= 0:
+                    entry_price = raw_price
+                open_lots_by_product.setdefault(product_id, []).append({
+                    "source": "trades_csv", "product_id": product_id, "entry_ts": _safe_float(row.get("ts"), 0.0),
+                    "qty": qty, "entry_price": entry_price, "notional_usd": _safe_float(row.get("notional_usd"), qty * entry_price),
+                    "fee_usd": _safe_float(row.get("fee_usd"), 0.0), "note": str(row.get("note", "")),
+                })
+            elif event == "SELL" or side == "SELL" or event == "STARTUP_LIQUIDATION":
+                remaining_sell_qty = qty
+                lots = open_lots_by_product.get(product_id, [])
+                while remaining_sell_qty > 1e-12 and lots:
+                    first = lots[0]
+                    first_qty = _safe_float(first.get("qty"), 0.0)
+                    if first_qty <= remaining_sell_qty + 1e-12:
+                        remaining_sell_qty -= first_qty
+                        lots.pop(0)
+                    else:
+                        first["qty"] = first_qty - remaining_sell_qty
+                        remaining_sell_qty = 0.0
+                open_lots_by_product[product_id] = lots
+    open_lots = []
+    for product_id, lots in open_lots_by_product.items():
+        market = latest_row_for_product(market_df, product_id)
+        target = latest_row_for_product(targets_df, product_id)
+        current_price = _safe_float(market.get("mid") or target.get("current_bid") or target.get("current_ask"), 0.0)
+        for lot in lots:
+            qty = _safe_float(lot.get("qty"), 0.0)
+            entry_price = _safe_float(lot.get("entry_price"), 0.0)
+            entry_ts = _safe_float(lot.get("entry_ts"), 0.0)
+            current_value = qty * current_price if current_price > 0 else 0.0
+            cost_basis = qty * entry_price if entry_price > 0 else _safe_float(lot.get("notional_usd"), 0.0)
+            open_lots.append({**lot, "current_price": current_price, "current_value": current_value, "cost_basis": cost_basis, "unrealized_pnl_usd": current_value - cost_basis, "unrealized_pnl_pct": ((current_price / entry_price) - 1.0) * 100.0 if current_price > 0 and entry_price > 0 else 0.0, "held_seconds": max(0.0, time.time() - entry_ts) if entry_ts > 0 else 0.0})
+    if open_lots:
+        return open_lots
+    if targets_df is not None and not targets_df.empty and "has_position" in targets_df.columns:
+        for _, row in targets_df.iterrows():
+            if not boolish(row.get("has_position")):
+                continue
+            product_id = str(row.get("product_id") or "").strip()
+            qty = _safe_float(row.get("position_qty"), 0.0)
+            entry_price = _safe_float(row.get("avg_entry_price"), 0.0)
+            current_price = _safe_float(row.get("current_bid") or row.get("current_ask"), 0.0)
+            entry_ts = _safe_float(row.get("entry_ts"), 0.0)
+            if not product_id or qty <= 0:
+                continue
+            cost_basis = qty * entry_price if entry_price > 0 else 0.0
+            current_value = qty * current_price if current_price > 0 else 0.0
+            open_lots.append({"source": "position_targets_fallback", "product_id": product_id, "entry_ts": entry_ts, "qty": qty, "entry_price": entry_price, "notional_usd": cost_basis, "fee_usd": 0.0, "current_price": current_price, "current_value": current_value, "cost_basis": cost_basis, "unrealized_pnl_usd": current_value - cost_basis, "unrealized_pnl_pct": ((current_price / entry_price) - 1.0) * 100.0 if current_price > 0 and entry_price > 0 else 0.0, "held_seconds": max(0.0, time.time() - entry_ts) if entry_ts > 0 else 0.0, "note": str(row.get("exit_plan_note", ""))})
+    return open_lots
+
+
+def build_recent_closed_sales(trades_df: pd.DataFrame, limit: int = 10) -> list[dict]:
+    if trades_df is None or trades_df.empty or "product_id" not in trades_df.columns:
+        return []
+    df = trades_df.copy()
+    df["ts_num"] = pd.to_numeric(df.get("ts"), errors="coerce")
+    df = df.dropna(subset=["ts_num"])
+    event_text = df.get("event", pd.Series("", index=df.index)).astype(str).str.upper()
+    side_text = df.get("side", pd.Series("", index=df.index)).astype(str).str.upper()
+    sales = df[(event_text.eq("SELL")) | (side_text.eq("SELL")) | (event_text.eq("STARTUP_LIQUIDATION"))].copy()
+    if sales.empty:
+        return []
+    out = []
+    for _, row in sales.sort_values("ts_num", ascending=False).head(int(limit)).iterrows():
+        net_pnl = _safe_float(row.get("net_pnl_usd"), 0.0)
+        gross_pnl = _safe_float(row.get("gross_pnl_usd"), 0.0)
+        note = str(row.get("note", ""))
+        exit_role = str(row.get("exit_role", ""))
+        is_stop = net_pnl < 0 or "stop" in note.lower() or "hard_stop" in note.lower() or "stop" in exit_role.lower()
+        out.append({"product_id": str(row.get("product_id") or ""), "sell_ts": _safe_float(row.get("ts"), 0.0), "qty": _safe_float(row.get("qty"), 0.0), "exit_price": _safe_float(row.get("exit_price") or row.get("price"), 0.0), "entry_price": _safe_float(row.get("entry_price"), 0.0), "notional_usd": _safe_float(row.get("notional_usd"), 0.0), "fee_usd": _safe_float(row.get("fee_usd"), 0.0), "gross_pnl_usd": gross_pnl, "net_pnl_usd": net_pnl, "exit_role": exit_role, "note": note, "result_label": "STOP LOSS" if is_stop else "PROFIT", "result_class": "sold-loss" if is_stop else "sold-profit"})
+    return out
+
+
+def render_held_positions(snapshot: Dict[str, Any], market_df: pd.DataFrame, trades_df: pd.DataFrame, targets_df: pd.DataFrame) -> None:
+    open_lots = build_open_position_lots_from_trades(trades_df, market_df, targets_df)
+    recent_sales = build_recent_closed_sales(trades_df, limit=10)
+    st.markdown(f'''<div class="held-banner">Currently Held Positions · Local timezone: {_html(local_timezone_label())}</div>''', unsafe_allow_html=True)
+    if not open_lots:
+        st.info("No currently held positions.")
+    else:
+        html = ['<div class="held-grid">']
+        for lot in open_lots:
+            product_id = str(lot.get("product_id") or "")
+            qty = _safe_float(lot.get("qty"), 0.0)
+            entry_price = _safe_float(lot.get("entry_price"), 0.0)
+            current_price = _safe_float(lot.get("current_price"), 0.0)
+            notional = _safe_float(lot.get("notional_usd") or lot.get("cost_basis"), 0.0)
+            current_value = _safe_float(lot.get("current_value"), 0.0)
+            unrealized = _safe_float(lot.get("unrealized_pnl_usd"), 0.0)
+            unrealized_pct = _safe_float(lot.get("unrealized_pnl_pct"), 0.0)
+            entry_ts = _safe_float(lot.get("entry_ts"), 0.0)
+            held_seconds = _safe_float(lot.get("held_seconds"), 0.0)
+            pnl_class = "positive" if unrealized >= 0 else "negative"
+            html.append(f'''<div class="held-position-card"><div style="font-size:1.25rem;font-weight:900;">{_html(product_id)}</div><div class="muted">Open position</div><div>Quantity: <b>{qty:.12f}</b></div><div>Bought: <b>{signed_usd(notional)}</b></div><div>Entry price: <b>{entry_price:.8f}</b></div><div>Current price: <b>{current_price:.8f}</b></div><div>Current value: <b>{signed_usd(current_value)}</b></div><div>Purchased: <b>{_html(format_local_datetime(entry_ts))}</b></div><div>Held: <b>{_html(format_hold_duration(held_seconds))}</b></div><div class="position-pnl-banner {pnl_class}">Currently {signed_usd(unrealized)} · {signed_pct(unrealized_pct)}</div></div>''')
+        html.append('</div>')
+        st.markdown("".join(html), unsafe_allow_html=True)
+    if recent_sales:
+        st.markdown('<div class="held-banner">Most Recent Closed Sales</div>', unsafe_allow_html=True)
+        html = ['<div class="held-grid">']
+        for sale in recent_sales:
+            product_id = str(sale.get("product_id") or "")
+            result_class = str(sale.get("result_class") or "sold-profit")
+            is_profit = result_class == "sold-profit"
+            overlay_class = "profit" if is_profit else "loss"
+            label = "PROFIT" if is_profit else "STOP LOSS"
+            html.append(f'''<div class="held-position-card {result_class}"><div class="sale-result-overlay {overlay_class}">{label}</div><div style="font-size:1.25rem;font-weight:900;">{_html(product_id)}</div><div class="muted">Closed sale</div><div>Quantity sold: <b>{_safe_float(sale.get("qty")):.12f}</b></div><div>Entry price: <b>{_safe_float(sale.get("entry_price")):.8f}</b></div><div>Exit price: <b>{_safe_float(sale.get("exit_price")):.8f}</b></div><div>Sold: <b>{_html(format_local_datetime(sale.get("sell_ts")))}</b></div><div>Fee: <b>{signed_usd(sale.get("fee_usd"))}</b></div><div>Gross P/L: <b>{signed_usd(sale.get("gross_pnl_usd"))}</b></div><div class="position-pnl-banner {'positive' if is_profit else 'negative'}">Net {signed_usd(sale.get("net_pnl_usd"))}</div></div>''')
+        html.append('</div>')
+        st.markdown("".join(html), unsafe_allow_html=True)
 
 def latest_targets_for_coin(df: pd.DataFrame, product_id: str) -> Dict[str, Any]:
     if df.empty or "product_id" not in df.columns: return {}
@@ -869,7 +1083,7 @@ def build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, tar
     for idx, row in enumerate(rows, start=1): row["rank"] = idx
     return rows
 
-def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config):
+def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config):
     rows = build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, targets_df)
     readiness = snapshot.get("readiness", {}) or {}
     updated_ts = _safe_float(snapshot.get("updated_ts"))
@@ -885,6 +1099,7 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
         st.caption(f'Continuously sorted by viability score. Current leader: {rows[0]["product_id"]} — {rows[0]["viability_reason"]}')
     if readiness.get("high_fee_tier_active"):
         st.warning("Profit-First Fee-Aware Mode is active because Coinbase fees are high. The bot can still trade, but projected net profit must clear maker/taker fees, spread, and execution cost.")
+    render_held_positions(snapshot, market_df, trades_df, targets_df)
     st.markdown('<div class="muted">Tap a coin card to open it in Strategy Arena.</div>', unsafe_allow_html=True)
     for i in range(0, len(rows), 3):
         cols = st.columns(3)
@@ -1034,7 +1249,7 @@ def render_learning_console(selected_coin, votes, decisions_df, market_df, snaps
     render_topic_explanation(topic, selected_coin, votes, decisions_df, market_df, snapshot)
 
 
-def render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
+def render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
     available = get_available_products(snapshot)
     if not available:
         st.info("No products are available yet. Waiting for bot files to populate.")
@@ -1045,9 +1260,28 @@ def render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, d
         current = available[0]
     st.session_state["selected_coin"] = current
     st.session_state["strategy_arena_coin"] = current
-    selected = st.selectbox("Strategy Arena Coin", available, index=available.index(current), key="strategy_arena_coin")
+    selected = st.selectbox(
+        "Strategy Arena Coin",
+        available,
+        index=available.index(current),
+        key="strategy_arena_coin",
+    )
     st.session_state["selected_coin"] = selected
-    st.markdown(f'<div class="hud-header"><div class="hud-title">Strategy Arena</div><div class="hud-subtitle">{_html(selected)} · chart first, analyst debate below.</div></div>', unsafe_allow_html=True)
+
+    timeframe_label = st.radio(
+        "Chart Mode",
+        ["1D · 1m", "7D · 1m", "30D · 15m", "90D · 1h", "2Y · 1d"],
+        horizontal=True,
+        key="chart_timeframe_label",
+    )
+    timeframe = normalize_timeframe_label(timeframe_label)
+    overlays = render_overlay_controls()
+
+    st.markdown(
+        f'<div class="hud-header"><div class="hud-title">Strategy Arena</div>'
+        f'<div class="hud-subtitle">{_html(selected)} · chart first, analyst debate below.</div></div>',
+        unsafe_allow_html=True,
+    )
     chart_df, chart_meta = load_chart_history(selected, timeframe)
     confirmed = confirmed_trades_only(trades_df, selected)
     target = latest_targets_for_coin(targets_df, selected)
@@ -1254,12 +1488,12 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         with st.expander(name, expanded=False):
             st.dataframe(df.tail(100), width="stretch", hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
 
-def render_live_dashboard(selected, timeframe, overlays, refresh_config):
+def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
-    module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": timeframe, "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
+    module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
     snapshot = load_viewer_snapshot(); market_df = load_csv(MARKET_CSV_PATH); decisions_df = load_csv(COUNCIL_DECISIONS_PATH); council_votes_df = load_csv(COUNCIL_VOTES_CSV_PATH); targets_df = load_csv(POSITION_TARGETS_PATH); trades_df = load_csv(TRADES_CSV_PATH); orders_df = load_csv(ORDERS_CSV_PATH); shadow_df = load_csv(SHADOW_TRADES_CSV_PATH); order_book_df = load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
-    with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df); st.markdown('</section>', unsafe_allow_html=True)
 
@@ -1273,18 +1507,15 @@ def main() -> None:
     if not selected:
         st.info("Waiting for bot data. Start the bot and wait for viewer_snapshot.json to update.")
         return
-    timeframe_label = st.radio("Chart Mode", ["1D · 1m", "7D · 1m", "30D · 15m", "90D · 1h", "2Y · 1d"], horizontal=True, key="chart_timeframe")
-    timeframe = normalize_timeframe_label(timeframe_label)
-    overlays = render_overlay_controls()
     run_every = run_every_value(refresh_config)
     if callable(getattr(st, "fragment", None)):
         @st.fragment(run_every=run_every)
         def live_dashboard_fragment():
-            render_live_dashboard(selected, timeframe, overlays, refresh_config)
+            render_live_dashboard(selected, refresh_config)
         live_dashboard_fragment()
     else:
         st.warning("Subtle auto-refresh needs Streamlit 1.37+. Manual refresh still works.")
-        render_live_dashboard(selected, timeframe, overlays, refresh_config)
+        render_live_dashboard(selected, refresh_config)
 
 
 if __name__ == "__main__":

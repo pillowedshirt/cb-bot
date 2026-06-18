@@ -192,6 +192,8 @@ MARKET_CSV_PATH: str = os.path.join(BASE_DIR, "market.csv")
 VIEWER_SNAPSHOT_PATH: str = os.path.join(BASE_DIR, "viewer_snapshot.json")
 VIEWER_SNAPSHOT_JSON: str = VIEWER_SNAPSHOT_PATH
 VIEWER_SNAPSHOT_WRITE_EVERY_SEC: float = 2.0
+CALCULATION_STATUS_JSON_PATH: str = os.path.join(BASE_DIR, "calculation_status.json")
+CALCULATION_STATUS_WRITE_EVERY_SEC: float = 2.0
 MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
 MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
@@ -909,7 +911,16 @@ ENABLE_REPLAY_SUPPORT_LIVE_BUY_GATE: bool = True
 REPLAY_SUPPORT_MIN_ROWS: int = 50
 REPLAY_SUPPORT_MIN_AVG_NET_BPS: float = 10.0
 REPLAY_SUPPORT_MIN_WIN_RATE: float = 0.35
-ALLOW_STRONG_UTILITY_OVERRIDE_WITHOUT_REPLAY: bool = True
+VIEWER_REQUIRE_FULL_STARTUP_CALCULATION: bool = True
+REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY: bool = True
+REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY: bool = True
+ALLOW_STRONG_UTILITY_OVERRIDE_WITHOUT_REPLAY: bool = False
+STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT: int = 120
+STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT: int = 300
+STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT: int = 100
+STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT: int = 300
+STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT: int = 100
+STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE: bool = True
 STRONG_UTILITY_OVERRIDE_MIN_BPS: float = 175.0
 HIST_REPLAY_RECENCY_HALFLIFE_DAYS: float = 30.0
 
@@ -5965,6 +5976,7 @@ class TradingBot:
             f"{self.startup_had_existing_runtime_state}"
         )
         self._last_viewer_snapshot_write_ts: float = 0.0
+        self._last_calculation_status_write_ts = 0.0
         self._last_runtime_csv_compact_ts = 0.0
         self._runtime_csv_compact_running = False
         self._latest_viewer_snapshot_rows: Dict[str, Dict[str, Any]] = {}
@@ -8865,6 +8877,10 @@ class TradingBot:
                 self._product_calibration_ready[product] = False
         self._startup_calibration_ready = all(bool(v) for v in self._product_calibration_ready.values()) if self._product_calibration_ready else False
         log("[calibration] startup walk-forward calibration finished")
+        try:
+            self._write_calculation_status()
+        except Exception as exc:
+            module_exception(MODULE_NAME, "calculation_status_after_startup_calibration_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
     def _run_hourly_banked_recalibration(self) -> None:
         """Append recent observations and rebuild profiles from the full bank."""
@@ -12387,6 +12403,25 @@ class TradingBot:
         """
         try:
             product_id = str(candidate.get("product_id", ""))
+            if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
+                calc_status = self._calculation_status()
+                if not bool(calc_status.get("full_viewer_unlocked")):
+                    return False, (
+                        "live_buy_blocked:startup_calculation_incomplete "
+                        f"progress={float(calc_status.get('overall_progress_pct', 0.0)):.1f}%;"
+                        f"phase={calc_status.get('phase_label')};"
+                        f"complete_products={calc_status.get('complete_products')}/"
+                        f"{calc_status.get('product_count')}"
+                    )
+            if bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY):
+                verdict = self._historical_profit_verdict_for_product(product_id)
+                if not bool(verdict.get("profit_ready")):
+                    return False, (
+                        "live_buy_blocked:product_replay_not_profitable "
+                        f"product_id={product_id};"
+                        f"verdict={verdict.get('verdict')};"
+                        f"reason={verdict.get('reason')}"
+                    )
             mode = str(TRADING_AGGRESSION_MODE or "PROFIT_FIRST_FEE_AWARE").upper()
             profit_first = mode == "PROFIT_FIRST_FEE_AWARE"
             observation_only = mode == "OBSERVATION_ONLY"
@@ -14373,7 +14408,7 @@ class TradingBot:
         except Exception:
             return 0.0
 
-    def _live_readiness_status(self) -> Dict[str, Any]:
+    def _live_readiness_status(self, *, include_calculation: bool = True) -> Dict[str, Any]:
         status = {"viewer_snapshot_recent": False, "websocket_recent": False, "market_csv_recent": False, "council_recent": False, "no_duplicate_process": True, "fee_tier_ready": False, "risk_pause_active": False, "drawdown_brake_active": False, "open_positions_count": 0, "learning_files_writable": False, "sqlite_writable": False, "safe_to_run_overnight": False}
         maker_fee_bps = getattr(self, "current_maker_fee_bps", None)
         taker_fee_bps = getattr(self, "current_taker_fee_bps", None)
@@ -14452,6 +14487,20 @@ class TradingBot:
             status["readiness_explanation"].append("market.csv has not been refreshed recently")
         if not status.get("safe_to_run_overnight"):
             status["readiness_explanation"].append("overnight mode remains disabled until snapshot, market, council, fee, file, and top-of-book checks are all fresh")
+        if include_calculation:
+            try:
+                calc_status = self._calculation_status(include_readiness=False, readiness_override=status)
+                status["calculation_progress_pct"] = float(calc_status.get("overall_progress_pct", 0.0))
+                status["calculation_phase"] = str(calc_status.get("phase_label", "unknown"))
+                status["full_viewer_unlocked"] = bool(calc_status.get("full_viewer_unlocked"))
+                status["calculation_complete_products"] = int(calc_status.get("complete_products", 0))
+                status["calculation_product_count"] = int(calc_status.get("product_count", len(PRODUCTS)))
+                status["calculation_profit_ready_products"] = int(calc_status.get("profit_ready_products", 0))
+                status["calculation_blocked_products"] = int(calc_status.get("blocked_products", 0))
+            except Exception:
+                status["calculation_progress_pct"] = 0.0
+                status["calculation_phase"] = "calculation status unavailable"
+                status["full_viewer_unlocked"] = False
         return status
 
 
@@ -16394,6 +16443,7 @@ class TradingBot:
                     writer = csv.DictWriter(f, fieldnames=HISTORICAL_SHADOW_REPLAY_COLUMNS)
                     for row in rows_to_write: writer.writerow({col: row.get(col, "") for col in HISTORICAL_SHADOW_REPLAY_COLUMNS})
             self._write_historical_replay_summary(product_id)
+            self._write_calculation_status()
             module_debug(MODULE_NAME, "historical_shadow_replay_pass_completed", data={"product_id": product_id, "timeframe": timeframe, "granularity": granularity, "source": replay_source, "candles": len(candles), "evaluated": evaluated, "rows_written": len(rows_to_write), "fetch_elapsed_sec": round(fetch_elapsed_sec, 3), "eval_elapsed_sec": round(time.perf_counter() - eval_started, 3), "total_elapsed_sec": round(time.perf_counter() - pass_started, 3), "next_job_index": self._historical_replay_job_index, "job_count": len(jobs)}, level="INFO", also_overall=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "historical_shadow_replay_pass_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
@@ -16467,6 +16517,69 @@ class TradingBot:
             module_exception(MODULE_NAME, "all_historical_replay_rows_for_product_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
             return pd.DataFrame()
 
+    def _count_rows_by_product_from_csv(self, path: str, *, max_lines: int = 200000) -> Dict[str, int]:
+        counts = {p: 0 for p in PRODUCTS}
+        try:
+            frame = self._read_csv_tail_for_bot(path, max_lines=max_lines)
+            if frame.empty or "product_id" not in frame.columns:
+                return counts
+            vc = frame["product_id"].astype(str).value_counts().to_dict()
+            for product_id in PRODUCTS:
+                counts[product_id] = int(vc.get(product_id, 0))
+            return counts
+        except Exception as exc:
+            module_exception(MODULE_NAME, "count_rows_by_product_from_csv_failed", exc, data={"path": path, "traceback": traceback.format_exc()}, also_overall=False)
+            return counts
+
+    def _historical_replay_counts_for_product(self, product_id: str) -> Dict[str, Any]:
+        counts = {"all_rows": 0, "primary_15m_90d_rows": 0, "regime_1h_365d_rows": 0, "daily_1d_2y_rows": 0, "qualified_rows": 0, "accepted_rows": 0, "wins": 0, "losses": 0, "avg_net_pnl_bps": 0.0, "median_net_pnl_bps": 0.0, "win_rate": 0.0}
+        try:
+            frame = self._all_historical_replay_rows_for_product(product_id)
+            if frame.empty:
+                return counts
+            counts["all_rows"] = int(len(frame))
+            if "timeframe" in frame.columns:
+                tf = frame["timeframe"].astype(str)
+                counts["primary_15m_90d_rows"] = int(tf.eq("primary_15m_90d").sum())
+                counts["regime_1h_365d_rows"] = int(tf.eq("regime_1h_365d").sum())
+                counts["daily_1d_2y_rows"] = int(tf.eq("daily_1d_2y").sum())
+            if "replay_candidate_qualified" in frame.columns:
+                qualified = pd.to_numeric(frame.get("replay_candidate_qualified"), errors="coerce").fillna(0)
+                counts["qualified_rows"] = int(qualified.astype(int).eq(1).sum())
+            if "accepted_for_calibration" in frame.columns:
+                accepted = pd.to_numeric(frame.get("accepted_for_calibration"), errors="coerce").fillna(0)
+                counts["accepted_rows"] = int(accepted.astype(int).eq(1).sum())
+            net = pd.to_numeric(frame.get("net_pnl_bps"), errors="coerce").dropna()
+            if not net.empty:
+                counts["wins"] = int((net > 0).sum())
+                counts["losses"] = int((net <= 0).sum())
+                counts["avg_net_pnl_bps"] = float(net.mean())
+                counts["median_net_pnl_bps"] = float(net.median())
+                counts["win_rate"] = float((net > 0).mean())
+            return counts
+        except Exception as exc:
+            module_exception(MODULE_NAME, "historical_replay_counts_for_product_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
+            return counts
+
+    def _historical_profit_verdict_for_product(self, product_id: str) -> Dict[str, Any]:
+        counts = self._historical_replay_counts_for_product(product_id)
+        has_required_15m = counts["primary_15m_90d_rows"] >= int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)
+        has_required_1h = counts["regime_1h_365d_rows"] >= int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)
+        replay_complete = bool(has_required_15m and has_required_1h)
+        qualified_rows = int(counts["qualified_rows"]); accepted_rows = int(counts["accepted_rows"]); wins = int(counts["wins"])
+        avg_net = float(counts["avg_net_pnl_bps"]); median_net = float(counts["median_net_pnl_bps"]); win_rate = float(counts["win_rate"])
+        profit_ready = bool(replay_complete and accepted_rows >= int(HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION) and wins >= int(HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION) and avg_net >= float(HIST_REPLAY_MIN_AVG_NET_PNL_BPS_FOR_CALIBRATION))
+        if profit_ready:
+            verdict = "profit_replay_ready"; complete = True; live_trade_allowed = True
+            reason = f"profit replay ready; accepted_rows={accepted_rows};wins={wins};avg_net={avg_net:.2f};median_net={median_net:.2f};win_rate={win_rate:.3f}"
+        elif replay_complete and bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE):
+            verdict = "replay_complete_unprofitable_or_unqualified"; complete = True; live_trade_allowed = False
+            reason = f"replay complete but not profitable enough; qualified_rows={qualified_rows};accepted_rows={accepted_rows};wins={wins};avg_net={avg_net:.2f};median_net={median_net:.2f};win_rate={win_rate:.3f}"
+        else:
+            verdict = "replay_incomplete"; complete = False; live_trade_allowed = False
+            reason = f"replay incomplete; 15m_rows={counts['primary_15m_90d_rows']}/{int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)};1h_rows={counts['regime_1h_365d_rows']}/{int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)}"
+        return {"product_id": product_id, "complete": bool(complete), "replay_complete": bool(replay_complete), "profit_ready": bool(profit_ready), "live_trade_allowed": bool(live_trade_allowed), "verdict": verdict, "reason": reason, **counts}
+
     def _historical_replay_is_ready_for_product(self, product_id: str) -> bool:
         frame = self._historical_replay_rows_for_product(product_id)
         if frame.empty: return False
@@ -16495,16 +16608,87 @@ class TradingBot:
 
     def _write_historical_replay_summary(self, product_id: str) -> None:
         try:
-            self._ensure_historical_replay_summary_header(); frame = self._historical_replay_rows_for_product(product_id)
-            if frame.empty: return
-            net = pd.to_numeric(frame.get("net_pnl_bps"), errors="coerce").dropna()
-            if net.empty: return
-            wins = int((net > 0).sum()); losses = int((net <= 0).sum()); min_ts = float(frame["replay_ts"].min()) if "replay_ts" in frame.columns else 0.0; max_ts = float(frame["replay_ts"].max()) if "replay_ts" in frame.columns else 0.0; days_covered = max(0.0, (max_ts - min_ts) / 86400.0); ready = bool(self._historical_replay_is_ready_for_product(product_id)); profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
-            row = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "rows": int(len(frame)), "wins": wins, "losses": losses, "win_rate": wins / max(1, wins + losses), "median_net_pnl_bps": float(net.median()), "avg_net_pnl_bps": float(net.mean()), "best_net_pnl_bps": float(net.max()), "worst_net_pnl_bps": float(net.min()), "median_mfe_bps": float(pd.to_numeric(frame.get("max_favorable_bps"), errors="coerce").dropna().median()) if "max_favorable_bps" in frame.columns else 0.0, "median_mae_bps": float(pd.to_numeric(frame.get("max_adverse_bps"), errors="coerce").dropna().median()) if "max_adverse_bps" in frame.columns else 0.0, "days_covered": days_covered, "calibration_ready": int(ready), "recommended_min_score": float(profile.min_score), "recommended_min_probability": float(profile.min_probability), "recommended_min_expected_value_bps": float(profile.min_expected_value_bps), "reason": (f"historical_replay_summary;ready={ready};rows={len(frame)};wins={wins};avg_net={float(net.mean()):.2f};median_net={float(net.median()):.2f};days={days_covered:.1f}")}
+            self._ensure_historical_replay_summary_header()
+            all_frame = self._all_historical_replay_rows_for_product(product_id)
+            qualified_frame = self._historical_replay_rows_for_product(product_id)
+            if all_frame.empty:
+                return
+            net_all = pd.to_numeric(all_frame.get("net_pnl_bps"), errors="coerce").dropna()
+            net_qualified = pd.to_numeric(qualified_frame.get("net_pnl_bps"), errors="coerce").dropna() if qualified_frame is not None and not qualified_frame.empty else pd.Series(dtype=float)
+            counts = self._historical_replay_counts_for_product(product_id)
+            verdict = self._historical_profit_verdict_for_product(product_id)
+            source_net = net_qualified if not net_qualified.empty else net_all
+            wins = int((source_net > 0).sum()) if not source_net.empty else 0
+            losses = int((source_net <= 0).sum()) if not source_net.empty else 0
+            if "replay_ts" in all_frame.columns:
+                ts_series = pd.to_numeric(all_frame["replay_ts"], errors="coerce").dropna()
+                min_ts = float(ts_series.min()) if not ts_series.empty else 0.0
+                max_ts = float(ts_series.max()) if not ts_series.empty else 0.0
+                days_covered = max(0.0, (max_ts - min_ts) / 86400.0)
+            else:
+                days_covered = 0.0
+            profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
+            row = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "rows": int(len(qualified_frame)) if qualified_frame is not None else 0, "wins": wins, "losses": losses, "win_rate": wins / max(1, wins + losses), "median_net_pnl_bps": float(source_net.median()) if not source_net.empty else 0.0, "avg_net_pnl_bps": float(source_net.mean()) if not source_net.empty else 0.0, "best_net_pnl_bps": float(source_net.max()) if not source_net.empty else 0.0, "worst_net_pnl_bps": float(source_net.min()) if not source_net.empty else 0.0, "median_mfe_bps": float(pd.to_numeric(all_frame.get("max_favorable_bps"), errors="coerce").dropna().median()) if "max_favorable_bps" in all_frame.columns else 0.0, "median_mae_bps": float(pd.to_numeric(all_frame.get("max_adverse_bps"), errors="coerce").dropna().median()) if "max_adverse_bps" in all_frame.columns else 0.0, "days_covered": days_covered, "calibration_ready": int(bool(verdict.get("profit_ready"))), "recommended_min_score": float(profile.min_score), "recommended_min_probability": float(profile.min_probability), "recommended_min_expected_value_bps": float(profile.min_expected_value_bps), "reason": (f"historical_replay_summary;verdict={verdict.get('verdict')};complete={verdict.get('complete')};profit_ready={verdict.get('profit_ready')};all_rows={counts.get('all_rows')};qualified_rows={counts.get('qualified_rows')};accepted_rows={counts.get('accepted_rows')};15m_rows={counts.get('primary_15m_90d_rows')};1h_rows={counts.get('regime_1h_365d_rows')};avg_net={counts.get('avg_net_pnl_bps'):.2f};median_net={counts.get('median_net_pnl_bps'):.2f};detail={verdict.get('reason')}")}
             with open(HISTORICAL_REPLAY_SUMMARY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=HISTORICAL_REPLAY_SUMMARY_COLUMNS); writer.writerow({col: row.get(col, "") for col in HISTORICAL_REPLAY_SUMMARY_COLUMNS})
+                writer = csv.DictWriter(f, fieldnames=HISTORICAL_REPLAY_SUMMARY_COLUMNS)
+                writer.writerow({col: row.get(col, "") for col in HISTORICAL_REPLAY_SUMMARY_COLUMNS})
         except Exception as exc:
             module_exception(MODULE_NAME, "write_historical_replay_summary_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
+
+    def _calculation_status(self, *, include_readiness: bool = True, readiness_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            micro_counts = self._count_rows_by_product_from_csv(MICRO_HISTORY_CSV_PATH, max_lines=200000)
+            candle_15m_counts = self._count_rows_by_product_from_csv(HIST_REPLAY_15M_90D_CSV_PATH, max_lines=250000)
+            candle_1h_counts = self._count_rows_by_product_from_csv(HIST_REPLAY_1H_365D_CSV_PATH, max_lines=250000)
+            product_status: Dict[str, Dict[str, Any]] = {}
+            phase_totals = {"live_data": 0.0, "micro_backlog": 0.0, "historical_candle_backlog": 0.0, "historical_replay": 0.0, "replay_calibration_verdicts": 0.0}
+            readiness = dict(readiness_override or {}) if readiness_override is not None else (self._live_readiness_status(include_calculation=False) if include_readiness else {})
+            live_data_checks = [bool(readiness.get("viewer_snapshot_recent")), bool(readiness.get("websocket_recent")), bool(readiness.get("market_csv_recent")), bool(readiness.get("council_recent")), bool(readiness.get("fee_tier_ready")), bool(readiness.get("micro_history_ready"))]
+            phase_totals["live_data"] = sum(1.0 for x in live_data_checks if x) / max(1, len(live_data_checks))
+            for product_id in PRODUCTS:
+                replay_verdict = self._historical_profit_verdict_for_product(product_id)
+                micro_rows = int(micro_counts.get(product_id, 0)); candle_15m_rows = int(candle_15m_counts.get(product_id, 0)); candle_1h_rows = int(candle_1h_counts.get(product_id, 0))
+                micro_progress = min(1.0, micro_rows / max(1.0, float(STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT)))
+                candle_15m_progress = min(1.0, candle_15m_rows / max(1.0, float(STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT)))
+                candle_1h_progress = min(1.0, candle_1h_rows / max(1.0, float(STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT)))
+                replay_15m_progress = min(1.0, float(replay_verdict.get("primary_15m_90d_rows", 0)) / max(1.0, float(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)))
+                replay_1h_progress = min(1.0, float(replay_verdict.get("regime_1h_365d_rows", 0)) / max(1.0, float(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)))
+                product_backlog_progress = (micro_progress + candle_15m_progress + candle_1h_progress) / 3.0
+                product_replay_progress = (replay_15m_progress + replay_1h_progress) / 2.0
+                product_verdict_progress = 1.0 if bool(replay_verdict.get("complete")) else 0.0
+                product_progress = product_backlog_progress * 0.35 + product_replay_progress * 0.45 + product_verdict_progress * 0.20
+                product_status[product_id] = {**replay_verdict, "micro_rows": micro_rows, "historical_15m_candle_rows": candle_15m_rows, "historical_1h_candle_rows": candle_1h_rows, "micro_progress": float(micro_progress), "historical_candle_progress": float((candle_15m_progress + candle_1h_progress) / 2.0), "historical_replay_progress": float(product_replay_progress), "calibration_verdict_progress": float(product_verdict_progress), "overall_product_progress": float(product_progress)}
+            product_count = max(1, len(PRODUCTS))
+            phase_totals["micro_backlog"] = sum(product_status[p]["micro_progress"] for p in PRODUCTS) / product_count
+            phase_totals["historical_candle_backlog"] = sum(product_status[p]["historical_candle_progress"] for p in PRODUCTS) / product_count
+            phase_totals["historical_replay"] = sum(product_status[p]["historical_replay_progress"] for p in PRODUCTS) / product_count
+            phase_totals["replay_calibration_verdicts"] = sum(product_status[p]["calibration_verdict_progress"] for p in PRODUCTS) / product_count
+            all_products_complete = all(bool(product_status[p]["complete"]) for p in PRODUCTS)
+            full_viewer_unlocked = bool((not VIEWER_REQUIRE_FULL_STARTUP_CALCULATION) or (all_products_complete and phase_totals["live_data"] >= 1.0 and phase_totals["micro_backlog"] >= 1.0 and phase_totals["historical_candle_backlog"] >= 1.0 and phase_totals["historical_replay"] >= 1.0 and phase_totals["replay_calibration_verdicts"] >= 1.0))
+            overall_progress = phase_totals["live_data"] * 0.10 + phase_totals["micro_backlog"] * 0.15 + phase_totals["historical_candle_backlog"] * 0.20 + phase_totals["historical_replay"] * 0.35 + phase_totals["replay_calibration_verdicts"] * 0.20
+            complete_products = sum(1 for p in PRODUCTS if bool(product_status[p]["complete"])); profit_ready_products = sum(1 for p in PRODUCTS if bool(product_status[p]["profit_ready"])); blocked_products = sum(1 for p in PRODUCTS if product_status[p]["verdict"] == "replay_complete_unprofitable_or_unqualified")
+            if overall_progress < 0.15: phase_label = "Starting live data and micro-history backlogs"
+            elif phase_totals["historical_candle_backlog"] < 1.0: phase_label = "Building historical candle backlogs"
+            elif phase_totals["historical_replay"] < 1.0: phase_label = "Running historical replay across all products"
+            elif phase_totals["replay_calibration_verdicts"] < 1.0: phase_label = "Calculating replay-based product verdicts"
+            elif not full_viewer_unlocked: phase_label = "Final readiness checks"
+            else: phase_label = "Complete"
+            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE)}}
+        except Exception as exc:
+            module_exception(MODULE_NAME, "calculation_status_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+            return {"ts": now_ts(), "full_viewer_unlocked": False, "overall_progress": 0.0, "overall_progress_pct": 0.0, "phase_label": "Calculation status unavailable", "phase_progress": {}, "product_status": {}, "error": str(exc)}
+
+    def _write_calculation_status(self) -> Dict[str, Any]:
+        status = self._calculation_status()
+        try:
+            tmp = CALCULATION_STATUS_JSON_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(status, f, indent=2, sort_keys=True)
+            os.replace(tmp, CALCULATION_STATUS_JSON_PATH)
+            module_debug(MODULE_NAME, "calculation_status_written", data={"progress_pct": round(float(status.get("overall_progress_pct", 0.0)), 2), "phase": status.get("phase_label"), "full_viewer_unlocked": bool(status.get("full_viewer_unlocked")), "complete_products": status.get("complete_products"), "profit_ready_products": status.get("profit_ready_products"), "blocked_products": status.get("blocked_products")}, level="DEBUG", also_overall=False)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "write_calculation_status_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+        return status
 
     def _parse_trade_note_float(self, note: Any, key: str) -> Optional[float]:
         """
@@ -17281,6 +17465,12 @@ class TradingBot:
 
                     self._write_viewer_snapshot(snapshot)
                     self._last_viewer_snapshot_write_ts = time.time()
+                    try:
+                        if now_ts() - float(getattr(self, "_last_calculation_status_write_ts", 0.0) or 0.0) >= float(CALCULATION_STATUS_WRITE_EVERY_SEC):
+                            self._last_calculation_status_write_ts = now_ts()
+                            self._write_calculation_status()
+                    except Exception as exc:
+                        module_exception(MODULE_NAME, "calculation_status_heartbeat_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
                     module_debug(
                         MODULE_NAME,

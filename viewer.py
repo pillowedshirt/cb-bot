@@ -154,45 +154,35 @@ div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid r
     transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
 }
 .coin-overview-card:hover { transform: translateY(-2px); border-color: rgba(57, 245, 163, 0.65); box-shadow: 0 0 24px rgba(57, 245, 163, 0.10); }
-/* Native Streamlit button overlays.
-   These are real Streamlit buttons, so they update session_state reliably.
-   They are visually transparent and sit over the card that appears directly above them. */
-div[data-testid="stButton"]:has(button[aria-label^="coin_card_overlay_"]) {
-    margin-top: -285px;
-    height: 285px;
-    margin-bottom: 0.75rem;
-    position: relative;
-    z-index: 30;
+/* Themed Streamlit click buttons under coin and agent cards.
+   These intentionally remain visible because transparent overlays are unreliable
+   across Streamlit/browser versions. */
+div[data-testid="stButton"] {
+    margin-top: -0.35rem !important;
+    margin-bottom: 0.75rem !important;
 }
 
-div[data-testid="stButton"]:has(button[aria-label^="coin_card_overlay_"]) button {
-    width: 100%;
-    height: 285px;
-    min-height: 285px;
-    opacity: 0;
-    background: transparent !important;
-    border: 0 !important;
+div[data-testid="stButton"] button {
+    background: rgba(6, 18, 32, 0.90) !important;
+    color: #d9f5ff !important;
+    border: 1px solid rgba(80, 220, 255, 0.22) !important;
+    border-radius: 14px !important;
     box-shadow: none !important;
-    cursor: pointer;
+    font-weight: 800 !important;
+    letter-spacing: 0.02em !important;
+    min-height: 2.5rem !important;
 }
 
-div[data-testid="stButton"]:has(button[aria-label^="agent_card_overlay_"]) {
-    margin-top: -260px;
-    height: 260px;
-    margin-bottom: 0.75rem;
-    position: relative;
-    z-index: 30;
+div[data-testid="stButton"] button:hover {
+    background: rgba(7, 24, 42, 0.96) !important;
+    color: #e8fbff !important;
+    border-color: rgba(57, 245, 163, 0.55) !important;
+    box-shadow: 0 0 18px rgba(57, 245, 163, 0.10) !important;
 }
 
-div[data-testid="stButton"]:has(button[aria-label^="agent_card_overlay_"]) button {
-    width: 100%;
-    height: 260px;
-    min-height: 260px;
-    opacity: 0;
-    background: transparent !important;
-    border: 0 !important;
-    box-shadow: none !important;
-    cursor: pointer;
+div[data-testid="stButton"] button:focus {
+    outline: 2px solid rgba(57, 245, 163, 0.45) !important;
+    outline-offset: 2px !important;
 }
 
 .coin-overview-card,
@@ -782,7 +772,7 @@ def render_confirmed_trades(trades: pd.DataFrame) -> None:
     st.markdown('### Confirmed Trades Only')
     if trades.empty: st.info("No confirmed trades yet."); return
     cols=[c for c in ["ts","product_id","side","price","qty","size","fee","fee_usd","order_id"] if c in trades.columns]
-    st.dataframe(trades[cols] if cols else trades, use_container_width=True, hide_index=True)
+    st.dataframe(trades[cols] if cols else trades, width="stretch", hide_index=True)
 
 
 def render_coin_analytics(coin: Dict[str, Any]) -> None:
@@ -918,13 +908,14 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
                     ''', unsafe_allow_html=True)
 
                 if st.button(
-                    f"coin_card_overlay_{product_id}",
-                    key=f"coin_card_overlay_{product_id}",
-                    use_container_width=True,
+                    "Click here",
+                    key=f"coin_card_click_{product_id}",
+                    width="stretch",
+                    type="secondary",
                 ):
                     set_selected_coin(product_id)
     with st.expander("All-coin sortable table", expanded=False):
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, decision_row: dict, votes: pd.DataFrame):
     st.markdown('<div class="agent-ticker"><b>Live Agent Debate</b><div class="muted">The highlighted analyst rotates automatically as the viewer refreshes.</div></div>', unsafe_allow_html=True)
@@ -936,7 +927,7 @@ def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, deci
     st.markdown("".join(highlighted), unsafe_allow_html=True)
     with st.expander("Full debate transcript for this decision", expanded=False):
         display_cols = [c for c in ["agent", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reason"] if c in votes.columns]
-        st.dataframe(votes[display_cols] if display_cols else votes, use_container_width=True, hide_index=True)
+        st.dataframe(votes[display_cols] if display_cols else votes, width="stretch", hide_index=True)
 
 
 def render_agent_dialogue_panel(agent_name: str, votes: pd.DataFrame):
@@ -1011,9 +1002,10 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
                 )
 
                 if st.button(
-                    f"agent_card_overlay_{selected_coin}_{agent}",
-                    key=f"agent_card_overlay_{selected_coin}_{agent}",
-                    use_container_width=True,
+                    "Click here",
+                    key=f"agent_card_click_{selected_coin}_{agent}",
+                    width="stretch",
+                    type="secondary",
                 ):
                     set_selected_agent(agent)
 
@@ -1060,7 +1052,12 @@ def render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, d
     confirmed = confirmed_trades_only(trades_df, selected)
     target = latest_targets_for_coin(targets_df, selected)
     fig = build_coin_chart(chart_df, chart_meta, dict((snapshot.get("coins") or {}).get(selected, {}) or {}), market_df, confirmed, shadow_df, decisions_df, target, overlays, full_chart=True)
-    st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{selected}_{timeframe}", config={"displayModeBar": True, "scrollZoom": True, "responsive": True})
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        key=f"main_chart_{selected}_{timeframe}",
+        config={"displayModeBar": True, "scrollZoom": True, "responsive": True},
+    )
     latest_decision_id, drow, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected)
     render_agent_debate_stream(selected, latest_decision_id, drow, votes); render_agent_roster_no_buttons(selected, votes)
 
@@ -1187,7 +1184,7 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
         render_agent_disagreement_summary(votes)
         display_cols = [c for c in ["agent", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reason"] if c in votes.columns]
         if display_cols and not votes.empty:
-            st.dataframe(votes[display_cols], use_container_width=True, hide_index=True)
+            st.dataframe(votes[display_cols], width="stretch", hide_index=True)
         else:
             st.info("No council vote rows yet for this coin.")
     with st.expander("Raw context rows", expanded=False):
@@ -1255,7 +1252,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         st.json(readiness)
     for name, df in [("trades", trades_df), ("orders", orders_df), ("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df)]:
         with st.expander(name, expanded=False):
-            st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
+            st.dataframe(df.tail(100), width="stretch", hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
 
 def render_live_dashboard(selected, timeframe, overlays, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick

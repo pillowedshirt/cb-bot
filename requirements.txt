@@ -6,6 +6,6 @@ plotly
 python-dotenv
 requests
 scikit-learn
-streamlit
+streamlit>=1.37.0
 coinbase-advanced-py
 websockets

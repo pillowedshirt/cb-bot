@@ -316,6 +316,15 @@ div[data-testid="stButton"] button:focus {
 .rank-badge { display: inline-block; border: 1px solid rgba(57, 245, 163, 0.45); border-radius: 999px; padding: 0.18rem 0.5rem; font-size: 0.78rem; color: #39f5a3; background: rgba(57, 245, 163, 0.08); margin-right: 0.35rem; }
 .viability-score { font-size: 1.35rem; font-weight: 900; color: #e8fbff; }
 .viability-reason { color: #8db7c8; font-size: 0.86rem; line-height: 1.25rem; }
+.leadership-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; margin: 1rem 0 1.1rem 0; }
+.leadership-card { border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 20px; padding: 1rem; background: linear-gradient(180deg, rgba(6, 18, 32, 0.96), rgba(4, 12, 24, 0.94)); box-shadow: 0 0 22px rgba(80, 220, 255, 0.06); }
+.leadership-card.oracle { border-color: rgba(255, 214, 102, 0.35); box-shadow: 0 0 22px rgba(255, 214, 102, 0.07); }
+.leadership-title { font-size: 1.15rem; font-weight: 900; margin-bottom: 0.2rem; }
+.leadership-subtitle { color: #8db7c8; font-size: 0.86rem; margin-bottom: 0.65rem; }
+.leadership-verdict { font-size: 1.05rem; font-weight: 900; margin-bottom: 0.5rem; }
+.leadership-paragraph { color: #d9f5ff; line-height: 1.35rem; font-size: 0.93rem; }
+.leadership-learning { margin-top: 0.7rem; padding: 0.65rem; border-radius: 14px; background: rgba(57, 245, 163, 0.06); border: 1px solid rgba(57, 245, 163, 0.18); color: #c9f8e2; font-size: 0.88rem; line-height: 1.25rem; }
+@media (max-width: 900px) { .leadership-grid { grid-template-columns: 1fr; } }
 .context-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.8rem; }
 .context-card { border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; padding: 0.9rem; background: rgba(6, 18, 32, 0.86); }
 .context-card h3 { margin-top: 0; margin-bottom: 0.45rem; }

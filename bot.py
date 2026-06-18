@@ -864,7 +864,7 @@ SHADOW_SELL_REPLAY_EVERY_SEC: float = 60.0
 SHADOW_SELL_REPLAY_MAX_ROWS_PER_PASS: int = 100
 SHADOW_SELL_REPLAY_MAX_DECISION_AGE_HOURS: float = 24.0
 SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES: int = 5
-SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES: int = 60
+SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES: int = 30
 SHADOW_SELL_REPLAY_SYNTHETIC_NOTIONAL_USD: float = 5.0
 
 ENABLE_HISTORICAL_SHADOW_REPLAY: bool = True
@@ -875,11 +875,14 @@ HIST_REPLAY_DAILY_CONTEXT_DAYS: int = 730
 HIST_REPLAY_PRIMARY_GRANULARITY: str = "FIFTEEN_MINUTE"
 HIST_REPLAY_REGIME_GRANULARITY: str = "ONE_HOUR"
 HIST_REPLAY_DAILY_GRANULARITY: str = "ONE_DAY"
+HIST_REPLAY_FAST_BOOTSTRAP_MODE: bool = True
+HIST_REPLAY_BOOTSTRAP_ROWS_PER_PRODUCT_TARGET: int = 300
 HIST_REPLAY_PRODUCTS_PER_PASS: int = 1
 HIST_REPLAY_MAX_CANDIDATES_PER_PASS: int = 300
 HIST_REPLAY_MAX_RUNTIME_SEC: float = 45.0
-HIST_REPLAY_EVERY_SEC: float = 3 * 60.0
+HIST_REPLAY_EVERY_SEC: float = 120.0
 HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC: float = 1.0
+HIST_REPLAY_PRIORITIZE_PRODUCTS_WITH_FEWEST_ROWS: bool = True
 HIST_REPLAY_STEP_BARS_15M: int = 1
 HIST_REPLAY_STEP_BARS_1H: int = 1
 HIST_REPLAY_MIN_PREFIX_15M: int = 96
@@ -902,6 +905,12 @@ HIST_REPLAY_MIN_EXPECTED_EDGE_BPS_FOR_CALIBRATION: float = -25.0
 HIST_REPLAY_BLOCK_NEAR_POC_CHOP: bool = True
 HIST_REPLAY_MAX_POC_DISTANCE_FOR_CHOP_BPS: float = 18.0
 REQUIRE_HISTORICAL_REPLAY_CALIBRATION_FOR_LIVE_BUY: bool = False
+ENABLE_REPLAY_SUPPORT_LIVE_BUY_GATE: bool = True
+REPLAY_SUPPORT_MIN_ROWS: int = 50
+REPLAY_SUPPORT_MIN_AVG_NET_BPS: float = 10.0
+REPLAY_SUPPORT_MIN_WIN_RATE: float = 0.35
+ALLOW_STRONG_UTILITY_OVERRIDE_WITHOUT_REPLAY: bool = True
+STRONG_UTILITY_OVERRIDE_MIN_BPS: float = 175.0
 HIST_REPLAY_RECENCY_HALFLIFE_DAYS: float = 30.0
 
 # Max total exposure per product can reach 80% of total equity through scale-ins.
@@ -12784,6 +12793,10 @@ class TradingBot:
                     f"{backtest_reason}"
                 )
 
+            replay_ok, replay_reason = self._replay_support_for_live_candidate(product_id, candidate)
+            candidate["replay_support_reason"] = replay_reason
+            if not replay_ok:
+                return False, f"live_buy_blocked:replay_support_missing_or_negative {replay_reason}"
 
             if bool(ENABLE_STALE_DATA_LIVE_BUY_GATE):
                 market_age_sec = self._market_data_age_for_product(product_id)
@@ -15965,24 +15978,63 @@ class TradingBot:
 
     def _historical_replay_job_queue(self) -> List[Tuple[str, str]]:
         """
-        Weighted round-robin replay queue.
-
-        Priority:
-        1. primary_15m_90d for every product
-        2. regime_1h_365d for every product
-        3. another primary_15m_90d pass for every product
-        4. daily_1d_2y only as sparse context
+        Weighted replay queue:
+        - prioritizes products with fewer replay rows,
+        - gives 15m/90d the most work,
+        - gives 1h/365d secondary work,
+        - keeps daily sparse and context-only.
         """
+        counts = self._historical_replay_counts_by_product()
+        products_by_need = sorted(
+            PRODUCTS,
+            key=lambda p: (
+                counts.get(p, {}).get("primary_15m_90d", 0),
+                counts.get(p, {}).get("regime_1h_365d", 0),
+                counts.get(p, {}).get("all", 0),
+            ),
+        )
         jobs: List[Tuple[str, str]] = []
-        for product_id in PRODUCTS:
+        for product_id in products_by_need:
             jobs.append((product_id, "primary_15m_90d"))
-        for product_id in PRODUCTS:
+        for product_id in products_by_need:
             jobs.append((product_id, "regime_1h_365d"))
-        for product_id in PRODUCTS:
+        for product_id in products_by_need:
             jobs.append((product_id, "primary_15m_90d"))
-        for product_id in PRODUCTS:
+        for product_id in products_by_need:
             jobs.append((product_id, "daily_1d_2y"))
         return jobs
+
+    def _historical_replay_counts_by_product(self) -> Dict[str, Dict[str, int]]:
+        try:
+            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=200000)
+            counts: Dict[str, Dict[str, int]] = {
+                p: {"all": 0, "primary_15m_90d": 0, "regime_1h_365d": 0, "daily_1d_2y": 0, "qualified": 0}
+                for p in PRODUCTS
+            }
+            if frame.empty or "product_id" not in frame.columns:
+                return counts
+            if "timeframe" not in frame.columns:
+                frame["timeframe"] = ""
+            if "replay_candidate_qualified" not in frame.columns:
+                frame["replay_candidate_qualified"] = 0
+            for _, row in frame.iterrows():
+                product_id = str(row.get("product_id") or "")
+                timeframe = str(row.get("timeframe") or "")
+                qualified = int(float(row.get("replay_candidate_qualified") or 0))
+                if product_id not in counts:
+                    continue
+                counts[product_id]["all"] += 1
+                if timeframe in counts[product_id]:
+                    counts[product_id][timeframe] += 1
+                if qualified:
+                    counts[product_id]["qualified"] += 1
+            return counts
+        except Exception as exc:
+            module_exception(MODULE_NAME, "historical_replay_counts_by_product_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+            return {
+                p: {"all": 0, "primary_15m_90d": 0, "regime_1h_365d": 0, "daily_1d_2y": 0, "qualified": 0}
+                for p in PRODUCTS
+            }
 
     def _qualified_historical_replay_candidate(self, signal: Any, *, timeframe: str, granularity: str) -> Tuple[bool, str, float]:
         """
@@ -16112,24 +16164,26 @@ class TradingBot:
                         rows.append({"ts": ts_val, "open": float(getattr(c, "open", 0.0)), "high": float(getattr(c, "high", 0.0)), "low": float(getattr(c, "low", 0.0)), "close": float(getattr(c, "close", 0.0)), "volume": float(getattr(c, "volume", 0.0) or 0.0)})
                 if rows:
                     return pd.DataFrame(rows).sort_values("ts")
-            for path, max_lines in [(MICRO_HISTORY_CSV_PATH, 50000), (CHART_1M_7D_CSV_PATH, 120000)]:
-                if not os.path.exists(path):
-                    continue
-                frame = self._read_csv_tail_for_bot(path, max_lines=max_lines)
-                if frame.empty or "product_id" not in frame.columns:
-                    continue
-                frame = frame[frame["product_id"].astype(str).eq(str(product_id))].copy()
-                if frame.empty:
-                    continue
-                frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce")
-                frame = frame.dropna(subset=["ts"])
-                frame = frame[(frame["ts"] >= float(start_ts)) & (frame["ts"] <= float(end_ts))].copy()
-                for col in ["open", "high", "low", "close", "volume"]:
-                    if col in frame.columns:
-                        frame[col] = pd.to_numeric(frame[col], errors="coerce")
-                frame = frame.dropna(subset=["open", "high", "low", "close"]).sort_values("ts")
-                if not frame.empty:
-                    return frame
+            for path in [MICRO_HISTORY_CSV_PATH, CHART_1M_7D_CSV_PATH, HIST_REPLAY_15M_90D_CSV_PATH]:
+                try:
+                    frame = self._read_csv_tail_for_bot(path, max_lines=150000)
+                    if frame.empty or "product_id" not in frame.columns:
+                        continue
+                    frame = frame[frame["product_id"].astype(str).eq(str(product_id))].copy()
+                    if frame.empty:
+                        continue
+                    frame["ts"] = pd.to_numeric(frame.get("ts"), errors="coerce")
+                    frame = frame.dropna(subset=["ts"])
+                    frame = frame[(frame["ts"] >= float(start_ts)) & (frame["ts"] <= float(end_ts))].copy()
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        if col in frame.columns:
+                            frame[col] = pd.to_numeric(frame.get(col), errors="coerce")
+                    frame = frame.dropna(subset=["open", "high", "low", "close"]).sort_values("ts")
+                    if not frame.empty:
+                        module_debug(MODULE_NAME, "runtime_shadow_replay_candles_loaded", data={"product_id": product_id, "path": path, "rows": len(frame), "start_ts": start_ts, "end_ts": end_ts}, level="DEBUG", also_overall=False)
+                        return frame
+                except Exception as exc:
+                    module_exception(MODULE_NAME, "runtime_shadow_replay_candle_source_failed", exc, data={"product_id": product_id, "path": path, "start_ts": start_ts, "end_ts": end_ts, "traceback": traceback.format_exc()}, also_overall=False)
             return pd.DataFrame()
         except Exception as exc:
             module_exception(MODULE_NAME, "micro_candles_for_replay_window_failed", exc, data={"product_id": product_id, "start_ts": start_ts, "end_ts": end_ts, "traceback": traceback.format_exc()}, also_overall=False)
@@ -16149,7 +16203,7 @@ class TradingBot:
             shadows = self._read_csv_tail_for_bot(SHADOW_TRADES_CSV_PATH, max_lines=30000)
             if not shadows.empty and {"ts", "decision_id", "product_id"}.issubset(set(shadows.columns)):
                 shadows = shadows.copy()
-                shadow_action = shadows.get("shadow_action", "BUY").astype(str).str.upper()
+                shadow_action = shadows.get("shadow_action", pd.Series("BUY", index=shadows.index)).astype(str).str.upper()
                 shadows["action"] = shadow_action.apply(lambda x: "SHADOW_BUY" if x == "BUY" else f"SHADOW_{x}")
                 shadows["decision_bucket"] = "SHADOW"
                 shadows["source_file"] = "shadow_trades.csv"
@@ -16236,12 +16290,12 @@ class TradingBot:
         try:
             decisions = self._runtime_shadow_decisions_for_sell_replay()
             if decisions.empty:
-                module_debug(MODULE_NAME, "shadow_sell_replay_no_rows", data={"reviewable": 0, "skip_counts": {}, "now_ts": now_value, "min_age_sec": float(SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES) * 60.0, "max_age_sec": float(SHADOW_SELL_REPLAY_MAX_DECISION_AGE_HOURS) * 3600.0}, level="INFO", also_overall=False)
+                module_debug(MODULE_NAME, "shadow_sell_replay_no_rows", data={"source_rows": 0, "reviewable": 0, "skip_counts": {}, "action_counts": {}, "now_ts": now_value, "min_age_sec": float(SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES) * 60.0, "max_age_sec": float(SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES) * 60.0}, level="INFO", also_overall=False)
                 return
             decisions["ts"] = pd.to_numeric(decisions["ts"], errors="coerce")
             decisions = decisions.dropna(subset=["ts"])
             min_age_sec = float(SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES) * 60.0
-            max_age_sec = float(SHADOW_SELL_REPLAY_MAX_DECISION_AGE_HOURS) * 3600.0
+            max_age_sec = float(SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES) * 60.0
             reviewable_actions = {"SHADOW", "SHADOW_BUY", "BUY", "COMMENTARY", "WAIT"}
             reviewable = decisions[(decisions["ts"] <= now_value - min_age_sec) & (decisions["ts"] >= now_value - max_age_sec) & (decisions["action"].astype(str).str.upper().isin(reviewable_actions))].copy()
             if reviewable.empty:
@@ -16277,7 +16331,7 @@ class TradingBot:
                 else:
                     skip_counts["simulate_none"] += 1
             if not rows_to_write:
-                module_debug(MODULE_NAME, "shadow_sell_replay_no_rows", data={"reviewable": int(len(reviewable)), "skip_counts": skip_counts, "now_ts": now_value, "min_age_sec": min_age_sec, "max_age_sec": max_age_sec}, level="INFO", also_overall=False)
+                module_debug(MODULE_NAME, "shadow_sell_replay_no_rows", data={"source_rows": int(len(decisions)) if decisions is not None else 0, "reviewable": int(len(reviewable)) if "reviewable" in locals() else 0, "skip_counts": skip_counts if "skip_counts" in locals() else {}, "action_counts": (decisions["action"].astype(str).str.upper().value_counts().to_dict() if decisions is not None and not decisions.empty and "action" in decisions.columns else {}), "now_ts": now_value, "min_age_sec": float(SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES) * 60.0, "max_age_sec": float(SHADOW_SELL_REPLAY_MAX_REVIEW_MINUTES) * 60.0}, level="INFO", also_overall=False)
                 return
             with open(SHADOW_SELL_REPLAY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=SHADOW_SELL_REPLAY_COLUMNS)
@@ -16303,8 +16357,9 @@ class TradingBot:
             job_idx = int(getattr(self, "_historical_replay_job_index", 0)) % max(1, len(jobs))
             product_id, timeframe = jobs[job_idx]
             self._historical_replay_job_index = (job_idx + 1) % max(1, len(jobs))
+            fetch_started = time.perf_counter()
             candles, granularity, replay_source = await self._get_historical_replay_candles(product_id=product_id, timeframe=timeframe)
-            fetch_elapsed_sec = time.perf_counter() - pass_started
+            fetch_elapsed_sec = time.perf_counter() - fetch_started
             eval_started = time.perf_counter()
             if not candles:
                 module_debug(MODULE_NAME, "historical_shadow_replay_no_candles", data={"product_id": product_id, "timeframe": timeframe}, level="INFO", also_overall=False); return
@@ -16370,6 +16425,33 @@ class TradingBot:
             return frame.sort_values("replay_ts")
         except Exception as exc:
             module_exception(MODULE_NAME, "historical_replay_rows_for_product_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False); return pd.DataFrame()
+
+    def _replay_support_for_live_candidate(self, product_id: str, candidate: Dict[str, Any]) -> Tuple[bool, str]:
+        try:
+            if not bool(ENABLE_REPLAY_SUPPORT_LIVE_BUY_GATE):
+                return True, "replay_support_gate_disabled"
+            frame = self._historical_replay_rows_for_product(product_id)
+            if frame.empty:
+                expected_utility = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
+                if bool(ALLOW_STRONG_UTILITY_OVERRIDE_WITHOUT_REPLAY) and expected_utility >= float(STRONG_UTILITY_OVERRIDE_MIN_BPS):
+                    return True, f"strong_utility_override_no_replay expected_utility={expected_utility:.2f};min={float(STRONG_UTILITY_OVERRIDE_MIN_BPS):.2f}"
+                return False, "no_qualified_historical_replay_rows"
+            net = pd.to_numeric(frame.get("net_pnl_bps"), errors="coerce").dropna()
+            if net.empty:
+                return False, "qualified_replay_has_no_net_pnl"
+            rows = int(len(net))
+            avg_net = float(net.mean())
+            win_rate = float((net > 0).mean())
+            if rows < int(REPLAY_SUPPORT_MIN_ROWS):
+                return False, f"not_enough_replay_rows rows={rows};min={int(REPLAY_SUPPORT_MIN_ROWS)}"
+            if avg_net < float(REPLAY_SUPPORT_MIN_AVG_NET_BPS):
+                return False, f"replay_avg_net_too_low avg_net={avg_net:.2f};min={float(REPLAY_SUPPORT_MIN_AVG_NET_BPS):.2f}"
+            if win_rate < float(REPLAY_SUPPORT_MIN_WIN_RATE):
+                return False, f"replay_win_rate_too_low win_rate={win_rate:.3f};min={float(REPLAY_SUPPORT_MIN_WIN_RATE):.3f}"
+            return True, f"replay_supported rows={rows};avg_net={avg_net:.2f};win_rate={win_rate:.3f}"
+        except Exception as exc:
+            module_exception(MODULE_NAME, "replay_support_for_live_candidate_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
+            return False, "replay_support_check_failed"
 
     def _all_historical_replay_rows_for_product(self, product_id: str) -> pd.DataFrame:
         try:
@@ -20606,7 +20688,12 @@ class TradingBot:
             snap_live: Optional[Dict[str, Dict[str, float]]] = None
             section_started = time.perf_counter()
             try:
-                snap_live = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
+                snap_live = await asyncio.wait_for(
+                    asyncio.to_thread(self.portfolio.refresh_snapshot, True, 0.0),
+                    timeout=8.0,
+                )
+                self.cached_account_snapshot = snap_live
+                self.cached_account_snapshot_ts = now_ts()
                 cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
                 equity_usd = float(
                     self.portfolio.compute_equity_usd(
@@ -20614,10 +20701,16 @@ class TradingBot:
                         snapshot=snap_live,
                     )
                 )
+            except asyncio.TimeoutError:
+                module_debug(MODULE_NAME, "eval_live_snapshot_refresh_timeout", data={"timeout_sec": 8.0}, level="WARN", also_overall=False)
+                snap_live = self.cached_account_snapshot or {}
+                cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
+                equity_usd = float(self.portfolio.compute_equity_usd(mid_by_product=self._live_mid_by_product(), snapshot=snap_live))
             except Exception as e:
-                log(f"[eval] Coinbase account refresh failed; skipping evaluation: {e}")
-                await asyncio.sleep(EVAL_TICK_SEC)
-                continue
+                module_exception(MODULE_NAME, "eval_live_snapshot_refresh_failed", e, data={"traceback": traceback.format_exc()}, also_overall=False)
+                snap_live = self.cached_account_snapshot or {}
+                cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
+                equity_usd = float(self.portfolio.compute_equity_usd(mid_by_product=self._live_mid_by_product(), snapshot=snap_live))
 
             mark_cycle_section("live_snapshot_refresh", section_started)
 

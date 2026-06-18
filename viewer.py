@@ -6,7 +6,7 @@ import traceback
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -154,24 +154,58 @@ div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid r
     transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
 }
 .coin-overview-card:hover { transform: translateY(-2px); border-color: rgba(57, 245, 163, 0.65); box-shadow: 0 0 24px rgba(57, 245, 163, 0.10); }
-.clickable-coin-card { cursor: pointer; }
-.coin-card-hitbox {
-    position: absolute;
-    inset: 0;
-    z-index: 20;
-    border-radius: 18px;
-    background: rgba(255, 255, 255, 0);
-    text-decoration: none;
+/* Native Streamlit button overlays.
+   These are real Streamlit buttons, so they update session_state reliably.
+   They are visually transparent and sit over the card that appears directly above them. */
+div[data-testid="stButton"]:has(button[aria-label^="coin_card_overlay_"]) {
+    margin-top: -285px;
+    height: 285px;
+    margin-bottom: 0.75rem;
+    position: relative;
+    z-index: 30;
+}
+
+div[data-testid="stButton"]:has(button[aria-label^="coin_card_overlay_"]) button {
+    width: 100%;
+    height: 285px;
+    min-height: 285px;
+    opacity: 0;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
     cursor: pointer;
 }
-.coin-card-hitbox:focus {
-    outline: 2px solid rgba(57, 245, 163, 0.65);
-    outline-offset: 2px;
+
+div[data-testid="stButton"]:has(button[aria-label^="agent_card_overlay_"]) {
+    margin-top: -260px;
+    height: 260px;
+    margin-bottom: 0.75rem;
+    position: relative;
+    z-index: 30;
 }
-.coin-card-hitbox:hover {
-    background: rgba(57, 245, 163, 0.035);
+
+div[data-testid="stButton"]:has(button[aria-label^="agent_card_overlay_"]) button {
+    width: 100%;
+    height: 260px;
+    min-height: 260px;
+    opacity: 0;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    cursor: pointer;
 }
-.tv-chart-shell { width: 100%; height: 900px; min-height: 900px; border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; overflow: hidden; background: #0b0f14; }
+
+.coin-overview-card,
+.agent-card {
+    position: relative;
+}
+
+.coin-overview-card:hover,
+.agent-card:hover {
+    transform: translateY(-2px);
+    border-color: rgba(57, 245, 163, 0.65);
+    box-shadow: 0 0 24px rgba(57, 245, 163, 0.10);
+}
 .coin-overview-card.buy { border-color: rgba(0, 255, 160, 0.48); }
 .coin-overview-card.shadow { border-color: rgba(255, 214, 102, 0.45); }
 .coin-overview-card.wait { border-color: rgba(135, 159, 180, 0.38); }
@@ -601,63 +635,114 @@ def agent_plain_summary(row: dict) -> str:
     return " ".join(summaries[:2])
 
 
+
+def agent_full_plain_summary(row: dict) -> str:
+    """Full paragraph version for the selected agent dialogue panel."""
+    agent = str(row.get("agent", "fallback"))
+    reason = str(row.get("reason", "") or "")
+    low = reason.lower()
+    leaning = vote_leaning(row)
+    opening = (f"{agent_title_icon(agent)} is currently leaning {leaning}. "
+        f"Its adjusted scores are buy {_safe_float(row.get('adjusted_buy_score')):.3f}, sell {_safe_float(row.get('adjusted_sell_score')):.3f}, "
+        f"hold {_safe_float(row.get('adjusted_hold_score')):.3f}, and wait {_safe_float(row.get('adjusted_wait_score')):.3f}, with confidence {_safe_float(row.get('confidence')):.3f}. ")
+    observations = []
+    patterns = [
+        (("entry_mode=no_position", "no position", "owns_position=false"), "It is judging this as a fresh-entry situation because the bot does not currently hold the coin, so sell pressure is being interpreted as a reason to avoid a new buy rather than as an instruction to exit an existing position."),
+        (("expected_utility_too_low", "expected_utility="), "The most important issue is expected utility: after Coinbase fees, spread, uncertainty, wait utility, and context penalties, the setup does not appear to offer enough net reward for live execution."),
+        (("maker_adjusted_ev_too_low", "maker_ev"), "Even if the bot tries to enter with maker-style execution, the maker-adjusted edge is still weak, so the analyst is not convinced that the trade can overcome costs cleanly."),
+        (("inside_value_area", "inside_value"), "Price appears to be inside the main value area, which often means the market is balanced or choppy rather than clearly trending. That makes a new buy less attractive unless price breaks and accepts outside value."),
+        (("near_poc", "poc_distance"), "Price is near the point of control, where a lot of trading has already happened. That can make the market more likely to chop around instead of moving cleanly toward a target."),
+        (("above_value_area", "accepted_above"), "There is some bullish context because price is above or trying to accept above value. The analyst still wants confirmation that this is acceptance, not a quick rejection back into the prior range."),
+        (("below_value_area", "accepted_lower"), "The value-area context is weaker because price is below or accepting lower prices, which can make a buy premature unless price reclaims value with strength."),
+        (("sweep_reclaim", "swept", "reclaimed"), "The analyst is watching for a sweep-and-reclaim style setup, where price takes liquidity and then reclaims a level. That can be useful, but it needs cleaner follow-through before it becomes a strong live entry."),
+        (("upper_rejection=true",), "The candle structure shows upper-wick rejection, which means buyers pushed price up but sellers pushed it back down. That weakens the immediate buy case."),
+        (("lower_rejection=true",), "The candle structure shows lower-wick rejection, which can mean buyers defended lower prices. That can support a buy only if the rest of the setup also confirms."),
+        (("bullish_fvg",), "There is a bullish fair-value-gap context on the chart. The bot is watching whether price respects that imbalance or fails back through it."),
+        (("bearish_fvg",), "There is a bearish fair-value-gap context on the chart. That can create overhead pressure unless price breaks through it convincingly."),
+        (("volume_profile_unavailable",), "The volume-profile data for this specific decision is weak or unavailable, so this analyst has less confidence in value-area levels for the current coin."),
+        (("low_volume_node", "lvn"), "A nearby low-volume area may create a faster move if price breaks into it cleanly, but the bot still needs the setup to clear fees and execution cost."),
+        (("high_volume_node",), "A high-volume node can slow price down because many trades have already occurred there, so the bot is cautious about expecting a clean scalp through that zone."),
+        (("walk_forward",), "The walk-forward validation layer is not strongly supportive yet. That does not automatically mean the setup is bad, but it reduces confidence because similar historical examples have not proven themselves cleanly."),
+        (("buy_vs_wait",), "The buy-versus-wait calculation favors patience. In plain English, the bot believes waiting may offer a better risk/reward than buying immediately."),
+        (("probability_below", "calibrated_p_win"), "The calibrated probability model is not giving enough edge yet. The analyst wants stronger odds before supporting a live trade."),
+        (("payoff",), "The payoff ratio is part of the hesitation: the expected win is not large enough compared with the expected loss and cost burden."),
+    ]
+    for keys, text in patterns:
+        if any(key in low for key in keys): observations.append(text)
+    if not observations:
+        observations.append("The raw reason does not map to a known explanation pattern yet. The safest interpretation is that this analyst is weighing the chart, score, confidence, and Level 8 context before supporting live execution.")
+    closing = f"Overall, this analyst is saying {leaning} because it wants a cleaner alignment between chart structure, volume context, probability, and fee-adjusted profitability before Level 8 risks live money."
+    return opening + " ".join(observations[:5]) + " " + closing
+
 def set_selected_coin(product_id: str) -> None:
     product_id = str(product_id or "").strip()
     if not product_id:
         return
+
     st.session_state["selected_coin"] = product_id
     st.session_state["strategy_arena_coin"] = product_id
     st.session_state["_scroll_to_strategy_arena"] = True
 
-
-def apply_query_selected_coin(snapshot: Dict[str, Any]) -> None:
-    """
-    Reads ?coin=PRODUCT and applies it to the Strategy Arena selection.
-    It only triggers scroll when the query coin changes, so auto-refresh does not
-    keep yanking the user back down the page.
-    """
-    try:
-        available = get_available_products(snapshot)
-        raw_coin = st.query_params.get("coin", None)
-        if isinstance(raw_coin, list):
-            raw_coin = raw_coin[0] if raw_coin else None
-        selected = unquote(str(raw_coin or "")).strip()
-        if not selected or selected not in available:
-            return
-        last_applied = st.session_state.get("_last_query_coin_applied")
-        st.session_state["selected_coin"] = selected
-        st.session_state["strategy_arena_coin"] = selected
-        if selected != last_applied:
-            st.session_state["_scroll_to_strategy_arena"] = True
-            st.session_state["_last_query_coin_applied"] = selected
-        module_debug(MODULE_NAME, "query_coin_applied", data={"selected": selected, "last_applied": last_applied, "available_count": len(available)}, level="INFO", also_overall=False)
-    except Exception as exc:
-        module_exception(MODULE_NAME, "apply_query_selected_coin_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+    module_debug(
+        MODULE_NAME,
+        "coin_card_selected",
+        data={"product_id": product_id},
+        level="INFO",
+        also_overall=False,
+    )
 
 
-def scroll_to_strategy_arena_if_requested() -> None:
-    if not st.session_state.pop("_scroll_to_strategy_arena", False):
+def set_selected_agent(agent_name: str) -> None:
+    agent_name = str(agent_name or "").strip()
+    if not agent_name:
         return
+
+    st.session_state["selected_agent_dialogue"] = agent_name
+    st.session_state["_scroll_to_agent_dialogue"] = True
+
+    module_debug(
+        MODULE_NAME,
+        "agent_card_selected",
+        data={"agent": agent_name},
+        level="INFO",
+        also_overall=False,
+    )
+
+
+def scroll_to_anchor_if_requested(flag_key: str, anchor_id: str) -> None:
+    """
+    Scrolls inside the current Streamlit page after a native Streamlit click.
+    This does not use href links, javascript:void links, or query params.
+    """
+    if not st.session_state.pop(flag_key, False):
+        return
+
+    safe_anchor = str(anchor_id).replace('"', '').replace("'", "")
+
     components.html(
-        """
+        f"""
         <script>
         const parentWindow = window.parent || window;
         const doc = parentWindow.document;
-        setTimeout(function() {
-            const el = doc.getElementById("strategy-arena-anchor");
-            if (el) {
-                el.scrollIntoView({behavior: "smooth", block: "start"});
-            }
-            try {
-                const cleanUrl = new URL(parentWindow.location.href);
-                cleanUrl.searchParams.delete("coin");
-                parentWindow.history.replaceState({}, "", cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
-            } catch (err) {}
-        }, 180);
+        setTimeout(function() {{
+            const el = doc.getElementById("{safe_anchor}");
+            if (el) {{
+                el.scrollIntoView({{behavior: "smooth", block: "start"}});
+            }}
+        }}, 150);
         </script>
         """,
         height=0,
     )
+
+
+def scroll_to_strategy_arena_if_requested() -> None:
+    scroll_to_anchor_if_requested("_scroll_to_strategy_arena", "strategy-arena-anchor")
+
+
+def scroll_to_agent_dialogue_if_requested() -> None:
+    scroll_to_anchor_if_requested("_scroll_to_agent_dialogue", "agent-dialogue-anchor")
+
 
 def render_agent_disagreement_summary(votes: pd.DataFrame) -> Dict[str, Any]:
     if votes.empty: return {"BUY":0,"SELL":0,"HOLD":0,"WAIT":0,"consensus":"WAIT","main_blocker":"No agent votes yet"}
@@ -817,26 +902,8 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
             product_id = str(row.get("product_id") or "")
             card_state = ("buy" if row.get("action") == "BUY" else "shadow" if "SHADOW" in str(row.get("action") or "") else "blocked" if row.get("blocker") else "wait")
             with col:
-                encoded_coin = quote(product_id, safe="")
                 st.markdown(f'''
-                    <div class="coin-overview-card {card_state} clickable-coin-card">
-                        <a
-                            class="coin-card-hitbox"
-                            href="javascript:void(0)"
-                            data-coin="{encoded_coin}"
-                            aria-label="Open {html.escape(product_id)} in Strategy Arena"
-                            onclick="
-                                event.preventDefault();
-                                event.stopPropagation();
-                                const coin = this.getAttribute('data-coin');
-                                const parentWindow = window.parent || window;
-                                const url = new URL(parentWindow.location.href);
-                                url.searchParams.set('coin', coin);
-                                url.hash = 'strategy-arena-anchor';
-                                parentWindow.location.assign(url.toString());
-                                return false;
-                            "
-                        ></a>
+                    <div class="coin-overview-card {card_state}">
                         <div style="font-size:1.25rem;font-weight:900;"><span class="rank-badge">#{row["rank"]}</span>{_html(product_id)}</div>
                         <div class="viability-score">Viability {row["viability_score"]:.1f}</div>
                         <div class="viability-reason">{_html(row["viability_reason"])}</div>
@@ -849,44 +916,15 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
                         <div class="muted">Blocker: {_html(row["blocker"][:160] or "No blocker published.")}</div>
                     </div>
                     ''', unsafe_allow_html=True)
+
+                if st.button(
+                    f"coin_card_overlay_{product_id}",
+                    key=f"coin_card_overlay_{product_id}",
+                    use_container_width=True,
+                ):
+                    set_selected_coin(product_id)
     with st.expander("All-coin sortable table", expanded=False):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-def tradingview_symbol(product_id: str) -> str:
-    return f"COINBASE:{str(product_id or '').replace('-', '')}"
-
-
-def render_tradingview_chart(product_id: str) -> None:
-    symbol = tradingview_symbol(product_id)
-
-    html_block = f'''
-    <div class="tv-chart-shell">
-        <div class="tradingview-widget-container" style="height:100%;width:100%;">
-            <div class="tradingview-widget-container__widget" style="height:100%;width:100%;"></div>
-            <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
-            {{
-                "autosize": true,
-                "symbol": "{symbol}",
-                "interval": "15",
-                "timezone": "Etc/UTC",
-                "theme": "dark",
-                "style": "1",
-                "locale": "en",
-                "allow_symbol_change": false,
-                "hide_side_toolbar": false,
-                "hide_top_toolbar": false,
-                "hide_legend": false,
-                "hide_volume": false,
-                "calendar": false,
-                "support_host": "https://www.tradingview.com"
-            }}
-            </script>
-        </div>
-    </div>
-    '''
-
-    components.html(html_block, height=930, scrolling=False)
-
 
 def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, decision_row: dict, votes: pd.DataFrame):
     st.markdown('<div class="agent-ticker"><b>Live Agent Debate</b><div class="muted">The highlighted analyst rotates automatically as the viewer refreshes.</div></div>', unsafe_allow_html=True)
@@ -901,28 +939,63 @@ def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, deci
         st.dataframe(votes[display_cols] if display_cols else votes, use_container_width=True, hide_index=True)
 
 
-def render_agent_detail_panel(agent_name: str, votes: pd.DataFrame):
+def render_agent_dialogue_panel(agent_name: str, votes: pd.DataFrame):
     sub = votes[votes["agent"].astype(str) == str(agent_name)] if not votes.empty and "agent" in votes.columns else pd.DataFrame()
-    if sub.empty: return
-    row = sub.iloc[-1].to_dict(); reason = str(row.get("reason", ""))
-    st.markdown(f'''<div class="screen-card"><h3>{_html(agent_title_icon(agent_name))}</h3><b>Leaning:</b> {vote_leaning(row)}<br><b>Confidence:</b> {_safe_float(row.get("confidence")):.3f}<br><b>Strongest score:</b> {strongest_vote_score(row):.3f}<br><b>Plain-English reason:</b> {_html(plain_reason(reason))}<br></div>''', unsafe_allow_html=True)
-    with st.expander("Raw analyst reason", expanded=False): st.text(reason)
 
+    if sub.empty:
+        st.info("Select an analyst card to view its full dialogue.")
+        return
+
+    row = sub.iloc[-1].to_dict()
+    reason = str(row.get("reason", ""))
+
+    st.markdown(
+        f'''
+        <div class="screen-card">
+            <h2>{_html(agent_title_icon(agent_name))}</h2>
+            <div class="muted">Full analyst dialogue for the selected decision.</div>
+            <p>{_html(agent_full_plain_summary(row))}</p>
+            <div class="context-grid">
+                <div class="context-card"><h3>Current leaning</h3><p><b>{_html(vote_leaning(row))}</b></p></div>
+                <div class="context-card"><h3>Confidence</h3><p><b>{_safe_float(row.get("confidence")):.3f}</b></p></div>
+                <div class="context-card"><h3>Strongest score</h3><p><b>{strongest_vote_score(row):.3f}</b></p></div>
+                <div class="context-card"><h3>Leaderboard rank</h3><p><b>{_html(row.get("leaderboard_rank", "not published"))}</b></p></div>
+            </div>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Raw coded analyst reason", expanded=False):
+        st.text(reason)
 
 def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
     st.markdown("### Analyst Roster")
-    if votes.empty: st.info("No analyst rows yet."); return
-    focus_options = votes["agent"].dropna().astype(str).unique().tolist() if "agent" in votes.columns else []
-    focused = st.selectbox("Focus analyst", focus_options, format_func=agent_title_icon, key=f"focus_analyst_{selected_coin}") if focus_options else ""
+
+    if votes.empty:
+        st.info("No analyst rows yet.")
+        return
+
     rows = votes.to_dict("records")
+
+    if not st.session_state.get("selected_agent_dialogue"):
+        if "agent" in votes.columns and "volume_profile_leader" in votes["agent"].astype(str).tolist():
+            st.session_state["selected_agent_dialogue"] = "volume_profile_leader"
+        elif rows:
+            st.session_state["selected_agent_dialogue"] = str(rows[0].get("agent", "fallback"))
+
     for i in range(0, len(rows), 3):
         cols = st.columns(3)
+
         for col, row in zip(cols, rows[i:i + 3]):
-            agent = str(row.get("agent", "fallback")); leaning = vote_leaning(row).lower()
+            agent = str(row.get("agent", "fallback"))
+            leaning = vote_leaning(row).lower()
+            selected_class = "active" if agent == st.session_state.get("selected_agent_dialogue") else ""
+
             with col:
                 st.markdown(
                     f'''
-                    <div class="agent-card agent-card-{leaning}">
+                    <div class="agent-card agent-card-{leaning} {selected_class}">
                         <div class="agent-title">{_html(agent_title_icon(agent))}</div>
                         <div class="agent-metrics">
                             Leaning: <b>{leaning.upper()}</b><br>
@@ -936,8 +1009,20 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
                     ''',
                     unsafe_allow_html=True,
                 )
-    if focused: render_agent_detail_panel(focused, votes)
 
+                if st.button(
+                    f"agent_card_overlay_{selected_coin}_{agent}",
+                    key=f"agent_card_overlay_{selected_coin}_{agent}",
+                    use_container_width=True,
+                ):
+                    set_selected_agent(agent)
+
+    st.markdown('<div id="agent-dialogue-anchor"></div>', unsafe_allow_html=True)
+    scroll_to_agent_dialogue_if_requested()
+
+    selected_agent = st.session_state.get("selected_agent_dialogue")
+    if selected_agent:
+        render_agent_dialogue_panel(selected_agent, votes)
 
 def render_topic_explanation(topic, selected_coin, votes, decisions_df, market_df, snapshot):
     coin = dict((snapshot.get("coins", {}) or {}).get(selected_coin, {}) or {}); _, drow, _ = latest_council_votes_for_coin(votes, decisions_df, selected_coin)
@@ -953,7 +1038,7 @@ def render_learning_console(selected_coin, votes, decisions_df, market_df, snaps
     topic = st.selectbox("Learning topic", ["Why the bot is not buying live", "What would need to change", "Chart levels", "Fee impact", "Agent disagreement", "Selected analyst details"], key=f"learning_topic_{selected_coin}")
     agent_options = [str(a) for a in votes["agent"].dropna().astype(str).unique().tolist()] if not votes.empty and "agent" in votes.columns else []
     if topic == "Selected analyst details" and agent_options:
-        selected_agent = st.selectbox("Focus analyst", agent_options, format_func=agent_title_icon, key=f"focus_agent_{selected_coin}"); render_agent_detail_panel(selected_agent, votes); return
+        selected_agent = st.selectbox("Focus analyst", agent_options, format_func=agent_title_icon, key=f"focus_agent_{selected_coin}"); render_agent_dialogue_panel(selected_agent, votes); return
     render_topic_explanation(topic, selected_coin, votes, decisions_df, market_df, snapshot)
 
 
@@ -971,13 +1056,11 @@ def render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, d
     selected = st.selectbox("Strategy Arena Coin", available, index=available.index(current), key="strategy_arena_coin")
     st.session_state["selected_coin"] = selected
     st.markdown(f'<div class="hud-header"><div class="hud-title">Strategy Arena</div><div class="hud-subtitle">{_html(selected)} · chart first, analyst debate below.</div></div>', unsafe_allow_html=True)
-    chart_choice = st.radio("Chart source", ["Bot overlay chart", "TradingView visual chart"], horizontal=True, key=f"chart_source_{selected}")
-    if chart_choice == "TradingView visual chart":
-        render_tradingview_chart(selected); st.info("TradingView is visual-only. The bot still learns from Coinbase API data and internal CSV history.")
-    else:
-        chart_df, chart_meta = load_chart_history(selected, timeframe); confirmed = confirmed_trades_only(trades_df, selected); target = latest_targets_for_coin(targets_df, selected)
-        fig = build_coin_chart(chart_df, chart_meta, dict((snapshot.get("coins") or {}).get(selected, {}) or {}), market_df, confirmed, shadow_df, decisions_df, target, overlays, full_chart=True)
-        st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{selected}_{timeframe}", config={"displayModeBar": True, "scrollZoom": True, "responsive": True})
+    chart_df, chart_meta = load_chart_history(selected, timeframe)
+    confirmed = confirmed_trades_only(trades_df, selected)
+    target = latest_targets_for_coin(targets_df, selected)
+    fig = build_coin_chart(chart_df, chart_meta, dict((snapshot.get("coins") or {}).get(selected, {}) or {}), market_df, confirmed, shadow_df, decisions_df, target, overlays, full_chart=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{selected}_{timeframe}", config={"displayModeBar": True, "scrollZoom": True, "responsive": True})
     latest_decision_id, drow, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected)
     render_agent_debate_stream(selected, latest_decision_id, drow, votes); render_agent_roster_no_buttons(selected, votes)
 
@@ -1157,12 +1240,19 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
             "score_below_target": reasons_blob.count("score_below"),
             "probability_below_target": reasons_blob.count("probability_below"),
         }
-        st.write(f"Latest action counts: {actions}")
-        st.write(f"Latest blocker counts: {counts}")
+        count_cols = st.columns(2)
+        count_cols[0].metric("Latest SHADOW decisions", actions.get("SHADOW", 0))
+        count_cols[1].metric("Latest COMMENTARY decisions", actions.get("COMMENTARY", 0))
+
+        with st.expander("Raw latest no-trade counts", expanded=False):
+            st.write({"actions": actions, "blockers": counts})
+
         if counts["expected_utility_too_low"] > 0:
             st.warning("The main reason no trades are firing is expected_utility_too_low. That means Level 8 thinks the setup does not make enough net profit after Coinbase fees, spread, uncertainty, wait utility, and context penalties.")
+            st.info("This is not a viewer failure. It means the bot is finding activity, but Level 8 does not believe the setups are net-profitable enough yet after Coinbase costs and context penalties.")
 
-    st.json(readiness)
+    with st.expander("Raw readiness JSON", expanded=False):
+        st.json(readiness)
     for name, df in [("trades", trades_df), ("orders", orders_df), ("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df)]:
         with st.expander(name, expanded=False):
             st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
@@ -1182,7 +1272,6 @@ def main() -> None:
     refresh_config = get_refresh_config()
     render_crypto_header()
     snapshot_static = load_viewer_snapshot()
-    apply_query_selected_coin(snapshot_static)
     selected = pick_selected_coin(snapshot_static)
     if not selected:
         st.info("Waiting for bot data. Start the bot and wait for viewer_snapshot.json to update.")

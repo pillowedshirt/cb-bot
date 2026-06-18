@@ -212,7 +212,7 @@ HISTORY_FETCH_CONCURRENCY: int = 2
 MACRO_FETCH_CONCURRENCY: int = 1
 MACRO_DAY_REFRESH_EVERY_SEC = 180
 MACRO_WEEK_REFRESH_EVERY_SEC = 900
-MACRO_PRODUCTS_PER_PASS = 3
+MACRO_PRODUCTS_PER_PASS = 1
 SIGNAL_EVENTS_CSV_PATH: str = os.path.join(BASE_DIR, "signal_events.csv")
 LEVEL8_COUNCIL_DECISIONS_CSV_PATH: str = os.path.join(
     BASE_DIR, "council_decisions.csv"
@@ -16318,6 +16318,124 @@ class TradingBot:
         except Exception as exc:
             module_exception(MODULE_NAME, f"background_work_schedule_failed:{name}", exc, also_overall=True)
 
+    async def viewer_snapshot_heartbeat_loop(self) -> None:
+        """
+        Keeps viewer_snapshot.json fresh even when eval_loop is busy.
+        Uses the latest cached viewer snapshot rows rather than recalculating Level 8.
+        """
+        await asyncio.sleep(2.0)
+
+        while not self._stop_event.is_set():
+            try:
+                rows = dict(getattr(self, "_latest_viewer_snapshot_rows", {}) or {})
+
+                if rows:
+                    ranked = sorted(
+                        list(rows.values()),
+                        key=lambda x: (
+                            _viewer_safe_float(x.get("expected_utility_bps", 0.0)),
+                            _viewer_safe_float(x.get("truth_score", 0.0)),
+                            _viewer_safe_float(x.get("volume_profile_leader_buy_score", 0.0)),
+                        ),
+                        reverse=True,
+                    )
+
+                    snapshot = {
+                        "updated_ts": time.time(),
+                        "coins": rows,
+                        "top_products": [r.get("product_id", "") for r in ranked[:8]],
+                        "live_positions": [
+                            r.get("product_id", "")
+                            for r in ranked
+                            if bool(r.get("owns_position", False))
+                        ],
+                        "readiness": self._live_readiness_status(),
+                    }
+
+                    self._write_viewer_snapshot(snapshot)
+                    self._last_viewer_snapshot_write_ts = time.time()
+
+                    module_debug(
+                        MODULE_NAME,
+                        "viewer_snapshot_heartbeat_written",
+                        data={
+                            "coin_count": len(rows),
+                            "top_products": snapshot["top_products"],
+                        },
+                        level="DEBUG",
+                        also_overall=False,
+                    )
+
+            except Exception as exc:
+                module_exception(
+                    MODULE_NAME,
+                    "viewer_snapshot_heartbeat_failed",
+                    exc,
+                    data={"traceback": traceback.format_exc()},
+                    also_overall=False,
+                )
+
+            await asyncio.sleep(float(VIEWER_SNAPSHOT_WRITE_EVERY_SEC))
+
+    def _seed_micro_history_ready_from_csv(self) -> None:
+        try:
+            if not os.path.exists(MICRO_HISTORY_CSV_PATH):
+                self._micro_history_ready = False
+                return
+
+            counts: Dict[str, int] = {}
+            latest_ts_by_product: Dict[str, float] = {}
+
+            with open(MICRO_HISTORY_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    product_id = str(row.get("product_id") or "")
+                    if not product_id:
+                        continue
+
+                    counts[product_id] = counts.get(product_id, 0) + 1
+
+                    try:
+                        ts_value = float(row.get("ts") or 0.0)
+                    except Exception:
+                        ts_value = 0.0
+
+                    latest_ts_by_product[product_id] = max(
+                        latest_ts_by_product.get(product_id, 0.0),
+                        ts_value,
+                    )
+
+            ready_products = [
+                p for p in PRODUCTS
+                if counts.get(p, 0) >= 120
+            ]
+
+            self._micro_history_ready = len(ready_products) >= max(1, int(len(PRODUCTS) * 0.80))
+
+            module_debug(
+                MODULE_NAME,
+                "micro_history_ready_seeded_from_csv",
+                data={
+                    "ready": bool(self._micro_history_ready),
+                    "ready_products": len(ready_products),
+                    "product_count": len(PRODUCTS),
+                    "counts_sample": {p: counts.get(p, 0) for p in PRODUCTS[:5]},
+                    "latest_ts_sample": {p: latest_ts_by_product.get(p, 0.0) for p in PRODUCTS[:5]},
+                },
+                level="INFO",
+                also_overall=True,
+            )
+
+        except Exception as exc:
+            self._micro_history_ready = False
+            module_exception(
+                MODULE_NAME,
+                "seed_micro_history_ready_from_csv_failed",
+                exc,
+                data={"traceback": traceback.format_exc()},
+                also_overall=True,
+            )
+
     async def top_of_book_keeper_loop(self) -> None:
         """
         Keep bid/ask fresh without letting REST quote repair stall the event loop.
@@ -16440,6 +16558,7 @@ class TradingBot:
         log(f"[run] mode=LIVE_ONLY products={PRODUCTS}")
         self.active_products_log.write_products(PRODUCTS)
         log(f"[startup] active products written: {PRODUCTS}")
+        self._seed_micro_history_ready_from_csv()
 
         log("[run] starting websocket task first")
         ws_task = asyncio.create_task(self.ws_loop())
@@ -16459,6 +16578,7 @@ class TradingBot:
         log("[run] starting telemetry and eval loops before slow calibration finishes")
         telemetry_task = asyncio.create_task(self.telemetry_loop())
         eval_task = asyncio.create_task(self.eval_loop())
+        viewer_snapshot_heartbeat_task = asyncio.create_task(self.viewer_snapshot_heartbeat_loop())
 
         log("[run] starting background history, macro, calibration, and extended chart tasks")
         history_task = asyncio.create_task(self.preload_micro_history())
@@ -16466,7 +16586,7 @@ class TradingBot:
         calibration_task = asyncio.create_task(self.calibrate_products_on_startup_background())
         extended_chart_task = asyncio.create_task(self.extended_chart_cache_loop())
 
-        await asyncio.gather(ws_task, tob_keeper_task, telemetry_task, eval_task, history_task, macro_task, calibration_task, extended_chart_task)
+        await asyncio.gather(ws_task, tob_keeper_task, telemetry_task, eval_task, viewer_snapshot_heartbeat_task, history_task, macro_task, calibration_task, extended_chart_task)
 
     # --------------------------------------------------------
     # WebSocket loop
@@ -16563,7 +16683,20 @@ class TradingBot:
                 for product in product_batch:
                     if do_week:
                         start_week = int(now_ts()) - 7 * 24 * 60 * 60
-                        candles_week = await self.fetcher.fetch_chunked(product, start_week, end_ts, "FIFTEEN_MINUTE")
+                        try:
+                            candles_week = await asyncio.wait_for(
+                                self.fetcher.fetch_chunked(product, start_week, end_ts, "FIFTEEN_MINUTE"),
+                                timeout=20.0,
+                            )
+                        except asyncio.TimeoutError:
+                            module_debug(
+                                MODULE_NAME,
+                                "macro_week_fetch_timeout",
+                                data={"product_id": product, "timeout_sec": 20.0},
+                                level="WARN",
+                                also_overall=False,
+                            )
+                            candles_week = []
                         if candles_week:
                             levels_week = compute_macro_levels(candles_week)
                             if levels_week:
@@ -16576,8 +16709,10 @@ class TradingBot:
                         if len(live_rows) >= 120:
                             candles_day = [Candle(ts=int(r["ts"]), open=float(r["open"]), high=float(r["high"]), low=float(r["low"]), close=float(r["close"]), volume=float(r.get("volume", 0.0))) for r in live_rows]
                         else:
-                            start_day = int(now_ts_i()) - 24 * 60 * 60
-                            candles_day = await self.fetcher.fetch_chunked(product, start_day, end_ts, "ONE_MINUTE")
+                            # Do not REST-fetch a full day of 1m candles inside the live macro loop.
+                            # That is too heavy and causes eval_loop gaps.
+                            # Use cached macro_day.csv/live_1m, then let preload/background jobs fill gaps.
+                            candles_day = []
                         if candles_day:
                             levels_day = compute_macro_levels(candles_day)
                             if levels_day:
@@ -20982,12 +21117,26 @@ class TradingBot:
                     or now_ts() - float(self.cached_account_snapshot_ts or 0.0)
                     >= TELEMETRY_ACCOUNT_REFRESH_TTL_SEC
                 ):
-                    self.cached_account_snapshot = await asyncio.to_thread(
-                        self.portfolio.refresh_snapshot,
-                        True,
-                        0.0,
-                    )
-                    self.cached_account_snapshot_ts = now_ts()
+                    try:
+                        self.cached_account_snapshot = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.portfolio.refresh_snapshot,
+                                True,
+                                0.0,
+                            ),
+                            timeout=8.0,
+                        )
+                        self.cached_account_snapshot_ts = now_ts()
+                    except asyncio.TimeoutError:
+                        module_debug(
+                            MODULE_NAME,
+                            "telemetry_account_refresh_timeout",
+                            data={"timeout_sec": 8.0},
+                            level="WARN",
+                            also_overall=False,
+                        )
+                        self.cached_account_snapshot = self.cached_account_snapshot or {}
+                        self.cached_account_snapshot_ts = float(getattr(self, "cached_account_snapshot_ts", 0.0) or 0.0)
 
                 snap_live = self.cached_account_snapshot
                 cash_usd = self.portfolio.get_tradable_usd(snapshot=snap_live)

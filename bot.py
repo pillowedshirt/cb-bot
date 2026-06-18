@@ -637,6 +637,22 @@ LEVEL8_ALLOW_CORE_BUCKET_LIVE_TRADES: bool = True
 # ============================================================
 # LEVEL 8 LIVE EXECUTION QUALITY GATE
 # ============================================================
+
+TRADING_AGGRESSION_MODE: str = "PROFIT_FIRST_FEE_AWARE"
+# Options:
+# - "STRICT_FEE_AWARE": highest filtering, fewer trades
+# - "PROFIT_FIRST_FEE_AWARE": trade when Level 8 and net-after-fees math are strong
+# - "OBSERVATION_ONLY": no live buys
+
+PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS: bool = True
+PROFIT_FIRST_KEEP_OPERATIONAL_BLOCKS: bool = True
+PROFIT_FIRST_MIN_PROJECTED_NET_AFTER_COST_BPS: float = 35.0
+PROFIT_FIRST_MIN_EXPECTED_UTILITY_BPS: float = 20.0
+PROFIT_FIRST_MIN_MAKER_ADJUSTED_EV_BPS: float = 5.0
+PROFIT_FIRST_MIN_CALIBRATED_P_WIN: float = 0.42
+PROFIT_FIRST_MIN_PAYOFF_RATIO: float = 0.70
+PROFIT_FIRST_BUY_MUST_BEAT_WAIT_BY_BPS: float = 5.0
+
 # Level 8 can still learn from weak ideas, but weak ideas become SHADOW.
 # Live buys require stronger evidence because real Coinbase fees are expensive.
 LEVEL8_ENABLE_LIVE_BUY_QUALITY_GATE: bool = True
@@ -5839,6 +5855,7 @@ class TradingBot:
         self._macro_ready: bool = False
         self._startup_calibration_ready: bool = False
         self._product_calibration_ready: Dict[str, bool] = {p: False for p in PRODUCTS}
+        self._seed_product_calibration_ready_from_csv()
         self._extended_chart_cache_running: bool = False
         self._last_extended_chart_refresh_ts: float = 0.0
         self._extended_chart_job_index = 0
@@ -6506,15 +6523,15 @@ class TradingBot:
         """
         Refresh Coinbase maker/taker fee bps from transaction_summary.
 
-        This bot is live-only and fee-strict:
+        This bot is live-only and fee-aware:
         - If Coinbase fee tier cannot be detected, trading is blocked.
         - No hardcoded maker/taker fallback is used.
         """
         if not AUTO_REFRESH_COINBASE_FEE_TIER:
-            raise RuntimeError("AUTO_REFRESH_COINBASE_FEE_TIER must remain True for live-only fee-strict mode.")
+            raise RuntimeError("AUTO_REFRESH_COINBASE_FEE_TIER must remain True for live-only fee-aware mode.")
 
         if not REQUIRE_COINBASE_FEE_TIER:
-            raise RuntimeError("REQUIRE_COINBASE_FEE_TIER must remain True for live-only fee-strict mode.")
+            raise RuntimeError("REQUIRE_COINBASE_FEE_TIER must remain True for live-only fee-aware mode.")
 
         if not isinstance(self.portfolio, LivePortfolio):
             raise RuntimeError("Live-only bot requires LivePortfolio.")
@@ -8495,6 +8512,53 @@ class TradingBot:
         )
         return profile
 
+
+    def _seed_product_calibration_ready_from_csv(self) -> None:
+        try:
+            if not os.path.exists(CALIBRATION_CSV_PATH):
+                return
+            with open(CALIBRATION_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            latest_by_product: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                product_id = str(row.get("product_id") or "")
+                if not product_id:
+                    continue
+                try:
+                    ts = float(row.get("ts") or 0.0)
+                except Exception:
+                    ts = 0.0
+                old = latest_by_product.get(product_id)
+                if old is None or ts >= float(old.get("_ts_num", 0.0) or 0.0):
+                    row["_ts_num"] = ts
+                    latest_by_product[product_id] = row
+            ready_count = 0
+            for product_id in PRODUCTS:
+                row = latest_by_product.get(product_id)
+                if not row:
+                    self._product_calibration_ready[product_id] = False
+                    continue
+                is_ready = str(row.get("is_calibrated") or "").strip().lower() in {"1", "true", "yes"}
+                self._product_calibration_ready[product_id] = bool(is_ready)
+                if is_ready:
+                    ready_count += 1
+            if ready_count == len(PRODUCTS):
+                self._startup_calibration_ready = True
+            module_debug(MODULE_NAME, "product_calibration_ready_seeded_from_csv", data={"ready_count": ready_count, "product_count": len(PRODUCTS), "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False))}, level="INFO", also_overall=True)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "seed_product_calibration_ready_from_csv_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+
+    async def calibrate_products_on_startup_background(self) -> None:
+        try:
+            await self.calibrate_products_on_startup()
+            self._startup_calibration_ready = True
+            self.last_hourly_calibration_update_ts = now_ts()
+            module_debug(MODULE_NAME, "startup_calibration_ready", data={"products": PRODUCTS, "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v)}, level="INFO", also_overall=True)
+        except Exception as exc:
+            self._startup_calibration_ready = False
+            module_exception(MODULE_NAME, "startup_calibration_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+
     async def calibrate_products_on_startup(self) -> None:
         """Fetch recent history and build per-product calibration profiles."""
         if not ENABLE_WALK_FORWARD_CALIBRATION:
@@ -8506,6 +8570,9 @@ class TradingBot:
         start_week = end_ts - CALIB_WEEK_LOOKBACK_MINUTES * 60
         for product in PRODUCTS:
             try:
+                if self._is_product_calibration_ready(product):
+                    module_debug(MODULE_NAME, "startup_calibration_using_existing_ready_product", data={"product_id": product}, level="INFO", also_overall=False)
+                    continue
                 log(f"[calibration] fetching history for {product}")
                 day_candles = await self.fetcher.fetch_chunked(
                     product, start_day, end_ts, CALIB_DAY_GRANULARITY
@@ -12128,6 +12195,16 @@ class TradingBot:
         """
         try:
             product_id = str(candidate.get("product_id", ""))
+            mode = str(TRADING_AGGRESSION_MODE or "PROFIT_FIRST_FEE_AWARE").upper()
+            profit_first = mode == "PROFIT_FIRST_FEE_AWARE"
+            observation_only = mode == "OBSERVATION_ONLY"
+            if observation_only:
+                return False, "live_buy_blocked:observation_only_mode"
+
+            def add_profit_first_warning(reason: str) -> None:
+                existing = str(candidate.get("profit_first_non_economic_warnings", "") or "")
+                candidate["profit_first_non_economic_warnings"] = (existing + "|" + reason) if existing else reason
+
             current_price_for_stack_check = float(
                 candidate.get("price", 0.0)
                 or candidate.get("mid", 0.0)
@@ -12219,6 +12296,10 @@ class TradingBot:
                 + float(regime_adj.get("regime_margin_adjust", 0.0) or 0.0)
                 + float(adaptive_adj.get("margin_adjust", 0.0) or 0.0)
             )
+            if profit_first:
+                effective_min_utility_bps = min(float(effective_min_utility_bps), float(PROFIT_FIRST_MIN_EXPECTED_UTILITY_BPS))
+                effective_min_truth = min(float(effective_min_truth), 0.50)
+                effective_min_margin = min(float(effective_min_margin), 0.04)
 
             setup_tag_text = str(
                 candidate.get("setup_tag", "")
@@ -12232,10 +12313,16 @@ class TradingBot:
 
             projected_net_after_cost = float(projected_forward) - float(cost_bps)
 
-            base_min_projected_net = max(
-                float(LEVEL8_MIN_NET_AFTER_COST_FOR_LIVE_BUY_BPS),
-                float(LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS),
-            )
+            if profit_first:
+                base_min_projected_net = max(
+                    float(PROFIT_FIRST_MIN_PROJECTED_NET_AFTER_COST_BPS),
+                    float(MIN_NET_GAIN_AFTER_FEES_BPS),
+                )
+            else:
+                base_min_projected_net = max(
+                    float(LEVEL8_MIN_NET_AFTER_COST_FOR_LIVE_BUY_BPS),
+                    float(LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS),
+                )
 
             backtest_gate = self._backtest_live_buy_requirements(
                 product_id=product_id,
@@ -12249,19 +12336,23 @@ class TradingBot:
             backtest_reason = str(backtest_gate.get("reason", ""))
 
             if bool(ENABLE_EXPECTED_UTILITY_LEADER):
-                if calibrated_p_win < float(UTILITY_MIN_CALIBRATED_P_WIN):
+                min_calibrated_p_win = (float(PROFIT_FIRST_MIN_CALIBRATED_P_WIN) if profit_first else float(UTILITY_MIN_CALIBRATED_P_WIN))
+                if calibrated_p_win < min_calibrated_p_win:
                     return False, (
                         f"live_buy_shadowed:utility_calibrated_probability_too_low "
                         f"calibrated_p_win={calibrated_p_win:.3f};"
-                        f"min={float(UTILITY_MIN_CALIBRATED_P_WIN):.3f};"
+                        f"min={min_calibrated_p_win:.3f};"
+                        f"mode={mode};"
                         f"expected_utility={expected_utility_bps:.2f};"
                     )
 
-                if payoff_ratio < float(UTILITY_MIN_PAYOFF_RATIO):
+                min_payoff_ratio = (float(PROFIT_FIRST_MIN_PAYOFF_RATIO) if profit_first else float(UTILITY_MIN_PAYOFF_RATIO))
+                if payoff_ratio < min_payoff_ratio:
                     return False, (
                         f"live_buy_shadowed:utility_payoff_ratio_too_low "
                         f"payoff={payoff_ratio:.3f};"
-                        f"min={float(UTILITY_MIN_PAYOFF_RATIO):.3f};"
+                        f"min={min_payoff_ratio:.3f};"
+                        f"mode={mode};"
                         f"expected_utility={expected_utility_bps:.2f};"
                     )
 
@@ -12275,20 +12366,24 @@ class TradingBot:
                         f"adaptive={adaptive_adj.get('reason', '')};"
                     )
 
-                if bool(ENABLE_WAIT_UTILITY_SCORING) and buy_vs_wait_edge_bps < float(BUY_MUST_BEAT_WAIT_BY_BPS):
+                min_buy_vs_wait = (float(PROFIT_FIRST_BUY_MUST_BEAT_WAIT_BY_BPS) if profit_first else float(BUY_MUST_BEAT_WAIT_BY_BPS))
+                if bool(ENABLE_WAIT_UTILITY_SCORING) and buy_vs_wait_edge_bps < min_buy_vs_wait:
                     return False, (
                         f"live_buy_shadowed:buy_does_not_beat_wait_enough "
                         f"buy_vs_wait_edge={buy_vs_wait_edge_bps:.2f};"
-                        f"min={float(BUY_MUST_BEAT_WAIT_BY_BPS):.2f};"
+                        f"min={min_buy_vs_wait:.2f};"
+                        f"mode={mode};"
                         f"wait_utility={wait_utility_bps:.2f};"
                         f"expected_utility={expected_utility_bps:.2f};"
                     )
 
-                if maker_adjusted_ev_bps < float(UTILITY_MIN_MAKER_ADJUSTED_BPS_FOR_LIVE_BUY):
+                min_maker_adjusted_ev = (float(PROFIT_FIRST_MIN_MAKER_ADJUSTED_EV_BPS) if profit_first else float(UTILITY_MIN_MAKER_ADJUSTED_BPS_FOR_LIVE_BUY))
+                if maker_adjusted_ev_bps < min_maker_adjusted_ev:
                     return False, (
                         f"live_buy_shadowed:maker_adjusted_ev_too_low "
                         f"maker_adjusted_ev={maker_adjusted_ev_bps:.2f};"
-                        f"min={float(UTILITY_MIN_MAKER_ADJUSTED_BPS_FOR_LIVE_BUY):.2f};"
+                        f"min={min_maker_adjusted_ev:.2f};"
+                        f"mode={mode};"
                         f"maker_fill_probability={maker_fill_probability:.3f};"
                     )
 
@@ -12322,8 +12417,8 @@ class TradingBot:
                     and inside_value_chop
                     and not strong_exception
                 ):
-                    return False, (
-                        f"live_buy_shadowed:volume_profile_inside_fair_value_or_poc_chop "
+                    reason = (
+                        f"volume_profile_inside_fair_value_or_poc_chop "
                         f"value_acceptance_state={value_acceptance_state};"
                         f"volume_node_state={volume_node_state};"
                         f"poc_distance_bps={poc_distance_bps:.2f};"
@@ -12331,26 +12426,38 @@ class TradingBot:
                         f"expected_utility={expected_utility_bps:.2f};"
                         f"strong_exception={strong_exception};"
                     )
+                    if profit_first and bool(PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS):
+                        add_profit_first_warning(reason)
+                    else:
+                        return False, f"live_buy_shadowed:{reason}"
 
                 if (
                     bool(VOLUME_BLOCK_BUY_ACCEPTED_BELOW_VALUE)
                     and value_acceptance_state == "accepted_below_value"
                 ):
-                    return False, (
-                        f"live_buy_shadowed:volume_profile_accepted_lower_prices "
+                    reason = (
+                        f"volume_profile_accepted_lower_prices "
                         f"value_acceptance_state={value_acceptance_state};"
                         f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
                     )
+                    if profit_first and bool(PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS):
+                        add_profit_first_warning(reason)
+                    else:
+                        return False, f"live_buy_shadowed:{reason}"
 
                 if (
                     bool(VOLUME_BLOCK_BUY_REJECTED_ABOVE_VALUE)
                     and value_acceptance_state == "rejected_above_value"
                 ):
-                    return False, (
-                        f"live_buy_shadowed:volume_profile_rejected_above_value "
+                    reason = (
+                        f"volume_profile_rejected_above_value "
                         f"value_acceptance_state={value_acceptance_state};"
                         f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
                     )
+                    if profit_first and bool(PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS):
+                        add_profit_first_warning(reason)
+                    else:
+                        return False, f"live_buy_shadowed:{reason}"
             previous_reaction = str(candidate.get("previous_session_profile_reaction_state", "") or "").lower()
             previous_wait = float(candidate.get("previous_session_profile_wait_score", 0.50) or 0.50)
             previous_conf = float(candidate.get("previous_session_profile_confidence", 0.10) or 0.10)
@@ -12361,11 +12468,15 @@ class TradingBot:
                 and previous_conf >= 0.30
                 and expected_utility_bps < float(VOLUME_ALLOW_INSIDE_VALUE_IF_SETUP_STRONG_AND_UTILITY_BPS)
             ):
-                return False, (
-                    f"live_buy_shadowed:previous_session_poc_chop "
+                reason = (
+                    f"previous_session_poc_chop "
                     f"reaction={previous_reaction};wait={previous_wait:.3f};"
                     f"conf={previous_conf:.3f};expected_utility={expected_utility_bps:.2f}"
                 )
+                if profit_first and bool(PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS):
+                    add_profit_first_warning(reason)
+                else:
+                    return False, f"live_buy_shadowed:{reason}"
 
             quant_stationarity = float(candidate.get("quant_stationarity_score", 0.0) or 0.0)
             quant_wait = float(candidate.get("quant_wait_score", 0.50) or 0.50)
@@ -12376,11 +12487,15 @@ class TradingBot:
                 and quant_wait >= 0.62
                 and expected_utility_bps < float(QUANT_CONTEXT_MIN_EXPECTED_UTILITY_EXCEPTION_BPS)
             ):
-                return False, (
-                    f"live_buy_shadowed:quant_unstable_low_edge "
+                reason = (
+                    f"quant_unstable_low_edge "
                     f"stationarity={quant_stationarity:.3f};wait={quant_wait:.3f};"
                     f"vol_state={quant_vol_state};expected_utility={expected_utility_bps:.2f}"
                 )
+                if profit_first and bool(PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS):
+                    add_profit_first_warning(reason)
+                else:
+                    return False, f"live_buy_shadowed:{reason}"
 
             liquidity_risk_score = float(candidate.get("liquidity_risk_score", 0.0) or 0.0)
             spread_instability_bps = float(candidate.get("spread_instability_bps", 0.0) or 0.0)
@@ -12435,13 +12550,17 @@ class TradingBot:
             if "falling_knife" in setup_tag_text and not (
                 setup_perf_strong and setup_perf_quality >= 0.66
             ):
-                return False, (
-                    f"live_buy_shadowed:falling_knife_requires_strong_setup_proof "
+                reason = (
+                    f"falling_knife_requires_strong_setup_proof "
                     f"setup={setup_tag_text};"
                     f"setup_perf_strong={setup_perf_strong};"
                     f"setup_quality={setup_perf_quality:.3f};"
                     f"{backtest_reason}"
                 )
+                if profit_first and bool(PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS):
+                    add_profit_first_warning(reason)
+                else:
+                    return False, f"live_buy_shadowed:{reason}"
 
             if spread_bps > float(LEVEL8_MAX_LIVE_BUY_SPREAD_BPS):
                 return False, (
@@ -13982,7 +14101,9 @@ class TradingBot:
         status = {"viewer_snapshot_recent": False, "websocket_recent": False, "market_csv_recent": False, "council_recent": False, "no_duplicate_process": True, "fee_tier_ready": False, "risk_pause_active": False, "drawdown_brake_active": False, "open_positions_count": 0, "learning_files_writable": False, "sqlite_writable": False, "safe_to_run_overnight": False}
         maker_fee_bps = getattr(self, "current_maker_fee_bps", None)
         taker_fee_bps = getattr(self, "current_taker_fee_bps", None)
-        status.update({"fee_tier_ready": maker_fee_bps is not None and taker_fee_bps is not None, "maker_fee_bps": maker_fee_bps, "taker_fee_bps": taker_fee_bps, "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""), "high_fee_tier_active": bool((maker_fee_bps is not None and float(maker_fee_bps) >= 50.0) or (taker_fee_bps is not None and float(taker_fee_bps) >= 100.0)), "live_trading_strict_reason": "High Coinbase fees require fewer, higher-edge maker-first trades."})
+        mode = str(TRADING_AGGRESSION_MODE or "PROFIT_FIRST_FEE_AWARE").upper()
+        high_fee_tier_active = bool((maker_fee_bps is not None and float(maker_fee_bps) >= 50.0) or (taker_fee_bps is not None and float(taker_fee_bps) >= 100.0))
+        status.update({"fee_tier_ready": maker_fee_bps is not None and taker_fee_bps is not None, "maker_fee_bps": maker_fee_bps, "taker_fee_bps": taker_fee_bps, "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""), "high_fee_tier_active": high_fee_tier_active, "trading_aggression_mode": mode, "fee_aware_profit_mode": mode == "PROFIT_FIRST_FEE_AWARE", "live_trading_mode_label": ("Profit-First Fee-Aware Mode" if mode == "PROFIT_FIRST_FEE_AWARE" else "Strict Fee-Aware Mode" if mode == "STRICT_FEE_AWARE" else "Observation Only"), "live_trading_mode_reason": ("The bot may trade more freely when projected net profit clears all fees, spread, and execution costs." if mode == "PROFIT_FIRST_FEE_AWARE" else "The bot is applying extra anti-churn filters because fees are high.")})
         try:
             status["viewer_snapshot_recent"] = os.path.exists(VIEWER_SNAPSHOT_JSON) and now_ts() - os.path.getmtime(VIEWER_SNAPSHOT_JSON) <= 10
             status["market_csv_recent"] = os.path.exists(MARKET_CSV_PATH) and now_ts() - os.path.getmtime(MARKET_CSV_PATH) <= 30
@@ -16213,46 +16334,39 @@ class TradingBot:
             await asyncio.sleep(90.0)
 
     async def run(self) -> None:
-        """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
+        """Launch websocket and viewer publishing early; keep live buys blocked until readiness is complete."""
         log("[run] TradingBot.run() started")
-        self._write_startup_viewer_snapshot("bot_started_waiting_for_history_and_first_eval")
+        self._write_startup_viewer_snapshot("bot_started_waiting_for_live_quotes")
         log(f"[run] mode=LIVE_ONLY products={PRODUCTS}")
         self.active_products_log.write_products(PRODUCTS)
         log(f"[startup] active products written: {PRODUCTS}")
 
-        log("[run] preloading micro history")
-        await self.preload_micro_history()
-
         log("[run] starting websocket task first")
         ws_task = asyncio.create_task(self.ws_loop())
 
-        log("[run] waiting for initial top-of-book data")
-        await self._wait_for_tob_ready(timeout_sec=TOP_OF_BOOK_WAIT_SEC)
+        log("[run] starting top-of-book keeper early")
+        tob_keeper_task = asyncio.create_task(self.top_of_book_keeper_loop())
+
+        log("[run] waiting briefly for initial top-of-book data")
+        await self._wait_for_tob_ready(timeout_sec=min(20.0, float(TOP_OF_BOOK_WAIT_SEC)))
 
         await self._refresh_coinbase_fee_tier_if_needed(force=True)
-
-        self._rest_backfill_top_of_book(PRODUCTS)
-        log("[run] calibrating products before live trading")
-        await self.calibrate_products_on_startup()
-        self.last_hourly_calibration_update_ts = now_ts()
-        log(
-            f"[calibration-hourly] next hourly update scheduled in "
-            f"{CALIBRATION_UPDATE_EVERY_SEC:.0f}s"
-        )
+        await asyncio.to_thread(self._rest_backfill_top_of_book, PRODUCTS)
 
         log("[run] reconciling live Coinbase portfolio before trading")
         await self._startup_portfolio_reconcile()
 
-        log("[run] starting macro / evaluation / telemetry tasks")
-        tasks = [
-            ws_task,
-            asyncio.create_task(self.macro_loop()),
-            asyncio.create_task(self.eval_loop()),
-            asyncio.create_task(self.telemetry_loop()),
-            asyncio.create_task(self.extended_chart_cache_loop()),
-            asyncio.create_task(self.top_of_book_keeper_loop()),
-        ]
-        await asyncio.gather(*tasks)
+        log("[run] starting telemetry and eval loops before slow calibration finishes")
+        telemetry_task = asyncio.create_task(self.telemetry_loop())
+        eval_task = asyncio.create_task(self.eval_loop())
+
+        log("[run] starting background history, macro, calibration, and extended chart tasks")
+        history_task = asyncio.create_task(self.preload_micro_history())
+        macro_task = asyncio.create_task(self.macro_loop())
+        calibration_task = asyncio.create_task(self.calibrate_products_on_startup_background())
+        extended_chart_task = asyncio.create_task(self.extended_chart_cache_loop())
+
+        await asyncio.gather(ws_task, tob_keeper_task, telemetry_task, eval_task, history_task, macro_task, calibration_task, extended_chart_task)
 
     # --------------------------------------------------------
     # WebSocket loop
@@ -18930,7 +19044,10 @@ class TradingBot:
                 "taker_fee_bps": getattr(self, "current_taker_fee_bps", None),
                 "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""),
                 "high_fee_tier_active": bool((getattr(self, "current_maker_fee_bps", None) is not None and float(getattr(self, "current_maker_fee_bps", 0.0)) >= 50.0) or (getattr(self, "current_taker_fee_bps", None) is not None and float(getattr(self, "current_taker_fee_bps", 0.0)) >= 100.0)),
-                "live_trading_strict_reason": "High Coinbase fees require fewer, higher-edge maker-first trades.",
+                "trading_aggression_mode": str(TRADING_AGGRESSION_MODE or "PROFIT_FIRST_FEE_AWARE").upper(),
+                "fee_aware_profit_mode": str(TRADING_AGGRESSION_MODE or "PROFIT_FIRST_FEE_AWARE").upper() == "PROFIT_FIRST_FEE_AWARE",
+                "live_trading_mode_label": "Profit-First Fee-Aware Mode",
+                "live_trading_mode_reason": "The bot may trade more freely when projected net profit clears all fees, spread, and execution costs.",
                 "extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)),
                 "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0),
                 "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v),

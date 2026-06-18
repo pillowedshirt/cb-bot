@@ -1,3 +1,4 @@
+import csv
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -51,6 +52,19 @@ SELL_QUALITY_REVIEWS_CSV = os.path.join(BASE_DIR, "sell_quality_reviews.csv")
 AI_MODEL_PATH = os.path.join(BASE_DIR, "ai_brain.joblib")
 AI_PREDICTIONS_CSV = os.path.join(BASE_DIR, "ai_predictions.csv")
 AI_FEATURE_IMPORTANCE_CSV = os.path.join(BASE_DIR, "ai_feature_importance.csv")
+AI_FEATURE_IMPORTANCE_CSV_PATH = AI_FEATURE_IMPORTANCE_CSV
+
+
+def ensure_ai_feature_importance_file() -> None:
+    columns = ["ts", "dt_utc", "feature", "importance", "rank", "model_ready", "reason"]
+    if os.path.exists(AI_FEATURE_IMPORTANCE_CSV_PATH) and os.path.getsize(AI_FEATURE_IMPORTANCE_CSV_PATH) > 0:
+        return
+    tmp = AI_FEATURE_IMPORTANCE_CSV_PATH + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+    os.replace(tmp, AI_FEATURE_IMPORTANCE_CSV_PATH)
+
 
 FEATURE_COLUMNS = [
     "score",
@@ -136,6 +150,7 @@ class AIDecision:
 
 class LocalAIBrain:
     def __init__(self, min_training_rows: int = 30) -> None:
+        ensure_ai_feature_importance_file()
         self.min_training_rows = max(2, int(min_training_rows))
         self.model_pack: Optional[Dict[str, Any]] = None
         self.load()
@@ -355,6 +370,8 @@ class LocalAIBrain:
             if frame.empty:
                 return
             rows = []
+            report_ts = float(pd.Timestamp.utcnow().timestamp())
+            report_dt = pd.Timestamp.utcnow().isoformat()
             y_move = pd.to_numeric(frame["y_move_30m_bps"], errors="coerce").fillna(0.0)
             y_up = pd.to_numeric(frame["y_up_30m"], errors="coerce").fillna(0)
             winners = frame[y_up == 1]
@@ -369,9 +386,16 @@ class LocalAIBrain:
                     corr = 0.0
                 winner_mean = float(pd.to_numeric(winners[column], errors="coerce").fillna(0.0).mean()) if not winners.empty else 0.0
                 loser_mean = float(pd.to_numeric(losers[column], errors="coerce").fillna(0.0).mean()) if not losers.empty else 0.0
+                importance = abs(float(corr or 0.0))
                 rows.append({
+                    "ts": report_ts,
+                    "dt_utc": report_dt,
                     "feature": column,
-                    "abs_corr_to_move": abs(float(corr or 0.0)),
+                    "importance": importance,
+                    "rank": 0,
+                    "model_ready": True,
+                    "reason": "correlation_proxy_after_training",
+                    "abs_corr_to_move": importance,
                     "corr_to_move": float(corr or 0.0),
                     "winner_mean": winner_mean,
                     "loser_mean": loser_mean,
@@ -379,10 +403,13 @@ class LocalAIBrain:
                     "sample_count": int(len(frame)),
                 })
             out = pd.DataFrame(rows).sort_values(
-                ["abs_corr_to_move", "winner_minus_loser"],
+                ["importance", "winner_minus_loser"],
                 ascending=[False, False],
             )
-            out.to_csv(AI_FEATURE_IMPORTANCE_CSV, index=False)
+            out["rank"] = list(range(1, len(out) + 1))
+            base_cols = ["ts", "dt_utc", "feature", "importance", "rank", "model_ready", "reason"]
+            extra_cols = [c for c in out.columns if c not in base_cols]
+            out[base_cols + extra_cols].to_csv(AI_FEATURE_IMPORTANCE_CSV_PATH, index=False)
         except Exception:
             pass
 
@@ -400,6 +427,7 @@ class LocalAIBrain:
             also_overall=False,
         )
         if len(frame) < self.min_training_rows:
+            ensure_ai_feature_importance_file()
             module_debug(
                 MODULE_NAME,
                 "ai_train_skipped_not_enough_rows",

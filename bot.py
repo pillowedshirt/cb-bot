@@ -194,10 +194,20 @@ MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candl
 MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
 CALIBRATION_CSV_PATH: str = os.path.join(BASE_DIR, "calibration.csv")
 MICRO_HISTORY_CSV_PATH: str = os.path.join(BASE_DIR, "micro_history.csv")
+CHART_1M_7D_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1m_7d.csv")
+CHART_15M_30D_CSV_PATH: str = os.path.join(BASE_DIR, "chart_15m_30d.csv")
+CHART_1H_90D_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1h_90d.csv")
+CHART_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1d_2y.csv")
+EXTENDED_CHART_REFRESH_EVERY_SEC: int = 30 * 60
+EXTENDED_CHART_FETCH_CONCURRENCY: int = 1
+COINBASE_CANDLE_REQUEST_PAUSE_SEC: float = 0.45
+COINBASE_CANDLE_429_BACKOFF_SEC: float = 6.0
 POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
+HISTORY_FETCH_CONCURRENCY: int = 2
+MACRO_FETCH_CONCURRENCY: int = 1
 SIGNAL_EVENTS_CSV_PATH: str = os.path.join(BASE_DIR, "signal_events.csv")
 LEVEL8_COUNCIL_DECISIONS_CSV_PATH: str = os.path.join(
     BASE_DIR, "council_decisions.csv"
@@ -2917,6 +2927,37 @@ class MarketLogger:
             ])
 
 
+def write_candle_csv_atomic(path: str, rows: list[dict]) -> None:
+    columns = ["ts", "product_id", "open", "high", "low", "close", "volume"]
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for r in rows:
+            writer.writerow([r.get(c, "") for c in columns])
+    os.replace(tmp, path)
+
+
+def merge_candle_csv_rows(existing_rows: list[dict], new_rows: list[dict], max_rows_per_product: int) -> list[dict]:
+    by_key = {}
+    for r in list(existing_rows or []) + list(new_rows or []):
+        try:
+            product = str(r.get("product_id") or "")
+            ts = int(float(r.get("ts") or 0))
+            if not product or ts <= 0:
+                continue
+            by_key[(product, ts)] = {"ts": ts, "product_id": product, "open": float(r.get("open") or 0.0), "high": float(r.get("high") or 0.0), "low": float(r.get("low") or 0.0), "close": float(r.get("close") or 0.0), "volume": float(r.get("volume") or 0.0)}
+        except Exception:
+            continue
+    grouped = {}
+    for (_, _), row in by_key.items():
+        grouped.setdefault(row["product_id"], []).append(row)
+    out = []
+    for product, rows in grouped.items():
+        out.extend(sorted(rows, key=lambda x: int(x["ts"]))[-int(max_rows_per_product):])
+    return sorted(out, key=lambda x: (x["product_id"], int(x["ts"])))
+
+
 class CandleCSVWriter:
     """
     Writes a list of candle dictionaries to a CSV file.  Always overwrites (atomic).
@@ -2988,42 +3029,37 @@ class MacroFetcher:
         self.rest = rest
 
     async def fetch(self, product_id: str, start: int, end: int, granularity: str) -> List[Candle]:
-        try:
-            log(f"[macro] get_candles {product_id} {granularity} start={int(start)} end={int(end)} span={(int(end)-int(start))}")
-            resp = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.rest.get_candles(
-                    product_id=product_id,
-                    start=str(int(start)),
-                    end=str(int(end)),
-                    granularity=granularity,
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            try:
+                log(f"[macro] get_candles {product_id} {granularity} start={int(start)} end={int(end)} span={(int(end)-int(start))}")
+                resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.rest.get_candles(product_id=product_id, start=str(int(start)), end=str(int(end)), granularity=granularity)
                 )
-            )
-            candles = _parse_candles_response(resp)
-            if candles:
-                return candles
-
-            # Fallback: Coinbase Exchange public candles endpoint (more reliable formatting)
-            gran_map = {
-                "ONE_MINUTE": 60,
-                "FIVE_MINUTE": 300,
-                "FIFTEEN_MINUTE": 900,
-                "ONE_HOUR": 3600,
-                "ONE_DAY": 86400,
-            }
-            g = gran_map.get(granularity)
-            if g:
-                rows = _fetch_candles_public(product_id=product_id, granularity=g, start=start, end=end, limit=300)
-                out = []
-                for r in rows:
-                    # r = [time, low, high, open, close, volume]
-                    out.append(Candle(ts=int(r[0]), open=float(r[3]), high=float(r[2]), low=float(r[1]), close=float(r[4]), volume=float(r[5])))
-                return out
-
-            return []
-        except Exception as e:
-            log_exception(f"[macro] fetch failed for {product_id} {granularity}", e)
-            return []
+                candles = _parse_candles_response(resp)
+                if candles:
+                    return candles
+                gran_map = {"ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900, "ONE_HOUR": 3600, "ONE_DAY": 86400}
+                g = gran_map.get(granularity)
+                if g:
+                    rows = _fetch_candles_public(product_id=product_id, granularity=g, start=start, end=end, limit=300)
+                    out = []
+                    for r in rows:
+                        out.append(Candle(ts=int(r[0]), open=float(r[3]), high=float(r[2]), low=float(r[1]), close=float(r[4]), volume=float(r[5])))
+                    return out
+                return []
+            except Exception as e:
+                text = str(e)
+                is_429 = "429" in text or "Too Many Requests" in text
+                if is_429 and attempt < max_attempts:
+                    backoff = float(COINBASE_CANDLE_429_BACKOFF_SEC) * attempt
+                    module_debug(MODULE_NAME, "coinbase_candle_429_backoff", data={"product_id": product_id, "granularity": granularity, "attempt": attempt, "backoff_sec": backoff}, level="WARN", also_overall=False)
+                    await asyncio.sleep(backoff)
+                    continue
+                log_exception(f"[macro] fetch failed for {product_id} {granularity}", e)
+                return []
+        return []
 
     async def fetch_chunked(
         self,
@@ -3068,7 +3104,7 @@ class MacroFetcher:
             if chunk:
                 out.extend(chunk)
             cursor = chunk_end
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(float(COINBASE_CANDLE_REQUEST_PAUSE_SEC))
         # deduplicate by ts
         if not out:
             return []
@@ -5797,6 +5833,13 @@ class TradingBot:
         self._backtest_reload_running: bool = False
         self._last_backtest_reload_ts: float = 0.0
         self._macro_refresh_running: bool = False
+        self._micro_history_ready: bool = False
+        self._macro_ready: bool = False
+        self._startup_calibration_ready: bool = False
+        self._product_calibration_ready: Dict[str, bool] = {p: False for p in PRODUCTS}
+        self._extended_chart_cache_running: bool = False
+        self._last_extended_chart_refresh_ts: float = 0.0
+        self._extended_chart_fetch_semaphore = asyncio.Semaphore(EXTENDED_CHART_FETCH_CONCURRENCY)
         self._last_legacy_diagnostic_log_ts: Dict[str, float] = {}
         self._last_no_position_sell_skip_log_ts: Dict[str, float] = {}
         self._last_viewer_snapshot_success_log_ts: float = 0.0
@@ -5955,9 +5998,11 @@ class TradingBot:
                     })
 
             self.micro_history_log.write_rows(history_rows)
+            self._micro_history_ready = bool(history_rows)
             log(f"[startup] preloaded {MICRO_PRELOAD_MINUTES}m true micro candles; rows={len(history_rows)}")
         except Exception as e:
             log(f"[startup] micro preload failed: {e}")
+            self._micro_history_ready = False
 
 
     # --------------------------------------------------------
@@ -8472,6 +8517,7 @@ class TradingBot:
                     )
                     self.calibration_profiles[product] = profile
                     self.clog.log_profile(profile)
+                    self._product_calibration_ready[product] = bool(profile.is_calibrated)
                     continue
                 tob = self.tob.get(product)
                 spread_bps = (
@@ -8524,6 +8570,7 @@ class TradingBot:
                 )
                 self.calibration_profiles[product] = profile
                 self.clog.log_profile(profile)
+                self._product_calibration_ready[product] = bool(profile.is_calibrated)
                 log(
                     f"[calibration-debug] {product} profile "
                     f"min_score={profile.min_score:.6f} "
@@ -8544,6 +8591,8 @@ class TradingBot:
                 )
                 self.calibration_profiles[product] = profile
                 self.clog.log_profile(profile)
+                self._product_calibration_ready[product] = False
+        self._startup_calibration_ready = all(bool(v) for v in self._product_calibration_ready.values()) if self._product_calibration_ready else False
         log("[calibration] startup walk-forward calibration finished")
 
     def _run_hourly_banked_recalibration(self) -> None:
@@ -13947,6 +13996,7 @@ class TradingBot:
             status["sqlite_writable"] = True
         except Exception:
             pass
+        status.update({"extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)), "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0), "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v), "product_count": len(PRODUCTS), "micro_history_ready": bool(getattr(self, "_micro_history_ready", False)), "macro_ready": bool(getattr(self, "_macro_ready", False)), "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False))})
         status["safe_to_run_overnight"] = bool(status["viewer_snapshot_recent"] and not status["risk_pause_active"] and not status["drawdown_brake_active"] and status["learning_files_writable"] and status["no_duplicate_process"])
         return status
 
@@ -15987,6 +16037,100 @@ class TradingBot:
                 "'ADOPT_EXISTING', or 'IGNORE_EXISTING'."
             )
 
+    def _read_candle_csv_rows(self, path: str, min_ts: int = 0) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            if not os.path.exists(path):
+                return out
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    try:
+                        ts = int(float(row.get("ts") or 0))
+                        if ts < int(min_ts):
+                            continue
+                        product = str(row.get("product_id") or "")
+                        if not product:
+                            continue
+                        out.setdefault(product, []).append({"ts": ts, "product_id": product, "open": float(row.get("open") or 0.0), "high": float(row.get("high") or 0.0), "low": float(row.get("low") or 0.0), "close": float(row.get("close") or 0.0), "volume": float(row.get("volume") or 0.0)})
+                    except Exception:
+                        continue
+            for rows in out.values():
+                rows.sort(key=lambda r: int(r["ts"]))
+        except Exception as exc:
+            module_exception(MODULE_NAME, "read_candle_csv_rows_failed", exc, data={"path": path}, also_overall=False)
+        return out
+
+    def _is_product_calibration_ready(self, product_id: str) -> bool:
+        if not bool(REQUIRE_VALID_LIVE_RECALIBRATION_PROFILE):
+            return True
+        if bool(getattr(self, "_startup_calibration_ready", False)):
+            return True
+        if bool(getattr(self, "_product_calibration_ready", {}).get(product_id, False)):
+            return True
+        profile = self.calibration_profiles.get(product_id)
+        if profile is not None and bool(getattr(profile, "is_calibrated", False)):
+            return True
+        return False
+
+    async def _fetch_extended_candles_for_product(self, product: str, start_ts: int, end_ts: int, granularity: str) -> list[dict]:
+        async with self._extended_chart_fetch_semaphore:
+            candles = await self.fetcher.fetch_chunked(product, start_ts, end_ts, granularity, max_candles_per_req=300)
+        return [{"ts": int(c.ts), "product_id": product, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(c.volume or 0.0)} for c in candles or []]
+
+    async def refresh_extended_chart_caches(self) -> None:
+        if self._extended_chart_cache_running:
+            return
+        self._extended_chart_cache_running = True
+        started = time.perf_counter()
+        try:
+            now_i = int(now_ts())
+            jobs = [
+                {"path": CHART_1M_7D_CSV_PATH, "granularity": "ONE_MINUTE", "lookback_sec": 7 * 24 * 60 * 60, "max_rows_per_product": 7 * 24 * 60 + 50},
+                {"path": CHART_15M_30D_CSV_PATH, "granularity": "FIFTEEN_MINUTE", "lookback_sec": 30 * 24 * 60 * 60, "max_rows_per_product": 30 * 24 * 4 + 50},
+                {"path": CHART_1H_90D_CSV_PATH, "granularity": "ONE_HOUR", "lookback_sec": 90 * 24 * 60 * 60, "max_rows_per_product": 90 * 24 + 50},
+                {"path": CHART_1D_2Y_CSV_PATH, "granularity": "ONE_DAY", "lookback_sec": 2 * 365 * 24 * 60 * 60, "max_rows_per_product": 2 * 365 + 20},
+            ]
+            for job in jobs:
+                path = job["path"]; granularity = job["granularity"]; start_ts = now_i - int(job["lookback_sec"])
+                existing_by_product = self._read_candle_csv_rows(path, min_ts=start_ts)
+                existing_rows = [r for rows in existing_by_product.values() for r in rows]
+                new_rows: List[Dict[str, Any]] = []
+                for product in PRODUCTS:
+                    rows = existing_by_product.get(product, [])
+                    latest_ts = int(rows[-1]["ts"]) if rows else 0
+                    if granularity == "ONE_MINUTE": freshness_sec, step_sec = 15 * 60, 60
+                    elif granularity == "FIFTEEN_MINUTE": freshness_sec, step_sec = 45 * 60, 15 * 60
+                    elif granularity == "ONE_HOUR": freshness_sec, step_sec = 3 * 60 * 60, 60 * 60
+                    else: freshness_sec, step_sec = 36 * 60 * 60, 24 * 60 * 60
+                    if latest_ts > 0 and now_i - latest_ts < freshness_sec and len(rows) >= min(50, int(job["max_rows_per_product"])):
+                        continue
+                    fetch_start = max(start_ts, latest_ts + step_sec) if latest_ts else start_ts
+                    if fetch_start >= now_i:
+                        continue
+                    fetched = await self._fetch_extended_candles_for_product(product, fetch_start, now_i, granularity)
+                    new_rows.extend(fetched)
+                    await asyncio.sleep(float(COINBASE_CANDLE_REQUEST_PAUSE_SEC))
+                merged = merge_candle_csv_rows(existing_rows, new_rows, int(job["max_rows_per_product"]))
+                write_candle_csv_atomic(path, merged)
+                module_debug(MODULE_NAME, "extended_chart_cache_written", data={"path": path, "granularity": granularity, "existing_rows": len(existing_rows), "new_rows": len(new_rows), "written_rows": len(merged)}, level="INFO", also_overall=False)
+            self._last_extended_chart_refresh_ts = now_ts()
+        except Exception as exc:
+            module_exception(MODULE_NAME, "extended_chart_cache_refresh_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+        finally:
+            self._extended_chart_cache_running = False
+            module_debug(MODULE_NAME, "extended_chart_cache_refresh_finished", data={"elapsed_sec": round(time.perf_counter() - started, 3)}, level="INFO", also_overall=False)
+
+    async def extended_chart_cache_loop(self) -> None:
+        await asyncio.sleep(10.0)
+        while not self._stop_event.is_set():
+            try:
+                age = now_ts() - float(getattr(self, "_last_extended_chart_refresh_ts", 0.0))
+                if age >= float(EXTENDED_CHART_REFRESH_EVERY_SEC):
+                    await self.refresh_extended_chart_caches()
+            except Exception as exc:
+                module_exception(MODULE_NAME, "extended_chart_cache_loop_failed", exc, also_overall=True)
+            await asyncio.sleep(30.0)
+
     async def run(self) -> None:
         """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
         log("[run] TradingBot.run() started")
@@ -16024,6 +16168,7 @@ class TradingBot:
             asyncio.create_task(self.macro_loop()),
             asyncio.create_task(self.eval_loop()),
             asyncio.create_task(self.telemetry_loop()),
+            asyncio.create_task(self.extended_chart_cache_loop()),
         ]
         await asyncio.gather(*tasks)
 
@@ -16166,7 +16311,7 @@ class TradingBot:
                                 "close": c.close,
                                 "volume": c.volume,
                             })
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(float(COINBASE_CANDLE_REQUEST_PAUSE_SEC))
                 # Write weekly and daily candles for viewer
                 try:
                     await self.week_writer.write(week_rows)
@@ -16176,6 +16321,7 @@ class TradingBot:
                     log_exception("[macro] write failed", e)
                 # update last macro time
                 self.last_macro_update = now_ts_i()
+                self._macro_ready = bool(week_rows or day_rows)
             finally:
                 self._macro_refresh_running = False
             await asyncio.sleep(MACRO_REFRESH_EVERY_SEC)
@@ -18581,6 +18727,12 @@ class TradingBot:
         )
         candidate = dict(candidate or {})
         row.update({
+            "micro_history_ready": bool(getattr(self, "_micro_history_ready", False)),
+            "macro_ready": bool(getattr(self, "_macro_ready", False)),
+            "product_calibration_ready": bool(getattr(self, "_product_calibration_ready", {}).get(product_id, False)),
+            "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False)),
+            "extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)),
+            "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0),
             "volume_profile_leader_buy_score": _json_safe_float(
                 candidate.get("volume_profile_leader_buy_score", row.get("leader_buy_score", 0.0))
             ),
@@ -18695,6 +18847,10 @@ class TradingBot:
                 "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""),
                 "high_fee_tier_active": bool((getattr(self, "current_maker_fee_bps", None) is not None and float(getattr(self, "current_maker_fee_bps", 0.0)) >= 50.0) or (getattr(self, "current_taker_fee_bps", None) is not None and float(getattr(self, "current_taker_fee_bps", 0.0)) >= 100.0)),
                 "live_trading_strict_reason": "High Coinbase fees require fewer, higher-edge maker-first trades.",
+                "extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)),
+                "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0),
+                "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v),
+                "product_count": len(PRODUCTS),
             },
         }
         self._write_viewer_snapshot(snapshot)
@@ -18789,10 +18945,18 @@ class TradingBot:
                     else "critical"
                 )
                 log(
-                    f"[lag] eval_loop gap={loop_gap:.2f}s; severity={severity}; "
+                    f"[lag] eval_loop gap={loop_gap:.2f}s; "
+                    f"severity={severity}; "
                     f"startup_age={startup_age:.1f}s; "
+                    f"micro_history_ready={bool(getattr(self, '_micro_history_ready', False))}; "
+                    f"macro_ready={bool(getattr(self, '_macro_ready', False))}; "
+                    f"startup_calibration_ready={bool(getattr(self, '_startup_calibration_ready', False))}; "
+                    f"product_calibration_ready_count={sum(1 for v in getattr(self, '_product_calibration_ready', {}).values() if v)}; "
+                    f"macro_refresh_running={bool(getattr(self, '_macro_refresh_running', False))}; "
+                    f"extended_chart_cache_running={bool(getattr(self, '_extended_chart_cache_running', False))}; "
                     f"live_recalibration_running={bool(getattr(self, 'live_recalibration_running', False))}; "
-                    f"possible_blocking_work=True; section_timings={getattr(self, '_last_eval_loop_section_timings', {})}; ai_training_running={bool(getattr(self, 'ai_training_running', False))}; backtest_reload_running={bool(getattr(self, 'backtest_reload_running', False))}; macro_refresh_running={bool(getattr(self, 'macro_refresh_running', False))}; pending_buy_reconciliations={len(getattr(self, 'pending_buy_reconciliations', {}) or {})}"
+                    f"section_timings={getattr(self, '_last_eval_loop_section_timings', {})}; "
+                    f"pending_buy_reconciliations={len(getattr(self, 'pending_buy_reconciliations', []))}"
                 )
             self.last_loop_lag_check_ts = ts_now
 
@@ -18944,23 +19108,27 @@ class TradingBot:
                     >= CALIBRATION_UPDATE_EVERY_SEC
                 )
             ):
-                self.last_hourly_calibration_update_ts = ts_now
-                self.live_recalibration_running = True
+                if not bool(getattr(self, "_micro_history_ready", False)):
+                    debug_every(MODULE_NAME, "hourly_calibration_waiting_for_micro_history", 30.0, "hourly_calibration_waiting_for_micro_history", data={"reason": "micro_history_not_ready"}, level="INFO", also_overall=False)
+                    self.last_hourly_calibration_update_ts = ts_now
+                else:
+                    self.last_hourly_calibration_update_ts = ts_now
+                    self.live_recalibration_running = True
 
-                async def _hourly_calibrate_in_thread() -> None:
-                    try:
-                        await asyncio.to_thread(
-                            self._run_hourly_banked_recalibration
-                        )
-                    except Exception as e:
-                        log(
-                            f"[calibration] hourly banked recalibration "
-                            f"failed: {e}"
-                        )
-                    finally:
-                        self.live_recalibration_running = False
+                    async def _hourly_calibrate_in_thread() -> None:
+                        try:
+                            await asyncio.to_thread(
+                                self._run_hourly_banked_recalibration
+                            )
+                        except Exception as e:
+                            log(
+                                f"[calibration] hourly banked recalibration "
+                                f"failed: {e}"
+                            )
+                        finally:
+                            self.live_recalibration_running = False
 
-                asyncio.create_task(_hourly_calibrate_in_thread())
+                    asyncio.create_task(_hourly_calibrate_in_thread())
 
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:

@@ -216,7 +216,11 @@ def dataframe_debug_summary(
     """Lightweight pandas dataframe summary."""
     try:
         required = list(required_columns or [])
-        columns = list(getattr(frame, "columns", []) or [])
+        raw_columns = getattr(frame, "columns", [])
+        try:
+            columns = list(raw_columns)
+        except Exception:
+            columns = []
         missing = [c for c in required if c not in columns]
         return {
             "name": name,
@@ -285,6 +289,7 @@ def csv_debug_summary(
                 "rows": 0,
                 "columns": [],
                 "missing_required_columns": list(required_columns or []),
+                "state": "missing_file",
             }
         frame = pd.read_csv(path, nrows=250)
         return {

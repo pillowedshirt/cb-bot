@@ -1602,6 +1602,18 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
         st.write("Latest market row"); st.json(market); st.write("Latest decision row"); st.json(decision); st.write("Latest order-book row"); st.json(order_book); st.write("Latest target row"); st.json(target)
 
 
+def replay_calibration_eligible_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    out = frame.copy()
+    if "accepted_for_calibration" in out.columns:
+        accepted = pd.to_numeric(out.get("accepted_for_calibration"), errors="coerce").fillna(0)
+        out = out[accepted.astype(int).eq(1)].copy()
+    else:
+        out = out[~out.get("timeframe", pd.Series("", index=out.index)).astype(str).str.contains("daily", case=False, na=False)].copy()
+    return out
+
+
 def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
@@ -1627,11 +1639,30 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
     hist_running = readiness.get("historical_replay_running")
     hist_ready = readiness.get("historical_replay_ready_count", 0)
     hist_total = readiness.get("historical_replay_product_count", 0)
+    eligible_replay = replay_calibration_eligible_frame(historical_replay_df)
     replay_cols = st.columns(4)
-    replay_cols[0].metric("Replay Enabled", str(hist_enabled))
-    replay_cols[1].metric("Replay Running", str(hist_running))
-    replay_cols[2].metric("Replay Ready Products", f"{hist_ready}/{hist_total}")
-    replay_cols[3].metric("Calibration Mode", "Profit Replay" if readiness.get("profit_replay_based_calibration_enabled") else "Fallback")
+    replay_cols[0].metric("All Replay Rows", len(historical_replay_df) if historical_replay_df is not None else 0)
+    replay_cols[1].metric("Calibration Rows", len(eligible_replay))
+    replay_cols[2].metric("Ready Products", f"{hist_ready}/{hist_total}")
+    replay_cols[3].metric("Replay Running", str(hist_running))
+    st.caption(f"Replay enabled={hist_enabled}; calibration mode={'Profit Replay' if readiness.get('profit_replay_based_calibration_enabled') else 'Fallback'}")
+    if eligible_replay is not None and not eligible_replay.empty and "net_pnl_bps" in eligible_replay.columns:
+        net = pd.to_numeric(eligible_replay["net_pnl_bps"], errors="coerce").dropna()
+        wins = int((net > 0).sum())
+        losses = int((net <= 0).sum())
+        profit_cols = st.columns(4)
+        profit_cols[0].metric("Eligible Win Rate", f"{wins / max(1, wins + losses) * 100.0:.1f}%")
+        profit_cols[1].metric("Median Net", f"{net.median():.2f} bps")
+        profit_cols[2].metric("Average Net", f"{net.mean():.2f} bps")
+        profit_cols[3].metric("Total Net", f"{net.sum():.2f} bps")
+        if net.mean() > 0 and net.median() > 0:
+            st.success("Calibration-eligible historical replay is net-positive on average and at the median.")
+        elif net.mean() > 0:
+            st.warning("Historical replay is positive on average but not at the median. This may mean a few large winners are carrying many losers.")
+        else:
+            st.warning("Calibration-eligible historical replay is not net-positive yet. The bot should not rely on replay calibration for live scaling.")
+    else:
+        st.info("No calibration-eligible historical replay rows yet. Wait for 15m/90d and 1h/365d replay rows.")
     if historical_replay_summary_df is None or historical_replay_summary_df.empty:
         st.info("No historical replay summary rows yet. The bot will fill historical_shadow_replay.csv in the background, then use net replay profit to calibrate each product.")
     else:
@@ -1686,7 +1717,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
 
     st.markdown("### Shadow Sell Replay")
     if shadow_sell_replay_df is None or shadow_sell_replay_df.empty:
-        st.info("No shadow sell replay rows yet. The bot will start filling shadow_sell_replay.csv after shadow decisions have enough future candles to replay exits.")
+        st.info("shadow_sell_replay.csv is empty. This means runtime shadow entries have not yet been replayed through the sell model. After this patch, check bot.debug.log for shadow_sell_replay_no_rows to see whether the cause is no future candles, duplicate keys, or not enough aged shadow decisions.")
     else:
         replay = shadow_sell_replay_df.copy()
         wins = pd.to_numeric(replay.get("would_have_won", pd.Series(dtype=float)), errors="coerce").fillna(0)

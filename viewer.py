@@ -445,6 +445,22 @@ def plain_reason(reason: Any) -> str:
     return " ".join(parts) or (r[:220] if r else "No reason text was published for this row.")
 
 
+
+
+def set_selected_coin(product_id: str) -> None:
+    product_id = str(product_id or "").strip()
+    if not product_id:
+        return
+    st.session_state["selected_coin"] = product_id
+    st.session_state["strategy_arena_coin"] = product_id
+    st.session_state["_scroll_to_strategy_arena"] = True
+
+
+def scroll_to_strategy_arena_if_requested() -> None:
+    if not st.session_state.pop("_scroll_to_strategy_arena", False):
+        return
+    components.html("""<script>const doc = window.parent.document; setTimeout(function() { const el = doc.getElementById("strategy-arena-anchor"); if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); } }, 150);</script>""", height=0)
+
 def render_agent_disagreement_summary(votes: pd.DataFrame) -> Dict[str, Any]:
     if votes.empty: return {"BUY":0,"SELL":0,"HOLD":0,"WAIT":0,"consensus":"WAIT","main_blocker":"No agent votes yet"}
     rows = votes.to_dict("records"); leanings=[vote_leaning(r) for r in rows]
@@ -470,7 +486,7 @@ def render_status_strip(snapshot, selected, coin, chart_meta, votes, drow, marke
     pills=[("Selected",selected,"good"),("Action",action,"good" if str(action).upper()=="BUY" else "warn"),("Mode",live_mode,"good" if live_mode=="Live" else "warn"),("Snapshot",format_age(snapshot_age),freshness_class(snapshot_age,8, SNAPSHOT_STALE_WARN_SEC)),("Chart",format_age(chart_age),freshness_class(chart_age,60, CHART_STALE_WARN_SEC_WEEK)),("Council",format_age(council_age),freshness_class(council_age,20, COUNCIL_STALE_WARN_SEC)),("Fees",f"M {maker:.4g} / T {taker:.4g}","warn" if coin.get("high_fee_tier_active") else "good"),("Readiness",str(readiness.get("state", coin.get("trade_readiness", "—"))),"good" if str(readiness.get("state","")).lower() in {"ready","live"} else "warn"),("Blocker",blocker,"danger" if blocker and blocker != "—" else "good"),("Refresh",refresh_mode,"good" if "fragment" in refresh_mode else "warn")]
     html='<div class="status-strip">' + ''.join(f'<div class="status-pill"><div class="pill-label">{_html(l)}</div><div class="pill-value {_html(cls)}">{_html(v)}</div></div>' for l,v,cls in pills) + '</div>'
     st.markdown(html, unsafe_allow_html=True)
-    if coin.get("high_fee_tier_active"): st.warning("Strict mode: Coinbase fees are high, so the bot needs stronger edge before live entry.")
+    if coin.get("high_fee_tier_active"): st.warning("Profit-First Fee-Aware Mode is active. The bot can trade when projected net profit clears fees, spread, and execution cost; it is not observe-only mode.")
     return snapshot_age, chart_age, council_age, refresh_mode
 
 
@@ -586,27 +602,30 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
     if rows:
         st.caption(f'Continuously sorted by viability score. Current leader: {rows[0]["product_id"]} — {rows[0]["viability_reason"]}')
     if readiness.get("high_fee_tier_active"):
-        st.warning("Strict mode is active: Coinbase fees are high, so the bot needs stronger edge before live entries.")
-    html = ['<div class="overview-grid">']
-    for row in rows:
-        card_state = "buy" if row["action"] == "BUY" else "shadow" if "SHADOW" in row["action"] else "blocked" if row["blocker"] else "wait"
-        html.append(f'''
-<div class="coin-overview-card {card_state}">
-    <div style="font-size:1.25rem;font-weight:900;"><span class="rank-badge">#{row["rank"]}</span>{_html(row["product_id"])}</div>
-    <div class="viability-score">Viability {row["viability_score"]:.1f}</div>
-    <div class="viability-reason">{_html(row["viability_reason"])}</div>
-    <div class="muted">Action: <b>{_html(row["action"])}</b> · Consensus: <b>{_html(row["consensus"])}</b></div>
-    <div>Votes: BUY <b>{row["buy_votes"]}</b> · WAIT <b>{row["wait_votes"]}</b> · SELL <b>{row["sell_votes"]}</b> · HOLD <b>{row["hold_votes"]}</b></div>
-    <div>Price: <b>{row["price"]:.8f}</b></div>
-    <div>Spread: <b>{row["spread_bps"]:.2f} bps</b></div>
-    <div>Buy score: <b>{row["final_buy_score"]:.3f}</b> / threshold <b>{row["buy_threshold"]:.3f}</b></div>
-    <div>Utility: <b>{row["expected_utility_bps"]:.2f} bps</b></div>
-    <div>Size: <b>{row["recommended_position_pct"]:.1%}</b></div>
-    <div class="muted">Blocker: {_html(row["blocker"][:180] or "No blocker published.")}</div>
-</div>
-''')
-    html.append('</div>')
-    st.markdown("".join(html), unsafe_allow_html=True)
+        st.warning("Profit-First Fee-Aware Mode is active because Coinbase fees are high. The bot can still trade, but projected net profit must clear maker/taker fees, spread, and execution cost.")
+    st.markdown('<div class="muted">Tap a coin card to open it in Strategy Arena.</div>', unsafe_allow_html=True)
+    for i in range(0, len(rows), 3):
+        cols = st.columns(3)
+        for col, row in zip(cols, rows[i:i + 3]):
+            product_id = str(row.get("product_id") or "")
+            card_state = ("buy" if row.get("action") == "BUY" else "shadow" if "SHADOW" in str(row.get("action") or "") else "blocked" if row.get("blocker") else "wait")
+            with col:
+                st.markdown(f'''
+                    <div class="coin-overview-card {card_state}">
+                        <div style="font-size:1.25rem;font-weight:900;"><span class="rank-badge">#{row["rank"]}</span>{_html(product_id)}</div>
+                        <div class="viability-score">Viability {row["viability_score"]:.1f}</div>
+                        <div class="viability-reason">{_html(row["viability_reason"])}</div>
+                        <div class="muted">Action: <b>{_html(row["action"])}</b> · Consensus: <b>{_html(row["consensus"])}</b></div>
+                        <div>Votes: BUY <b>{row["buy_votes"]}</b> · WAIT <b>{row["wait_votes"]}</b> · SELL <b>{row["sell_votes"]}</b> · HOLD <b>{row["hold_votes"]}</b></div>
+                        <div>Price: <b>{row["price"]:.8f}</b></div>
+                        <div>Spread: <b>{row["spread_bps"]:.2f} bps</b></div>
+                        <div>Buy score: <b>{row["final_buy_score"]:.3f}</b> / threshold <b>{row["buy_threshold"]:.3f}</b></div>
+                        <div>Utility: <b>{row["expected_utility_bps"]:.2f} bps</b></div>
+                        <div class="muted">Blocker: {_html(row["blocker"][:160] or "No blocker published.")}</div>
+                    </div>
+                    ''', unsafe_allow_html=True)
+                if st.button(f"Open {product_id} in Strategy Arena", key=f"open_coin_{product_id}", use_container_width=True):
+                    set_selected_coin(product_id)
     with st.expander("All-coin sortable table", expanded=False):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -660,7 +679,7 @@ def render_topic_explanation(topic, selected_coin, votes, decisions_df, market_d
     if topic == "Why the bot is not buying live": st.info(plain_reason(coin.get("main_blocker") or coin.get("buy_blocker") or drow.get("reason", "No live-buy blocker is currently published.")))
     elif topic == "What would need to change": st.info("The bot needs fresher data, stronger expected utility, lower spread/fees, stronger agent confidence, or removal of the currently published blocker.")
     elif topic == "Chart levels": st.info(f"Published levels: POC {_safe_float(coin.get('point_of_control')):.8f}, VAH {_safe_float(coin.get('value_area_high')):.8f}, VAL {_safe_float(coin.get('value_area_low')):.8f}.")
-    elif topic == "Fee impact": st.info("Strict high-fee mode is active, so entries need more edge." if coin.get("high_fee_tier_active") else "No explicit fee blocker is present in the selected snapshot row.")
+    elif topic == "Fee impact": st.info("Profit-First Fee-Aware Mode is active: entries need projected net profit after Coinbase fees and spread." if coin.get("high_fee_tier_active") else "No explicit fee blocker is present in the selected snapshot row.")
     elif topic == "Agent disagreement": render_agent_disagreement_summary(votes)
 
 
@@ -676,8 +695,14 @@ def render_learning_console(selected_coin, votes, decisions_df, market_df, snaps
 def render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
     available = get_available_products(snapshot)
     if available:
-        current = st.session_state.get("selected_coin", available[0]); idx = available.index(current) if current in available else 0
-        selected = st.selectbox("Strategy Arena Coin", available, index=idx, key="strategy_arena_coin"); st.session_state["selected_coin"] = selected
+        current = st.session_state.get("selected_coin", available[0])
+        if current not in available:
+            current = available[0]
+            st.session_state["selected_coin"] = current
+        if st.session_state.get("strategy_arena_coin") not in available:
+            st.session_state["strategy_arena_coin"] = current
+        selected = st.selectbox("Strategy Arena Coin", available, index=available.index(st.session_state.get("strategy_arena_coin", current)), key="strategy_arena_coin")
+        st.session_state["selected_coin"] = selected
     st.markdown(f'<div class="hud-header"><div class="hud-title">Strategy Arena</div><div class="hud-subtitle">{_html(selected)} · chart first, analyst debate below.</div></div>', unsafe_allow_html=True)
     chart_choice = st.radio("Chart source", ["Bot overlay chart", "TradingView visual chart"], horizontal=True, key=f"chart_source_{selected}")
     if chart_choice == "TradingView visual chart":
@@ -779,6 +804,7 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
 def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
+    st.metric("Trading Mode", readiness.get("live_trading_mode_label", readiness.get("trading_aggression_mode", "unknown")))
     cols = st.columns(6)
     cols[0].metric("WebSocket Recent", str(readiness.get("websocket_recent")))
     cols[1].metric("Safe Overnight", str(readiness.get("safe_to_run_overnight")))
@@ -803,7 +829,7 @@ def render_live_dashboard(selected, timeframe, overlays, full_chart, refresh_con
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": timeframe, "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
     snapshot = load_viewer_snapshot(); market_df = load_csv(MARKET_CSV_PATH); decisions_df = load_csv(COUNCIL_DECISIONS_PATH); council_votes_df = load_csv(COUNCIL_VOTES_CSV_PATH); targets_df = load_csv(POSITION_TARGETS_PATH); trades_df = load_csv(TRADES_CSV_PATH); orders_df = load_csv(ORDERS_CSV_PATH); shadow_df = load_csv(SHADOW_TRADES_CSV_PATH); order_book_df = load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df); st.markdown('</section>', unsafe_allow_html=True)
 

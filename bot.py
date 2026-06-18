@@ -18042,6 +18042,73 @@ class TradingBot:
 
         return float(proposed)
 
+
+    def _apply_minimum_live_buy_notional(
+        self,
+        *,
+        product_id: str,
+        desired_notional: float,
+        min_order: float,
+        spendable_cash: float,
+        product_room: float,
+        total_room: float,
+        remaining_eval_budget: float,
+        equity_usd: float,
+        candidate: Dict[str, Any],
+    ) -> Tuple[float, str]:
+        """
+        Keep percentage-based sizing as the source of truth, but round up to the
+        minimum live order when the percentage output is below Coinbase minimum.
+        Caps remain authoritative.
+        """
+        desired = max(0.0, float(desired_notional))
+        min_order = max(float(MIN_ENTRY_USD), float(min_order))
+        hard_cap = max(
+            0.0,
+            min(
+                float(spendable_cash),
+                float(product_room),
+                float(total_room),
+                float(remaining_eval_budget),
+            ),
+        )
+        if desired <= 0:
+            return 0.0, (
+                f"min_order_size blocked_no_desired_notional;"
+                f"desired={desired:.4f};hard_cap={hard_cap:.4f};"
+                f"min_order={min_order:.4f}"
+            )
+        if desired >= min_order:
+            final_value = min(desired, hard_cap)
+            if final_value < min_order:
+                return 0.0, (
+                    f"min_order_size_blocked_by_caps;"
+                    f"desired={desired:.4f};hard_cap={hard_cap:.4f};"
+                    f"min_order={min_order:.4f};spendable_cash={float(spendable_cash):.4f};"
+                    f"product_room={float(product_room):.4f};total_room={float(total_room):.4f};"
+                    f"remaining_eval_budget={float(remaining_eval_budget):.4f}"
+                )
+            return final_value, (
+                f"percent_size_kept;"
+                f"desired={desired:.4f};final={final_value:.4f};"
+                f"hard_cap={hard_cap:.4f};min_order={min_order:.4f}"
+            )
+        if hard_cap >= min_order:
+            return min_order, (
+                f"percent_size_raised_to_coinbase_minimum;"
+                f"desired={desired:.4f};raised={min_order:.4f};"
+                f"hard_cap={hard_cap:.4f};equity={float(equity_usd):.4f};"
+                f"pct_before_raise={desired / max(float(equity_usd), 1e-9):.6f};"
+                f"pct_after_raise={min_order / max(float(equity_usd), 1e-9):.6f}"
+            )
+        return 0.0, (
+            f"min_order_size_blocked_by_caps;"
+            f"desired={desired:.4f};hard_cap={hard_cap:.4f};"
+            f"min_order={min_order:.4f};spendable_cash={float(spendable_cash):.4f};"
+            f"product_room={float(product_room):.4f};total_room={float(total_room):.4f};"
+            f"remaining_eval_budget={float(remaining_eval_budget):.4f}"
+        )
+
     def _maybe_train_ai_brain(self) -> None:
         if not ENABLE_LOCAL_AI_BRAIN or self.ai_brain is None:
             return
@@ -19361,8 +19428,17 @@ class TradingBot:
 
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
+            cycle_started_perf = time.perf_counter()
+            cycle_timing: Dict[str, float] = {}
+
+            def mark_cycle_section(name: str, start_perf: float) -> None:
+                try:
+                    cycle_timing[name] = round(time.perf_counter() - start_perf, 4)
+                except Exception:
+                    pass
+
             ts_now = now_ts()
-            self._last_eval_loop_section_timings = {}
+            self._last_eval_loop_section_timings = cycle_timing
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
                 _t = time.perf_counter(); self._schedule_background_work("missed_opportunity_review", "_missed_opportunity_review_running", self._review_level8_missed_opportunities); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["missed_opportunity_review"] = round(_e, 4); self._log_hot_loop_timing("missed_opportunity_review", _e)
             _t = time.perf_counter(); self._schedule_background_work("maker_miss_review", "_maker_miss_review_running", self._review_maker_miss_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["maker_miss_review"] = round(_e, 4); self._log_hot_loop_timing("maker_miss_review", _e)
@@ -19624,6 +19700,7 @@ class TradingBot:
             warmup_done = (ts_now - self.bot_start_ts) >= FIRST_BUY_DELAY_SEC
 
             snap_live: Optional[Dict[str, Dict[str, float]]] = None
+            section_started = time.perf_counter()
             try:
                 snap_live = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
                 cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
@@ -19637,6 +19714,8 @@ class TradingBot:
                 log(f"[eval] Coinbase account refresh failed; skipping evaluation: {e}")
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
+
+            mark_cycle_section("live_snapshot_refresh", section_started)
 
             skip_new_buys_this_loop = False
 
@@ -19662,6 +19741,7 @@ class TradingBot:
                     f"telemetry and shadow learning remain active"
                 )
 
+            section_started = time.perf_counter()
             candidates = []
             council_watch_candidates: List[Dict[str, Any]] = []
             # Level 8-direct mode no longer uses the old pre-Level-8 buy-ready gate.
@@ -20043,6 +20123,9 @@ class TradingBot:
                     ),
                 })
 
+            mark_cycle_section("candidate_build", section_started)
+            section_started = time.perf_counter()
+
             if ENABLE_LEVEL8_COUNCIL and LEVEL8_ENABLE_COUNCIL_HEARTBEAT:
                 self._run_level8_council_heartbeat(
                     watch_candidates=council_watch_candidates,
@@ -20352,6 +20435,9 @@ class TradingBot:
                 except Exception:
                     pass
 
+            mark_cycle_section("level8_decisions", section_started)
+            section_started = time.perf_counter()
+
             ai_filtered_candidates = []
             for candidate in timed_candidates:
                 product_id_for_ai = str(candidate.get("product_id", ""))
@@ -20413,6 +20499,7 @@ class TradingBot:
                     else live_buy_pool[:1]
                 )
 
+            mark_cycle_section("candidate_filtering", section_started)
             log(
                 f"[buy-loop] candidate_slice={len(candidate_slice)} "
                 f"ai_filtered={len(ai_filtered_candidates)} "
@@ -20426,6 +20513,7 @@ class TradingBot:
                 )
                 candidate_slice = []
 
+            section_started = time.perf_counter()
             if ENABLE_INVERTED_STOPLOSS_CYCLE:
                 for candidate in ai_filtered_candidates:
                     product_id_for_marker = str(candidate.get("product_id", ""))
@@ -20440,10 +20528,19 @@ class TradingBot:
                 # This runs every evaluation, including evaluations with no fresh
                 # candidate, so existing markers and positions remain managed.
                 await self._process_inverted_stoploss_cycle(equity_usd=equity_usd)
+                mark_cycle_section("inverted_cycle", section_started)
+                section_started = time.perf_counter()
                 log(f"[loop] sleeping {EVAL_TICK_SEC:.1f}s until next evaluation")
+                mark_cycle_section("sleep_start", section_started)
+                for section_name in ["adopt_existing_holdings", "position_target_write", "sell_review_loop", "snapshot_write"]:
+                    cycle_timing.setdefault(section_name, 0.0)
+                self._last_eval_loop_section_timings = dict(cycle_timing)
+                module_debug(MODULE_NAME, "eval_loop_cycle_timing", data={"elapsed_sec": round(time.perf_counter() - cycle_started_perf, 4), "section_timings": cycle_timing}, level="INFO" if time.perf_counter() - cycle_started_perf >= 10.0 else "DEBUG", also_overall=time.perf_counter() - cycle_started_perf >= 30.0)
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
 
+            mark_cycle_section("inverted_cycle", section_started)
+            section_started = time.perf_counter()
             for candidate in candidate_slice:
                 product_id = candidate["product_id"]
                 if not self._trade_rate_ok(product_id):
@@ -20558,68 +20655,37 @@ class TradingBot:
                     max_total_exposure = float(equity_usd) * float(LEVEL8_MAX_TOTAL_EXPOSURE_PCT)
                     total_room = max(0.0, max_total_exposure - float(total_exposure))
 
-                    entry_notional = min(
-                        float(entry_notional),
-                        float(product_room),
-                        float(total_room),
-                        float(remaining_eval_budget),
-                        float(spendable_cash),
+                    min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
+                    entry_notional, sizing_floor_reason = self._apply_minimum_live_buy_notional(
+                        product_id=product_id,
+                        desired_notional=float(entry_notional),
+                        min_order=float(min_order),
+                        spendable_cash=float(spendable_cash),
+                        product_room=float(product_room),
+                        total_room=float(total_room),
+                        remaining_eval_budget=float(remaining_eval_budget),
+                        equity_usd=float(equity_usd),
+                        candidate=candidate,
                     )
-
+                    candidate["entry_notional_sizing_reason"] = sizing_floor_reason
                     if entry_notional <= 0:
                         log(
                             f"[level8] {product_id} entry_notional blocked by mechanical cap "
                             f"cash={cash_usd:.6f} equity={equity_usd:.6f} "
                             f"reserve={reserve_cash_required:.6f} "
                             f"product_room={product_room:.6f} total_room={total_room:.6f} "
-                            f"remaining_eval_budget={remaining_eval_budget:.6f}"
+                            f"remaining_eval_budget={remaining_eval_budget:.6f};"
+                            f"{sizing_floor_reason}"
                         )
                         continue
-
-                min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
-
-                if entry_notional < min_order:
-                    reserve_cash_required = (
-                        float(equity_usd) * float(LEVEL8_RESERVE_CASH_PCT)
-                        if ENABLE_LEVEL8_COUNCIL
-                        else float(RESERVE_USD)
+                    log(
+                        f"[level8] {product_id} entry_notional sized "
+                        f"entry_notional={entry_notional:.2f};"
+                        f"{sizing_floor_reason}"
                     )
-                    spendable_cash = max(
-                        0.0, float(cash_usd) - reserve_cash_required
-                    )
-                    if (
-                        ENABLE_LEVEL8_COUNCIL
-                        and str(candidate.get("level8_action", "")).upper()
-                        == "ALLOW_BUY"
-                        and spendable_cash >= min_order
-                        and remaining_eval_budget >= min_order
-                    ):
-                        min_order_pct = float(min_order) / max(float(equity_usd), 1e-9)
-                        expected_utility = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
-                        truth_score = float(candidate.get("level8_truth_score", candidate.get("truth_score", 0.0)) or 0.0)
-                        allow_min_order_exception = bool(
-                            min_order_pct <= float(MIN_ORDER_RAISE_MAX_EQUITY_PCT)
-                            or (
-                                expected_utility >= float(MIN_ORDER_RAISE_EXCEPTION_UTILITY_BPS)
-                                and truth_score >= float(MIN_ORDER_RAISE_EXCEPTION_TRUTH)
-                            )
-                        )
-                        if not allow_min_order_exception:
-                            log(
-                                f"[level8] {product_id} shadowing min-order raise; "
-                                f"old={entry_notional:.2f};min_order={float(min_order):.2f};"
-                                f"min_order_pct={min_order_pct:.3f};equity={equity_usd:.2f};"
-                                f"expected_utility={expected_utility:.2f};truth={truth_score:.3f}"
-                            )
-                            continue
-                        log(
-                            f"[level8] {product_id} raising ALLOW_BUY notional "
-                            f"to min live order old={entry_notional:.2f} "
-                            f"new={min_order:.2f};"
-                            f"min_order_pct={min_order_pct:.3f};exception={allow_min_order_exception}"
-                        )
-                        entry_notional = min_order
-                    else:
+                else:
+                    min_order = max(float(MIN_ENTRY_USD), float(MIN_LIVE_ORDER_USD))
+                    if entry_notional < min_order:
                         log(
                             f"[buy-skip] {product_id} below_min_order "
                             f"entry_notional={entry_notional:.2f} "
@@ -20689,6 +20755,7 @@ class TradingBot:
                     entry_timing_ok=candidate.get("entry_timing_ok", ""),
                     entry_timing_reason=candidate.get("entry_timing_reason", ""),
                     action="attempt_buy", reason="selected_after_rank_and_timing",
+                    sizing_reason=candidate.get("entry_notional_sizing_reason", ""),
                 )
                 candidate["entry_reason"] = (
                     str(candidate.get("entry_reason", ""))
@@ -20701,6 +20768,7 @@ class TradingBot:
                     f"[buy-attempt] {product_id} "
                     f"mode={entry_mode_for_this_trade} "
                     f"quote_usd={entry_notional:.2f} "
+                    f"sizing={candidate.get('entry_notional_sizing_reason', '')} "
                     f"entry_fee_bps={entry_fee_bps:.3f} "
                     f"timing={candidate.get('entry_timing_ok')} "
                     f"timing_reason={candidate.get('entry_timing_reason', '')} "
@@ -20940,7 +21008,23 @@ class TradingBot:
                     except Exception as exc:
                         log(f"[buy-loop] post-buy exposure cap check failed: {exc}")
 
+            mark_cycle_section("buy_execution_loop", section_started)
+            for section_name in ["adopt_existing_holdings", "position_target_write", "sell_review_loop", "snapshot_write"]:
+                cycle_timing.setdefault(section_name, 0.0)
+            section_started = time.perf_counter()
             log(f"[loop] sleeping {EVAL_TICK_SEC:.1f}s until next evaluation")
+            mark_cycle_section("sleep_start", section_started)
+            self._last_eval_loop_section_timings = dict(cycle_timing)
+            module_debug(
+                MODULE_NAME,
+                "eval_loop_cycle_timing",
+                data={
+                    "elapsed_sec": round(time.perf_counter() - cycle_started_perf, 4),
+                    "section_timings": cycle_timing,
+                },
+                level="INFO" if time.perf_counter() - cycle_started_perf >= 10.0 else "DEBUG",
+                also_overall=time.perf_counter() - cycle_started_perf >= 30.0,
+            )
             await asyncio.sleep(EVAL_TICK_SEC)
 
 

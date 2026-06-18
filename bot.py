@@ -9,6 +9,7 @@ import os
 import json
 import time
 import sys
+import traceback
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import csv
@@ -241,6 +242,20 @@ MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.
 MAKER_MISS_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_miss_outcomes.csv")
 ORDER_BOOK_SNAPSHOTS_CSV_PATH: str = os.path.join(BASE_DIR, "order_book_snapshots.csv")
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
+
+RUNTIME_CSV_ROW_LIMITS = {
+    "market.csv": 15000,
+    "council_decisions.csv": 15000,
+    "council_votes.csv": 60000,
+    "shadow_trades.csv": 20000,
+    "agent_performance.csv": 75000,
+    "candidate_replay.csv": 75000,
+    "decision_audit.csv": 50000,
+    "order_book_snapshots.csv": 15000,
+    "signal_events.csv": 30000,
+}
+
+RUNTIME_CSV_COMPACT_EVERY_SEC = 15 * 60
 
 # Startup CSV-state detection.
 # This must check for meaningful pre-existing data rows, not just file existence.
@@ -5814,6 +5829,8 @@ class TradingBot:
             f"{self.startup_had_existing_runtime_state}"
         )
         self._last_viewer_snapshot_write_ts: float = 0.0
+        self._last_runtime_csv_compact_ts = 0.0
+        self._runtime_csv_compact_running = False
         self._latest_viewer_snapshot_rows: Dict[str, Dict[str, Any]] = {}
         # top of book per product
         self.tob: Dict[str, Optional[TopOfBook]] = {p: None for p in PRODUCTS}
@@ -19426,6 +19443,59 @@ class TradingBot:
         except Exception as exc:
             log_exception("viewer snapshot refresh failed", exc)
 
+    def _compact_runtime_csv_file(self, path: str, max_rows: int) -> None:
+        try:
+            if not os.path.exists(path):
+                return
+
+            try:
+                size_bytes = os.path.getsize(path)
+            except Exception:
+                size_bytes = 0
+
+            if size_bytes < 2_000_000:
+                return
+
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                header = f.readline()
+                rows = deque(f, maxlen=max(1, int(max_rows)))
+
+            if not header:
+                return
+
+            tmp = path + ".compact.tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(header)
+                f.writelines(rows)
+
+            os.replace(tmp, path)
+
+            module_debug(
+                MODULE_NAME,
+                "runtime_csv_compacted",
+                data={
+                    "path": path,
+                    "max_rows": max_rows,
+                    "old_size_bytes": size_bytes,
+                    "new_size_bytes": os.path.getsize(path) if os.path.exists(path) else 0,
+                },
+                level="INFO",
+                also_overall=False,
+            )
+
+        except Exception as exc:
+            module_exception(
+                MODULE_NAME,
+                "runtime_csv_compact_file_failed",
+                exc,
+                data={"path": path, "traceback": traceback.format_exc()},
+                also_overall=False,
+            )
+
+    def _compact_runtime_csvs(self) -> None:
+        for filename, max_rows in RUNTIME_CSV_ROW_LIMITS.items():
+            self._compact_runtime_csv_file(os.path.join(BASE_DIR, filename), int(max_rows))
+
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             cycle_started_perf = time.perf_counter()
@@ -19439,6 +19509,17 @@ class TradingBot:
 
             ts_now = now_ts()
             self._last_eval_loop_section_timings = cycle_timing
+            if ts_now - float(getattr(self, "_last_runtime_csv_compact_ts", 0.0) or 0.0) >= float(RUNTIME_CSV_COMPACT_EVERY_SEC):
+                self._last_runtime_csv_compact_ts = ts_now
+                _t = time.perf_counter()
+                self._schedule_background_work(
+                    "runtime_csv_compaction",
+                    "_runtime_csv_compact_running",
+                    self._compact_runtime_csvs,
+                )
+                _e = time.perf_counter() - _t
+                self._last_eval_loop_section_timings["runtime_csv_compaction"] = round(_e, 4)
+                self._log_hot_loop_timing("runtime_csv_compaction", _e)
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
                 _t = time.perf_counter(); self._schedule_background_work("missed_opportunity_review", "_missed_opportunity_review_running", self._review_level8_missed_opportunities); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["missed_opportunity_review"] = round(_e, 4); self._log_hot_loop_timing("missed_opportunity_review", _e)
             _t = time.perf_counter(); self._schedule_background_work("maker_miss_review", "_maker_miss_review_running", self._review_maker_miss_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["maker_miss_review"] = round(_e, 4); self._log_hot_loop_timing("maker_miss_review", _e)

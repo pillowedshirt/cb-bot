@@ -3,8 +3,10 @@ import json
 import os
 import time
 import traceback
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from io import StringIO
 from typing import Any, Dict
 from urllib.parse import quote
 
@@ -51,6 +53,7 @@ MICRO_HISTORY_CSV_PATH = os.path.join(BASE_DIR, "micro_history.csv")
 MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
 MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
 SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
+MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
 CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
 CHART_15M_30D_CSV_PATH = os.path.join(BASE_DIR, "chart_15m_30d.csv")
 CHART_1H_90D_CSV_PATH = os.path.join(BASE_DIR, "chart_1h_90d.csv")
@@ -332,6 +335,57 @@ def load_csv(path: str, usecols: list[str] | None = None) -> pd.DataFrame:
         return frame
     except Exception as exc:
         module_exception(MODULE_NAME, "viewer_csv_load_failed", exc, data={"path": path, "signature": sig, "traceback": traceback.format_exc()}, also_overall=True)
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def _load_csv_tail_cached(
+    path: str,
+    exists: bool,
+    size_bytes: int,
+    mtime_ns: int,
+    max_lines: int,
+    usecols_key: tuple | None = None,
+) -> pd.DataFrame:
+    if not exists:
+        return pd.DataFrame()
+
+    usecols = list(usecols_key) if usecols_key else None
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            header = f.readline()
+            tail_lines = deque(f, maxlen=max(1, int(max_lines)))
+
+        if not header:
+            return pd.DataFrame()
+
+        text = header + "".join(tail_lines)
+        return pd.read_csv(StringIO(text), usecols=usecols)
+
+    except Exception:
+        if size_bytes <= 5_000_000:
+            return pd.read_csv(path, usecols=usecols)
+        return pd.DataFrame()
+
+
+def load_csv_tail(path: str, max_lines: int = 25000, usecols: list[str] | None = None) -> pd.DataFrame:
+    sig = file_signature(path)
+    usecols_key = tuple(usecols) if usecols else None
+
+    try:
+        frame = _load_csv_tail_cached(
+            sig[0],
+            sig[1],
+            sig[2],
+            sig[3],
+            int(max_lines),
+            usecols_key,
+        )
+        module_debug(MODULE_NAME, "viewer_csv_tail_loaded", data={"path": path, "exists": sig[1], "size_bytes": sig[2], "mtime_ns": sig[3], "rows": int(len(frame)) if hasattr(frame, "__len__") else 0, "max_lines": int(max_lines), "columns": list(frame.columns)[:80] if hasattr(frame, "columns") else []}, level="DEBUG", also_overall=False)
+        return frame
+    except Exception as exc:
+        module_exception(MODULE_NAME, "viewer_csv_tail_load_failed", exc, data={"path": path, "signature": sig, "max_lines": int(max_lines), "traceback": traceback.format_exc()}, also_overall=True)
         return pd.DataFrame()
 
 
@@ -763,22 +817,110 @@ def build_coin_chart(chart_df, chart_meta, coin_state, market_df, confirmed_trad
 
 
 def latest_council_votes_for_coin(council_votes_df, decisions_df, product_id):
-    latest_decision_id, latest_row = "", {}
-    try:
-        d=decisions_df[decisions_df["product_id"].astype(str)==str(product_id)].copy() if not decisions_df.empty and "product_id" in decisions_df.columns else pd.DataFrame()
-        if not d.empty:
-            d["ts_num"]=pd.to_numeric(d.get("ts"), errors="coerce"); d=d.sort_values("ts_num"); latest_row=d.iloc[-1].to_dict(); latest_decision_id=str(latest_row.get("decision_id", ""))
-        v=council_votes_df[council_votes_df["product_id"].astype(str)==str(product_id)].copy() if not council_votes_df.empty and "product_id" in council_votes_df.columns else pd.DataFrame()
-        if not v.empty and latest_decision_id and "decision_id" in v.columns:
-            matched=v[v["decision_id"].astype(str)==latest_decision_id].copy(); v=matched if not matched.empty else v
-        if not v.empty and (not latest_decision_id) and "decision_id" in v.columns:
-            v["ts_num"]=pd.to_numeric(v.get("ts"), errors="coerce"); v=v.sort_values("ts_num"); latest_decision_id=str(v.iloc[-1].get("decision_id", "")); v=v[v["decision_id"].astype(str)==latest_decision_id].copy()
-        sort_cols=[c for c in ["leaderboard_rank","agent"] if c in v.columns]
-        if sort_cols: v=v.sort_values(sort_cols)
-        return latest_decision_id, latest_row, v
-    except Exception as exc:
-        module_exception(MODULE_NAME, "latest_council_votes_for_coin_failed", exc, also_overall=True); return latest_decision_id, latest_row, pd.DataFrame()
+    """
+    Return the latest usable Level 8 decision and the matching council vote rows.
 
+    Heartbeat / COMMENTARY rows can have blank or NaN decision_id values.
+    If "nan" is treated as a real decision_id, matching fails and callers can
+    accidentally render every historical vote for the product.
+    """
+    latest_decision_id = ""
+    latest_row = {}
+
+    def valid_decision_id(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text or text.lower() in {"nan", "none", "null", "nat"}:
+            return ""
+        return text
+
+    try:
+        decisions = (
+            decisions_df[decisions_df["product_id"].astype(str) == str(product_id)].copy()
+            if decisions_df is not None
+            and not decisions_df.empty
+            and "product_id" in decisions_df.columns
+            else pd.DataFrame()
+        )
+
+        votes = (
+            council_votes_df[council_votes_df["product_id"].astype(str) == str(product_id)].copy()
+            if council_votes_df is not None
+            and not council_votes_df.empty
+            and "product_id" in council_votes_df.columns
+            else pd.DataFrame()
+        )
+
+        if not decisions.empty:
+            decisions["ts_num"] = pd.to_numeric(decisions.get("ts"), errors="coerce")
+            decisions = decisions.sort_values("ts_num")
+            usable_decisions = decisions[
+                decisions.get("decision_id", pd.Series("", index=decisions.index))
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .replace({"nan": "", "none": "", "null": ""})
+                .ne("")
+            ].copy()
+
+            latest_row = (usable_decisions.iloc[-1] if not usable_decisions.empty else decisions.iloc[-1]).to_dict()
+            latest_decision_id = valid_decision_id(latest_row.get("decision_id", ""))
+
+        if votes.empty:
+            return latest_decision_id, latest_row, pd.DataFrame()
+
+        if "ts" in votes.columns:
+            votes["ts_num"] = pd.to_numeric(votes.get("ts"), errors="coerce")
+            votes = votes.sort_values("ts_num")
+
+        matched = pd.DataFrame()
+
+        if latest_decision_id and "decision_id" in votes.columns:
+            matched = votes[votes["decision_id"].astype(str) == latest_decision_id].copy()
+
+        if matched.empty and "decision_id" in votes.columns:
+            clean_vote_ids = votes["decision_id"].astype(str).str.strip()
+            usable_votes = votes[
+                clean_vote_ids.ne("")
+                & clean_vote_ids.str.lower().ne("nan")
+                & clean_vote_ids.str.lower().ne("none")
+                & clean_vote_ids.str.lower().ne("null")
+            ].copy()
+
+            if not usable_votes.empty:
+                latest_decision_id = str(usable_votes.iloc[-1].get("decision_id", "")).strip()
+                matched = usable_votes[usable_votes["decision_id"].astype(str) == latest_decision_id].copy()
+
+        if matched.empty:
+            matched = votes.tail(25).copy()
+
+        sort_cols = [c for c in ["leaderboard_rank", "agent"] if c in matched.columns]
+        if sort_cols:
+            matched = matched.sort_values(sort_cols)
+
+        module_debug(
+            MODULE_NAME,
+            "latest_council_votes_selected",
+            data={
+                "product_id": product_id,
+                "decision_id": latest_decision_id,
+                "vote_rows": int(len(matched)),
+                "unique_agents": int(matched["agent"].nunique()) if "agent" in matched.columns else 0,
+            },
+            level="DEBUG",
+            also_overall=False,
+        )
+
+        return latest_decision_id, latest_row, matched
+
+    except Exception as exc:
+        module_exception(
+            MODULE_NAME,
+            "latest_council_votes_for_coin_failed",
+            exc,
+            data={"product_id": product_id, "traceback": traceback.format_exc()},
+            also_overall=True,
+        )
+        return latest_decision_id, latest_row, pd.DataFrame()
 
 def vote_leaning(row):
     scores={"BUY":_safe_float(row.get("adjusted_buy_score", row.get("buy_score"))),"SELL":_safe_float(row.get("adjusted_sell_score", row.get("sell_score"))),"HOLD":_safe_float(row.get("adjusted_hold_score", row.get("hold_score"))),"WAIT":_safe_float(row.get("adjusted_wait_score", row.get("wait_score")))}
@@ -1147,6 +1289,10 @@ def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, deci
 
 def render_agent_dialogue_panel(agent_name: str, votes: pd.DataFrame):
     sub = votes[votes["agent"].astype(str) == str(agent_name)] if not votes.empty and "agent" in votes.columns else pd.DataFrame()
+    if not sub.empty and "ts" in sub.columns:
+        sub = sub.copy()
+        sub["ts_num"] = pd.to_numeric(sub.get("ts"), errors="coerce")
+        sub = sub.sort_values("ts_num")
 
     if sub.empty:
         st.info("Select an analyst card to view its full dialogue.")
@@ -1182,7 +1328,16 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
         st.info("No analyst rows yet.")
         return
 
-    rows = votes.to_dict("records")
+    if "agent" in votes.columns:
+        display_votes = votes.copy()
+        if "ts" in display_votes.columns:
+            display_votes["ts_num"] = pd.to_numeric(display_votes.get("ts"), errors="coerce")
+            display_votes = display_votes.sort_values("ts_num")
+        display_votes = display_votes.drop_duplicates(subset=["agent"], keep="last")
+    else:
+        display_votes = votes.copy()
+
+    rows = display_votes.to_dict("records")
 
     if not st.session_state.get("selected_agent_dialogue"):
         if "agent" in votes.columns and "volume_profile_leader" in votes["agent"].astype(str).tolist():
@@ -1216,9 +1371,13 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
                     unsafe_allow_html=True,
                 )
 
+                decision_key = str(row.get("decision_id") or "no_decision")
+                rank_key = str(row.get("leaderboard_rank") or i)
+                row_key = f"{i}_{agent}_{decision_key}_{rank_key}".replace(" ", "_").replace("/", "_")
+
                 if st.button(
                     "Click here",
-                    key=f"agent_card_click_{selected_coin}_{agent}",
+                    key=f"agent_card_click_{selected_coin}_{row_key}",
                     width="stretch",
                     type="secondary",
                 ):
@@ -1425,7 +1584,7 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
         st.write("Latest market row"); st.json(market); st.write("Latest decision row"); st.json(decision); st.write("Latest order-book row"); st.json(order_book); st.write("Latest target row"); st.json(target)
 
 
-def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df):
+def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
     st.metric("Trading Mode", readiness.get("live_trading_mode_label", readiness.get("trading_aggression_mode", "unknown")))
@@ -1482,6 +1641,53 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
             st.warning("The main reason no trades are firing is expected_utility_too_low. That means Level 8 thinks the setup does not make enough net profit after Coinbase fees, spread, uncertainty, wait utility, and context penalties.")
             st.info("This is not a viewer failure. It means the bot is finding activity, but Level 8 does not believe the setups are net-profitable enough yet after Coinbase costs and context penalties.")
 
+    st.markdown("### Overnight Run Summary")
+    try:
+        total_decisions = int(len(decisions_df)) if decisions_df is not None else 0
+        total_votes = int(len(council_votes_df)) if council_votes_df is not None else 0
+        total_trades = int(len(trades_df)) if trades_df is not None else 0
+        total_orders = int(len(orders_df)) if orders_df is not None else 0
+        action_counts = (
+            decisions_df["action"].astype(str).value_counts().to_dict()
+            if decisions_df is not None and not decisions_df.empty and "action" in decisions_df.columns
+            else {}
+        )
+        st.write(
+            f"During the loaded runtime window, the bot published {total_decisions} Level 8 decisions, "
+            f"{total_votes} agent votes, {total_orders} backend order rows, and {total_trades} confirmed trade rows."
+        )
+        st.write(f"Latest loaded action mix: {action_counts}")
+        if total_trades == 0 and total_orders == 0:
+            st.info(
+                "No live orders or confirmed trades were recorded in the loaded runtime files. "
+                "The bot was evaluating and shadowing setups, but it did not approve live execution."
+            )
+        if decisions_df is not None and not decisions_df.empty and "expected_utility_bps" in decisions_df.columns:
+            util = pd.to_numeric(decisions_df["expected_utility_bps"], errors="coerce").dropna()
+            if not util.empty:
+                st.write(
+                    f"Expected utility summary: median {util.median():.2f} bps, "
+                    f"best {util.max():.2f} bps, worst {util.min():.2f} bps."
+                )
+    except Exception as exc:
+        module_exception(MODULE_NAME, "overnight_summary_render_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+    if missed_df is not None and not missed_df.empty:
+        st.markdown("### Missed Opportunity Learning")
+        count = int(len(missed_df))
+        st.write(f"The bot logged {count} missed opportunity review rows in the loaded runtime window.")
+        if "product_id" in missed_df.columns:
+            top_missed = missed_df["product_id"].astype(str).value_counts().head(5).to_dict()
+            st.write(f"Most common missed-opportunity products: {top_missed}")
+        if "move_bps" in missed_df.columns:
+            moves = pd.to_numeric(missed_df["move_bps"], errors="coerce").dropna()
+            if not moves.empty:
+                st.write(f"Missed move size: median {moves.median():.2f} bps, max {moves.max():.2f} bps.")
+        st.info(
+            "Missed opportunities do not automatically mean the bot should have live traded. "
+            "They are learning rows that show where the bot avoided or shadowed a setup that later moved."
+        )
+
     with st.expander("Raw readiness JSON", expanded=False):
         st.json(readiness)
     for name, df in [("trades", trades_df), ("orders", orders_df), ("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df)]:
@@ -1491,11 +1697,20 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
-    snapshot = load_viewer_snapshot(); market_df = load_csv(MARKET_CSV_PATH); decisions_df = load_csv(COUNCIL_DECISIONS_PATH); council_votes_df = load_csv(COUNCIL_VOTES_CSV_PATH); targets_df = load_csv(POSITION_TARGETS_PATH); trades_df = load_csv(TRADES_CSV_PATH); orders_df = load_csv(ORDERS_CSV_PATH); shadow_df = load_csv(SHADOW_TRADES_CSV_PATH); order_book_df = load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
+    snapshot = load_viewer_snapshot()
+    market_df = load_csv_tail(MARKET_CSV_PATH, max_lines=6000)
+    decisions_df = load_csv_tail(COUNCIL_DECISIONS_PATH, max_lines=6000)
+    council_votes_df = load_csv_tail(COUNCIL_VOTES_CSV_PATH, max_lines=40000)
+    targets_df = load_csv(POSITION_TARGETS_PATH)
+    trades_df = load_csv(TRADES_CSV_PATH)
+    orders_df = load_csv(ORDERS_CSV_PATH)
+    shadow_df = load_csv_tail(SHADOW_TRADES_CSV_PATH, max_lines=6000)
+    order_book_df = load_csv_tail(ORDER_BOOK_SNAPSHOTS_PATH, max_lines=6000)
+    missed_df = load_csv_tail(MISSED_OPPORTUNITIES_CSV_PATH, max_lines=5000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
 def main() -> None:

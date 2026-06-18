@@ -54,6 +54,8 @@ MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
 MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
 SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
 SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
+HISTORICAL_SHADOW_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
+HISTORICAL_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_summary.csv")
 MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
 CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
 CHART_15M_30D_CSV_PATH = os.path.join(BASE_DIR, "chart_15m_30d.csv")
@@ -1233,7 +1235,7 @@ def build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, tar
         else: consensus = "WAIT"; buy_votes = wait_votes = sell_votes = hold_votes = 0
         action = str(decision.get("action") or coin.get("decision_action") or market.get("buy_gate_tradeable") or "WAIT").upper()
         blocker = str(market.get("buy_gate_blocker") or coin.get("main_blocker") or coin.get("buy_blocker") or decision.get("reason") or decision.get("main_reason") or "")
-        row = {"product_id": product, "price": _safe_float(market.get("mid") or coin.get("price")), "spread_bps": _safe_float(market.get("spread_bps") or coin.get("spread_bps")), "action": action, "consensus": consensus, "buy_votes": buy_votes, "sell_votes": sell_votes, "hold_votes": hold_votes, "wait_votes": wait_votes, "owns_position": boolish(coin.get("owns_position") or target.get("has_position")), "final_buy_score": _safe_float(decision.get("final_buy_score") or coin.get("final_buy_score")), "buy_threshold": _safe_float(decision.get("buy_threshold") or coin.get("buy_threshold")), "expected_utility_bps": _safe_float(decision.get("expected_utility_bps") or coin.get("expected_utility_bps")), "recommended_position_pct": _safe_float(decision.get("recommended_position_pct") or coin.get("recommended_position_pct")), "buy_gate_tradeable": market.get("buy_gate_tradeable"), "buy_gate_strict_ok": market.get("buy_gate_strict_ok"), "buy_gate_spread_ok": market.get("buy_gate_spread_ok"), "buy_gate_ev_ok": market.get("buy_gate_ev_ok"), "buy_gate_score_ok": market.get("buy_gate_score_ok"), "buy_gate_prob_ok": market.get("buy_gate_prob_ok"), "blocker": plain_reason(blocker), "decision_id": latest_decision_id}
+        row = {"product_id": product, "price": _safe_float(market.get("mid") or coin.get("price")), "spread_bps": _safe_float(market.get("spread_bps") or coin.get("spread_bps")), "action": action, "consensus": consensus, "buy_votes": buy_votes, "sell_votes": sell_votes, "hold_votes": hold_votes, "wait_votes": wait_votes, "owns_position": boolish(coin.get("owns_position") or target.get("has_position")), "final_buy_score": _safe_float(decision.get("final_buy_score") or coin.get("final_buy_score")), "buy_threshold": _safe_float(decision.get("buy_threshold") or coin.get("buy_threshold")), "expected_utility_bps": _safe_float(decision.get("expected_utility_bps") or coin.get("expected_utility_bps")), "recommended_position_pct": _safe_float(decision.get("recommended_position_pct") or coin.get("recommended_position_pct")), "buy_gate_tradeable": market.get("buy_gate_tradeable"), "buy_gate_strict_ok": market.get("buy_gate_strict_ok"), "buy_gate_spread_ok": market.get("buy_gate_spread_ok"), "buy_gate_ev_ok": market.get("buy_gate_ev_ok"), "buy_gate_score_ok": market.get("buy_gate_score_ok"), "buy_gate_prob_ok": market.get("buy_gate_prob_ok"), "blocker": plain_reason(blocker), "decision_id": latest_decision_id, "historical_replay_ready": boolish(coin.get("historical_replay_ready")), "historical_replay_rows": _safe_float(coin.get("historical_replay_rows")), "calibration_source": str(coin.get("calibration_source") or "unknown")}
         row["viability_score"], row["viability_reason"] = calculate_coin_viability(row); rows.append(row)
     rows.sort(key=lambda r: (_safe_float(r.get("viability_score")), boolish(r.get("buy_gate_tradeable")), _safe_float(r.get("expected_utility_bps")), _safe_float(r.get("final_buy_score")) - _safe_float(r.get("buy_threshold")), _safe_float(r.get("buy_votes"))), reverse=True)
     for idx, row in enumerate(rows, start=1): row["rank"] = idx
@@ -1274,6 +1276,8 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
                         <div>Spread: <b>{row["spread_bps"]:.2f} bps</b></div>
                         <div>Buy score: <b>{row["final_buy_score"]:.3f}</b> / threshold <b>{row["buy_threshold"]:.3f}</b></div>
                         <div>Utility: <b>{row["expected_utility_bps"]:.2f} bps</b></div>
+                        <div>Calibration: <b>{_html(row["calibration_source"])}</b></div>
+                        <div>Replay rows: <b>{int(row["historical_replay_rows"])}</b></div>
                         <div class="muted">Blocker: {_html(row["blocker"][:160] or "No blocker published.")}</div>
                     </div>
                     ''', unsafe_allow_html=True)
@@ -1598,7 +1602,7 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
         st.write("Latest market row"); st.json(market); st.write("Latest decision row"); st.json(decision); st.write("Latest order-book row"); st.json(order_book); st.write("Latest target row"); st.json(target)
 
 
-def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None):
+def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
     st.metric("Trading Mode", readiness.get("live_trading_mode_label", readiness.get("trading_aggression_mode", "unknown")))
@@ -1616,6 +1620,30 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         st.warning("WebSocket/top-of-book freshness is not healthy. The bot may shadow valid setups as stale_market_data until top-of-book refresh is repaired.")
     if readiness.get("safe_to_run_overnight") is False:
         st.warning("safe_to_run_overnight is false. Check websocket freshness, duplicate process status, writable logs, and risk pause status before unattended running.")
+
+
+    st.markdown("### Historical Shadow Replay Calibration")
+    hist_enabled = readiness.get("historical_replay_enabled")
+    hist_running = readiness.get("historical_replay_running")
+    hist_ready = readiness.get("historical_replay_ready_count", 0)
+    hist_total = readiness.get("historical_replay_product_count", 0)
+    replay_cols = st.columns(4)
+    replay_cols[0].metric("Replay Enabled", str(hist_enabled))
+    replay_cols[1].metric("Replay Running", str(hist_running))
+    replay_cols[2].metric("Replay Ready Products", f"{hist_ready}/{hist_total}")
+    replay_cols[3].metric("Calibration Mode", "Profit Replay" if readiness.get("profit_replay_based_calibration_enabled") else "Fallback")
+    if historical_replay_summary_df is None or historical_replay_summary_df.empty:
+        st.info("No historical replay summary rows yet. The bot will fill historical_shadow_replay.csv in the background, then use net replay profit to calibrate each product.")
+    else:
+        summary = historical_replay_summary_df.copy()
+        if "ts" in summary.columns:
+            summary["ts_num"] = pd.to_numeric(summary["ts"], errors="coerce")
+            summary = summary.sort_values("ts_num").groupby("product_id").tail(1)
+        show_cols = [c for c in ["product_id", "rows", "wins", "losses", "win_rate", "median_net_pnl_bps", "avg_net_pnl_bps", "days_covered", "calibration_ready", "recommended_min_score", "recommended_min_probability", "recommended_min_expected_value_bps"] if c in summary.columns]
+        st.dataframe(summary[show_cols], width="stretch", hide_index=True)
+        net = pd.to_numeric(summary.get("median_net_pnl_bps", pd.Series(dtype=float)), errors="coerce").dropna()
+        if not net.empty:
+            st.write(f"Across ready products, median replay net P/L is {net.median():.2f} bps. Positive values mean the entry+sell model was net-profitable in historical replay.")
 
     explanations = readiness.get("readiness_explanation") or []
     if explanations:
@@ -1747,10 +1775,12 @@ def render_live_dashboard(selected, refresh_config):
     order_book_df = load_csv_tail(ORDER_BOOK_SNAPSHOTS_PATH, max_lines=6000)
     missed_df = load_csv_tail(MISSED_OPPORTUNITIES_CSV_PATH, max_lines=5000)
     shadow_sell_replay_df = load_csv_tail(SHADOW_SELL_REPLAY_CSV_PATH, max_lines=20000)
+    historical_replay_df = load_csv_tail(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=50000)
+    historical_replay_summary_df = load_csv_tail(HISTORICAL_REPLAY_SUMMARY_CSV_PATH, max_lines=5000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
 def main() -> None:

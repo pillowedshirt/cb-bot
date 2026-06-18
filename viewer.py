@@ -39,6 +39,7 @@ MODULE_NAME = "viewer"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIEWER_SNAPSHOT_PATH = os.path.join(BASE_DIR, "viewer_snapshot.json")
 VIEWER_SNAPSHOT_CSV_SAFE_PATH = VIEWER_SNAPSHOT_PATH
+CALCULATION_STATUS_JSON_PATH = os.path.join(BASE_DIR, "calculation_status.json")
 MARKET_CSV_PATH = os.path.join(BASE_DIR, "market.csv")
 TRADES_CSV_PATH = os.path.join(BASE_DIR, "trades.csv")
 POSITION_TARGETS_PATH = os.path.join(BASE_DIR, "position_targets.csv")
@@ -227,6 +228,11 @@ def inject_crypto_game_css() -> None:
 .good { color: #39f5a3; font-weight: 800; } .warn { color: #ffd166; font-weight: 800; } .danger { color: #ff5c7a; font-weight: 800; } .muted { color: #8db7c8; }
 div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid rgba(80,220,255,.15); padding: 8px 10px; border-radius: 12px; }
 .screen-section { width: 100%; display: block; padding: 0.35rem 0 0.75rem 0; margin: 0; border-bottom: 1px solid rgba(80, 220, 255, 0.08); }
+.calibration-gate { max-width: 1080px; margin: 2rem auto; padding: 1.25rem; border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 24px; background: linear-gradient(180deg, rgba(6, 18, 32, 0.96), rgba(3, 9, 18, 0.98)); box-shadow: 0 0 32px rgba(80, 220, 255, 0.08); }
+.calibration-title { font-size: 1.7rem; font-weight: 900; margin-bottom: 0.35rem; }
+.calibration-subtitle { color: #8db7c8; margin-bottom: 1rem; }
+.calibration-phase-card { border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 16px; padding: 0.85rem; background: rgba(7, 18, 32, 0.88); margin-bottom: 0.75rem; }
+.calibration-product-table { font-size: 0.9rem; }
 .held-banner {
     max-width: 760px;
     margin: 0.9rem auto 1rem auto;
@@ -436,6 +442,26 @@ def load_viewer_snapshot() -> Dict[str, Any]:
     except Exception as exc:
         module_exception(MODULE_NAME, "viewer_snapshot_load_failed", exc, data={"path": VIEWER_SNAPSHOT_PATH, "signature": sig, "traceback": traceback.format_exc()}, also_overall=True)
         return {"updated_ts": 0.0, "coins": {}, "top_products": [], "live_positions": [], "readiness": {}, "_viewer_snapshot_error": f"{type(exc).__name__}: {exc}"}
+
+
+@st.cache_data(show_spinner=False)
+def _load_calculation_status_cached(path: str, exists: bool, size_bytes: int, mtime_ns: int) -> dict:
+    if not exists:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        module_exception(MODULE_NAME, "calculation_status_load_failed", exc, data={"path": path, "traceback": traceback.format_exc()}, also_overall=False)
+        return {}
+
+
+def load_calculation_status() -> dict:
+    sig = file_signature(CALCULATION_STATUS_JSON_PATH)
+    status = _load_calculation_status_cached(sig[0], sig[1], sig[2], sig[3])
+    if not status:
+        return {"full_viewer_unlocked": False, "overall_progress": 0.0, "overall_progress_pct": 0.0, "phase_label": "Waiting for bot calculation status", "phase_progress": {}, "product_status": {}}
+    return status
 
 
 def dataframe_latest_age_sec(frame: pd.DataFrame) -> float:
@@ -1754,6 +1780,47 @@ def replay_calibration_eligible_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None:
+    progress = float(calc_status.get("overall_progress", 0.0) or 0.0)
+    progress = max(0.0, min(1.0, progress))
+    progress_pct = progress * 100.0
+    phase_label = str(calc_status.get("phase_label") or "Calculating and calibrating")
+    complete_products = int(calc_status.get("complete_products", 0) or 0)
+    product_count = int(calc_status.get("product_count", 0) or 0)
+    profit_ready_products = int(calc_status.get("profit_ready_products", 0) or 0)
+    blocked_products = int(calc_status.get("blocked_products", 0) or 0)
+    incomplete_products = int(calc_status.get("incomplete_products", 0) or 0)
+    st.markdown(
+        f"""<div class=\"calibration-gate\"><div class=\"calibration-title\">Calculating and calibrating</div><div class=\"calibration-subtitle\">The full viewer is locked until every tracked coin has completed backlogs, historical replay, and replay-based calibration verdicts.</div><div class=\"calibration-phase-card\"><b>Current phase:</b> {_html(phase_label)}<br><b>Overall completion:</b> {progress_pct:.1f}%</div></div>""",
+        unsafe_allow_html=True,
+    )
+    st.progress(progress)
+    cols = st.columns(4)
+    cols[0].metric("Complete products", f"{complete_products}/{product_count}")
+    cols[1].metric("Profit-ready products", profit_ready_products)
+    cols[2].metric("Blocked by replay", blocked_products)
+    cols[3].metric("Still calculating", incomplete_products)
+    phase = calc_status.get("phase_progress", {}) or {}
+    st.markdown("### Phase progress")
+    pcols = st.columns(5)
+    pcols[0].metric("Live data", f"{float(phase.get('live_data', 0.0)) * 100.0:.1f}%")
+    pcols[1].metric("Micro backlog", f"{float(phase.get('micro_backlog', 0.0)) * 100.0:.1f}%")
+    pcols[2].metric("Candle backlog", f"{float(phase.get('historical_candle_backlog', 0.0)) * 100.0:.1f}%")
+    pcols[3].metric("Historical replay", f"{float(phase.get('historical_replay', 0.0)) * 100.0:.1f}%")
+    pcols[4].metric("Replay verdicts", f"{float(phase.get('replay_calibration_verdicts', 0.0)) * 100.0:.1f}%")
+    product_status = calc_status.get("product_status", {}) or {}
+    if product_status:
+        rows = []
+        for product_id, status in product_status.items():
+            rows.append({"product_id": product_id, "overall_progress_pct": round(float(status.get("overall_product_progress", 0.0)) * 100.0, 1), "verdict": status.get("verdict", "unknown"), "micro_rows": status.get("micro_rows", 0), "15m_candles": status.get("historical_15m_candle_rows", 0), "1h_candles": status.get("historical_1h_candle_rows", 0), "15m_replay": status.get("primary_15m_90d_rows", 0), "1h_replay": status.get("regime_1h_365d_rows", 0), "qualified_rows": status.get("qualified_rows", 0), "avg_net_bps": round(float(status.get("avg_net_pnl_bps", 0.0)), 2), "complete": bool(status.get("complete")), "live_trade_allowed": bool(status.get("live_trade_allowed")), "reason": status.get("reason", "")})
+        df = pd.DataFrame(rows).sort_values(["complete", "overall_progress_pct"], ascending=[True, True])
+        st.markdown("### Product calculation status")
+        st.dataframe(df, width="stretch", hide_index=True)
+    with st.expander("Raw calculation status", expanded=False):
+        st.json(calc_status)
+    st.info("When this reaches 100%, refreshing localhost will show the normal All-Coin Command Deck. If a product is replay-complete but unprofitable, it still counts as calculated, but live buys remain blocked for that product.")
+
+
 def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
@@ -1936,6 +2003,10 @@ def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
     snapshot = load_viewer_snapshot()
+    calc_status = load_calculation_status()
+    if not bool(calc_status.get("full_viewer_unlocked", False)):
+        render_calibration_loading_screen(calc_status, snapshot)
+        return
     market_df = load_csv_tail(MARKET_CSV_PATH, max_lines=6000)
     decisions_df = load_csv_tail(COUNCIL_DECISIONS_PATH, max_lines=6000)
     council_votes_df = load_csv_tail(COUNCIL_VOTES_CSV_PATH, max_lines=40000)
@@ -1961,6 +2032,10 @@ def main() -> None:
     snapshot_static = load_viewer_snapshot()
     selected = pick_selected_coin(snapshot_static)
     if not selected:
+        calc_status = load_calculation_status()
+        if not bool(calc_status.get("full_viewer_unlocked", False)):
+            render_calibration_loading_screen(calc_status, snapshot_static)
+            return
         st.info("Waiting for bot data. Start the bot and wait for viewer_snapshot.json to update.")
         return
     run_every = run_every_value(refresh_config)

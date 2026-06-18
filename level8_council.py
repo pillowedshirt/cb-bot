@@ -36,9 +36,11 @@ import json
 import os
 import sqlite3
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from io import StringIO
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -55,6 +57,41 @@ SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
 AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
 AGENT_ABLATION_CSV = os.path.join(BASE_DIR, "agent_ablation.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
+
+LEVEL8_CSV_TAIL_LIMITS = {
+    "agent_performance.csv": 50000,
+    "council_observation_outcomes.csv": 50000,
+    "backtest_agent_priors.csv": 50000,
+    "missed_opportunities.csv": 5000,
+    "trades.csv": 5000,
+    "agent_ablation.csv": 5000,
+}
+
+LEVEL8_CSV_USECOLS = {
+    "agent_performance.csv": ["ts", "product_id", "agent", "strategy", "setup_tag", "market_regime", "execution_state", "outcome_source", "source", "outcome_move_bps", "move_bps", "outcome_success", "success", "agent_credit_score", "weighted_agent_credit_score"],
+    "council_observation_outcomes.csv": ["ts", "product_id", "agent", "decision_strategy", "strategy", "setup_tag", "market_regime", "execution_state", "would_have_won", "success", "move_bps"],
+    "backtest_agent_priors.csv": ["ts", "product_id", "agent", "strategy", "setup_tag", "market_regime", "execution_state", "outcome_move_bps", "move_bps", "outcome_success", "success", "outcome_source"],
+    "missed_opportunities.csv": ["ts", "product_id", "move_bps", "decision_action", "decision_strategy"],
+    "trades.csv": ["ts", "event", "product_id", "side", "entry_price", "exit_price", "price", "move_bps", "net_pnl_usd", "pnl", "agent"],
+}
+
+
+def _read_csv_tail_direct(path: str, max_lines: int, usecols: Optional[List[str]] = None) -> pd.DataFrame:
+    try:
+        if not os.path.exists(path):
+            return pd.DataFrame()
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            header = f.readline()
+            tail_lines = deque(f, maxlen=max(1, int(max_lines)))
+        if not header:
+            return pd.DataFrame()
+        text = header + "".join(tail_lines)
+        if usecols:
+            allowed = set(usecols)
+            return pd.read_csv(StringIO(text), usecols=lambda c: c in allowed)
+        return pd.read_csv(StringIO(text))
+    except Exception:
+        return pd.DataFrame()
 
 # Initial council reliability priors.
 # These are starting weights only. Live outcomes, sell outcomes, SHADOW outcomes,
@@ -382,8 +419,8 @@ class Level8Council:
         # the same large CSV files over and over.
         self._csv_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._outcome_stats_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, float]]] = {}
-        self._csv_cache_sec: float = 20.0
-        self._outcome_stats_cache_sec: float = 20.0
+        self._csv_cache_sec: float = 60.0
+        self._outcome_stats_cache_sec: float = 60.0
 
     def _neutral_stats(self, reason: str = "no_matching_data") -> Dict[str, float]:
         return {
@@ -400,30 +437,41 @@ class Level8Council:
 
     def _read_csv_cached(self, path: str, *, ttl_sec: Optional[float] = None) -> pd.DataFrame:
         """
-        Read a CSV with a short TTL cache.
-
-        Level 8 calls outcome stats many times per evaluation. Without this cache,
-        every agent vote repeatedly re-reads agent_performance.csv,
-        council_observation_outcomes.csv, trades.csv, and missed_opportunities.csv.
+        Read runtime learning CSVs with a short TTL cache and tail limits.
+        This prevents Level 8 from repeatedly loading huge CSVs into memory.
         """
         try:
             ttl = float(ttl_sec if ttl_sec is not None else self._csv_cache_sec)
             now_value = utc_ts()
-
+            basename = os.path.basename(path)
             cached = self._csv_cache.get(path)
 
             if cached is not None:
                 cached_ts, cached_frame = cached
                 if now_value - float(cached_ts) <= ttl:
-                    return cached_frame.copy()
+                    return cached_frame.copy(deep=False)
 
             if not os.path.exists(path):
                 frame = pd.DataFrame()
             else:
-                frame = pd.read_csv(path)
+                max_lines = int(LEVEL8_CSV_TAIL_LIMITS.get(basename, 20000))
+                usecols = LEVEL8_CSV_USECOLS.get(basename)
+                try:
+                    size_bytes = os.path.getsize(path)
+                except Exception:
+                    size_bytes = 0
 
-            self._csv_cache[path] = (now_value, frame.copy())
-            return frame.copy()
+                if size_bytes > 5_000_000 or basename in LEVEL8_CSV_TAIL_LIMITS:
+                    frame = _read_csv_tail_direct(path, max_lines=max_lines, usecols=usecols)
+                else:
+                    if usecols:
+                        allowed = set(usecols)
+                        frame = pd.read_csv(path, usecols=lambda c: c in allowed)
+                    else:
+                        frame = pd.read_csv(path)
+
+            self._csv_cache[path] = (now_value, frame)
+            return frame.copy(deep=False)
 
         except Exception:
             return pd.DataFrame()
@@ -689,6 +737,13 @@ class Level8Council:
             return self._neutral_stats("no_frames")
 
         data = pd.concat(frames, ignore_index=True, sort=False)
+
+        try:
+            if "ts" in data.columns:
+                data["ts_num"] = pd.to_numeric(data.get("ts"), errors="coerce")
+                data = data.sort_values("ts_num").tail(50000)
+        except Exception:
+            data = data.tail(50000)
 
         if data.empty:
             return self._neutral_stats("empty_data")

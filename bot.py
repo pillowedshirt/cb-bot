@@ -9,6 +9,7 @@ import os
 import json
 import time
 import sys
+import traceback
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import csv
@@ -422,6 +423,9 @@ DEBUG_LOG_MAX_BYTES: int = 5_000_000
 
 # Cadence for macro refresh
 MACRO_REFRESH_EVERY_SEC: int = 3 * 60  # every 3 minutes
+MACRO_DAY_REFRESH_EVERY_SEC: int = 180
+MACRO_WEEK_REFRESH_EVERY_SEC: int = 900
+MACRO_FETCH_CONCURRENCY: int = 4
 
 # WebSocket configuration
 WS_MARKET_URL: str = "wss://advanced-trade-ws.coinbase.com"
@@ -431,6 +435,7 @@ WS_RECONNECT_DELAY_SEC: int = 3
 
 # Preload micro context (minutes of 1m candles) on startup
 MICRO_PRELOAD_MINUTES: int = 1440
+HISTORY_FETCH_CONCURRENCY: int = 4
 
 
 # Sigma window (minutes of 1m candles for volatility calc)
@@ -5797,6 +5802,17 @@ class TradingBot:
         self._backtest_reload_running: bool = False
         self._last_backtest_reload_ts: float = 0.0
         self._macro_refresh_running: bool = False
+        self._micro_history_ready: bool = False
+        self._macro_ready: bool = False
+        self._startup_calibration_ready: bool = False
+        self._missed_opportunity_review_running: bool = False
+        self._decision_audit_review_running: bool = False
+        self._agent_performance_update_running: bool = False
+        self._sell_outcome_classification_running: bool = False
+        self._last_macro_day_fetch_ts: float = 0.0
+        self._last_macro_week_fetch_ts: float = 0.0
+        self._history_fetch_semaphore = asyncio.Semaphore(HISTORY_FETCH_CONCURRENCY)
+        self._macro_fetch_semaphore = asyncio.Semaphore(MACRO_FETCH_CONCURRENCY)
         self._last_legacy_diagnostic_log_ts: Dict[str, float] = {}
         self._last_no_position_sell_skip_log_ts: Dict[str, float] = {}
         self._last_viewer_snapshot_success_log_ts: float = 0.0
@@ -5910,53 +5926,123 @@ class TradingBot:
         self.last_fee_tier_refresh_ts: float = 0.0
         self.last_fee_tier_reason: str = "not_refreshed_yet"
 
-    async def preload_micro_history(self) -> None:
-        """Preload true 1-minute OHLCV into bot buffers and viewer history."""
-        history_rows: List[Dict[str, Any]] = []
+    def _read_candle_csv_rows(self, path: str, min_ts: int = 0) -> Dict[str, List[Dict[str, Any]]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+                return grouped
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    product = str(row.get("product_id", "") or "")
+                    if not product:
+                        continue
+                    ts = int(float(row.get("ts", 0) or 0))
+                    if ts < int(min_ts):
+                        continue
+                    candle = {
+                        "ts": ts,
+                        "product_id": product,
+                        "open": float(row.get("open", 0.0) or 0.0),
+                        "high": float(row.get("high", 0.0) or 0.0),
+                        "low": float(row.get("low", 0.0) or 0.0),
+                        "close": float(row.get("close", 0.0) or 0.0),
+                        "volume": float(row.get("volume", 0.0) or 0.0),
+                    }
+                    if candle["close"] > 0:
+                        grouped.setdefault(product, []).append(candle)
+            for product in list(grouped.keys()):
+                grouped[product] = sorted(grouped[product], key=lambda r: int(r["ts"]))
+        except Exception as exc:
+            log(f"[history-cache] failed reading {path}: {exc}")
+        return grouped
 
+    def _load_existing_micro_history_rows(self) -> Dict[str, List[Dict[str, Any]]]:
+        min_ts = int(now_ts()) - int(MICRO_PRELOAD_MINUTES) * 60
+        return self._read_candle_csv_rows(MICRO_HISTORY_CSV_PATH, min_ts=min_ts)
+
+    def _seed_product_micro_history_from_rows(self, product: str, rows: List[Dict[str, Any]]) -> None:
+        for r in sorted(rows or [], key=lambda x: int(x.get("ts", 0) or 0)):
+            try:
+                close_price = float(r.get("close", 0.0) or 0.0)
+                if close_price <= 0:
+                    continue
+                minute_ts = int(float(r.get("ts", 0) or 0))
+                self.live_1m[product].append_closed_candle(
+                    minute_start_ts=minute_ts,
+                    open_price=float(r.get("open", close_price) or close_price),
+                    high_price=float(r.get("high", close_price) or close_price),
+                    low_price=float(r.get("low", close_price) or close_price),
+                    close_price=close_price,
+                    volume=float(r.get("volume", 0.0) or 0.0),
+                )
+                self.mid_series[product].push(float(minute_ts) + 30.0, close_price)
+            except Exception:
+                continue
+
+    def _merge_candle_rows(self, old_rows, new_rows, max_rows_per_product: int) -> List[Dict[str, Any]]:
+        by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for r in list(old_rows or []) + list(new_rows or []):
+            try:
+                product = str(r.get("product_id", "") or "")
+                ts = int(float(r.get("ts", 0) or 0))
+                if product and ts > 0:
+                    rr = dict(r); rr["ts"] = ts; rr["product_id"] = product
+                    by_key[(product, ts)] = rr
+            except Exception:
+                continue
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for (product, _), row in by_key.items():
+            grouped.setdefault(product, []).append(row)
+        out: List[Dict[str, Any]] = []
+        for product, rows in grouped.items():
+            out.extend(sorted(rows, key=lambda x: int(x["ts"]))[-int(max_rows_per_product):])
+        return sorted(out, key=lambda x: (str(x.get("product_id", "")), int(x.get("ts", 0) or 0)))
+
+    async def _fetch_missing_micro_for_product(self, product, start_ts, end_ts):
+        async with self._history_fetch_semaphore:
+            return await self.fetcher.fetch_chunked(product, int(start_ts), int(end_ts), "ONE_MINUTE")
+
+    async def preload_micro_history(self) -> None:
+        """Preload true 1-minute OHLCV into bot buffers and viewer history, using CSV cache first."""
         try:
             end_ts = int(now_ts())
-            start_ts = end_ts - int(MICRO_PRELOAD_MINUTES) * 60
-
+            full_start_ts = end_ts - int(MICRO_PRELOAD_MINUTES) * 60
+            cached_by_product = self._load_existing_micro_history_rows()
+            existing_rows = [r for rows in cached_by_product.values() for r in rows]
+            new_rows: List[Dict[str, Any]] = []
+            fetch_jobs = []
             for product in PRODUCTS:
-                candles = await self.fetcher.fetch_chunked(product, start_ts, end_ts, "ONE_MINUTE")
-                if not candles:
-                    log(f"[startup] no micro preload candles for {product}")
+                rows = cached_by_product.get(product, [])
+                if rows:
+                    self._seed_product_micro_history_from_rows(product, rows)
+                latest_ts = int(rows[-1]["ts"]) if rows else 0
+                fresh = latest_ts > 0 and (end_ts - latest_ts) < 15 * 60
+                if len(rows) >= 1200 and fresh:
+                    log(f"[startup] seeded cached micro history for {product}; rows={len(rows)} latest_age_sec={end_ts-latest_ts}")
                     continue
-
-                for c in candles:
-                    minute_ts = int(c.ts)
-                    open_price = float(c.open)
-                    high_price = float(c.high)
-                    low_price = float(c.low)
-                    close_price = float(c.close)
-                    volume = float(c.volume or 0.0)
-
-                    if close_price <= 0:
-                        continue
-
-                    self.live_1m[product].append_closed_candle(
-                        minute_start_ts=minute_ts,
-                        open_price=open_price,
-                        high_price=high_price,
-                        low_price=low_price,
-                        close_price=close_price,
-                        volume=volume,
-                    )
-                    self.mid_series[product].push(float(minute_ts) + 30.0, close_price)
-                    history_rows.append({
-                        "ts": minute_ts,
-                        "product_id": product,
-                        "open": open_price,
-                        "high": high_price,
-                        "low": low_price,
-                        "close": close_price,
-                        "volume": volume,
-                    })
-
-            self.micro_history_log.write_rows(history_rows)
-            log(f"[startup] preloaded {MICRO_PRELOAD_MINUTES}m true micro candles; rows={len(history_rows)}")
+                start_ts = max(full_start_ts, latest_ts + 60) if latest_ts else full_start_ts
+                if start_ts < end_ts:
+                    fetch_jobs.append((product, start_ts, end_ts))
+            async def _one(product, start_ts, end_ts):
+                candles = await self._fetch_missing_micro_for_product(product, start_ts, end_ts)
+                rows = []
+                for c in candles or []:
+                    rows.append({"ts": int(c.ts), "product_id": product, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(c.volume or 0.0)})
+                self._seed_product_micro_history_from_rows(product, rows)
+                return rows
+            if fetch_jobs:
+                fetched = await asyncio.gather(*[_one(*job) for job in fetch_jobs], return_exceptions=True)
+                for item in fetched:
+                    if isinstance(item, list):
+                        new_rows.extend(item)
+                    elif isinstance(item, Exception):
+                        log(f"[startup] micro tail fetch failed: {item}")
+            merged = self._merge_candle_rows(existing_rows, new_rows, int(MICRO_PRELOAD_MINUTES) + 5)
+            self.micro_history_log.write_rows(merged)
+            self._micro_history_ready = True
+            log(f"[startup] preloaded micro candles from cache/tail fetch; cached_rows={len(existing_rows)} fetched_rows={len(new_rows)} written_rows={len(merged)}")
         except Exception as e:
+            self._micro_history_ready = False
             log(f"[startup] micro preload failed: {e}")
 
 
@@ -8449,13 +8535,26 @@ class TradingBot:
         start_week = end_ts - CALIB_WEEK_LOOKBACK_MINUTES * 60
         for product in PRODUCTS:
             try:
-                log(f"[calibration] fetching history for {product}")
-                day_candles = await self.fetcher.fetch_chunked(
-                    product, start_day, end_ts, CALIB_DAY_GRANULARITY
-                )
-                week_candles = await self.fetcher.fetch_chunked(
-                    product, start_week, end_ts, CALIB_WEEK_GRANULARITY
-                )
+                cached_day_rows = self._read_candle_csv_rows(MICRO_HISTORY_CSV_PATH, min_ts=start_day).get(product, [])
+                if len(cached_day_rows) < max(120, CALIB_MIN_PREFIX_CANDLES_1M):
+                    cached_day_rows = self._read_candle_csv_rows(MACRO_DAY_CSV, min_ts=start_day).get(product, [])
+                cached_week_rows = self._read_candle_csv_rows(MACRO_WEEK_CSV, min_ts=start_week).get(product, [])
+                day_candles = self._rows_to_candles(cached_day_rows)
+                week_candles = self._rows_to_candles(cached_week_rows)
+                day_fresh = bool(day_candles and (end_ts - int(day_candles[-1].ts)) < 15 * 60 and len(day_candles) >= max(120, CALIB_MIN_PREFIX_CANDLES_1M))
+                week_fresh = bool(week_candles and (end_ts - int(week_candles[-1].ts)) < 30 * 60 and len(week_candles) >= max(100, CALIB_MIN_PREFIX_CANDLES_15M))
+                if day_fresh and week_fresh:
+                    log(f"[calibration] using cached CSV candles for {product} day_rows={len(day_candles)} week_rows={len(week_candles)}")
+                if not day_fresh:
+                    fetch_start = max(start_day, int(day_candles[-1].ts) + 60) if day_candles else start_day
+                    log(f"[calibration] fetching day history tail for {product} start_ts={fetch_start}")
+                    fetched_day = await self.fetcher.fetch_chunked(product, fetch_start, end_ts, CALIB_DAY_GRANULARITY)
+                    day_candles = sorted(list(day_candles) + list(fetched_day or []), key=lambda c: int(c.ts))
+                if not week_fresh:
+                    fetch_start = max(start_week, int(week_candles[-1].ts) + 15 * 60) if week_candles else start_week
+                    log(f"[calibration] fetching week history tail for {product} start_ts={fetch_start}")
+                    fetched_week = await self.fetcher.fetch_chunked(product, fetch_start, end_ts, CALIB_WEEK_GRANULARITY)
+                    week_candles = sorted(list(week_candles) + list(fetched_week or []), key=lambda c: int(c.ts))
                 if day_candles:
                     self.historical_replay_candles_by_product[product] = list(day_candles)
                 elif week_candles:
@@ -12045,6 +12144,37 @@ class TradingBot:
         except Exception as exc:
             return {"utility_adjust_bps": 0.0, "truth_adjust": 0.0, "margin_adjust": 0.0, "reason": f"adaptive_guardrail_error:{exc}"}
 
+
+    async def _ensure_fresh_tob_for_live_action(self, product_id: str, max_age_sec: float) -> Tuple[bool, float, str]:
+        age = self._market_data_age_for_product(product_id)
+        if age <= max_age_sec:
+            return True, age, "websocket_tob_fresh"
+        try:
+            bid, ask = await asyncio.to_thread(self.portfolio.get_best_bid_ask, product_id)
+            if bid and ask and bid > 0 and ask > 0:
+                self.tob[product_id] = TopOfBook(bid=float(bid), ask=float(ask), ts=now_ts())
+                repaired_age = self._market_data_age_for_product(product_id)
+                module_debug(MODULE_NAME, "tob_rest_repair_for_live_action", data={"product_id": product_id, "before_age_sec": age, "after_age_sec": repaired_age, "bid": float(bid), "ask": float(ask), "max_age_sec": max_age_sec}, level="INFO", also_overall=False)
+                return repaired_age <= max_age_sec, repaired_age, "rest_repair"
+        except Exception as exc:
+            module_exception(MODULE_NAME, "tob_rest_repair_failed", exc, data={"product_id": product_id, "before_age_sec": age}, also_overall=False)
+        return False, age, "stale_after_repair_attempt"
+
+    def _ensure_fresh_tob_for_live_action_sync(self, product_id: str, max_age_sec: float) -> Tuple[bool, float, str]:
+        age = self._market_data_age_for_product(product_id)
+        if age <= max_age_sec:
+            return True, age, "websocket_tob_fresh"
+        try:
+            bid, ask = self.portfolio.get_best_bid_ask(product_id)
+            if bid and ask and bid > 0 and ask > 0:
+                self.tob[product_id] = TopOfBook(bid=float(bid), ask=float(ask), ts=now_ts())
+                repaired_age = self._market_data_age_for_product(product_id)
+                module_debug(MODULE_NAME, "tob_rest_repair_for_live_action", data={"product_id": product_id, "before_age_sec": age, "after_age_sec": repaired_age, "bid": float(bid), "ask": float(ask), "max_age_sec": max_age_sec}, level="INFO", also_overall=False)
+                return repaired_age <= max_age_sec, repaired_age, "rest_repair"
+        except Exception as exc:
+            module_exception(MODULE_NAME, "tob_rest_repair_failed", exc, data={"product_id": product_id, "before_age_sec": age}, also_overall=False)
+        return False, age, "stale_after_repair_attempt"
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -12067,14 +12197,24 @@ class TradingBot:
         """
         try:
             product_id = str(candidate.get("product_id", ""))
+            if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
+                return False, "live_buy_blocked:startup_waiting_for_fee_tier"
+            if not bool(getattr(self, "_micro_history_ready", False)):
+                return False, "live_buy_blocked:startup_waiting_for_micro_history"
+            if not bool(getattr(self, "_macro_ready", False)):
+                return False, "live_buy_blocked:startup_waiting_for_macro_context"
+            if bool(REQUIRE_VALID_LIVE_RECALIBRATION_PROFILE) and not bool(getattr(self, "_startup_calibration_ready", False)):
+                return False, "live_buy_blocked:startup_waiting_for_calibration"
             if bool(ENABLE_STALE_DATA_LIVE_BUY_GATE):
-                market_age_sec = self._market_data_age_for_product(product_id)
+                fresh_ok, market_age_sec, quote_source = self._ensure_fresh_tob_for_live_action_sync(product_id, float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC))
                 candidate["market_data_age_sec"] = float(market_age_sec)
-                if market_age_sec > float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):
+                candidate["market_data_quote_source"] = str(quote_source)
+                if not fresh_ok:
                     return False, (
                         f"live_buy_blocked:stale_market_data "
                         f"market_data_age_sec={market_age_sec:.2f};"
-                        f"max_allowed={float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):.2f}"
+                        f"max_allowed={float(MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC):.2f};"
+                        f"quote_source={quote_source}"
                     )
             current_price_for_stack_check = float(
                 candidate.get("price", 0.0)
@@ -13919,7 +14059,7 @@ class TradingBot:
         status = {"viewer_snapshot_recent": False, "websocket_recent": False, "market_csv_recent": False, "council_recent": False, "no_duplicate_process": True, "fee_tier_ready": False, "risk_pause_active": False, "drawdown_brake_active": False, "open_positions_count": 0, "learning_files_writable": False, "sqlite_writable": False, "safe_to_run_overnight": False}
         maker_fee_bps = getattr(self, "current_maker_fee_bps", None)
         taker_fee_bps = getattr(self, "current_taker_fee_bps", None)
-        status.update({"fee_tier_ready": maker_fee_bps is not None and taker_fee_bps is not None, "maker_fee_bps": maker_fee_bps, "taker_fee_bps": taker_fee_bps, "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""), "high_fee_tier_active": bool((maker_fee_bps is not None and float(maker_fee_bps) >= 50.0) or (taker_fee_bps is not None and float(taker_fee_bps) >= 100.0)), "live_trading_strict_reason": "High Coinbase fees require fewer, higher-edge maker-first trades."})
+        status.update({"micro_history_ready": bool(getattr(self, "_micro_history_ready", False)), "macro_ready": bool(getattr(self, "_macro_ready", False)), "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False)), "fee_tier_ready": maker_fee_bps is not None and taker_fee_bps is not None, "maker_fee_bps": maker_fee_bps, "taker_fee_bps": taker_fee_bps, "fee_tier_reason": getattr(self, "last_fee_tier_reason", ""), "high_fee_tier_active": bool((maker_fee_bps is not None and float(maker_fee_bps) >= 50.0) or (taker_fee_bps is not None and float(taker_fee_bps) >= 100.0)), "live_trading_strict_reason": "High Coinbase fees require fewer, higher-edge maker-first trades."})
         try:
             status["viewer_snapshot_recent"] = os.path.exists(VIEWER_SNAPSHOT_JSON) and now_ts() - os.path.getmtime(VIEWER_SNAPSHOT_JSON) <= 10
             status["market_csv_recent"] = os.path.exists(MARKET_CSV_PATH) and now_ts() - os.path.getmtime(MARKET_CSV_PATH) <= 30
@@ -15988,44 +16128,52 @@ class TradingBot:
             )
 
     async def run(self) -> None:
-        """Launch websocket first, reconcile Coinbase portfolio, then start trading loops."""
+        """Launch websocket and viewer-facing loops before heavier startup work."""
         log("[run] TradingBot.run() started")
-        self._write_startup_viewer_snapshot("bot_started_waiting_for_history_and_first_eval")
+        self._write_startup_viewer_snapshot("bot_started_waiting_for_live_quotes")
+
         log(f"[run] mode=LIVE_ONLY products={PRODUCTS}")
         self.active_products_log.write_products(PRODUCTS)
-        log(f"[startup] active products written: {PRODUCTS}")
-
-        log("[run] preloading micro history")
-        await self.preload_micro_history()
 
         log("[run] starting websocket task first")
         ws_task = asyncio.create_task(self.ws_loop())
 
-        log("[run] waiting for initial top-of-book data")
-        await self._wait_for_tob_ready(timeout_sec=TOP_OF_BOOK_WAIT_SEC)
+        log("[run] waiting briefly for initial top-of-book data")
+        await self._wait_for_tob_ready(timeout_sec=min(20.0, float(TOP_OF_BOOK_WAIT_SEC)))
 
         await self._refresh_coinbase_fee_tier_if_needed(force=True)
-
         self._rest_backfill_top_of_book(PRODUCTS)
-        log("[run] calibrating products before live trading")
-        await self.calibrate_products_on_startup()
-        self.last_hourly_calibration_update_ts = now_ts()
-        log(
-            f"[calibration-hourly] next hourly update scheduled in "
-            f"{CALIBRATION_UPDATE_EVERY_SEC:.0f}s"
-        )
 
         log("[run] reconciling live Coinbase portfolio before trading")
         await self._startup_portfolio_reconcile()
 
-        log("[run] starting macro / evaluation / telemetry tasks")
-        tasks = [
+        log("[run] starting telemetry/eval tasks")
+        telemetry_task = asyncio.create_task(self.telemetry_loop())
+        eval_task = asyncio.create_task(self.eval_loop())
+
+        log("[run] starting history/macro/calibration background tasks")
+        history_task = asyncio.create_task(self.preload_micro_history())
+        macro_task = asyncio.create_task(self.macro_loop())
+        calibration_task = asyncio.create_task(self.calibrate_products_on_startup_background())
+
+        await asyncio.gather(
             ws_task,
-            asyncio.create_task(self.macro_loop()),
-            asyncio.create_task(self.eval_loop()),
-            asyncio.create_task(self.telemetry_loop()),
-        ]
-        await asyncio.gather(*tasks)
+            telemetry_task,
+            eval_task,
+            history_task,
+            macro_task,
+            calibration_task,
+        )
+
+    async def calibrate_products_on_startup_background(self) -> None:
+        try:
+            await self.calibrate_products_on_startup()
+            self._startup_calibration_ready = True
+            self.last_hourly_calibration_update_ts = now_ts()
+            module_debug(MODULE_NAME, "startup_calibration_ready", data={"products": PRODUCTS}, level="INFO", also_overall=True)
+        except Exception as exc:
+            self._startup_calibration_ready = False
+            module_exception(MODULE_NAME, "startup_calibration_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
 
     # --------------------------------------------------------
     # WebSocket loop
@@ -16097,88 +16245,95 @@ class TradingBot:
     # --------------------------------------------------------
     # Macro loop
     # --------------------------------------------------------
+    async def _macro_fetch_product(self, product: str, start_ts: int, end_ts: int, granularity: str):
+        async with self._macro_fetch_semaphore:
+            return await self.fetcher.fetch_chunked(product, int(start_ts), int(end_ts), granularity)
+
+    def _rows_to_candles(self, rows: List[Dict[str, Any]]) -> List[Candle]:
+        candles: List[Candle] = []
+        for r in rows or []:
+            try:
+                candles.append(Candle(ts=int(r["ts"]), open=float(r["open"]), high=float(r["high"]), low=float(r["low"]), close=float(r["close"]), volume=float(r.get("volume", 0.0) or 0.0)))
+            except Exception:
+                continue
+        return candles
+
     async def macro_loop(self) -> None:
-        """
-        Periodically fetch macro candles, compute macro levels and write CSVs for viewer.
-        Uses chunked REST requests to avoid exceeding API limits.
-        """
+        """Refresh day/week macro context at separate cadences using cache and bounded REST concurrency."""
+        cached_week = self._read_candle_csv_rows(MACRO_WEEK_CSV, min_ts=int(now_ts()) - 7 * 24 * 60 * 60)
+        cached_day = self._read_candle_csv_rows(MACRO_DAY_CSV, min_ts=int(now_ts()) - 24 * 60 * 60)
         while not self._stop_event.is_set():
             if bool(getattr(self, "_macro_refresh_running", False)):
                 await asyncio.sleep(1.0)
                 continue
             self._macro_refresh_running = True
-            start_week = int(now_ts()) - 7 * 24 * 60 * 60
-            start_day = int(now_ts_i()) - 24 * 60 * 60
+            started = time.perf_counter()
             end_ts = int(now_ts_i())
-            week_rows: List[Dict[str, Any]] = []
-            day_rows: List[Dict[str, Any]] = []
+            refresh_day = (end_ts - float(getattr(self, "_last_macro_day_fetch_ts", 0.0))) >= float(MACRO_DAY_REFRESH_EVERY_SEC)
+            refresh_week = (end_ts - float(getattr(self, "_last_macro_week_fetch_ts", 0.0))) >= float(MACRO_WEEK_REFRESH_EVERY_SEC)
+            week_rows: List[Dict[str, Any]] = [r for rows in cached_week.values() for r in rows]
+            day_rows: List[Dict[str, Any]] = [r for rows in cached_day.values() for r in rows]
             levels_rows: List[Dict[str, Any]] = []
             try:
-                for product in PRODUCTS:
-                    # Weekly 15‑minute candles
-                    candles_week = await self.fetcher.fetch_chunked(product, start_week, end_ts, "FIFTEEN_MINUTE")
-                    if candles_week:
-                        levels_week = compute_macro_levels(candles_week)
-                        if levels_week:
-                            self.macro.set_levels(product, "week", levels_week)
-                            levels_rows.append({"ts": end_ts, "product_id": product, "timeframe": "week", **levels_week.__dict__})
-                        for c in candles_week:
-                            week_rows.append({
-                                "ts": c.ts,
-                                "product_id": product,
-                                "open": c.open,
-                                "high": c.high,
-                                "low": c.low,
-                                "close": c.close,
-                                "volume": c.volume,
-                            })
-                    # Daily 1‑minute candles: use live_1m if enough data else REST
-                    live_rows = self.live_1m[product].export_rows(product)
-                    if len(live_rows) >= 120:
-                        candles_day: List[Candle] = [
-                            Candle(
-                                ts=int(r["ts"]),
-                                open=float(r["open"]),
-                                high=float(r["high"]),
-                                low=float(r["low"]),
-                                close=float(r["close"]),
-                                volume=float(r.get("volume", 0.0))
-                            ) for r in live_rows
-                        ]
-                    else:
-                        candles_day = await self.fetcher.fetch_chunked(product, start_day, end_ts, "ONE_MINUTE")
-                    if not candles_week:
-                        log(f"[macro] week empty for {product}")
-                    if not candles_day:
-                        log(f"[macro] day empty for {product} (live_rows={len(live_rows)})")
-                    if candles_day:
+                if refresh_day:
+                    module_debug(MODULE_NAME, "macro_day_refresh_started", data={"products": PRODUCTS}, level="INFO", also_overall=False)
+                    start_day = end_ts - 24 * 60 * 60
+                    async def _day(product: str):
+                        live_rows = self.live_1m[product].export_rows(product)
+                        if len(live_rows) >= 120:
+                            return product, self._rows_to_candles(live_rows), live_rows
+                        candles = await self._macro_fetch_product(product, start_day, end_ts, "ONE_MINUTE")
+                        rows = [{"ts": int(c.ts), "product_id": product, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(c.volume or 0.0)} for c in candles or []]
+                        return product, list(candles or []), rows
+                    results = await asyncio.gather(*[_day(p) for p in PRODUCTS], return_exceptions=True)
+                    fresh_day = []
+                    for res in results:
+                        if isinstance(res, Exception):
+                            log(f"[macro] day refresh product failed: {res}"); continue
+                        product, candles_day, rows = res
+                        fresh_day.extend(rows)
                         levels_day = compute_macro_levels(candles_day)
                         if levels_day:
                             self.macro.set_levels(product, "day", levels_day)
                             levels_rows.append({"ts": end_ts, "product_id": product, "timeframe": "day", **levels_day.__dict__})
-                        for c in candles_day:
-                            day_rows.append({
-                                "ts": c.ts,
-                                "product_id": product,
-                                "open": c.open,
-                                "high": c.high,
-                                "low": c.low,
-                                "close": c.close,
-                                "volume": c.volume,
-                            })
-                    await asyncio.sleep(0.05)
-                # Write weekly and daily candles for viewer
-                try:
-                    await self.week_writer.write(week_rows)
+                    day_rows = self._merge_candle_rows(day_rows, fresh_day, 24 * 60 + 5)
+                    cached_day = {}
+                    for r in day_rows: cached_day.setdefault(str(r["product_id"]), []).append(r)
                     await self.day_writer.write(day_rows)
+                    self._last_macro_day_fetch_ts = end_ts
+                if refresh_week:
+                    module_debug(MODULE_NAME, "macro_week_refresh_started", data={"products": PRODUCTS}, level="INFO", also_overall=False)
+                    start_week = end_ts - 7 * 24 * 60 * 60
+                    async def _week(product: str):
+                        candles = await self._macro_fetch_product(product, start_week, end_ts, "FIFTEEN_MINUTE")
+                        rows = [{"ts": int(c.ts), "product_id": product, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(c.volume or 0.0)} for c in candles or []]
+                        return product, list(candles or []), rows
+                    results = await asyncio.gather(*[_week(p) for p in PRODUCTS], return_exceptions=True)
+                    fresh_week = []
+                    for res in results:
+                        if isinstance(res, Exception):
+                            log(f"[macro] week refresh product failed: {res}"); continue
+                        product, candles_week, rows = res
+                        fresh_week.extend(rows)
+                        levels_week = compute_macro_levels(candles_week)
+                        if levels_week:
+                            self.macro.set_levels(product, "week", levels_week)
+                            levels_rows.append({"ts": end_ts, "product_id": product, "timeframe": "week", **levels_week.__dict__})
+                    week_rows = self._merge_candle_rows(week_rows, fresh_week, 7 * 24 * 4 + 5)
+                    cached_week = {}
+                    for r in week_rows: cached_week.setdefault(str(r["product_id"]), []).append(r)
+                    await self.week_writer.write(week_rows)
+                    self._last_macro_week_fetch_ts = end_ts
+                if refresh_day or refresh_week:
                     await self.levels_writer.write(levels_rows)
-                except Exception as e:
-                    log_exception("[macro] write failed", e)
-                # update last macro time
-                self.last_macro_update = now_ts_i()
+                self.last_macro_update = end_ts
+                self._macro_ready = True
+                module_debug(MODULE_NAME, "macro_refresh_completed", data={"day_rows_written": len(day_rows), "week_rows_written": len(week_rows), "levels_rows_written": len(levels_rows), "elapsed_sec": round(time.perf_counter() - started, 4)}, level="INFO", also_overall=False)
+            except Exception as e:
+                log_exception("[macro] refresh failed", e)
             finally:
                 self._macro_refresh_running = False
-            await asyncio.sleep(MACRO_REFRESH_EVERY_SEC)
+            await asyncio.sleep(5.0)
 
     # --------------------------------------------------------
     # Evaluation loop
@@ -18689,6 +18844,9 @@ class TradingBot:
             "readiness": {
                 "startup_state": reason,
                 "viewer_snapshot_recent": True,
+                "micro_history_ready": bool(getattr(self, "_micro_history_ready", False)),
+                "macro_ready": bool(getattr(self, "_macro_ready", False)),
+                "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False)),
                 "fee_tier_ready": getattr(self, "current_maker_fee_bps", None) is not None and getattr(self, "current_taker_fee_bps", None) is not None,
                 "maker_fee_bps": getattr(self, "current_maker_fee_bps", None),
                 "taker_fee_bps": getattr(self, "current_taker_fee_bps", None),
@@ -18740,12 +18898,34 @@ class TradingBot:
         except Exception as exc:
             log_exception("viewer snapshot refresh failed", exc)
 
+
+    def _schedule_background_work(self, name: str, flag_name: str, fn) -> None:
+        try:
+            if bool(getattr(self, flag_name, False)):
+                return
+            setattr(self, flag_name, True)
+
+            async def _task():
+                started = time.perf_counter()
+                try:
+                    await asyncio.to_thread(fn)
+                    elapsed = time.perf_counter() - started
+                    module_debug(MODULE_NAME, "background_work_completed", data={"name": name, "elapsed_sec": round(elapsed, 4)}, level="INFO" if elapsed >= 1.0 else "DEBUG", also_overall=elapsed >= 5.0)
+                except Exception as exc:
+                    module_exception(MODULE_NAME, f"background_work_failed:{name}", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+                finally:
+                    setattr(self, flag_name, False)
+
+            asyncio.create_task(_task())
+        except Exception as exc:
+            module_exception(MODULE_NAME, f"background_work_schedule_failed:{name}", exc, also_overall=True)
+
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
             ts_now = now_ts()
             self._last_eval_loop_section_timings = {}
             if ENABLE_LEVEL8_MISSED_OPPORTUNITY_LEARNING:
-                _t = time.perf_counter(); self._review_level8_missed_opportunities(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["missed_opportunity_review"] = round(_e, 4); self._log_hot_loop_timing("missed_opportunity_review", _e)
+                _t = time.perf_counter(); self._schedule_background_work("missed_opportunity_review", "_missed_opportunity_review_running", self._review_level8_missed_opportunities); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["background_scheduling"] = round(_e, 4); self._log_hot_loop_timing("background_scheduling", _e)
             _t = time.perf_counter(); self._review_maker_miss_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["maker_miss_review"] = round(_e, 4); self._log_hot_loop_timing("maker_miss_review", _e)
             _t = time.perf_counter(); self._review_sell_quality(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_quality_review"] = round(_e, 4); self._log_hot_loop_timing("sell_quality_review", _e)
             if (
@@ -18754,7 +18934,7 @@ class TradingBot:
                 >= float(DECISION_AUDIT_REVIEW_EVERY_SEC)
             ):
                 self.last_decision_audit_review_ts = ts_now
-                _t = time.perf_counter(); self._review_decision_audits(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["decision_audit_review"] = round(_e, 4); self._log_hot_loop_timing("decision_audit_review", _e)
+                _t = time.perf_counter(); self._schedule_background_work("decision_audit_review", "_decision_audit_review_running", self._review_decision_audits); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["background_scheduling"] = round(_e, 4); self._log_hot_loop_timing("background_scheduling", _e)
             if (
                 ENABLE_LEVEL8_COUNCIL
                 and ts_now - float(self.last_agent_performance_update_ts)
@@ -18765,12 +18945,12 @@ class TradingBot:
                 _t = time.perf_counter(); self._maybe_reload_backtest_background(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["backtest_reload_scheduling"] = round(_e, 4); self._log_hot_loop_timing("backtest_reload_scheduling", _e)
 
                 try:
-                    _t = time.perf_counter(); self._classify_level8_sell_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_outcome_classification"] = round(_e, 4); self._log_hot_loop_timing("sell_outcome_classification", _e)
+                    _t = time.perf_counter(); self._schedule_background_work("sell_outcome_classification", "_sell_outcome_classification_running", self._classify_level8_sell_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["background_scheduling"] = round(_e, 4); self._log_hot_loop_timing("background_scheduling", _e)
                 except Exception as exc:
                     log_exception("level8 sell outcome classification failed", exc)
 
                 try:
-                    _t = time.perf_counter(); self._append_agent_performance_from_outcomes(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["agent_performance_update"] = round(_e, 4); self._log_hot_loop_timing("agent_performance_update", _e)
+                    _t = time.perf_counter(); self._schedule_background_work("agent_performance_update", "_agent_performance_update_running", self._append_agent_performance_from_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["background_scheduling"] = round(_e, 4); self._log_hot_loop_timing("background_scheduling", _e)
                 except Exception as exc:
                     log_exception("level8 agent performance update failed", exc)
 
@@ -18792,7 +18972,7 @@ class TradingBot:
                     f"[lag] eval_loop gap={loop_gap:.2f}s; severity={severity}; "
                     f"startup_age={startup_age:.1f}s; "
                     f"live_recalibration_running={bool(getattr(self, 'live_recalibration_running', False))}; "
-                    f"possible_blocking_work=True; section_timings={getattr(self, '_last_eval_loop_section_timings', {})}; ai_training_running={bool(getattr(self, 'ai_training_running', False))}; backtest_reload_running={bool(getattr(self, 'backtest_reload_running', False))}; macro_refresh_running={bool(getattr(self, 'macro_refresh_running', False))}; pending_buy_reconciliations={len(getattr(self, 'pending_buy_reconciliations', {}) or {})}"
+                    f"possible_blocking_work=True; section_timings={getattr(self, '_last_eval_loop_section_timings', {})}; ai_training_running={bool(getattr(self, '_ai_training_running', False))}; backtest_reload_running={bool(getattr(self, '_backtest_reload_running', False))}; macro_refresh_running={bool(getattr(self, '_macro_refresh_running', False))}; pending_buy_reconciliations={len(getattr(self, 'pending_buy_reconciliations', {}) or {})}"
                 )
             self.last_loop_lag_check_ts = ts_now
 

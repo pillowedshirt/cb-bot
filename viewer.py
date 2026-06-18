@@ -81,8 +81,13 @@ st.set_page_config(
 initialize_all_module_debug_logs(BASE_DIR)
 module_debug(MODULE_NAME, "viewer_module_loaded", data={"base_dir": BASE_DIR, "file": __file__}, level="INFO", also_overall=True)
 
+LEAD_DECISION_MAKER_TITLE = "🧠 The Signal Core"
+LEAD_DECISION_MAKER_SUBTITLE = "Final strategy verdict"
+VOLUME_LEADER_TITLE = "🧭 The Volume Oracle"
+VOLUME_LEADER_SUBTITLE = "Value, volume, and market-location verdict"
+
 AGENT_TITLES = {
-    "volume_profile_leader": "🧭 Chief Market Strategist", "volume_profile_agent": "📊 Value Area Analyst",
+    "volume_profile_leader": VOLUME_LEADER_TITLE, "volume_profile_agent": "📊 Value Area Analyst",
     "trend": "📈 Trend Analyst", "mean_reversion": "🔁 Reversion Analyst", "breakout": "🚀 Breakout Analyst",
     "ai_outcome": "🧠 AI Outcome Coach", "execution": "⚙️ Execution Analyst", "order_book_liquidity_agent": "🧱 Order Book Analyst",
     "previous_session_volume_profile_agent": "🗂 Prior Session Analyst", "quant_boundary_agent": "🔬 Quant Boundary Analyst",
@@ -190,6 +195,16 @@ def inject_crypto_game_css() -> None:
 .pill-value { color: #e8fbff; font-size: 1.05rem; font-weight: 800; }
 .arena-grid { display: grid; grid-template-columns: 1.05fr 1.95fr; gap: 0.85rem; margin-bottom: 1rem; }
 .chief-card { border: 1px solid rgba(0, 255, 194, 0.35); border-radius: 20px; padding: 1rem; background: linear-gradient(180deg, rgba(0, 73, 92, 0.44), rgba(6, 13, 24, 0.94)); }
+.leadership-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; margin: 1rem 0 1.1rem 0; }
+.leadership-card { border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 20px; padding: 1rem; background: linear-gradient(180deg, rgba(6, 18, 32, 0.96), rgba(4, 12, 24, 0.94)); box-shadow: 0 0 22px rgba(80, 220, 255, 0.06); }
+.leadership-card.oracle { border-color: rgba(255, 214, 102, 0.35); box-shadow: 0 0 22px rgba(255, 214, 102, 0.07); }
+.leadership-title { font-size: 1.15rem; font-weight: 900; margin-bottom: 0.2rem; }
+.leadership-subtitle { color: #8db7c8; font-size: 0.86rem; margin-bottom: 0.65rem; }
+.leadership-verdict { font-size: 1.05rem; font-weight: 900; margin-bottom: 0.5rem; }
+.leadership-paragraph { color: #d9f5ff; line-height: 1.35rem; font-size: 0.93rem; }
+.leadership-learning { margin-top: 0.7rem; padding: 0.65rem; border-radius: 14px; background: rgba(57, 245, 163, 0.06); border: 1px solid rgba(57, 245, 163, 0.18); color: #c9f8e2; font-size: 0.88rem; line-height: 1.25rem; }
+@media (max-width: 900px) { .leadership-grid { grid-template-columns: 1fr; } }
+
 .agent-card {
     border: 1px solid rgba(80, 220, 255, 0.20);
     border-radius: 16px;
@@ -1036,6 +1051,118 @@ def agent_full_plain_summary(row: dict) -> str:
     closing = f"Overall, this analyst is saying {leaning} because it wants a cleaner alignment between chart structure, volume context, probability, and fee-adjusted profitability before Level 8 risks live money."
     return opening + " ".join(observations[:5]) + " " + closing
 
+def latest_decision_for_product(decisions_df: pd.DataFrame, product_id: str) -> dict:
+    try:
+        if decisions_df is None or decisions_df.empty or "product_id" not in decisions_df.columns:
+            return {}
+        sub = decisions_df[decisions_df["product_id"].astype(str).eq(str(product_id))].copy()
+        if sub.empty:
+            return {}
+        if "ts" in sub.columns:
+            sub["ts_num"] = pd.to_numeric(sub["ts"], errors="coerce")
+            sub = sub.sort_values("ts_num")
+        return sub.iloc[-1].to_dict()
+    except Exception:
+        return {}
+
+
+def latest_volume_oracle_vote(council_votes_df: pd.DataFrame, decisions_df: pd.DataFrame, product_id: str) -> dict:
+    try:
+        _, _, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, product_id)
+        if votes.empty or "agent" not in votes.columns:
+            return {}
+        sub = votes[votes["agent"].astype(str).eq("volume_profile_leader")].copy()
+        if sub.empty:
+            return {}
+        if "ts" in sub.columns:
+            sub["ts_num"] = pd.to_numeric(sub["ts"], errors="coerce")
+            sub = sub.sort_values("ts_num")
+        return sub.iloc[-1].to_dict()
+    except Exception:
+        return {}
+
+
+def signal_core_paragraph(decision: dict, top_row: dict) -> str:
+    action = str(decision.get("action") or top_row.get("action") or "WAIT").upper()
+    product_id = str(decision.get("product_id") or top_row.get("product_id") or "the top candidate")
+    expected_utility = _safe_float(decision.get("expected_utility_bps") or top_row.get("expected_utility_bps"))
+    score = _safe_float(decision.get("final_buy_score") or top_row.get("final_buy_score"))
+    threshold = _safe_float(decision.get("buy_threshold") or top_row.get("buy_threshold"))
+    reason = plain_reason(decision.get("reason") or top_row.get("blocker"))
+    if action == "BUY":
+        verdict = f"The Signal Core is allowing {product_id} to move toward live execution because the candidate has cleared the highest-level strategy checks."
+    elif action == "SHADOW":
+        verdict = f"The Signal Core is shadowing {product_id}. It sees enough structure to study the setup, but not enough net edge to risk live money yet."
+    elif action == "COMMENTARY":
+        verdict = f"The Signal Core is treating {product_id} as commentary. The setup is useful for learning, but it is not close enough to a live entry."
+    else:
+        verdict = f"The Signal Core is waiting on {product_id}. It is not seeing a strong enough combination of score, utility, and execution quality."
+    return f"{verdict} The current score is {score:.3f} against a threshold of {threshold:.3f}, and expected utility is {expected_utility:.2f} bps. In plain English, its decision is being driven by whether the trade can become net-profitable after fees, spread, wait utility, and context penalties. {reason}"
+
+
+def signal_core_learning_paragraph(decision: dict, top_row: dict) -> str:
+    product_id = str(decision.get("product_id") or top_row.get("product_id") or "this product")
+    reason_blob = str(decision.get("reason") or top_row.get("blocker") or "").lower()
+    priorities = []
+    if "expected_utility_too_low" in reason_blob:
+        priorities.append("it is learning whether the utility penalty is too harsh or correctly avoiding fee-negative trades")
+    if "inside_value" in reason_blob or "near_poc" in reason_blob:
+        priorities.append("it is studying whether value-area chop should keep blocking entries")
+    if "buy_vs_wait" in reason_blob:
+        priorities.append("it is comparing immediate buys against the value of waiting")
+    if "adaptive_waiting_for_reviews" in reason_blob:
+        priorities.append("it is waiting for more reviewed outcomes before trusting adaptive thresholds")
+    if "historical" in reason_blob or "replay" in reason_blob:
+        priorities.append("it is using replay outcomes to decide whether this setup class is actually profitable")
+    if not priorities:
+        priorities.append("it is learning which analysts consistently predict net-positive outcomes after the sell model is applied")
+    return f"Right now, The Signal Core is trying to learn whether {product_id} belongs in a profitable setup family. It is prioritizing the analysts whose signals affect net P/L the most: utility, volume/profile location, order-book execution quality, price action, and historical replay. At this moment, " + "; ".join(priorities[:3]) + "."
+
+
+def volume_oracle_paragraph(vote: dict, product_id: str) -> str:
+    if not vote:
+        return f"The Volume Oracle does not have a fresh vote for {product_id} yet. Once the council vote rows update, this panel will explain value area, POC, VAH, VAL, and volume-node context."
+    leaning = vote_leaning(vote)
+    confidence = _safe_float(vote.get("confidence"))
+    buy_score = _safe_float(vote.get("adjusted_buy_score"))
+    sell_score = _safe_float(vote.get("adjusted_sell_score"))
+    wait_score = _safe_float(vote.get("adjusted_wait_score"))
+    return f"The Volume Oracle is leaning {leaning} on {product_id} with confidence {confidence:.3f}. Its buy score is {buy_score:.3f}, sell score is {sell_score:.3f}, and wait score is {wait_score:.3f}. This verdict is mainly about whether price is in a clean location or trapped in value-area chop near POC. {agent_full_plain_summary(vote)}"
+
+
+def volume_oracle_learning_paragraph(vote: dict, product_id: str) -> str:
+    reason_blob = str(vote.get("reason") or "").lower() if vote else ""
+    focus = []
+    if "inside_value" in reason_blob:
+        focus.append("inside-value trades are being treated cautiously because they often chop")
+    if "near_poc" in reason_blob:
+        focus.append("POC proximity is being monitored as a balance/chop warning")
+    if "high_volume_node" in reason_blob:
+        focus.append("high-volume nodes are being studied as places where moves can stall")
+    if "low_volume_node" in reason_blob:
+        focus.append("low-volume paths are being studied as possible fast-move zones")
+    if "accepted_above" in reason_blob or "reclaimed_value" in reason_blob:
+        focus.append("acceptance and reclaim behavior are being watched for cleaner directional setups")
+    if not focus:
+        focus.append("it is learning whether value-area position improves or weakens final net trade outcomes")
+    return f"The Volume Oracle is currently learning how {product_id}'s value-area location affects the bot's final profit. It is prioritizing POC distance, VAH/VAL acceptance, high-volume-node resistance, low-volume-node opportunity, and whether price is accepting or rejecting value. Current focus: " + "; ".join(focus[:3]) + "."
+
+
+def render_leadership_verdicts(rows: list[dict], decisions_df: pd.DataFrame, council_votes_df: pd.DataFrame):
+    if not rows:
+        return
+    top_row = rows[0]
+    product_id = str(top_row.get("product_id") or "")
+    decision = latest_decision_for_product(decisions_df, product_id)
+    oracle_vote = latest_volume_oracle_vote(council_votes_df, decisions_df, product_id)
+    action = str(decision.get("action") or top_row.get("action") or "WAIT").upper()
+    expected_utility = _safe_float(decision.get("expected_utility_bps") or top_row.get("expected_utility_bps"))
+    oracle_leaning = vote_leaning(oracle_vote) if oracle_vote else "WAIT"
+    st.markdown(
+        f'''<div class="leadership-grid"><div class="leadership-card"><div class="leadership-title">{_html(LEAD_DECISION_MAKER_TITLE)}</div><div class="leadership-subtitle">{_html(LEAD_DECISION_MAKER_SUBTITLE)} · {_html(product_id)}</div><div class="leadership-verdict">Current verdict: {_html(action)} · Utility {expected_utility:.2f} bps</div><div class="leadership-paragraph">{_html(signal_core_paragraph(decision, top_row))}</div><div class="leadership-learning"><b>Current learning:</b> {_html(signal_core_learning_paragraph(decision, top_row))}</div></div><div class="leadership-card oracle"><div class="leadership-title">{_html(VOLUME_LEADER_TITLE)}</div><div class="leadership-subtitle">{_html(VOLUME_LEADER_SUBTITLE)} · {_html(product_id)}</div><div class="leadership-verdict">Current verdict: {_html(oracle_leaning)}</div><div class="leadership-paragraph">{_html(volume_oracle_paragraph(oracle_vote, product_id))}</div><div class="leadership-learning"><b>Current learning:</b> {_html(volume_oracle_learning_paragraph(oracle_vote, product_id))}</div></div></div>''',
+        unsafe_allow_html=True,
+    )
+
 def set_selected_coin(product_id: str) -> None:
     product_id = str(product_id or "").strip()
     if not product_id:
@@ -1255,6 +1382,7 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
     cols[4].metric("Snapshot Age", format_age(age))
     if rows:
         st.caption(f'Continuously sorted by viability score. Current leader: {rows[0]["product_id"]} — {rows[0]["viability_reason"]}')
+    render_leadership_verdicts(rows, decisions_df, council_votes_df)
     if readiness.get("high_fee_tier_active"):
         st.warning("Profit-First Fee-Aware Mode is active because Coinbase fees are high. The bot can still trade, but projected net profit must clear maker/taker fees, spread, and execution cost.")
     render_held_positions(snapshot, market_df, trades_df, targets_df)
@@ -1611,6 +1739,9 @@ def replay_calibration_eligible_frame(frame: pd.DataFrame) -> pd.DataFrame:
         out = out[accepted.astype(int).eq(1)].copy()
     else:
         out = out[~out.get("timeframe", pd.Series("", index=out.index)).astype(str).str.contains("daily", case=False, na=False)].copy()
+    if "replay_candidate_qualified" in out.columns:
+        qualified = pd.to_numeric(out.get("replay_candidate_qualified"), errors="coerce").fillna(0)
+        out = out[qualified.astype(int).eq(1)].copy()
     return out
 
 
@@ -1642,7 +1773,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
     eligible_replay = replay_calibration_eligible_frame(historical_replay_df)
     replay_cols = st.columns(4)
     replay_cols[0].metric("All Replay Rows", len(historical_replay_df) if historical_replay_df is not None else 0)
-    replay_cols[1].metric("Calibration Rows", len(eligible_replay))
+    replay_cols[1].metric("Qualified Calibration Rows", len(eligible_replay))
     replay_cols[2].metric("Ready Products", f"{hist_ready}/{hist_total}")
     replay_cols[3].metric("Replay Running", str(hist_running))
     st.caption(f"Replay enabled={hist_enabled}; calibration mode={'Profit Replay' if readiness.get('profit_replay_based_calibration_enabled') else 'Fallback'}")
@@ -1651,18 +1782,18 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         wins = int((net > 0).sum())
         losses = int((net <= 0).sum())
         profit_cols = st.columns(4)
-        profit_cols[0].metric("Eligible Win Rate", f"{wins / max(1, wins + losses) * 100.0:.1f}%")
+        profit_cols[0].metric("Qualified Win Rate", f"{wins / max(1, wins + losses) * 100.0:.1f}%")
         profit_cols[1].metric("Median Net", f"{net.median():.2f} bps")
         profit_cols[2].metric("Average Net", f"{net.mean():.2f} bps")
         profit_cols[3].metric("Total Net", f"{net.sum():.2f} bps")
         if net.mean() > 0 and net.median() > 0:
-            st.success("Calibration-eligible historical replay is net-positive on average and at the median.")
+            st.success("Qualified replay is net-positive on average and at the median.")
         elif net.mean() > 0:
-            st.warning("Historical replay is positive on average but not at the median. This may mean a few large winners are carrying many losers.")
+            st.warning("Qualified replay is positive on average but negative at the median. A few large winners may be carrying many losers.")
         else:
-            st.warning("Calibration-eligible historical replay is not net-positive yet. The bot should not rely on replay calibration for live scaling.")
+            st.warning("Qualified replay is not net-positive yet. The bot should not trust this product family for live scaling.")
     else:
-        st.info("No calibration-eligible historical replay rows yet. Wait for 15m/90d and 1h/365d replay rows.")
+        st.info("No qualified calibration replay rows yet. Wait for 15m/90d and 1h/365d rows to build across products.")
     if historical_replay_summary_df is None or historical_replay_summary_df.empty:
         st.info("No historical replay summary rows yet. The bot will fill historical_shadow_replay.csv in the background, then use net replay profit to calibrate each product.")
     else:

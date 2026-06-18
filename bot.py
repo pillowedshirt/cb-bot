@@ -295,7 +295,9 @@ HISTORICAL_SHADOW_REPLAY_COLUMNS: List[str] = [
     "value_acceptance_state", "volume_node_state", "poc_distance_bps",
     "volume_profile_leader_buy_score", "volume_profile_leader_wait_score",
     "price_action_buy_score", "market_structure_buy_score", "quant_buy_score",
-    "setup_tag", "regime_tag", "accepted_for_calibration", "replay_source", "reason",
+    "setup_tag", "regime_tag", "replay_candidate_qualified",
+    "replay_candidate_quality", "replay_filter_reason", "accepted_for_calibration",
+    "replay_source", "reason",
 ]
 
 HISTORICAL_REPLAY_SUMMARY_COLUMNS: List[str] = [
@@ -841,7 +843,7 @@ LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES: int = 8
 
 # Let the bot buy more than one learning candidate per evaluation if cash allows.
 LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL: int = 1
-LEVEL8_MAX_PRODUCTS_PER_EVAL: int = 6
+LEVEL8_MAX_PRODUCTS_PER_EVAL: int = 4
 LEVEL8_ALWAYS_INCLUDE_HELD_PRODUCTS: bool = True
 LEVEL8_ROTATE_UNEVALUATED_PRODUCTS: bool = True
 
@@ -874,10 +876,10 @@ HIST_REPLAY_PRIMARY_GRANULARITY: str = "FIFTEEN_MINUTE"
 HIST_REPLAY_REGIME_GRANULARITY: str = "ONE_HOUR"
 HIST_REPLAY_DAILY_GRANULARITY: str = "ONE_DAY"
 HIST_REPLAY_PRODUCTS_PER_PASS: int = 1
-HIST_REPLAY_MAX_CANDIDATES_PER_PASS: int = 500
-HIST_REPLAY_MAX_RUNTIME_SEC: float = 60.0
-HIST_REPLAY_EVERY_SEC: float = 5 * 60.0
-HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC: float = 0.75
+HIST_REPLAY_MAX_CANDIDATES_PER_PASS: int = 300
+HIST_REPLAY_MAX_RUNTIME_SEC: float = 45.0
+HIST_REPLAY_EVERY_SEC: float = 3 * 60.0
+HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC: float = 1.0
 HIST_REPLAY_STEP_BARS_15M: int = 1
 HIST_REPLAY_STEP_BARS_1H: int = 1
 HIST_REPLAY_MIN_PREFIX_15M: int = 96
@@ -887,6 +889,18 @@ HIST_REPLAY_FORWARD_BARS_1H: List[int] = [2, 4, 8, 12, 24]
 HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION: int = 250
 HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION: int = 25
 HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION: int = 30
+HIST_REPLAY_REQUIRE_POSITIVE_AVG_FOR_CALIBRATION: bool = True
+HIST_REPLAY_REQUIRE_POSITIVE_MEDIAN_FOR_CALIBRATION: bool = False
+HIST_REPLAY_MIN_AVG_NET_PNL_BPS_FOR_CALIBRATION: float = 15.0
+HIST_REPLAY_MIN_MEDIAN_NET_PNL_BPS_FOR_STRONG_CALIBRATION: float = 0.0
+ENABLE_QUALIFIED_HISTORICAL_REPLAY_FILTER: bool = True
+HIST_REPLAY_MIN_TARGET_OVER_COST_BPS: float = 35.0
+HIST_REPLAY_MIN_TARGET_TO_COST_RATIO: float = 1.35
+HIST_REPLAY_MIN_SCORE_FOR_CALIBRATION: float = 0.42
+HIST_REPLAY_MIN_PROBABILITY_FOR_CALIBRATION: float = 0.42
+HIST_REPLAY_MIN_EXPECTED_EDGE_BPS_FOR_CALIBRATION: float = -25.0
+HIST_REPLAY_BLOCK_NEAR_POC_CHOP: bool = True
+HIST_REPLAY_MAX_POC_DISTANCE_FOR_CHOP_BPS: float = 18.0
 REQUIRE_HISTORICAL_REPLAY_CALIBRATION_FOR_LIVE_BUY: bool = False
 HIST_REPLAY_RECENCY_HALFLIFE_DAYS: float = 30.0
 
@@ -5933,6 +5947,7 @@ class TradingBot:
         self._last_historical_replay_ts = 0.0
         self._historical_replay_product_index = 0
         self._historical_replay_timeframe_index = 0
+        self._historical_replay_job_index = 0
         self._historical_replay_ready_by_product: Dict[str, bool] = {p: False for p in PRODUCTS}
         self._level8_product_rotation_index = 0
 
@@ -15947,6 +15962,74 @@ class TradingBot:
         await asyncio.sleep(float(HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC))
         return candles or cached, granularity, "rest_fetch" if candles else "csv_cache_partial"
 
+
+    def _historical_replay_job_queue(self) -> List[Tuple[str, str]]:
+        """
+        Weighted round-robin replay queue.
+
+        Priority:
+        1. primary_15m_90d for every product
+        2. regime_1h_365d for every product
+        3. another primary_15m_90d pass for every product
+        4. daily_1d_2y only as sparse context
+        """
+        jobs: List[Tuple[str, str]] = []
+        for product_id in PRODUCTS:
+            jobs.append((product_id, "primary_15m_90d"))
+        for product_id in PRODUCTS:
+            jobs.append((product_id, "regime_1h_365d"))
+        for product_id in PRODUCTS:
+            jobs.append((product_id, "primary_15m_90d"))
+        for product_id in PRODUCTS:
+            jobs.append((product_id, "daily_1d_2y"))
+        return jobs
+
+    def _qualified_historical_replay_candidate(self, signal: Any, *, timeframe: str, granularity: str) -> Tuple[bool, str, float]:
+        """
+        Decide whether this historical signal is worth using as a calibration replay row.
+
+        This does not decide live trading. It only decides whether a historical row
+        represents a serious enough setup to count toward profit-based calibration.
+        """
+        if not bool(ENABLE_QUALIFIED_HISTORICAL_REPLAY_FILTER):
+            return True, "qualified_filter_disabled", 0.0
+        try:
+            score = float(getattr(signal, "score", 0.0) or 0.0)
+            probability = float(getattr(signal, "estimated_prob_up", 0.0) or 0.0)
+            expected_edge = float(getattr(signal, "expected_net_edge_bps", 0.0) or 0.0)
+            target_bps = float(getattr(signal, "target_bps", 0.0) or 0.0)
+            cost_bps = float(getattr(signal, "cost_bps", 0.0) or 0.0)
+            poc_distance = abs(float(getattr(signal, "poc_distance_bps", 999.0) or 999.0))
+            value_state = str(getattr(signal, "value_acceptance_state", "") or "").lower()
+            volume_node = str(getattr(signal, "volume_node_state", "") or "").lower()
+            target_over_cost = target_bps - cost_bps
+            target_to_cost = target_bps / max(cost_bps, 1e-9)
+            quality = 0.0
+            quality += max(0.0, min(25.0, (score - float(HIST_REPLAY_MIN_SCORE_FOR_CALIBRATION)) * 100.0))
+            quality += max(0.0, min(25.0, (probability - float(HIST_REPLAY_MIN_PROBABILITY_FOR_CALIBRATION)) * 100.0))
+            quality += max(-20.0, min(30.0, target_over_cost * 0.20))
+            quality += max(-20.0, min(20.0, expected_edge * 0.10))
+            reasons = []
+            if target_over_cost < float(HIST_REPLAY_MIN_TARGET_OVER_COST_BPS):
+                reasons.append(f"target_over_cost_too_low target={target_bps:.2f};cost={cost_bps:.2f};over={target_over_cost:.2f}")
+            if target_to_cost < float(HIST_REPLAY_MIN_TARGET_TO_COST_RATIO):
+                reasons.append(f"target_to_cost_ratio_too_low ratio={target_to_cost:.3f};min={float(HIST_REPLAY_MIN_TARGET_TO_COST_RATIO):.3f}")
+            if score < float(HIST_REPLAY_MIN_SCORE_FOR_CALIBRATION):
+                reasons.append(f"score_too_low score={score:.3f}")
+            if probability < float(HIST_REPLAY_MIN_PROBABILITY_FOR_CALIBRATION):
+                reasons.append(f"probability_too_low probability={probability:.3f}")
+            if expected_edge < float(HIST_REPLAY_MIN_EXPECTED_EDGE_BPS_FOR_CALIBRATION):
+                reasons.append(f"expected_edge_too_low expected_edge={expected_edge:.2f}")
+            if bool(HIST_REPLAY_BLOCK_NEAR_POC_CHOP) and "inside" in value_state and "high_volume" in volume_node and poc_distance <= float(HIST_REPLAY_MAX_POC_DISTANCE_FOR_CHOP_BPS):
+                reasons.append(f"near_poc_high_volume_chop value={value_state};node={volume_node};poc_distance={poc_distance:.2f}")
+            qualified = len(reasons) == 0
+            if qualified:
+                return True, (f"qualified target_over_cost={target_over_cost:.2f};target_to_cost={target_to_cost:.3f};score={score:.3f};probability={probability:.3f};expected_edge={expected_edge:.2f}"), float(quality)
+            return False, ";".join(reasons), float(quality)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "qualified_historical_replay_candidate_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+            return False, "qualification_failed", 0.0
+
     def _historical_setup_tag_from_signal(self, signal: Any) -> Tuple[str, str]:
         try:
             setup_parts = []
@@ -15978,6 +16061,7 @@ class TradingBot:
             tob = self.tob.get(product_id); spread_bps = float(tob.spread_bps) if tob and tob.spread_bps > 0 else float(MAX_SPREAD_BPS)
             signal = self._build_historical_signal_from_candles(product_id=product_id, candles=prefix, weekly_candles=available_weekly, spread_bps=spread_bps)
             setup_tag, regime_tag = self._historical_setup_tag_from_signal(signal)
+            qualified, qualification_reason, replay_quality = self._qualified_historical_replay_candidate(signal, timeframe=timeframe, granularity=granularity)
             entry_fee_bps = float(self._entry_fee_bps_for_mode(execution_mode=ENTRY_EXECUTION_MODE)); exit_fee_bps = float(self._exit_fee_bps_for_mode())
             synthetic_notional = float(SHADOW_SELL_REPLAY_SYNTHETIC_NOTIONAL_USD); entry_fee_usd = fee_usd(synthetic_notional, entry_fee_bps)
             synthetic_qty = synthetic_notional / max(entry_price, 1e-12); all_in_entry_price = (synthetic_notional + entry_fee_usd) / max(synthetic_qty, 1e-12)
@@ -15998,7 +16082,7 @@ class TradingBot:
             gross_proceeds = synthetic_qty * float(exit_price); exit_fee = fee_usd(gross_proceeds, exit_fee_bps); gross_pnl = gross_proceeds - synthetic_notional; net_pnl = gross_proceeds - synthetic_notional - entry_fee_usd - exit_fee; net_pnl_bps = (net_pnl / max(synthetic_notional, 1e-12)) * 10000.0
             max_favorable_bps = ((peak_price / entry_price) - 1.0) * 10000.0; max_adverse_bps = ((trough_price / entry_price) - 1.0) * 10000.0
             replay_key = f"{product_id}|{timeframe}|{replay_ts}|{int(float(signal.score) * 1000000)}"
-            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "accepted_for_calibration": int(self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
+            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
         except Exception as exc:
             module_exception(MODULE_NAME, "simulate_historical_replay_candidate_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "traceback": traceback.format_exc()}, also_overall=False)
             return None
@@ -16065,7 +16149,9 @@ class TradingBot:
             shadows = self._read_csv_tail_for_bot(SHADOW_TRADES_CSV_PATH, max_lines=30000)
             if not shadows.empty and {"ts", "decision_id", "product_id"}.issubset(set(shadows.columns)):
                 shadows = shadows.copy()
-                shadows["action"] = shadows.get("shadow_action", "SHADOW")
+                shadow_action = shadows.get("shadow_action", "BUY").astype(str).str.upper()
+                shadows["action"] = shadow_action.apply(lambda x: "SHADOW_BUY" if x == "BUY" else f"SHADOW_{x}")
+                shadows["decision_bucket"] = "SHADOW"
                 shadows["source_file"] = "shadow_trades.csv"
                 frames.append(shadows)
         except Exception:
@@ -16156,9 +16242,11 @@ class TradingBot:
             decisions = decisions.dropna(subset=["ts"])
             min_age_sec = float(SHADOW_SELL_REPLAY_MIN_REVIEW_MINUTES) * 60.0
             max_age_sec = float(SHADOW_SELL_REPLAY_MAX_DECISION_AGE_HOURS) * 3600.0
-            reviewable = decisions[(decisions["ts"] <= now_value - min_age_sec) & (decisions["ts"] >= now_value - max_age_sec) & (decisions["action"].astype(str).str.upper().isin(["SHADOW", "COMMENTARY", "WAIT"]))].copy()
+            reviewable_actions = {"SHADOW", "SHADOW_BUY", "BUY", "COMMENTARY", "WAIT"}
+            reviewable = decisions[(decisions["ts"] <= now_value - min_age_sec) & (decisions["ts"] >= now_value - max_age_sec) & (decisions["action"].astype(str).str.upper().isin(reviewable_actions))].copy()
             if reviewable.empty:
-                module_debug(MODULE_NAME, "shadow_sell_replay_no_rows", data={"reviewable": 0, "skip_counts": {}, "now_ts": now_value, "min_age_sec": min_age_sec, "max_age_sec": max_age_sec}, level="INFO", also_overall=False)
+                action_counts = (decisions["action"].astype(str).str.upper().value_counts().to_dict() if "action" in decisions.columns else {})
+                module_debug(MODULE_NAME, "shadow_sell_replay_no_rows", data={"source_rows": int(len(decisions)), "reviewable": 0, "action_counts": action_counts, "oldest_ts": float(decisions["ts"].min()) if "ts" in decisions.columns and not decisions.empty else 0.0, "newest_ts": float(decisions["ts"].max()) if "ts" in decisions.columns and not decisions.empty else 0.0, "now_ts": now_value, "min_age_sec": min_age_sec, "max_age_sec": max_age_sec}, level="INFO", also_overall=False)
                 return
             existing_keys = set()
             if os.path.exists(SHADOW_SELL_REPLAY_CSV_PATH):
@@ -16211,9 +16299,10 @@ class TradingBot:
         try:
             self._ensure_historical_shadow_replay_header(); existing_keys = self._historical_replay_existing_keys()
             existing_prefixes = self._historical_replay_existing_prefixes(existing_keys)
-            timeframes = ["primary_15m_90d", "primary_15m_90d", "regime_1h_365d", "primary_15m_90d", "daily_1d_2y"]
-            product_idx = int(getattr(self, "_historical_replay_product_index", 0)) % len(PRODUCTS); timeframe_idx = int(getattr(self, "_historical_replay_timeframe_index", 0)) % len(timeframes)
-            product_id = PRODUCTS[product_idx]; timeframe = timeframes[timeframe_idx]
+            jobs = self._historical_replay_job_queue()
+            job_idx = int(getattr(self, "_historical_replay_job_index", 0)) % max(1, len(jobs))
+            product_id, timeframe = jobs[job_idx]
+            self._historical_replay_job_index = (job_idx + 1) % max(1, len(jobs))
             candles, granularity, replay_source = await self._get_historical_replay_candles(product_id=product_id, timeframe=timeframe)
             fetch_elapsed_sec = time.perf_counter() - pass_started
             eval_started = time.perf_counter()
@@ -16250,10 +16339,7 @@ class TradingBot:
                     writer = csv.DictWriter(f, fieldnames=HISTORICAL_SHADOW_REPLAY_COLUMNS)
                     for row in rows_to_write: writer.writerow({col: row.get(col, "") for col in HISTORICAL_SHADOW_REPLAY_COLUMNS})
             self._write_historical_replay_summary(product_id)
-            timeframe_idx += 1
-            if timeframe_idx >= len(timeframes): timeframe_idx = 0; product_idx = (product_idx + 1) % len(PRODUCTS)
-            self._historical_replay_timeframe_index = timeframe_idx; self._historical_replay_product_index = product_idx
-            module_debug(MODULE_NAME, "historical_shadow_replay_pass_completed", data={"product_id": product_id, "timeframe": timeframe, "granularity": granularity, "source": replay_source, "candles": len(candles), "evaluated": evaluated, "rows_written": len(rows_to_write), "fetch_elapsed_sec": round(fetch_elapsed_sec, 3), "eval_elapsed_sec": round(time.perf_counter() - eval_started, 3), "total_elapsed_sec": round(time.perf_counter() - pass_started, 3), "next_product_index": self._historical_replay_product_index, "next_timeframe_index": self._historical_replay_timeframe_index}, level="INFO", also_overall=False)
+            module_debug(MODULE_NAME, "historical_shadow_replay_pass_completed", data={"product_id": product_id, "timeframe": timeframe, "granularity": granularity, "source": replay_source, "candles": len(candles), "evaluated": evaluated, "rows_written": len(rows_to_write), "fetch_elapsed_sec": round(fetch_elapsed_sec, 3), "eval_elapsed_sec": round(time.perf_counter() - eval_started, 3), "total_elapsed_sec": round(time.perf_counter() - pass_started, 3), "next_job_index": self._historical_replay_job_index, "job_count": len(jobs)}, level="INFO", also_overall=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "historical_shadow_replay_pass_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
         finally:
@@ -16264,7 +16350,7 @@ class TradingBot:
         while not self._stop_event.is_set():
             try: await self._run_historical_shadow_replay_pass()
             except Exception as exc: module_exception(MODULE_NAME, "historical_shadow_replay_loop_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
-            await asyncio.sleep(30.0)
+            await asyncio.sleep(90.0)
 
     def _historical_replay_rows_for_product(self, product_id: str) -> pd.DataFrame:
         try:
@@ -16278,6 +16364,9 @@ class TradingBot:
             if "accepted_for_calibration" in frame.columns:
                 accepted = pd.to_numeric(frame.get("accepted_for_calibration"), errors="coerce").fillna(0)
                 frame = frame[accepted.astype(int).eq(1)].copy()
+            if "replay_candidate_qualified" in frame.columns:
+                qualified = pd.to_numeric(frame.get("replay_candidate_qualified"), errors="coerce").fillna(0)
+                frame = frame[qualified.astype(int).eq(1)].copy()
             return frame.sort_values("replay_ts")
         except Exception as exc:
             module_exception(MODULE_NAME, "historical_replay_rows_for_product_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False); return pd.DataFrame()
@@ -16301,7 +16390,12 @@ class TradingBot:
         if frame.empty: return False
         rows = int(len(frame)); wins = int((pd.to_numeric(frame.get("net_pnl_bps"), errors="coerce") > 0).sum())
         days_covered = max(0.0, (float(frame["replay_ts"].max()) - float(frame["replay_ts"].min())) / 86400.0) if "replay_ts" in frame.columns else 0.0
-        ready = rows >= int(HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION) and wins >= int(HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION) and days_covered >= float(HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION)
+        net = pd.to_numeric(frame.get("net_pnl_bps"), errors="coerce").dropna()
+        avg_net = float(net.mean()) if not net.empty else -999999.0
+        median_net = float(net.median()) if not net.empty else -999999.0
+        positive_avg_ok = avg_net >= float(HIST_REPLAY_MIN_AVG_NET_PNL_BPS_FOR_CALIBRATION) if bool(HIST_REPLAY_REQUIRE_POSITIVE_AVG_FOR_CALIBRATION) else True
+        positive_median_ok = median_net >= float(HIST_REPLAY_MIN_MEDIAN_NET_PNL_BPS_FOR_STRONG_CALIBRATION) if bool(HIST_REPLAY_REQUIRE_POSITIVE_MEDIAN_FOR_CALIBRATION) else True
+        ready = (rows >= int(HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION) and wins >= int(HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION) and days_covered >= float(HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION) and positive_avg_ok and positive_median_ok)
         self._historical_replay_ready_by_product[product_id] = bool(ready); return bool(ready)
 
     def _calibration_observations_from_historical_replay(self, product_id: str) -> List[CalibrationObservation]:
@@ -16324,7 +16418,7 @@ class TradingBot:
             net = pd.to_numeric(frame.get("net_pnl_bps"), errors="coerce").dropna()
             if net.empty: return
             wins = int((net > 0).sum()); losses = int((net <= 0).sum()); min_ts = float(frame["replay_ts"].min()) if "replay_ts" in frame.columns else 0.0; max_ts = float(frame["replay_ts"].max()) if "replay_ts" in frame.columns else 0.0; days_covered = max(0.0, (max_ts - min_ts) / 86400.0); ready = bool(self._historical_replay_is_ready_for_product(product_id)); profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
-            row = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "rows": int(len(frame)), "wins": wins, "losses": losses, "win_rate": wins / max(1, wins + losses), "median_net_pnl_bps": float(net.median()), "avg_net_pnl_bps": float(net.mean()), "best_net_pnl_bps": float(net.max()), "worst_net_pnl_bps": float(net.min()), "median_mfe_bps": float(pd.to_numeric(frame.get("max_favorable_bps"), errors="coerce").dropna().median()) if "max_favorable_bps" in frame.columns else 0.0, "median_mae_bps": float(pd.to_numeric(frame.get("max_adverse_bps"), errors="coerce").dropna().median()) if "max_adverse_bps" in frame.columns else 0.0, "days_covered": days_covered, "calibration_ready": int(ready), "recommended_min_score": float(profile.min_score), "recommended_min_probability": float(profile.min_probability), "recommended_min_expected_value_bps": float(profile.min_expected_value_bps), "reason": f"historical_replay_summary;ready={ready};rows={len(frame)};wins={wins};median_net={float(net.median()):.2f}"}
+            row = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "rows": int(len(frame)), "wins": wins, "losses": losses, "win_rate": wins / max(1, wins + losses), "median_net_pnl_bps": float(net.median()), "avg_net_pnl_bps": float(net.mean()), "best_net_pnl_bps": float(net.max()), "worst_net_pnl_bps": float(net.min()), "median_mfe_bps": float(pd.to_numeric(frame.get("max_favorable_bps"), errors="coerce").dropna().median()) if "max_favorable_bps" in frame.columns else 0.0, "median_mae_bps": float(pd.to_numeric(frame.get("max_adverse_bps"), errors="coerce").dropna().median()) if "max_adverse_bps" in frame.columns else 0.0, "days_covered": days_covered, "calibration_ready": int(ready), "recommended_min_score": float(profile.min_score), "recommended_min_probability": float(profile.min_probability), "recommended_min_expected_value_bps": float(profile.min_expected_value_bps), "reason": (f"historical_replay_summary;ready={ready};rows={len(frame)};wins={wins};avg_net={float(net.mean()):.2f};median_net={float(net.median()):.2f};days={days_covered:.1f}")}
             with open(HISTORICAL_REPLAY_SUMMARY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=HISTORICAL_REPLAY_SUMMARY_COLUMNS); writer.writerow({col: row.get(col, "") for col in HISTORICAL_REPLAY_SUMMARY_COLUMNS})
         except Exception as exc:

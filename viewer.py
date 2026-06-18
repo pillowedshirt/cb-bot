@@ -155,8 +155,22 @@ div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid r
 }
 .coin-overview-card:hover { transform: translateY(-2px); border-color: rgba(57, 245, 163, 0.65); box-shadow: 0 0 24px rgba(57, 245, 163, 0.10); }
 .clickable-coin-card { cursor: pointer; }
-.coin-card-hitbox { position: absolute; inset: 0; z-index: 8; border-radius: 18px; background: rgba(255, 255, 255, 0); text-decoration: none; }
-.coin-card-hitbox:hover { background: rgba(57, 245, 163, 0.035); }
+.coin-card-hitbox {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0);
+    text-decoration: none;
+    cursor: pointer;
+}
+.coin-card-hitbox:focus {
+    outline: 2px solid rgba(57, 245, 163, 0.65);
+    outline-offset: 2px;
+}
+.coin-card-hitbox:hover {
+    background: rgba(57, 245, 163, 0.035);
+}
 .tv-chart-shell { width: 100%; height: 900px; min-height: 900px; border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; overflow: hidden; background: #0b0f14; }
 .coin-overview-card.buy { border-color: rgba(0, 255, 160, 0.48); }
 .coin-overview-card.shadow { border-color: rgba(255, 214, 102, 0.45); }
@@ -279,11 +293,51 @@ def render_crypto_header() -> None:
 
 
 def get_available_products(snapshot: Dict[str, Any]) -> list[str]:
-    coins = snapshot.get("coins", {}) or {}
-    top = snapshot.get("top_products", []) or []
-    available = [c for c in list(top) + [c for c in coins.keys() if c not in top] if str(c).strip()]
-    return available
+    """
+    Product list priority:
+    1. viewer_snapshot top_products / coins
+    2. products_active.csv
+    3. market.csv
+    4. council_decisions.csv
+    5. position_targets.csv
 
+    This keeps the viewer usable even when viewer_snapshot.json is briefly
+    overwritten by a startup snapshot with zero coins.
+    """
+    products: list[str] = []
+
+    def add_product(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in products:
+            products.append(text)
+
+    try:
+        coins = snapshot.get("coins", {}) or {}
+        top = snapshot.get("top_products", []) or []
+        for p in top:
+            add_product(p)
+        for p in coins.keys():
+            add_product(p)
+    except Exception:
+        pass
+
+    if products:
+        return products
+
+    fallback_paths = [os.path.join(BASE_DIR, "products_active.csv"), MARKET_CSV_PATH, COUNCIL_DECISIONS_PATH, POSITION_TARGETS_PATH]
+    for path in fallback_paths:
+        try:
+            frame = load_csv(path, usecols=["product_id"])
+            if frame.empty or "product_id" not in frame.columns:
+                continue
+            for p in frame["product_id"].dropna().astype(str).unique().tolist():
+                add_product(p)
+            if products:
+                module_debug(MODULE_NAME, "available_products_loaded_from_fallback", data={"path": path, "count": len(products)}, level="INFO", also_overall=False)
+                return products
+        except Exception as exc:
+            module_exception(MODULE_NAME, "available_products_fallback_failed", exc, data={"path": path}, also_overall=False)
+    return products
 
 def pick_selected_coin(snapshot: Dict[str, Any]) -> str | None:
     available = get_available_products(snapshot)
@@ -557,25 +611,53 @@ def set_selected_coin(product_id: str) -> None:
 
 
 def apply_query_selected_coin(snapshot: Dict[str, Any]) -> None:
-    """Reads ?coin=PRODUCT and applies it to the Strategy Arena selection."""
+    """
+    Reads ?coin=PRODUCT and applies it to the Strategy Arena selection.
+    It only triggers scroll when the query coin changes, so auto-refresh does not
+    keep yanking the user back down the page.
+    """
     try:
         available = get_available_products(snapshot)
         raw_coin = st.query_params.get("coin", None)
         if isinstance(raw_coin, list):
             raw_coin = raw_coin[0] if raw_coin else None
         selected = unquote(str(raw_coin or "")).strip()
-        if selected and selected in available:
-            st.session_state["selected_coin"] = selected
-            st.session_state["strategy_arena_coin"] = selected
+        if not selected or selected not in available:
+            return
+        last_applied = st.session_state.get("_last_query_coin_applied")
+        st.session_state["selected_coin"] = selected
+        st.session_state["strategy_arena_coin"] = selected
+        if selected != last_applied:
             st.session_state["_scroll_to_strategy_arena"] = True
+            st.session_state["_last_query_coin_applied"] = selected
+        module_debug(MODULE_NAME, "query_coin_applied", data={"selected": selected, "last_applied": last_applied, "available_count": len(available)}, level="INFO", also_overall=False)
     except Exception as exc:
-        module_exception(MODULE_NAME, "apply_query_selected_coin_failed", exc, also_overall=False)
+        module_exception(MODULE_NAME, "apply_query_selected_coin_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
 
 def scroll_to_strategy_arena_if_requested() -> None:
     if not st.session_state.pop("_scroll_to_strategy_arena", False):
         return
-    components.html("""<script>const doc = window.parent.document; setTimeout(function() { const el = doc.getElementById("strategy-arena-anchor"); if (el) { el.scrollIntoView({behavior: "smooth", block: "start"}); } }, 150);</script>""", height=0)
+    components.html(
+        """
+        <script>
+        const parentWindow = window.parent || window;
+        const doc = parentWindow.document;
+        setTimeout(function() {
+            const el = doc.getElementById("strategy-arena-anchor");
+            if (el) {
+                el.scrollIntoView({behavior: "smooth", block: "start"});
+            }
+            try {
+                const cleanUrl = new URL(parentWindow.location.href);
+                cleanUrl.searchParams.delete("coin");
+                parentWindow.history.replaceState({}, "", cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
+            } catch (err) {}
+        }, 180);
+        </script>
+        """,
+        height=0,
+    )
 
 def render_agent_disagreement_summary(votes: pd.DataFrame) -> Dict[str, Any]:
     if votes.empty: return {"BUY":0,"SELL":0,"HOLD":0,"WAIT":0,"consensus":"WAIT","main_blocker":"No agent votes yet"}
@@ -689,7 +771,16 @@ def calculate_coin_viability(row: dict) -> tuple[float, str]:
 
 
 def build_all_coin_rows(snapshot, market_df, decisions_df, council_votes_df, targets_df) -> list[dict]:
-    coins = snapshot.get("coins", {}) or {}; products = list(snapshot.get("top_products") or []); products += [p for p in coins.keys() if p not in products]; rows = []
+    coins = snapshot.get("coins", {}) or {}
+    products = get_available_products(snapshot)
+
+    for frame in [market_df, decisions_df, targets_df, council_votes_df]:
+        if frame is not None and not frame.empty and "product_id" in frame.columns:
+            for p in frame["product_id"].dropna().astype(str).unique().tolist():
+                if p not in products:
+                    products.append(p)
+
+    rows = []
     for product in products:
         coin = dict(coins.get(product, {}) or {}); market = latest_row_for_product(market_df, product); decision = latest_row_for_product(decisions_df, product); target = latest_row_for_product(targets_df, product); latest_decision_id, _, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, product)
         if not votes.empty:
@@ -727,10 +818,25 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
             card_state = ("buy" if row.get("action") == "BUY" else "shadow" if "SHADOW" in str(row.get("action") or "") else "blocked" if row.get("blocker") else "wait")
             with col:
                 encoded_coin = quote(product_id, safe="")
-                card_href = f"?coin={encoded_coin}#strategy-arena-anchor"
                 st.markdown(f'''
                     <div class="coin-overview-card {card_state} clickable-coin-card">
-                        <a class="coin-card-hitbox" href="{card_href}" aria-label="Open {html.escape(product_id)} in Strategy Arena"></a>
+                        <a
+                            class="coin-card-hitbox"
+                            href="javascript:void(0)"
+                            data-coin="{encoded_coin}"
+                            aria-label="Open {html.escape(product_id)} in Strategy Arena"
+                            onclick="
+                                event.preventDefault();
+                                event.stopPropagation();
+                                const coin = this.getAttribute('data-coin');
+                                const parentWindow = window.parent || window;
+                                const url = new URL(parentWindow.location.href);
+                                url.searchParams.set('coin', coin);
+                                url.hash = 'strategy-arena-anchor';
+                                parentWindow.location.assign(url.toString());
+                                return false;
+                            "
+                        ></a>
                         <div style="font-size:1.25rem;font-weight:900;"><span class="rank-badge">#{row["rank"]}</span>{_html(product_id)}</div>
                         <div class="viability-score">Viability {row["viability_score"]:.1f}</div>
                         <div class="viability-reason">{_html(row["viability_reason"])}</div>
@@ -853,15 +959,17 @@ def render_learning_console(selected_coin, votes, decisions_df, market_df, snaps
 
 def render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
     available = get_available_products(snapshot)
-    if available:
-        current = st.session_state.get("selected_coin", available[0])
-        if current not in available:
-            current = available[0]
-            st.session_state["selected_coin"] = current
-        if st.session_state.get("strategy_arena_coin") not in available:
-            st.session_state["strategy_arena_coin"] = current
-        selected = st.selectbox("Strategy Arena Coin", available, index=available.index(st.session_state.get("strategy_arena_coin", current)), key="strategy_arena_coin")
-        st.session_state["selected_coin"] = selected
+    if not available:
+        st.info("No products are available yet. Waiting for bot files to populate.")
+        return
+
+    current = st.session_state.get("selected_coin") or st.session_state.get("strategy_arena_coin") or available[0]
+    if current not in available:
+        current = available[0]
+    st.session_state["selected_coin"] = current
+    st.session_state["strategy_arena_coin"] = current
+    selected = st.selectbox("Strategy Arena Coin", available, index=available.index(current), key="strategy_arena_coin")
+    st.session_state["selected_coin"] = selected
     st.markdown(f'<div class="hud-header"><div class="hud-title">Strategy Arena</div><div class="hud-subtitle">{_html(selected)} · chart first, analyst debate below.</div></div>', unsafe_allow_html=True)
     chart_choice = st.radio("Chart source", ["Bot overlay chart", "TradingView visual chart"], horizontal=True, key=f"chart_source_{selected}")
     if chart_choice == "TradingView visual chart":
@@ -1021,6 +1129,16 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         st.warning("WebSocket/top-of-book freshness is not healthy. The bot may shadow valid setups as stale_market_data until top-of-book refresh is repaired.")
     if readiness.get("safe_to_run_overnight") is False:
         st.warning("safe_to_run_overnight is false. Check websocket freshness, duplicate process status, writable logs, and risk pause status before unattended running.")
+
+    explanations = readiness.get("readiness_explanation") or []
+    if explanations:
+        st.warning("System readiness notes:")
+        for item in explanations:
+            st.write(f"- {item}")
+
+    coin_count = len((snapshot.get("coins") or {}))
+    if coin_count == 0:
+        st.info("viewer_snapshot.json currently has zero coins. The viewer is using CSV fallback data from market.csv, council_decisions.csv, council_votes.csv, and position_targets.csv until the bot publishes a full snapshot.")
 
     st.markdown("### Why no live trades yet?")
     latest_decisions = decisions_df.copy()

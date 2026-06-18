@@ -12267,11 +12267,17 @@ class TradingBot:
             expected_utility_bps = float(candidate.get("expected_utility_bps", 0.0) or 0.0)
             walk_forward_penalty_bps = float(candidate.get("walk_forward_penalty_bps", 0.0) or 0.0)
             if walk_forward_penalty_bps >= 55.0:
-                return False, (
-                    f"live_buy_shadowed:walk_forward_validation_failed "
+                wf_reason = (
+                    f"walk_forward_validation_weak "
                     f"walk_forward_penalty_bps={walk_forward_penalty_bps:.2f};"
                     f"reason={candidate.get('walk_forward_reason', '')}"
                 )
+
+                if profit_first:
+                    add_profit_first_warning(wf_reason)
+                    candidate["walk_forward_live_warning"] = wf_reason
+                else:
+                    return False, f"live_buy_shadowed:{wf_reason}"
             maker_adjusted_ev_bps = float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0)
             maker_fill_probability = float(candidate.get("maker_fill_probability", 0.0) or 0.0)
             wait_utility_bps = float(candidate.get("wait_utility_bps", 0.0) or 0.0)
@@ -14197,6 +14203,15 @@ class TradingBot:
             and status.get("sqlite_writable")
             and status.get("no_duplicate_process")
         )
+        status["readiness_explanation"] = []
+        if not status.get("viewer_snapshot_recent"):
+            status["readiness_explanation"].append("viewer snapshot is stale or startup placeholder is active")
+        if not status.get("websocket_recent"):
+            status["readiness_explanation"].append("top-of-book data is not fresh enough yet")
+        if not status.get("market_csv_recent"):
+            status["readiness_explanation"].append("market.csv has not been refreshed recently")
+        if not status.get("safe_to_run_overnight"):
+            status["readiness_explanation"].append("overnight mode remains disabled until snapshot, market, council, fee, file, and top-of-book checks are all fresh")
         return status
 
 
@@ -19101,6 +19116,46 @@ class TradingBot:
 
 
     def _write_startup_viewer_snapshot(self, reason: str = "bot_starting") -> None:
+        try:
+            if os.path.exists(VIEWER_SNAPSHOT_PATH):
+                with open(VIEWER_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+                    old_snapshot = json.load(f)
+
+                old_coins = old_snapshot.get("coins", {}) or {}
+                old_updated_ts = float(old_snapshot.get("updated_ts", 0.0) or 0.0)
+                old_age = max(0.0, now_ts() - old_updated_ts)
+
+                if old_coins and old_age <= 300.0:
+                    old_snapshot["readiness"] = dict(old_snapshot.get("readiness", {}) or {})
+                    old_snapshot["readiness"]["startup_state"] = reason
+                    old_snapshot["readiness"]["bot_restarting"] = True
+                    old_snapshot["readiness"]["startup_placeholder_preserved_previous_coins"] = True
+                    old_snapshot["updated_ts"] = now_ts()
+
+                    self._write_viewer_snapshot(old_snapshot)
+
+                    module_debug(
+                        MODULE_NAME,
+                        "startup_snapshot_preserved_previous_full_snapshot",
+                        data={
+                            "reason": reason,
+                            "old_coin_count": len(old_coins),
+                            "old_age_sec": old_age,
+                        },
+                        level="INFO",
+                        also_overall=True,
+                    )
+                    return
+
+        except Exception as exc:
+            module_exception(
+                MODULE_NAME,
+                "startup_snapshot_preserve_previous_failed",
+                exc,
+                data={"traceback": traceback.format_exc()},
+                also_overall=False,
+            )
+
         snapshot = {
             "updated_ts": time.time(),
             "coins": {},

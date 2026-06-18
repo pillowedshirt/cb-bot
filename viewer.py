@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import time
@@ -5,6 +6,7 @@ import traceback
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict
+from urllib.parse import quote, unquote
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -114,7 +116,22 @@ def inject_crypto_game_css() -> None:
 .pill-value { color: #e8fbff; font-size: 1.05rem; font-weight: 800; }
 .arena-grid { display: grid; grid-template-columns: 1.05fr 1.95fr; gap: 0.85rem; margin-bottom: 1rem; }
 .chief-card { border: 1px solid rgba(0, 255, 194, 0.35); border-radius: 20px; padding: 1rem; background: linear-gradient(180deg, rgba(0, 73, 92, 0.44), rgba(6, 13, 24, 0.94)); }
-.agent-card { border: 1px solid rgba(80, 220, 255, 0.20); border-radius: 16px; padding: 0.78rem; background: rgba(7, 18, 32, 0.92); min-height: 145px; }
+.agent-card {
+    border: 1px solid rgba(80, 220, 255, 0.20);
+    border-radius: 16px;
+    padding: 0.85rem;
+    background: rgba(7, 18, 32, 0.92);
+    height: 260px;
+    min-height: 260px;
+    max-height: 260px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+}
+.agent-card .agent-title { font-weight: 900; margin-bottom: 0.35rem; }
+.agent-card .agent-summary { flex: 1; overflow: hidden; color: #8db7c8; font-size: 0.88rem; line-height: 1.22rem; }
+.agent-card .agent-metrics { margin-top: 0.45rem; font-size: 0.85rem; }
 .agent-card-buy { border-color: rgba(0, 255, 160, 0.45); } .agent-card-sell { border-color: rgba(255, 87, 116, 0.45); } .agent-card-hold { border-color: rgba(255, 214, 102, 0.42); } .agent-card-wait { border-color: rgba(135, 159, 180, 0.38); }
 .inquiry-panel { border: 1px solid rgba(0, 255, 194, 0.25); border-radius: 18px; padding: 1rem; background: rgba(3, 22, 30, 0.88); margin-top: 0.8rem; }
 .codex-panel { border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; padding: 1rem; background: rgba(5, 13, 24, 0.92); }
@@ -127,7 +144,20 @@ div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid r
 .screen-section.debug-health { min-height: auto; }
 .screen-card { border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 22px; padding: 1rem; background: linear-gradient(180deg, rgba(7, 22, 39, 0.94), rgba(4, 9, 18, 0.97)); box-shadow: 0 0 28px rgba(0, 180, 255, 0.08); margin-bottom: 1rem; }
 .overview-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; }
-.coin-overview-card { border: 1px solid rgba(80, 220, 255, 0.20); border-radius: 18px; padding: 0.8rem; background: rgba(6, 18, 32, 0.90); }
+.coin-overview-card {
+    position: relative;
+    border: 1px solid rgba(80, 220, 255, 0.20);
+    border-radius: 18px;
+    padding: 0.8rem;
+    background: rgba(6, 18, 32, 0.90);
+    min-height: 285px;
+    transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+.coin-overview-card:hover { transform: translateY(-2px); border-color: rgba(57, 245, 163, 0.65); box-shadow: 0 0 24px rgba(57, 245, 163, 0.10); }
+.clickable-coin-card { cursor: pointer; }
+.coin-card-hitbox { position: absolute; inset: 0; z-index: 8; border-radius: 18px; background: rgba(255, 255, 255, 0); text-decoration: none; }
+.coin-card-hitbox:hover { background: rgba(57, 245, 163, 0.035); }
+.tv-chart-shell { width: 100%; height: 900px; min-height: 900px; border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 18px; overflow: hidden; background: #0b0f14; }
 .coin-overview-card.buy { border-color: rgba(0, 255, 160, 0.48); }
 .coin-overview-card.shadow { border-color: rgba(255, 214, 102, 0.45); }
 .coin-overview-card.wait { border-color: rgba(135, 159, 180, 0.38); }
@@ -216,14 +246,16 @@ def freshness_class(age_sec: float, warn: float, danger: float) -> str:
 
 
 def get_refresh_config() -> dict:
-    with st.sidebar:
-        st.markdown("### Live Data")
-        live_enabled = st.toggle("Live update data", value=True)
-        interval_label = st.selectbox("Update interval", ["1s", "2s", "3s", "5s", "10s", "15s", "30s"], index=1)
-        if st.button("Refresh data now"):
-            st.cache_data.clear()
-            st.session_state["_manual_refresh_tick"] = int(st.session_state.get("_manual_refresh_tick", 0)) + 1
-    return {"live_enabled": live_enabled, "interval_label": interval_label, "manual_tick": int(st.session_state.get("_manual_refresh_tick", 0)), "fragment_supported": callable(getattr(st, "fragment", None))}
+    """
+    Viewer refresh is intentionally automatic and hidden.
+    Keep the UI clean by removing the manual live-data settings.
+    """
+    return {
+        "live_enabled": True,
+        "interval_label": "2s",
+        "manual_tick": int(st.session_state.get("_manual_refresh_tick", 0)),
+        "fragment_supported": callable(getattr(st, "fragment", None)),
+    }
 
 
 def run_every_value(refresh_config: dict):
@@ -268,10 +300,39 @@ def normalize_timeframe_label(label: str) -> str:
 
 
 def render_overlay_controls():
-    defaults={"volume":True,"confirmed_trades":True,"shadow_trades":True,"profile":True,"prior_profile":True,"average_entry":True,"targets":True,"vwap":True,"structure":False,"level8_markers":True}
-    labels={"volume":"Volume","confirmed_trades":"Confirmed buys/sells","shadow_trades":"Shadow trades","profile":"POC / VAH / VAL","prior_profile":"Prior-session POC/VAH/VAL","average_entry":"Average entry","targets":"Targets/sell plan","vwap":"VWAP / anchored VWAP","structure":"Trend / structure lines","level8_markers":"Level 8 action markers"}
-    with st.expander("Chart overlays", expanded=False):
-        return {k: st.checkbox(labels[k], value=v, key=f"overlay_{k}") for k,v in defaults.items()}
+    defaults = {
+        "volume": True,
+        "confirmed_trades": True,
+        "shadow_trades": True,
+        "profile": True,
+        "prior_profile": True,
+        "average_entry": True,
+        "targets": True,
+        "vwap": True,
+        "structure": False,
+        "level8_markers": True,
+    }
+    labels = {
+        "volume": "Volume bars",
+        "confirmed_trades": "Confirmed live buys/sells",
+        "shadow_trades": "Shadow trades",
+        "profile": "POC / VAH / VAL",
+        "prior_profile": "Prior-session POC / VAH / VAL",
+        "average_entry": "Average entry",
+        "targets": "Target buy / target sell / stop / min-profitable exit",
+        "vwap": "VWAP / anchored VWAP",
+        "structure": "Trend / structure / liquidity lines",
+        "level8_markers": "Level 8 action markers",
+    }
+
+    with st.expander("Chart overlays", expanded=True):
+        st.caption("Toggle every line or marker the bot can display on the chart.")
+        cols = st.columns(2)
+        toggles = {}
+        for idx, (key, default) in enumerate(defaults.items()):
+            with cols[idx % 2]:
+                toggles[key] = st.checkbox(labels[key], value=default, key=f"overlay_{key}")
+        return toggles
 
 
 def render_held_positions(snapshot: Dict[str, Any]) -> None:
@@ -439,12 +500,51 @@ def agent_title_icon(agent): return AGENT_TITLES.get(str(agent), AGENT_TITLES["f
 
 def plain_reason(reason: Any) -> str:
     r=str(reason or ""); low=r.lower(); parts=[]
-    mapping=[("inside_value_area","Price is inside the value area, so this analyst is cautious about chasing."),("near_poc","Price is near the point of control, where chop is more likely."),("low_volume_node","Price may move faster through a low-volume area."),("stale_market_data","The bot does not trust the quote age enough for live trading."),("expected_utility_too_low","The projected reward is not strong enough after costs."),("probability_below","The probability model wants stronger odds before entry."),("spread","Spread and fees are reducing the net edge."),("fee","Spread and fees are reducing the net edge.")]
+    mapping=[("entry_mode=no_position","The bot is evaluating a new entry because it does not currently hold this coin."),("sell_score","Sell pressure is being used as a warning against buying, not necessarily as an instruction to sell."),("map_to_avoid_buy","That signal maps to avoiding a new buy right now."),("ev_below_calibrated_target","Expected value is below the coin’s calibrated target."),("score_below_calibrated_target","The live score is below the coin’s calibrated buy target."),("inside_value_area","Price is inside the value area, so this analyst is cautious about chasing."),("near_poc","Price is near the point of control, where chop is more likely."),("low_volume_node","Price may move faster through a low-volume area."),("stale_market_data","The bot does not trust the quote age enough for live trading."),("expected_utility_too_low","The projected reward is not strong enough after costs."),("probability_below","The probability model wants stronger odds before entry."),("spread","Spread and fees are reducing the net edge."),("fee","Spread and fees are reducing the net edge.")]
     for key, text in mapping:
         if key in low and text not in parts: parts.append(text)
     return " ".join(parts) or (r[:220] if r else "No reason text was published for this row.")
 
 
+
+
+def agent_plain_summary(row: dict) -> str:
+    reason = str(row.get("reason", "") or "")
+    low = reason.lower()
+    leaning = vote_leaning(row)
+    summaries = []
+    if "entry_mode=no_position" in low or "no position" in low:
+        summaries.append("This analyst is evaluating a fresh entry because the bot does not currently hold this coin.")
+    if "sell_score" in low and "map_to_avoid_buy" in low:
+        summaries.append("The sell pressure is being interpreted as a reason to avoid buying right now, not as an instruction to sell.")
+    if "expected_utility_too_low" in low:
+        summaries.append("The setup may look active, but the projected reward is not strong enough after fees, spread, uncertainty, and context penalties.")
+    if "inside_value" in low or "inside_value_area" in low:
+        summaries.append("Price is inside the main value area, where chop is more likely and breakout trades need stronger confirmation.")
+    if "near_poc" in low or "poc_distance" in low:
+        summaries.append("Price is near the point of control, which often means the market is balanced instead of clearly trending.")
+    if "high_volume_node" in low:
+        summaries.append("Price is sitting in a dense volume zone, so movement may be slower and harder to scalp cleanly.")
+    if "low_volume_node" in low or "lvn" in low:
+        summaries.append("A nearby low-volume area may create a faster move if price breaks into it cleanly.")
+    if "score_below_calibrated_target" in low:
+        summaries.append("The live score is below this coin’s calibrated buy target.")
+    if "probability_below_calibrated_target" in low:
+        summaries.append("The probability model wants stronger odds before risking live money.")
+    if "ev_below_calibrated_target" in low:
+        summaries.append("The expected value is below the calibrated target for this coin.")
+    if "spread" in low:
+        summaries.append("Spread and execution cost are reducing the quality of the entry.")
+    if "maker_adjusted_ev_too_low" in low:
+        summaries.append("The maker-adjusted edge is too low, so even a limit-order-first entry does not look attractive enough.")
+    if "buy_vs_wait" in low:
+        summaries.append("The bot thinks waiting may be better than buying immediately.")
+    if not summaries:
+        if leaning == "BUY": summaries.append("This analyst sees enough evidence to support a buy, but Level 8 still weighs it against fees, utility, and other agents.")
+        elif leaning == "SELL": summaries.append("This analyst sees downside or exit pressure and is not supporting a new buy.")
+        elif leaning == "HOLD": summaries.append("This analyst sees a reason to stay patient rather than force an entry.")
+        else: summaries.append("This analyst is waiting for cleaner confirmation before supporting live execution.")
+    return " ".join(summaries[:2])
 
 
 def set_selected_coin(product_id: str) -> None:
@@ -454,6 +554,22 @@ def set_selected_coin(product_id: str) -> None:
     st.session_state["selected_coin"] = product_id
     st.session_state["strategy_arena_coin"] = product_id
     st.session_state["_scroll_to_strategy_arena"] = True
+
+
+def apply_query_selected_coin(snapshot: Dict[str, Any]) -> None:
+    """Reads ?coin=PRODUCT and applies it to the Strategy Arena selection."""
+    try:
+        available = get_available_products(snapshot)
+        raw_coin = st.query_params.get("coin", None)
+        if isinstance(raw_coin, list):
+            raw_coin = raw_coin[0] if raw_coin else None
+        selected = unquote(str(raw_coin or "")).strip()
+        if selected and selected in available:
+            st.session_state["selected_coin"] = selected
+            st.session_state["strategy_arena_coin"] = selected
+            st.session_state["_scroll_to_strategy_arena"] = True
+    except Exception as exc:
+        module_exception(MODULE_NAME, "apply_query_selected_coin_failed", exc, also_overall=False)
 
 
 def scroll_to_strategy_arena_if_requested() -> None:
@@ -610,8 +726,11 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
             product_id = str(row.get("product_id") or "")
             card_state = ("buy" if row.get("action") == "BUY" else "shadow" if "SHADOW" in str(row.get("action") or "") else "blocked" if row.get("blocker") else "wait")
             with col:
+                encoded_coin = quote(product_id, safe="")
+                card_href = f"?coin={encoded_coin}#strategy-arena-anchor"
                 st.markdown(f'''
-                    <div class="coin-overview-card {card_state}">
+                    <div class="coin-overview-card {card_state} clickable-coin-card">
+                        <a class="coin-card-hitbox" href="{card_href}" aria-label="Open {html.escape(product_id)} in Strategy Arena"></a>
                         <div style="font-size:1.25rem;font-weight:900;"><span class="rank-badge">#{row["rank"]}</span>{_html(product_id)}</div>
                         <div class="viability-score">Viability {row["viability_score"]:.1f}</div>
                         <div class="viability-reason">{_html(row["viability_reason"])}</div>
@@ -624,8 +743,6 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
                         <div class="muted">Blocker: {_html(row["blocker"][:160] or "No blocker published.")}</div>
                     </div>
                     ''', unsafe_allow_html=True)
-                if st.button(f"Open {product_id} in Strategy Arena", key=f"open_coin_{product_id}", use_container_width=True):
-                    set_selected_coin(product_id)
     with st.expander("All-coin sortable table", expanded=False):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -635,8 +752,34 @@ def tradingview_symbol(product_id: str) -> str:
 
 def render_tradingview_chart(product_id: str) -> None:
     symbol = tradingview_symbol(product_id)
-    html = f'''<div class="tradingview-widget-container" style="height:860px;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>{{"autosize": true, "symbol": "{symbol}", "interval": "15", "timezone": "Etc/UTC", "theme": "dark", "style": "1", "locale": "en", "allow_symbol_change": false, "hide_side_toolbar": false, "hide_top_toolbar": false, "hide_legend": false, "hide_volume": false, "calendar": false, "support_host": "https://www.tradingview.com"}}</script></div>'''
-    components.html(html, height=900, scrolling=False)
+
+    html_block = f'''
+    <div class="tv-chart-shell">
+        <div class="tradingview-widget-container" style="height:100%;width:100%;">
+            <div class="tradingview-widget-container__widget" style="height:100%;width:100%;"></div>
+            <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
+            {{
+                "autosize": true,
+                "symbol": "{symbol}",
+                "interval": "15",
+                "timezone": "Etc/UTC",
+                "theme": "dark",
+                "style": "1",
+                "locale": "en",
+                "allow_symbol_change": false,
+                "hide_side_toolbar": false,
+                "hide_top_toolbar": false,
+                "hide_legend": false,
+                "hide_volume": false,
+                "calendar": false,
+                "support_host": "https://www.tradingview.com"
+            }}
+            </script>
+        </div>
+    </div>
+    '''
+
+    components.html(html_block, height=930, scrolling=False)
 
 
 def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, decision_row: dict, votes: pd.DataFrame):
@@ -670,7 +813,23 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
         cols = st.columns(3)
         for col, row in zip(cols, rows[i:i + 3]):
             agent = str(row.get("agent", "fallback")); leaning = vote_leaning(row).lower()
-            with col: st.markdown(f'''<div class="agent-card agent-card-{leaning}"><b>{_html(agent_title_icon(agent))}</b><br>Leaning: <b>{leaning.upper()}</b><br>Confidence: <b>{_safe_float(row.get("confidence")):.3f}</b><br>Strongest score: <b>{strongest_vote_score(row):.3f}</b><br><span class="muted">{_html(plain_reason(row.get("reason", "")))}</span></div>''', unsafe_allow_html=True)
+            with col:
+                st.markdown(
+                    f'''
+                    <div class="agent-card agent-card-{leaning}">
+                        <div class="agent-title">{_html(agent_title_icon(agent))}</div>
+                        <div class="agent-metrics">
+                            Leaning: <b>{leaning.upper()}</b><br>
+                            Confidence: <b>{_safe_float(row.get("confidence")):.3f}</b><br>
+                            Strongest score: <b>{strongest_vote_score(row):.3f}</b>
+                        </div>
+                        <div class="agent-summary">
+                            {_html(agent_plain_summary(row))}
+                        </div>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True,
+                )
     if focused: render_agent_detail_panel(focused, votes)
 
 
@@ -692,7 +851,7 @@ def render_learning_console(selected_coin, votes, decisions_df, market_df, snaps
     render_topic_explanation(topic, selected_coin, votes, decisions_df, market_df, snapshot)
 
 
-def render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
+def render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
     available = get_available_products(snapshot)
     if available:
         current = st.session_state.get("selected_coin", available[0])
@@ -712,7 +871,7 @@ def render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, 
         fig = build_coin_chart(chart_df, chart_meta, dict((snapshot.get("coins") or {}).get(selected, {}) or {}), market_df, confirmed, shadow_df, decisions_df, target, overlays, full_chart=True)
         st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{selected}_{timeframe}", config={"displayModeBar": True, "scrollZoom": True, "responsive": True})
     latest_decision_id, drow, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected)
-    render_agent_debate_stream(selected, latest_decision_id, drow, votes); render_agent_roster_no_buttons(selected, votes); render_learning_console(selected, votes, decisions_df, market_df, snapshot)
+    render_agent_debate_stream(selected, latest_decision_id, drow, votes); render_agent_roster_no_buttons(selected, votes)
 
 
 def explain_current_trade_state(blocker: str, decision: dict, market: dict) -> str:
@@ -768,6 +927,47 @@ def build_watch_items(selected_coin: str, coin: dict, market: dict, decision: di
     return {"main_watch": main_watch, "chart_watch": chart_watch, "order_book_watch": order_book_watch, "target_watch": target_watch}
 
 
+def render_chart_overlay_guide() -> None:
+    st.markdown('''
+        <div class="screen-card"><h2>Chart Overlay Guide</h2><div class="context-grid">
+            <div class="context-card"><h3>POC / VAH / VAL</h3><p>POC is the price where the most volume traded. VAH and VAL mark the upper and lower edges of the value area. The bot watches these to decide whether price is balanced, breaking out, or rejecting value.</p></div>
+            <div class="context-card"><h3>Prior Session POC / VAH / VAL</h3><p>These are yesterday or prior-session value levels. They help the bot judge whether today’s price is accepting above, rejecting from, or reclaiming older value.</p></div>
+            <div class="context-card"><h3>Anchored VWAP</h3><p>Anchored VWAP estimates the average traded price from a chosen anchor window. Price above it can show buyers in control; price below it can show weaker demand.</p></div>
+            <div class="context-card"><h3>Average Entry / Targets / Stop</h3><p>Average entry, target sell, stop, and min-profitable-exit lines are position-management levels. They matter after a live entry and keep exits fee-aware.</p></div>
+            <div class="context-card"><h3>Shadow Trades</h3><p>Shadow trades are simulated learning decisions. They show where Level 8 wanted to learn from a setup without risking live money.</p></div>
+            <div class="context-card"><h3>Level 8 Markers</h3><p>Level 8 markers show major strategy decisions. They help you connect the chart to what the council decided at that moment.</p></div>
+        </div></div>
+    ''', unsafe_allow_html=True)
+
+
+def render_setup_type_guide(selected_coin: str, market: dict, decision: dict, votes: pd.DataFrame) -> None:
+    reason_blob = " ".join([
+        str(market.get("buy_gate_blocker", "")),
+        str(decision.get("reason", "")),
+        " ".join(votes["reason"].astype(str).tail(25).tolist()) if not votes.empty and "reason" in votes.columns else "",
+    ]).lower()
+    setup_notes = []
+    if "sweep" in reason_blob or "reclaim" in reason_blob:
+        setup_notes.append(("Sweep + Reclaim", "The bot is watching for price to sweep liquidity, reclaim a level, and then hold above it. This can indicate a reversal attempt."))
+    if "breakout" in reason_blob or "accepted_above" in reason_blob:
+        setup_notes.append(("Acceptance Breakout", "The bot is watching for price to accept above value instead of rejecting back inside. This is cleaner when spread is tight and utility is positive."))
+    if "range_chop" in reason_blob or "inside_value" in reason_blob:
+        setup_notes.append(("Range / Chop Avoidance", "The bot sees a balanced market. It may avoid buying because the move can stall near POC or high-volume nodes."))
+    if "low_volume_node" in reason_blob or "lvn" in reason_blob:
+        setup_notes.append(("Low-Volume Path", "The bot is watching whether price can move through a low-volume zone quickly. This can create better upside if confirmation is strong."))
+    if "mean_reversion" in reason_blob or "reversion" in reason_blob:
+        setup_notes.append(("Mean Reversion", "The bot is watching whether price has stretched too far and may snap back toward fair value."))
+    if "expected_utility_too_low" in reason_blob:
+        setup_notes.append(("Utility Filter", "The main issue is not that nothing is happening. The issue is that the projected reward is negative after fees, spread, uncertainty, and context penalties."))
+    if not setup_notes:
+        setup_notes.append(("Current Focus", "The bot is waiting for a cleaner setup with positive expected utility, stronger score/probability alignment, and acceptable execution cost."))
+    html_parts = ['<div class="screen-card"><h2>Common Setup Types Being Monitored</h2><div class="context-grid">']
+    for title, body in setup_notes[:6]:
+        html_parts.append(f'<div class="context-card"><h3>{_html(title)}</h3><p>{_html(body)}</p></div>')
+    html_parts.append('</div></div>')
+    st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+
 def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df):
     selected_coin = st.session_state.get("selected_coin", selected)
     coin = dict((snapshot.get("coins", {}) or {}).get(selected_coin, {}) or {})
@@ -790,6 +990,8 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
     st.markdown(f'''<div class="context-card"><h3>3. Order Book + Fees</h3><b>Spread:</b> {_safe_float(market.get("spread_bps")):.2f} bps<br><b>Bid depth:</b> {_safe_float(order_book.get("bid_depth_usd")):.2f}<br><b>Ask depth:</b> {_safe_float(order_book.get("ask_depth_usd")):.2f}<br><b>Imbalance:</b> {_safe_float(order_book.get("imbalance")):.3f}<br><b>Liquidity risk:</b> {_safe_float(order_book.get("liquidity_risk_score")):.3f}<div class="watch-list"><b>Watch next:</b><br>{_html(watch_items.get("order_book_watch", "Wait for tighter spread and healthier bid/ask depth."))}</div></div>''', unsafe_allow_html=True)
     st.markdown(f'''<div class="context-card"><h3>4. Targets + Sell Plan</h3><b>Has position:</b> {_html(target.get("has_position", False))}<br><b>Average entry:</b> {_safe_float(target.get("avg_entry_price")):.8f}<br><b>Min profitable exit:</b> {_safe_float(target.get("min_profitable_exit_price")):.8f}<br><b>Scalp target:</b> {_safe_float(target.get("scalp_target_price")):.8f}<br><b>Core target:</b> {_safe_float(target.get("core_target_price")):.8f}<div class="watch-list"><b>Watch next:</b><br>{_html(watch_items.get("target_watch", "No live position yet, so target plan is waiting for entry."))}</div></div>''', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+    render_chart_overlay_guide()
+    render_setup_type_guide(selected_coin, market, decision, votes)
     with st.expander("Agent disagreement behind this context", expanded=False):
         render_agent_disagreement_summary(votes)
         display_cols = [c for c in ["agent", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reason"] if c in votes.columns]
@@ -819,17 +1021,40 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         st.warning("WebSocket/top-of-book freshness is not healthy. The bot may shadow valid setups as stale_market_data until top-of-book refresh is repaired.")
     if readiness.get("safe_to_run_overnight") is False:
         st.warning("safe_to_run_overnight is false. Check websocket freshness, duplicate process status, writable logs, and risk pause status before unattended running.")
+
+    st.markdown("### Why no live trades yet?")
+    latest_decisions = decisions_df.copy()
+    if not latest_decisions.empty and "ts" in latest_decisions.columns:
+        latest_decisions["ts_num"] = pd.to_numeric(latest_decisions["ts"], errors="coerce")
+        latest_decisions = latest_decisions.sort_values("ts_num").groupby("product_id").tail(1) if "product_id" in latest_decisions.columns else latest_decisions.sort_values("ts_num").tail(20)
+    if latest_decisions.empty:
+        st.info("No Level 8 decisions are published yet.")
+    else:
+        actions = latest_decisions["action"].astype(str).value_counts().to_dict() if "action" in latest_decisions.columns else {}
+        reasons_blob = " ".join(latest_decisions.get("reason", pd.Series(dtype=str)).fillna("").astype(str).tolist()).lower()
+        counts = {
+            "expected_utility_too_low": reasons_blob.count("expected_utility_too_low"),
+            "maker_adjusted_ev_too_low": reasons_blob.count("maker_adjusted_ev_too_low"),
+            "buy_does_not_beat_wait": reasons_blob.count("buy_does_not_beat_wait"),
+            "score_below_target": reasons_blob.count("score_below"),
+            "probability_below_target": reasons_blob.count("probability_below"),
+        }
+        st.write(f"Latest action counts: {actions}")
+        st.write(f"Latest blocker counts: {counts}")
+        if counts["expected_utility_too_low"] > 0:
+            st.warning("The main reason no trades are firing is expected_utility_too_low. That means Level 8 thinks the setup does not make enough net profit after Coinbase fees, spread, uncertainty, wait utility, and context penalties.")
+
     st.json(readiness)
     for name, df in [("trades", trades_df), ("orders", orders_df), ("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df)]:
         with st.expander(name, expanded=False):
             st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
 
-def render_live_dashboard(selected, timeframe, overlays, full_chart, refresh_config):
+def render_live_dashboard(selected, timeframe, overlays, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": timeframe, "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
     snapshot = load_viewer_snapshot(); market_df = load_csv(MARKET_CSV_PATH); decisions_df = load_csv(COUNCIL_DECISIONS_PATH); council_votes_df = load_csv(COUNCIL_VOTES_CSV_PATH); targets_df = load_csv(POSITION_TARGETS_PATH); trades_df = load_csv(TRADES_CSV_PATH); orders_df = load_csv(ORDERS_CSV_PATH); shadow_df = load_csv(SHADOW_TRADES_CSV_PATH); order_book_df = load_csv(ORDER_BOOK_SNAPSHOTS_PATH)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, full_chart, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, timeframe, overlays, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df); st.markdown('</section>', unsafe_allow_html=True)
 
@@ -839,23 +1064,23 @@ def main() -> None:
     refresh_config = get_refresh_config()
     render_crypto_header()
     snapshot_static = load_viewer_snapshot()
+    apply_query_selected_coin(snapshot_static)
     selected = pick_selected_coin(snapshot_static)
     if not selected:
         st.info("Waiting for bot data. Start the bot and wait for viewer_snapshot.json to update.")
         return
     timeframe_label = st.radio("Chart Mode", ["1D · 1m", "7D · 1m", "30D · 15m", "90D · 1h", "2Y · 1d"], horizontal=True, key="chart_timeframe")
     timeframe = normalize_timeframe_label(timeframe_label)
-    full_chart = st.toggle("Full chart mode", value=False)
     overlays = render_overlay_controls()
     run_every = run_every_value(refresh_config)
     if callable(getattr(st, "fragment", None)):
         @st.fragment(run_every=run_every)
         def live_dashboard_fragment():
-            render_live_dashboard(selected, timeframe, overlays, full_chart, refresh_config)
+            render_live_dashboard(selected, timeframe, overlays, refresh_config)
         live_dashboard_fragment()
     else:
         st.warning("Subtle auto-refresh needs Streamlit 1.37+. Manual refresh still works.")
-        render_live_dashboard(selected, timeframe, overlays, full_chart, refresh_config)
+        render_live_dashboard(selected, timeframe, overlays, refresh_config)
 
 
 if __name__ == "__main__":

@@ -103,10 +103,14 @@ try:
         process_worker_output_summary,
         run_full_replay_worker_job,
     )
-except Exception:
+    HISTORICAL_REPLAY_WORKER_IMPORT_OK = True
+    HISTORICAL_REPLAY_WORKER_IMPORT_ERROR = ""
+except Exception as _worker_import_exc:
     worker_health_check = None
     process_worker_output_summary = None
     run_full_replay_worker_job = None
+    HISTORICAL_REPLAY_WORKER_IMPORT_OK = False
+    HISTORICAL_REPLAY_WORKER_IMPORT_ERROR = str(_worker_import_exc)
 
 try:
     from ai_brain import LocalAIBrain, FEATURE_COLUMNS as AI_FEATURE_COLUMNS
@@ -6091,6 +6095,8 @@ class TradingBot:
         self.rest = rest
         self.api_key = api_key
         self.pem_secret = pem_secret
+        self._bot_boot_ts = now_ts()
+        self._calculation_started_ts = self._bot_boot_ts
 
         # Capture pre-existing runtime state before logger constructors create
         # header-only CSV files or current-run rows.
@@ -6169,6 +6175,17 @@ class TradingBot:
             self._ensure_historical_replay_manifest()
         except Exception as exc:
             module_exception(MODULE_NAME, "ensure_historical_replay_manifest_init_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+        module_debug(
+            MODULE_NAME,
+            "historical_replay_worker_import_health",
+            data={
+                "worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK),
+                "worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR),
+                "run_full_replay_worker_available": run_full_replay_worker_job is not None,
+            },
+            level="INFO" if HISTORICAL_REPLAY_WORKER_IMPORT_OK else "ERROR",
+            also_overall=True,
+        )
         if bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL):
             try:
                 self._historical_worker_pool = ProcessPoolExecutor(max_workers=int(HISTORICAL_REPLAY_PROCESS_WORKERS))
@@ -14669,6 +14686,9 @@ class TradingBot:
         status["historical_replay_parallel_startup_enabled"] = bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED)
         status["historical_replay_startup_parallel_jobs"] = int(HIST_REPLAY_STARTUP_PARALLEL_JOBS)
         status["historical_replay_max_parallel_fetches"] = int(HIST_REPLAY_MAX_PARALLEL_FETCHES)
+        status["historical_replay_worker_import_ok"] = bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK)
+        status["historical_replay_worker_import_error"] = str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR)
+        status["run_full_replay_worker_available"] = bool(run_full_replay_worker_job is not None)
         status.update({"extended_chart_cache_running": bool(getattr(self, "_extended_chart_cache_running", False)), "last_extended_chart_refresh_ts": float(getattr(self, "_last_extended_chart_refresh_ts", 0.0) or 0.0), "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v), "product_count": len(PRODUCTS), "micro_history_ready": bool(getattr(self, "_micro_history_ready", False)), "macro_ready": bool(getattr(self, "_macro_ready", False)), "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False)), "top_of_book_keeper_running": bool(getattr(self, "_top_of_book_keeper_running", False)), "last_tob_keeper_cycle_ts": float(getattr(self, "_last_tob_keeper_cycle_ts", 0.0) or 0.0)})
         try:
             tob_ages = []
@@ -16248,6 +16268,30 @@ class TradingBot:
         except Exception:
             return set()
 
+    def _master_replay_row_count_for_job(self, product_id: str, timeframe: str) -> int:
+        try:
+            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=300000)
+            if frame.empty or "product_id" not in frame.columns or "timeframe" not in frame.columns:
+                return 0
+            sub = frame[
+                frame["product_id"].astype(str).eq(str(product_id))
+                & frame["timeframe"].astype(str).eq(str(timeframe))
+            ]
+            return int(len(sub))
+        except Exception:
+            return 0
+
+    def _job_already_satisfied_in_master(self, product_id: str, timeframe: str) -> Tuple[bool, str, int]:
+        rows = self._master_replay_row_count_for_job(product_id, timeframe)
+        if timeframe == "primary_15m_90d":
+            required = int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)
+        elif timeframe == "regime_1h_365d":
+            required = int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)
+        else:
+            required = 120
+        ok = rows >= max(1, required)
+        return bool(ok), f"master_replay_rows={rows};required={required}", int(rows)
+
     def _read_worker_output_rows(self, output_path: str) -> List[Dict[str, Any]]:
         try:
             if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
@@ -17108,6 +17152,35 @@ class TradingBot:
         timeframe = str(job.get("timeframe") or "")
         job_id = str(job.get("job_id") or safe_job_id(product_id, timeframe))
         output_path = str(job.get("output_path") or self._worker_output_path_for_job(product_id, timeframe))
+        already_done, already_reason, already_rows = self._job_already_satisfied_in_master(product_id, timeframe)
+        if already_done:
+            async with self._historical_replay_manifest_lock:
+                update_job(
+                    path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH,
+                    job_id=job_id,
+                    updates={
+                        "status": JOB_MERGED,
+                        "started_ts": now_ts(),
+                        "finished_ts": now_ts(),
+                        "merged_ts": now_ts(),
+                        "rows_written": int(already_rows),
+                        "rows_appended_to_master": 0,
+                        "merge_note": "already_satisfied_in_master",
+                        "worker_mode": "process",
+                        "error": "",
+                        "source": "master_csv",
+                    },
+                )
+            return {
+                "ok": True,
+                "worker_mode": "process",
+                "product_id": product_id,
+                "timeframe": timeframe,
+                "rows_written": 0,
+                "rows_existing_in_master": int(already_rows),
+                "reason": already_reason,
+                "already_satisfied_in_master": True,
+            }
         async with self._historical_replay_manifest_lock:
             update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates={"status": JOB_RUNNING, "attempts": int(job.get("attempts", 0) or 0) + 1, "started_ts": now_ts(), "error": "", "output_path": output_path, "worker_mode": "process"})
         try:
@@ -17124,9 +17197,23 @@ class TradingBot:
             result = await loop.run_in_executor(self._historical_worker_pool, run_full_replay_worker_job, payload)
             updates = {"finished_ts": now_ts(), "rows_written": int(result.get("rows_written", 0) or 0), "evaluated": int(result.get("evaluated", 0) or 0), "candle_rows": int(result.get("candles", candle_rows) or 0), "qualified_rows": int(result.get("qualified_rows", 0) or 0), "accepted_rows": int(result.get("accepted_rows", 0) or 0), "avg_net_pnl_bps": float(result.get("avg_net_pnl_bps", 0.0) or 0.0), "median_net_pnl_bps": float(result.get("median_net_pnl_bps", 0.0) or 0.0), "source": source, "output_path": output_path, "worker_mode": "process"}
             if bool(result.get("ok")) and int(result.get("rows_written", 0) or 0) > 0:
-                updates["status"] = JOB_DONE; updates["error"] = ""
+                updates["status"] = JOB_DONE
+                updates["error"] = ""
+            elif bool(result.get("ok")):
+                already_done, already_reason, already_rows = self._job_already_satisfied_in_master(product_id, timeframe)
+                if already_done:
+                    updates["status"] = JOB_MERGED
+                    updates["merged_ts"] = now_ts()
+                    updates["rows_written"] = int(already_rows)
+                    updates["rows_appended_to_master"] = 0
+                    updates["merge_note"] = "worker_wrote_zero_but_master_satisfied"
+                    updates["error"] = ""
+                else:
+                    updates["status"] = JOB_FAILED
+                    updates["error"] = f"process worker wrote zero rows and master not satisfied; {already_reason}"
             else:
-                updates["status"] = JOB_FAILED; updates["error"] = str(result.get("error") or "process worker wrote zero rows")
+                updates["status"] = JOB_FAILED
+                updates["error"] = str(result.get("error") or "process worker failed")
             async with self._historical_replay_manifest_lock:
                 update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates=updates)
             return result
@@ -17546,7 +17633,9 @@ class TradingBot:
             elif phase_totals["replay_calibration_verdicts"] < 1.0: phase_label = "Calculating replay-based product verdicts"
             elif not full_viewer_unlocked: phase_label = "Final readiness checks"
             else: phase_label = "Complete"
-            status = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS)}}
+            calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
+            calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
+            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None)}}
             self._calculation_status_cache = dict(status)
             self._calculation_status_cache_ts = now_ts()
             return status

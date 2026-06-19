@@ -233,6 +233,8 @@ div[data-testid="stMetric"] { background: rgba(6,20,34,.75); border: 1px solid r
 .calibration-title { font-size: 1.7rem; font-weight: 900; margin-bottom: 0.35rem; }
 .calibration-subtitle { color: #8db7c8; margin-bottom: 1rem; }
 .calibration-phase-card { border: 1px solid rgba(80, 220, 255, 0.18); border-radius: 16px; padding: 0.85rem; background: rgba(7, 18, 32, 0.88); margin-bottom: 0.75rem; }
+.calibration-elapsed { max-width: 760px; margin: 0.75rem auto 0.55rem auto; text-align: center; font-size: 1.15rem; font-weight: 900; letter-spacing: 0.03em; color: #d9f5ff; border: 1px solid rgba(80, 220, 255, 0.20); border-radius: 999px; padding: 0.65rem 0.9rem; background: rgba(6, 18, 32, 0.82); box-shadow: 0 0 20px rgba(80, 220, 255, 0.07); }
+.calibration-elapsed span { color: #39f5a3; }
 .calibration-product-table { font-size: 0.9rem; }
 .held-banner {
     max-width: 760px;
@@ -477,6 +479,19 @@ def dataframe_latest_age_sec(frame: pd.DataFrame) -> float:
 def format_age(age_sec: float) -> str:
     age_sec = max(0.0, float(age_sec or 0.0))
     return f"{age_sec:.0f}s" if age_sec < 60 else f"{age_sec / 60.0:.1f}m"
+
+
+def format_elapsed_duration(seconds: float) -> str:
+    try:
+        seconds = max(0, int(float(seconds)))
+    except Exception:
+        seconds = 0
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
 
 
 def freshness_class(age_sec: float, warn: float, danger: float) -> str:
@@ -1795,6 +1810,16 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         f"""<div class=\"calibration-gate\"><div class=\"calibration-title\">Calculating and calibrating</div><div class=\"calibration-subtitle\">The full viewer is locked until every tracked coin has completed backlogs, historical replay, and replay-based calibration verdicts.</div><div class=\"calibration-phase-card\"><b>Current phase:</b> {_html(phase_label)}<br><b>Overall completion:</b> {progress_pct:.1f}%</div></div>""",
         unsafe_allow_html=True,
     )
+    elapsed_sec = float(calc_status.get("calculation_elapsed_sec", 0.0) or 0.0)
+    elapsed_label = format_elapsed_duration(elapsed_sec)
+    st.markdown(
+        f'''
+        <div class="calibration-elapsed">
+            Time elapsed calculating and calibrating: <span>{_html(elapsed_label)}</span>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
     st.progress(progress)
     status_ts = float(calc_status.get("ts", 0.0) or 0.0)
     age_sec = max(0.0, time.time() - status_ts) if status_ts > 0 else 0.0
@@ -1813,11 +1838,15 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     exchange_cols[2].metric("Binance live trading", str(policy.get("binance_live_execution_enabled") or readiness.get("binance_live_execution_enabled")))
     exchange_cols[3].metric("Historical priority", " → ".join(policy.get("historical_source_priority") or readiness.get("historical_source_priority") or []))
     st.markdown("### Startup engine")
-    startup_cols = st.columns(4)
+    startup_cols = st.columns(5)
     startup_cols[0].metric("Parallel replay", str(policy.get("historical_replay_parallel_startup_enabled", False)))
     startup_cols[1].metric("Parallel jobs", int(policy.get("historical_replay_startup_parallel_jobs", 0) or 0))
     startup_cols[2].metric("Parallel fetches", int(policy.get("historical_replay_max_parallel_fetches", 0) or 0))
     startup_cols[3].metric("CPU worker replay", str(policy.get("full_replay_math_in_process_workers", False)))
+    startup_cols[4].metric("Worker import", str(policy.get("historical_replay_worker_import_ok", False)))
+    worker_import_error = str(policy.get("historical_replay_worker_import_error", "") or "")
+    if worker_import_error:
+        st.error(f"CPU worker import error: {worker_import_error}")
     worker_manifest = calc_status.get("historical_replay_worker_manifest", {}) or {}
     if worker_manifest:
         st.markdown("### Replay worker manifest")

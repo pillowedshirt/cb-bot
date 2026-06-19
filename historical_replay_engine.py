@@ -9,7 +9,7 @@ import csv
 import os
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from price_action_context import build_price_action_context
-from session_liquidity import build_session_liquidity_context
+from session_liquidity import build_session_liquidity_signal
 
 TZ = ZoneInfo("America/Phoenix")
 
@@ -220,6 +220,29 @@ def _room_score(mid: float, levels_day: Dict[str, float], levels_week: Dict[str,
     return _clip_score(45.0 + min(55.0, target_bps * 0.20)), f"room_bps={target_bps:.2f}"
 
 
+
+def _to_mapping(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        if is_dataclass(value):
+            return asdict(value)
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "__dict__"):
+            return dict(value.__dict__)
+    except Exception:
+        pass
+    return {}
+
+
+def _map_get(value: Any, key: str, default: Any = None) -> Any:
+    mapping = _to_mapping(value)
+    return mapping.get(key, default)
+
 def _estimate_prob_up(score: float, spread_bps: float, expected_edge_bps: float) -> float:
     raw = 0.50 + (float(score) - 50.0) / 250.0 + float(expected_edge_bps) / 2000.0 - max(0.0, float(spread_bps) - 10.0) / 2000.0
     return max(0.01, min(0.99, raw))
@@ -245,11 +268,29 @@ def _build_worker_signal(*, product_id: str, candles: List[ReplayCandle], weekly
     edge_score = _score_from_bps(expected_net_edge_bps, center_bps=0.0, width_bps=max(35.0, float(config.min_required_net_edge_bps)))
     candle_dicts = [{"ts": c.ts, "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume} for c in candles]
     try:
-        session_liquidity = build_session_liquidity_context(product_id=product_id, minute_candles=candle_dicts, current_price=mid, spread_bps=float(spread_bps), cost_bps=float(cost_bps), projected_forward_gain_bps=float(target_bps))
+        session_liquidity = _to_mapping(
+            build_session_liquidity_signal(
+                product_id=product_id,
+                candles=candle_dicts,
+                current_price=mid,
+                spread_bps=float(spread_bps),
+                cost_bps=float(cost_bps),
+                projected_forward_gain_bps=float(target_bps),
+            )
+        )
     except Exception:
         session_liquidity = {}
     try:
-        price_action_context = build_price_action_context(product_id=product_id, minute_candles=candle_dicts, current_price=mid, spread_bps=float(spread_bps), cost_bps=float(cost_bps), projected_forward_gain_bps=float(target_bps))
+        price_action_context = _to_mapping(
+            build_price_action_context(
+                product_id=product_id,
+                candles=candle_dicts,
+                current_price=mid,
+                spread_bps=float(spread_bps),
+                cost_bps=float(cost_bps),
+                projected_forward_gain_bps=float(target_bps),
+            )
+        )
     except Exception:
         price_action_context = {}
     session_liquidity_score = float(session_liquidity.get("best_buy_score", 0.0) or 0.0)
@@ -262,7 +303,7 @@ def _build_worker_signal(*, product_id: str, candles: List[ReplayCandle], weekly
     price_action_confidence = float(price_action_context.get("candle_context_confidence", 0.0) or 0.0)
     combined_context_bonus = session_liquidity_score * session_liquidity_confidence * 10.0 + price_action_buy_score * price_action_confidence * 10.0 + market_structure_buy_score * 8.0 + volume_profile_buy_score * 8.0
     score = _clip_score(support_score * 0.16 + room_score * 0.18 + momentum_score * 0.20 + range_position_score * 0.12 + edge_score * 0.22 + combined_context_bonus - max(0.0, float(spread_bps) - 6.0) * 0.80 - max(0.0, float(cost_bps) - 50.0) * 0.10)
-    return ReplaySignal(score=score, estimated_prob_up=_estimate_prob_up(score, spread_bps, expected_net_edge_bps), expected_net_edge_bps=expected_net_edge_bps, target_bps=target_bps, cost_bps=cost_bps, spread_bps=spread_bps, session_liquidity_setup=str(session_liquidity.get("best_setup", "")), value_acceptance_state=str(price_action_context.get("value_acceptance_state", "")), volume_node_state=str(price_action_context.get("volume_node_state", "")), poc_distance_bps=float(price_action_context.get("poc_distance_bps", 0.0) or 0.0), volume_profile_leader_buy_score=volume_profile_leader_buy_score, volume_profile_leader_wait_score=volume_profile_leader_wait_score, price_action_buy_score=price_action_buy_score, market_structure_buy_score=market_structure_buy_score, quant_buy_score=float(edge_score / 100.0), structure_state=str(price_action_context.get("structure_state", "")), fvg_state=str(price_action_context.get("fvg_state", "")))
+    return ReplaySignal(score=score, estimated_prob_up=_estimate_prob_up(score, spread_bps, expected_net_edge_bps), expected_net_edge_bps=expected_net_edge_bps, target_bps=target_bps, cost_bps=cost_bps, spread_bps=spread_bps, session_liquidity_setup=str(session_liquidity.get("strongest_setup", session_liquidity.get("best_setup", ""))), value_acceptance_state=str(price_action_context.get("value_acceptance_state", "")), volume_node_state=str(price_action_context.get("volume_node_state", "")), poc_distance_bps=float(price_action_context.get("poc_distance_bps", 0.0) or 0.0), volume_profile_leader_buy_score=volume_profile_leader_buy_score, volume_profile_leader_wait_score=volume_profile_leader_wait_score, price_action_buy_score=price_action_buy_score, market_structure_buy_score=market_structure_buy_score, quant_buy_score=float(edge_score / 100.0), structure_state=str(price_action_context.get("structure_state", "")), fvg_state=str(price_action_context.get("fvg_state", "")))
 
 
 def _qualified_candidate(signal: ReplaySignal, config: ReplayEngineConfig) -> Tuple[bool, str, float]:

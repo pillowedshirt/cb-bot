@@ -57,6 +57,7 @@ SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
 SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
 HISTORICAL_SHADOW_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_summary.csv")
+STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "strategy_variant_replay_summary.csv")
 REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
 EXCHANGE_PRODUCT_MAP_CSV_PATH = os.path.join(BASE_DIR, "exchange_product_map.csv")
 MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
@@ -1831,6 +1832,8 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     cols[2].metric("Blocked by replay", blocked_products)
     cols[3].metric("Still calculating", incomplete_products)
     readiness = calc_status.get("readiness", {}) or {}
+    if calc_status.get("full_viewer_unlocked") and not all([readiness.get("viewer_snapshot_recent"), readiness.get("websocket_recent"), readiness.get("market_csv_recent")]):
+        st.warning("Calculation is complete, but live market data freshness is not perfect. The viewer remains unlocked; check websocket, market.csv, and viewer_snapshot freshness before unattended trading.")
     policy = calc_status.get("policy", {}) or {}
     st.markdown("### Historical data and exchange mode")
     exchange_cols = st.columns(4)
@@ -2116,6 +2119,24 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         with st.expander(name, expanded=False):
             st.dataframe(df.tail(100), width="stretch", hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
 
+
+def render_strategy_variant_replay_panel():
+    df = load_csv_tail(STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH, max_lines=5000)
+    st.markdown("### Strategy Variant Replay Comparison")
+    if df is None or df.empty:
+        st.info("No strategy variant replay summary yet. It will populate after historical worker outputs merge.")
+        return
+    numeric_cols = [c for c in df.columns if c.endswith("_avg_bps") or c.endswith("_win_rate") or c in ["rows", "hard_stop_rate", "profit_pullback_rate", "avg_mfe_bps", "avg_mae_bps"]]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    latest = df.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1)
+    show_cols = [c for c in ["product_id", "timeframe", "strategy_variant", "rows", "coinbase_maker_maker_avg_bps", "coinbase_maker_maker_win_rate", "coinbase_taker_taker_avg_bps", "coinbase_taker_taker_win_rate", "binance_taker_taker_avg_bps", "binance_taker_taker_win_rate", "hard_stop_rate", "profit_pullback_rate", "avg_mfe_bps", "avg_mae_bps"] if c in latest.columns]
+    st.dataframe(latest[show_cols], width="stretch", hide_index=True)
+    if "strategy_variant" in latest.columns:
+        by_variant = latest.groupby("strategy_variant").agg({"rows": "sum", "coinbase_taker_taker_avg_bps": "mean", "coinbase_taker_taker_win_rate": "mean", "binance_taker_taker_avg_bps": "mean", "binance_taker_taker_win_rate": "mean", "hard_stop_rate": "mean"}).reset_index()
+        st.markdown("#### Overall by variant")
+        st.dataframe(by_variant, width="stretch", hide_index=True)
+
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
@@ -2139,6 +2160,8 @@ def render_live_dashboard(selected, refresh_config):
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.expander("Strategy variant replay comparison", expanded=False):
+        render_strategy_variant_replay_panel()
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df); st.markdown('</section>', unsafe_allow_html=True)
 
 

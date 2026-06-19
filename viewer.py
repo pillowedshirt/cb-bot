@@ -1817,6 +1817,16 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     startup_cols[0].metric("Parallel replay", str(policy.get("historical_replay_parallel_startup_enabled", False)))
     startup_cols[1].metric("Parallel jobs", int(policy.get("historical_replay_startup_parallel_jobs", 0) or 0))
     startup_cols[2].metric("Parallel fetches", int(policy.get("historical_replay_max_parallel_fetches", 0) or 0))
+    worker_manifest = calc_status.get("historical_replay_worker_manifest", {}) or {}
+    if worker_manifest:
+        st.markdown("### Replay worker manifest")
+        cols = st.columns(5)
+        cols[0].metric("Worker jobs", int(worker_manifest.get("total_jobs", 0) or 0))
+        cols[1].metric("Merged", int(worker_manifest.get("merged_jobs", 0) or 0))
+        cols[2].metric("Done", int(worker_manifest.get("done_jobs", 0) or 0))
+        cols[3].metric("Running", int(worker_manifest.get("running_jobs", 0) or 0))
+        cols[4].metric("Failed", int(worker_manifest.get("failed_jobs", 0) or 0))
+        st.progress(float(worker_manifest.get("progress", 0.0) or 0.0))
     exchange_map_df = load_csv(EXCHANGE_PRODUCT_MAP_CSV_PATH)
     if exchange_map_df is not None and not exchange_map_df.empty:
         with st.expander("Coinbase ↔ Binance product mapping", expanded=False):
@@ -1833,7 +1843,7 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     if product_status:
         rows = []
         for product_id, status in product_status.items():
-            rows.append({"product_id": product_id, "overall_progress_pct": round(float(status.get("overall_product_progress", 0.0)) * 100.0, 1), "verdict": status.get("verdict", "unknown"), "micro_rows": status.get("micro_rows", 0), "15m_candles": status.get("historical_15m_candle_rows", 0), "1h_candles": status.get("historical_1h_candle_rows", 0), "15m_replay": status.get("primary_15m_90d_rows", 0), "1h_replay": status.get("regime_1h_365d_rows", 0), "qualified_rows": status.get("qualified_rows", 0), "avg_net_bps": round(float(status.get("avg_net_pnl_bps", 0.0)), 2), "complete": bool(status.get("complete")), "live_trade_allowed": bool(status.get("live_trade_allowed")), "reason": status.get("reason", "")})
+            rows.append({"product_id": product_id, "overall_progress_pct": round(float(status.get("overall_product_progress", 0.0)) * 100.0, 1), "verdict": status.get("verdict", "unknown"), "micro_rows": status.get("micro_rows", 0), "15m_candles": status.get("historical_15m_candle_rows", 0), "15m_required": status.get("required_15m_candle_rows", 0), "1h_candles": status.get("historical_1h_candle_rows", 0), "1h_required": status.get("required_1h_candle_rows", 0), "15m_replay": status.get("primary_15m_90d_rows", 0), "1h_replay": status.get("regime_1h_365d_rows", 0), "qualified_rows": status.get("qualified_rows", 0), "avg_net_bps": round(float(status.get("avg_net_pnl_bps", 0.0)), 2), "complete": bool(status.get("complete")), "live_trade_allowed": bool(status.get("live_trade_allowed")), "reason": status.get("reason", "")})
         df = pd.DataFrame(rows).sort_values(["complete", "overall_progress_pct"], ascending=[True, True])
         st.markdown("### Product calculation status")
         st.dataframe(df, width="stretch", hide_index=True)

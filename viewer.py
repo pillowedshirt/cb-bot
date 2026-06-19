@@ -57,6 +57,7 @@ SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
 SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
 HISTORICAL_SHADOW_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_summary.csv")
+EXCHANGE_PRODUCT_MAP_CSV_PATH = os.path.join(BASE_DIR, "exchange_product_map.csv")
 MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
 CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
 CHART_15M_30D_CSV_PATH = os.path.join(BASE_DIR, "chart_15m_30d.csv")
@@ -1803,6 +1804,18 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     cols[1].metric("Profit-ready products", profit_ready_products)
     cols[2].metric("Blocked by replay", blocked_products)
     cols[3].metric("Still calculating", incomplete_products)
+    readiness = calc_status.get("readiness", {}) or {}
+    policy = calc_status.get("policy", {}) or {}
+    st.markdown("### Historical data and exchange mode")
+    exchange_cols = st.columns(4)
+    exchange_cols[0].metric("Live execution", str(policy.get("live_execution_exchange") or readiness.get("live_execution_exchange") or "coinbase"))
+    exchange_cols[1].metric("Binance bulk history", str(policy.get("binance_bulk_historical_backfill_enabled") or readiness.get("binance_bulk_historical_backfill_enabled")))
+    exchange_cols[2].metric("Binance live trading", str(policy.get("binance_live_execution_enabled") or readiness.get("binance_live_execution_enabled")))
+    exchange_cols[3].metric("Historical priority", " → ".join(policy.get("historical_source_priority") or readiness.get("historical_source_priority") or []))
+    exchange_map_df = load_csv(EXCHANGE_PRODUCT_MAP_CSV_PATH)
+    if exchange_map_df is not None and not exchange_map_df.empty:
+        with st.expander("Coinbase ↔ Binance product mapping", expanded=False):
+            st.dataframe(exchange_map_df, width="stretch", hide_index=True)
     phase = calc_status.get("phase_progress", {}) or {}
     st.markdown("### Phase progress")
     pcols = st.columns(5)
@@ -1885,6 +1898,25 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         net = pd.to_numeric(summary.get("median_net_pnl_bps", pd.Series(dtype=float)), errors="coerce").dropna()
         if not net.empty:
             st.write(f"Across ready products, median replay net P/L is {net.median():.2f} bps. Positive values mean the entry+sell model was net-profitable in historical replay.")
+    if historical_replay_df is not None and not historical_replay_df.empty:
+        with st.expander("Latest historical replay rows", expanded=False):
+            show_cols = [
+                c
+                for c in [
+                    "product_id",
+                    "timeframe",
+                    "replay_source",
+                    "historical_source_exchange",
+                    "historical_source_symbol",
+                    "replay_candidate_qualified",
+                    "accepted_for_calibration",
+                    "net_pnl_bps",
+                    "replay_filter_reason",
+                    "historical_source_note",
+                ]
+                if c in historical_replay_df.columns
+            ]
+            st.dataframe(historical_replay_df.tail(200)[show_cols], width="stretch", hide_index=True)
 
     explanations = readiness.get("readiness_explanation") or []
     if explanations:

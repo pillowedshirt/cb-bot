@@ -2,7 +2,7 @@ import csv
 import os
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
 
@@ -79,6 +79,26 @@ class BinanceBulkHistoricalProvider:
         os.makedirs(folder, exist_ok=True)
         return os.path.join(folder, f"{symbol}-{interval}-{int(year):04d}-{int(month):02d}.zip")
 
+    def daily_zip_url(self, *, symbol: str, interval: str, year: int, month: int, day: int) -> str:
+        ymd = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        filename = f"{symbol}-{interval}-{ymd}.zip"
+        return f"{BINANCE_BULK_BASE_URL}/daily/klines/{symbol}/{interval}/{filename}"
+
+    def local_daily_zip_path(self, *, symbol: str, interval: str, year: int, month: int, day: int) -> str:
+        folder = os.path.join(self.cache_dir, "spot", "daily", "klines", symbol, interval)
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"{symbol}-{interval}-{int(year):04d}-{int(month):02d}-{int(day):02d}.zip")
+
+    def _day_iter(self, start_ts: int, end_ts: int) -> List[Tuple[int, int, int]]:
+        start_dt = datetime.fromtimestamp(int(start_ts), tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = datetime.fromtimestamp(int(end_ts), tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        days = []
+        cur = start_dt
+        while cur <= end_dt:
+            days.append((cur.year, cur.month, cur.day))
+            cur = cur + timedelta(days=1)
+        return days
+
     def _download_file(self, *, url: str, local_path: str) -> bool:
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
             return True
@@ -127,6 +147,9 @@ class BinanceBulkHistoricalProvider:
         except Exception:
             return []
 
+    def _read_daily_zip(self, *, zip_path: str, product_id: str, symbol: str, interval: str, start_ts: int, end_ts: int) -> List[NormalizedCandle]:
+        return self._read_monthly_zip(zip_path=zip_path, product_id=product_id, symbol=symbol, interval=interval, start_ts=start_ts, end_ts=end_ts)
+
     def fetch_bulk_candles(self, *, product_id: str, timeframe: str, start_ts: int, end_ts: int) -> Tuple[List[NormalizedCandle], Dict[str, object]]:
         symbol = self.binance_symbol_for_product(product_id)
         if not symbol:
@@ -144,8 +167,31 @@ class BinanceBulkHistoricalProvider:
             downloaded += 1
             for candle in self._read_monthly_zip(zip_path=local_path, product_id=product_id, symbol=symbol, interval=interval, start_ts=start_ts, end_ts=end_ts):
                 candles_by_ts[int(candle.ts)] = candle
+        daily_attempted = daily_downloaded = daily_missing = 0
+        expected_interval_sec = {"15m": 15 * 60, "1h": 60 * 60, "1d": 24 * 60 * 60}.get(interval, 60 * 60)
+        existing_ts = set(candles_by_ts.keys())
+        for year, month, day in self._day_iter(start_ts, end_ts):
+            day_start = int(datetime(year, month, day, tzinfo=timezone.utc).timestamp())
+            day_end = day_start + 86400 - 1
+            if day_end < int(start_ts) or day_start > int(end_ts):
+                continue
+            expected_points = max(1, int(86400 / max(1, expected_interval_sec)))
+            covered_points = sum(1 for ts in existing_ts if day_start <= int(ts) <= day_end)
+            if covered_points >= max(1, int(expected_points * 0.80)):
+                continue
+            daily_attempted += 1
+            url = self.daily_zip_url(symbol=symbol, interval=interval, year=year, month=month, day=day)
+            local_path = self.local_daily_zip_path(symbol=symbol, interval=interval, year=year, month=month, day=day)
+            ok = self._download_file(url=url, local_path=local_path)
+            if not ok:
+                daily_missing += 1
+                continue
+            daily_downloaded += 1
+            for candle in self._read_daily_zip(zip_path=local_path, product_id=product_id, symbol=symbol, interval=interval, start_ts=start_ts, end_ts=end_ts):
+                candles_by_ts[int(candle.ts)] = candle
+                existing_ts.add(int(candle.ts))
         candles = sorted(candles_by_ts.values(), key=lambda c: int(c.ts))
-        return candles, {"ok": bool(candles), "source": "binance_bulk", "source_exchange": "binance", "product_id": product_id, "symbol": symbol, "timeframe": timeframe, "interval": interval, "start_ts": int(start_ts), "end_ts": int(end_ts), "months_attempted": attempted, "monthly_files_downloaded_or_cached": downloaded, "monthly_files_missing": missing, "candles": len(candles)}
+        return candles, {"daily_files_attempted": daily_attempted, "daily_files_downloaded_or_cached": daily_downloaded, "daily_files_missing": daily_missing, "ok": bool(candles), "source": "binance_bulk", "source_exchange": "binance", "product_id": product_id, "symbol": symbol, "timeframe": timeframe, "interval": interval, "start_ts": int(start_ts), "end_ts": int(end_ts), "months_attempted": attempted, "monthly_files_downloaded_or_cached": downloaded, "monthly_files_missing": missing, "candles": len(candles)}
 
 def write_normalized_candles_to_bot_cache(*, path: str, product_id: str, candles: List[NormalizedCandle], min_ts: int) -> int:
     if not candles: return 0

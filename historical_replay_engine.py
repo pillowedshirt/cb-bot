@@ -92,6 +92,23 @@ class ReplayEngineConfig:
     comparison_entry_fee_bps: float = 0.0
     comparison_exit_fee_bps: float = 2.0
     enable_exchange_fee_comparison: bool = True
+    enable_fee_scenario_matrix: bool = True
+    fee_scenario_matrix: Optional[Dict[str, Dict[str, float]]] = None
+    enable_strategy_variant_replay: bool = True
+    strategy_variants: Optional[List[str]] = None
+    high_win_min_target_to_cost_ratio: float = 2.20
+    high_win_min_target_over_cost_bps: float = 80.0
+    high_win_min_probability: float = 0.58
+    high_win_min_score: float = 62.0
+    high_win_max_spread_bps: float = 12.0
+    high_win_require_positive_momentum_5: bool = True
+    high_win_require_positive_momentum_15: bool = True
+    high_win_min_momentum_5_bps: float = 4.0
+    high_win_min_momentum_15_bps: float = 8.0
+    high_win_block_inside_value_high_volume: bool = True
+    high_win_stop_loss_pct: float = 0.006
+    high_win_profit_pullback_pct: float = 0.0015
+    high_win_min_profit_over_cost_bps: float = 25.0
 
 
 def _dt_mst(ts: float) -> str:
@@ -351,6 +368,43 @@ def _qualified_candidate(signal: ReplaySignal, config: ReplayEngineConfig) -> Tu
     return True, f"qualified target_over_cost={target_over_cost:.2f};target_to_cost={target_to_cost:.3f};score={score:.3f};probability={probability:.3f};expected_edge={expected_edge:.2f}", float(quality)
 
 
+
+def _variant_entry_filter(*, variant: str, signal: ReplaySignal, candles: List[ReplayCandle], config: ReplayEngineConfig) -> Tuple[bool, str, Dict[str, float]]:
+    momentum_5 = _recent_close_momentum_bps(candles, lookback=5)
+    momentum_15 = _recent_close_momentum_bps(candles, lookback=15)
+    target_to_cost = float(signal.target_bps) / max(float(signal.cost_bps), 1e-9)
+    target_over_cost = float(signal.target_bps) - float(signal.cost_bps)
+    metrics = {"target_to_cost_ratio": float(target_to_cost), "target_over_cost_bps": float(target_over_cost), "momentum_5_bps": float(momentum_5), "momentum_15_bps": float(momentum_15)}
+    if str(variant) in {"baseline", "", "current"}:
+        return True, "baseline_allowed", metrics
+    reasons = []
+    if target_to_cost < float(config.high_win_min_target_to_cost_ratio): reasons.append(f"target_to_cost_low {target_to_cost:.3f}")
+    if target_over_cost < float(config.high_win_min_target_over_cost_bps): reasons.append(f"target_over_cost_low {target_over_cost:.2f}")
+    if float(signal.estimated_prob_up) < float(config.high_win_min_probability): reasons.append(f"probability_low {float(signal.estimated_prob_up):.3f}")
+    if float(signal.score) < float(config.high_win_min_score): reasons.append(f"score_low {float(signal.score):.2f}")
+    if float(signal.spread_bps) > float(config.high_win_max_spread_bps): reasons.append(f"spread_high {float(signal.spread_bps):.2f}")
+    if bool(config.high_win_require_positive_momentum_5) and momentum_5 < float(config.high_win_min_momentum_5_bps): reasons.append(f"momentum_5_low {momentum_5:.2f}")
+    if bool(config.high_win_require_positive_momentum_15) and momentum_15 < float(config.high_win_min_momentum_15_bps): reasons.append(f"momentum_15_low {momentum_15:.2f}")
+    if bool(config.high_win_block_inside_value_high_volume) and "inside" in str(signal.value_acceptance_state).lower() and "high" in str(signal.volume_node_state).lower(): reasons.append("inside_value_high_volume_chop")
+    if reasons:
+        return False, ";".join(reasons), metrics
+    return True, "high_win_rate_v1_allowed", metrics
+
+
+def _fee_scenario_matrix_results(*, notional: float, qty: float, exit_price: float, fee_scenario_matrix: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for name, fees in (fee_scenario_matrix or {}).items():
+        entry_fee_bps = float(fees.get("entry_fee_bps", 0.0) or 0.0)
+        exit_fee_bps = float(fees.get("exit_fee_bps", 0.0) or 0.0)
+        result = _same_timing_fee_result(notional=notional, qty=qty, exit_price=exit_price, entry_fee_bps=entry_fee_bps, exit_fee_bps=exit_fee_bps)
+        safe = str(name).lower().replace("-", "_").replace("/", "_")
+        out[f"{safe}_entry_fee_bps"] = entry_fee_bps
+        out[f"{safe}_exit_fee_bps"] = exit_fee_bps
+        out[f"{safe}_net_pnl_bps"] = float(result["net_pnl_bps"])
+        out[f"{safe}_net_pnl_usd"] = float(result["net_pnl_usd"])
+        out[f"{safe}_would_have_won"] = int(result["would_have_won"])
+    return out
+
 def _setup_tag_from_signal(signal: ReplaySignal) -> Tuple[str, str]:
     parts = []
     value_state = str(signal.value_acceptance_state or ""); volume_node = str(signal.volume_node_state or "")
@@ -366,13 +420,16 @@ def _setup_tag_from_signal(signal: ReplaySignal) -> Tuple[str, str]:
     return "|".join(parts[:4]), regime
 
 
-def _simulate_candidate(*, product_id: str, timeframe: str, granularity: str, prefix: List[ReplayCandle], future: List[ReplayCandle], replay_source: str, config: ReplayEngineConfig, columns: List[str]) -> Optional[Dict[str, Any]]:
+def _simulate_candidate(*, product_id: str, timeframe: str, granularity: str, prefix: List[ReplayCandle], future: List[ReplayCandle], replay_source: str, config: ReplayEngineConfig, columns: List[str], variant: str = "baseline") -> Optional[Dict[str, Any]]:
     if not prefix or not future:
         return None
     entry = prefix[-1]; replay_ts = int(entry.ts); entry_price = float(entry.close)
     if entry_price <= 0:
         return None
     signal = _build_worker_signal(product_id=product_id, candles=prefix, weekly_candles=prefix, spread_bps=float(config.max_spread_bps), config=config)
+    variant_allowed, variant_reason, variant_metrics = _variant_entry_filter(variant=variant, signal=signal, candles=prefix, config=config)
+    if not variant_allowed:
+        return None
     setup_tag, regime_tag = _setup_tag_from_signal(signal)
     qualified, qualification_reason, replay_quality = _qualified_candidate(signal, config)
     notional = float(config.synthetic_notional_usd)
@@ -380,7 +437,9 @@ def _simulate_candidate(*, product_id: str, timeframe: str, granularity: str, pr
     qty = notional / max(entry_price, 1e-12)
     all_in_entry = (notional + entry_fee) / max(qty, 1e-12)
     min_exit = _required_exit_price_for_net_gain(effective_entry_price=all_in_entry, exit_fee_bps=config.exit_fee_bps, est_slippage_bps=config.est_slippage_bps, est_adverse_fill_bps=config.est_adverse_fill_bps, min_net_gain_bps=config.min_net_profit_bps)
-    hard_stop = all_in_entry * (1.0 - float(config.max_position_loss_pct))
+    stop_loss_pct = float(config.high_win_stop_loss_pct) if str(variant) == "high_win_rate_v1" else float(config.max_position_loss_pct)
+    pullback_pct = float(config.high_win_profit_pullback_pct) if str(variant) == "high_win_rate_v1" else float(config.scalp_pullback_pct)
+    hard_stop = all_in_entry * (1.0 - float(stop_loss_pct))
     peak = entry_price; trough = entry_price; profit_armed = False; exit_ts = None; exit_price = None; exit_reason = ""
     for candle in future:
         age = float(candle.ts) - float(replay_ts); high = float(candle.high); low = float(candle.low); close = float(candle.close)
@@ -390,7 +449,7 @@ def _simulate_candidate(*, product_id: str, timeframe: str, granularity: str, pr
             exit_ts = float(candle.ts); exit_price = hard_stop; exit_reason = "historical_hard_stop"; break
         if age >= float(config.level8_min_hold_sec) and high >= min_exit:
             profit_armed = True
-        if profit_armed and close > 0 and close <= float(peak) * (1.0 - float(config.scalp_pullback_pct)):
+        if profit_armed and close > 0 and close <= float(peak) * (1.0 - float(pullback_pct)):
             exit_ts = float(candle.ts); exit_price = close; exit_reason = "historical_profit_pullback"; break
         if age >= float(config.level8_max_hold_sec):
             exit_ts = float(candle.ts); exit_price = close; exit_reason = "historical_max_hold_exit"; break
@@ -422,9 +481,11 @@ def _simulate_candidate(*, product_id: str, timeframe: str, granularity: str, pr
     comparison_net_improvement_bps = float(comparison_fee_result["net_pnl_bps"]) - float(primary_fee_result["net_pnl_bps"])
     comparison_break_even_reduction_bps = float(config.entry_fee_bps) + float(config.exit_fee_bps) - float(config.comparison_entry_fee_bps) - float(config.comparison_exit_fee_bps)
     mfe = ((peak / entry_price) - 1.0) * 10000.0; mae = ((trough / entry_price) - 1.0) * 10000.0
-    replay_key = f"{product_id}|{timeframe}|{replay_ts}|{int(float(signal.score) * 1000000)}"
+    replay_key = f"{product_id}|{timeframe}|{str(variant)}|{replay_ts}|{int(float(signal.score) * 1000000)}"
     now = time.time()
-    row = {"ts": now, "dt_mst": _dt_mst(now), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": float(config.entry_fee_bps), "exit_fee_bps": float(config.exit_fee_bps), "synthetic_notional_usd": notional, "synthetic_qty": qty, "all_in_entry_price": all_in_entry, "min_profitable_exit_price": min_exit, "hard_stop_price": hard_stop, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": mfe, "max_adverse_bps": mae, "peak_price": peak, "trough_price": trough, "gross_pnl_usd": gross_proceeds - notional, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_bps, "primary_fee_model": str(config.primary_fee_model), "comparison_fee_model": str(config.comparison_fee_model), "primary_entry_fee_bps": float(config.entry_fee_bps), "primary_exit_fee_bps": float(config.exit_fee_bps), "primary_entry_fee_usd": float(primary_fee_result["entry_fee_usd"]), "primary_exit_fee_usd": float(primary_fee_result["exit_fee_usd"]), "primary_net_pnl_usd": float(primary_fee_result["net_pnl_usd"]), "primary_net_pnl_bps": float(primary_fee_result["net_pnl_bps"]), "primary_would_have_won": int(primary_fee_result["would_have_won"]), "comparison_entry_fee_bps": float(config.comparison_entry_fee_bps), "comparison_exit_fee_bps": float(config.comparison_exit_fee_bps), "comparison_entry_fee_usd": float(comparison_fee_result["entry_fee_usd"]), "comparison_exit_fee_usd": float(comparison_fee_result["exit_fee_usd"]), "comparison_net_pnl_usd": float(comparison_fee_result["net_pnl_usd"]), "comparison_net_pnl_bps": float(comparison_fee_result["net_pnl_bps"]), "comparison_would_have_won": int(comparison_fee_result["would_have_won"]), "comparison_net_improvement_usd": float(comparison_net_improvement_usd), "comparison_net_improvement_bps": float(comparison_net_improvement_bps), "comparison_break_even_reduction_bps": float(comparison_break_even_reduction_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak >= min_exit), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(signal.spread_bps), "session_liquidity_setup": str(signal.session_liquidity_setup), "value_acceptance_state": str(signal.value_acceptance_state), "volume_node_state": str(signal.volume_node_state), "poc_distance_bps": float(signal.poc_distance_bps), "volume_profile_leader_buy_score": float(signal.volume_profile_leader_buy_score), "volume_profile_leader_wait_score": float(signal.volume_profile_leader_wait_score), "price_action_buy_score": float(signal.price_action_buy_score), "market_structure_buy_score": float(signal.market_structure_buy_score), "quant_buy_score": float(signal.quant_buy_score), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and timeframe in {"primary_15m_90d", "regime_1h_365d"}), "replay_source": replay_source, "historical_source_exchange": "binance" if str(replay_source) == "binance_bulk" else "local_cache", "historical_source_symbol": product_id, "historical_source_note": "process_worker_replay", "reason": f"process_worker_replay;exit={exit_reason};net_bps={net_bps:.2f};mfe={mfe:.2f};mae={mae:.2f};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};qualified={qualified};qualification={qualification_reason};setup={setup_tag};regime={regime_tag}"}
+    scenario_results = _fee_scenario_matrix_results(notional=notional, qty=qty, exit_price=float(exit_price), fee_scenario_matrix=getattr(config, "fee_scenario_matrix", {}) or {}) if bool(getattr(config, "enable_fee_scenario_matrix", False)) else {}
+    row = {"ts": now, "dt_mst": _dt_mst(now), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": float(config.entry_fee_bps), "exit_fee_bps": float(config.exit_fee_bps), "synthetic_notional_usd": notional, "synthetic_qty": qty, "all_in_entry_price": all_in_entry, "min_profitable_exit_price": min_exit, "hard_stop_price": hard_stop, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": mfe, "max_adverse_bps": mae, "peak_price": peak, "trough_price": trough, "gross_pnl_usd": gross_proceeds - notional, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_bps, "primary_fee_model": str(config.primary_fee_model), "comparison_fee_model": str(config.comparison_fee_model), "primary_entry_fee_bps": float(config.entry_fee_bps), "primary_exit_fee_bps": float(config.exit_fee_bps), "primary_entry_fee_usd": float(primary_fee_result["entry_fee_usd"]), "primary_exit_fee_usd": float(primary_fee_result["exit_fee_usd"]), "primary_net_pnl_usd": float(primary_fee_result["net_pnl_usd"]), "primary_net_pnl_bps": float(primary_fee_result["net_pnl_bps"]), "primary_would_have_won": int(primary_fee_result["would_have_won"]), "comparison_entry_fee_bps": float(config.comparison_entry_fee_bps), "comparison_exit_fee_bps": float(config.comparison_exit_fee_bps), "comparison_entry_fee_usd": float(comparison_fee_result["entry_fee_usd"]), "comparison_exit_fee_usd": float(comparison_fee_result["exit_fee_usd"]), "comparison_net_pnl_usd": float(comparison_fee_result["net_pnl_usd"]), "comparison_net_pnl_bps": float(comparison_fee_result["net_pnl_bps"]), "comparison_would_have_won": int(comparison_fee_result["would_have_won"]), "comparison_net_improvement_usd": float(comparison_net_improvement_usd), "comparison_net_improvement_bps": float(comparison_net_improvement_bps), "comparison_break_even_reduction_bps": float(comparison_break_even_reduction_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak >= min_exit), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(signal.spread_bps), "session_liquidity_setup": str(signal.session_liquidity_setup), "value_acceptance_state": str(signal.value_acceptance_state), "volume_node_state": str(signal.volume_node_state), "poc_distance_bps": float(signal.poc_distance_bps), "volume_profile_leader_buy_score": float(signal.volume_profile_leader_buy_score), "volume_profile_leader_wait_score": float(signal.volume_profile_leader_wait_score), "price_action_buy_score": float(signal.price_action_buy_score), "market_structure_buy_score": float(signal.market_structure_buy_score), "quant_buy_score": float(signal.quant_buy_score), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and timeframe in {"primary_15m_90d", "regime_1h_365d"}), "replay_source": replay_source, "historical_source_exchange": "binance" if str(replay_source) == "binance_bulk" else "local_cache", "historical_source_symbol": product_id, "historical_source_note": "process_worker_replay", "strategy_variant": str(variant), "variant_entry_allowed": int(1), "variant_block_reason": str(variant_reason), "variant_target_to_cost_ratio": float(variant_metrics.get("target_to_cost_ratio", 0.0)), "variant_target_over_cost_bps": float(variant_metrics.get("target_over_cost_bps", 0.0)), "variant_momentum_5_bps": float(variant_metrics.get("momentum_5_bps", 0.0)), "variant_momentum_15_bps": float(variant_metrics.get("momentum_15_bps", 0.0)), "reason": f"process_worker_replay;exit={exit_reason};net_bps={net_bps:.2f};mfe={mfe:.2f};mae={mae:.2f};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};qualified={qualified};qualification={qualification_reason};setup={setup_tag};regime={regime_tag}"}
+    row.update(scenario_results)
     return {col: row.get(col, "") for col in columns}
 
 
@@ -452,10 +513,12 @@ def run_replay_job_from_cache(payload: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             if f"{product_id}|{timeframe}|{int(prefix[-1].ts)}|" in existing_prefixes:
                 continue
-            row = _simulate_candidate(product_id=product_id, timeframe=timeframe, granularity=granularity, prefix=prefix, future=future, replay_source=replay_source, config=config, columns=columns)
+            variants = list(config.strategy_variants or ["baseline"])
+            for variant in variants:
+                row = _simulate_candidate(product_id=product_id, timeframe=timeframe, granularity=granularity, prefix=prefix, future=future, replay_source=replay_source, config=config, columns=columns, variant=str(variant))
+                if row:
+                    rows.append(row)
             evaluated += 1
-            if row:
-                rows.append(row)
             break
     rows_written = _write_replay_rows(output_path, columns, rows)
     net_values = []

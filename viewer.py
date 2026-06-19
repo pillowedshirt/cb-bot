@@ -68,6 +68,8 @@ CHART_1D_2Y_CSV_PATH = os.path.join(BASE_DIR, "chart_1d_2y.csv")
 CANDIDATE_REPLAY_PATH = os.path.join(BASE_DIR, "candidate_replay.csv")
 AGENT_ADJUSTMENTS_PATH = os.path.join(BASE_DIR, "agent_adjustments.csv")
 AGENT_PERFORMANCE_PATH = os.path.join(BASE_DIR, "agent_performance.csv")
+AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH = os.path.join(BASE_DIR, "agent_component_replay_attribution.csv")
+AGENT_TRADE_POLICY_CSV_PATH = os.path.join(BASE_DIR, "agent_trade_policy.csv")
 DECISION_AUDIT_PATH = os.path.join(BASE_DIR, "decision_audit.csv")
 
 SNAPSHOT_STALE_WARN_SEC = 20.0
@@ -2137,6 +2139,24 @@ def render_strategy_variant_replay_panel():
         st.markdown("#### Overall by variant")
         st.dataframe(by_variant, width="stretch", hide_index=True)
 
+def render_profitability_diagnostics_panel():
+    st.markdown("### Profitability Diagnostics")
+    variant_df = load_csv_tail(STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH, max_lines=10000)
+    agent_policy_df = load_csv_tail(AGENT_TRADE_POLICY_CSV_PATH, max_lines=5000)
+    component_df = load_csv_tail(AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH, max_lines=5000)
+    if variant_df is not None and not variant_df.empty:
+        st.markdown("#### Strategy variant performance")
+        st.dataframe(variant_df.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1), width="stretch", hide_index=True)
+    if agent_policy_df is not None and not agent_policy_df.empty:
+        st.markdown("#### Agent trade policy")
+        latest = agent_policy_df.sort_values("ts").groupby("agent", as_index=False).tail(1)
+        st.dataframe(latest, width="stretch", hide_index=True)
+    if component_df is not None and not component_df.empty:
+        st.markdown("#### Replay component attribution")
+        latest = component_df.sort_values("ts").groupby("component", as_index=False).tail(1)
+        st.dataframe(latest, width="stretch", hide_index=True)
+
+
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
@@ -2160,6 +2180,8 @@ def render_live_dashboard(selected, refresh_config):
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.expander("Profitability diagnostics", expanded=True):
+        render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):
         render_strategy_variant_replay_panel()
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df); st.markdown('</section>', unsafe_allow_html=True)

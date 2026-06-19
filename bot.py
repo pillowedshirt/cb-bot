@@ -376,6 +376,8 @@ COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH: str = os.path.join(
 )
 RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
+AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH: str = os.path.join(BASE_DIR, "agent_component_replay_attribution.csv")
+AGENT_TRADE_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "agent_trade_policy.csv")
 BACKTEST_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_recommendations.csv")
 BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_sell_recommendations.csv")
 BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
@@ -480,8 +482,26 @@ STRATEGY_VARIANT_REPLAY_SUMMARY_COLUMNS: List[str] = [
     "binance_maker_maker_avg_bps", "binance_maker_maker_win_rate",
     "binance_maker_taker_avg_bps", "binance_maker_taker_win_rate",
     "binance_taker_taker_avg_bps", "binance_taker_taker_win_rate",
-    "hard_stop_rate", "profit_pullback_rate", "avg_mfe_bps", "avg_mae_bps", "reason",
+    "hard_stop_rate", "profit_pullback_rate", "early_adverse_exit_rate", "avg_mfe_bps", "avg_mae_bps", "reason",
 ]
+
+REQUIRED_REPLAY_STRATEGY_VARIANTS: List[str] = ["baseline", "high_win_rate_v1", "high_win_rate_v2", "coinbase_survival_v1", "low_fee_scalp_v1"]
+MIN_REPLAY_ROWS_PER_VARIANT_PER_JOB: int = 25
+ENABLE_REPLAY_POLICY_LIVE_BUY_GATE: bool = True
+REPLAY_POLICY_MIN_ROWS: int = 30
+REPLAY_POLICY_MAX_HARD_STOP_RATE: float = 0.35
+REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_AVG_BPS: float = 15.0
+REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_WIN_RATE: float = 0.52
+REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW: bool = True
+COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY: bool = True
+COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE: bool = False
+POST_ONLY_ENTRY_TIMEOUT_SEC: float = 20.0
+POST_ONLY_EXIT_TIMEOUT_SEC: float = 30.0
+AGENT_COMPONENT_REPLAY_ATTRIBUTION_COLUMNS: List[str] = ["ts", "dt_mst", "component", "rows", "high_score_rows", "low_score_rows", "high_score_avg_coinbase_maker_maker_bps", "low_score_avg_coinbase_maker_maker_bps", "high_score_avg_binance_maker_maker_bps", "low_score_avg_binance_maker_maker_bps", "high_score_hard_stop_rate", "low_score_hard_stop_rate", "edge_vs_low_coinbase_bps", "edge_vs_low_binance_bps", "recommended_role", "reason"]
+AGENT_TRADE_POLICY_COLUMNS: List[str] = ["ts", "dt_mst", "agent", "rows", "buy_rows", "buy_avg_move_bps", "buy_success_rate", "wait_hold_rows", "wait_hold_avg_move_bps", "wait_hold_success_rate", "avg_weighted_credit", "recommended_role", "entry_weight_multiplier", "veto_weight_multiplier", "reason"]
+BACKTEST_SETUP_PERFORMANCE_COLUMNS: List[str] = ["ts", "dt_mst", "product_id", "timeframe", "strategy", "setup_tag", "market_regime", "rows", "win_rate", "avg_move_bps", "median_move_bps", "confidence", "recommended_action", "reason"]
+AGENT_ABLATION_COLUMNS: List[str] = ["ts", "dt_mst", "agent", "rows", "with_agent_avg_bps", "without_agent_avg_bps", "delta_bps", "binance_delta_bps", "recommended_weight_adjustment", "reason"]
+
 
 REPLAY_FEE_COMPARISON_SUMMARY_COLUMNS: List[str] = [
     "ts", "dt_mst", "product_id", "timeframe", "rows",
@@ -1196,6 +1216,10 @@ TOP_OF_BOOK_REST_FALLBACK_EVERY_SEC: float = 1.25
 # Treat a quote as stale quickly enough that REST refreshes before the viewer
 # spends a long time showing delayed/stale.
 TOP_OF_BOOK_MAX_STALE_SEC: float = 6.0
+TOP_OF_BOOK_REPAIR_TIMEOUT_SEC: float = 8.0
+TOP_OF_BOOK_REPAIR_CONCURRENCY: int = 4
+TOP_OF_BOOK_STALE_WARN_SEC: float = 45.0
+TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC: float = 90.0
 
 # Still do not buy with stale or missing bid/ask.
 REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY: bool = True
@@ -12743,6 +12767,25 @@ class TradingBot:
         """
         try:
             product_id = str(candidate.get("product_id", ""))
+            if bool(REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY):
+                tob_age = self._top_of_book_age_sec(product_id)
+                if tob_age is None or tob_age > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
+                    return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age}")
+            if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
+                policy = self._latest_strategy_variant_policy()
+                candidate_variants = ["coinbase_survival_v1", "high_win_rate_v2", "baseline"]
+                approved = []; shadow_only = []
+                for timeframe in ["primary_15m_90d", "regime_1h_365d"]:
+                    for variant in candidate_variants:
+                        row = policy.get((product_id, timeframe, variant))
+                        if not row: continue
+                        rows = int(row.get("rows", 0)); cb_avg = float(row.get("coinbase_mm_avg", 0.0)); cb_win = float(row.get("coinbase_mm_win", 0.0)); bn_avg = float(row.get("binance_mm_avg", 0.0)); hard_stop = float(row.get("hard_stop_rate", 1.0))
+                        if rows >= int(REPLAY_POLICY_MIN_ROWS) and cb_avg >= float(REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_AVG_BPS) and cb_win >= float(REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_WIN_RATE) and hard_stop <= float(REPLAY_POLICY_MAX_HARD_STOP_RATE):
+                            approved.append((timeframe, variant, row))
+                        elif bool(REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW) and bn_avg > 0:
+                            shadow_only.append((timeframe, variant, row))
+                if not approved:
+                    return False, ("live_buy_blocked:no_coinbase_replay_policy_approval " f"product_id={product_id};shadow_only_binance_candidates={len(shadow_only)}")
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
                 calc_status = self._calculation_status()
                 if not bool(calc_status.get("full_viewer_unlocked")):
@@ -14821,6 +14864,11 @@ class TradingBot:
             status["freshest_tob_age_sec"] = 999999.0
             status["median_tob_age_sec"] = 999999.0
             status["top_of_book_products_ready"] = 0
+        calc_latch = self._load_calculation_complete_latch()
+        calculation_complete_latched = bool(calc_latch.get("calculation_complete_latched"))
+        if calculation_complete_latched:
+            status["startup_calibration_ready"] = True
+            status["calculation_complete_latched"] = True
         status["safe_to_run_overnight"] = bool(
             status.get("viewer_snapshot_recent")
             and status.get("websocket_recent")
@@ -15993,6 +16041,9 @@ class TradingBot:
                 )
 
             mode = "MARKET"
+            if str(LIVE_EXECUTION_EXCHANGE_ID) == "coinbase" and bool(COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY) and not bool(COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE):
+                log(f"[buy-skip] {product_id} coinbase_market_buy_blocked:maker_first_required")
+                return None
             result = await self._live_buy_market(product_id=product_id, quote_usd=float(quote_usd))
             self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
             fill = self._require_live_fill(result, product_id=product_id, side="BUY")
@@ -16409,7 +16460,11 @@ class TradingBot:
             "fee_scenario_matrix": self._replay_fee_scenario_bps(product_id),
             "enable_fee_scenario_matrix": bool(ENABLE_REPLAY_FEE_SCENARIO_MATRIX),
             "enable_strategy_variant_replay": True,
-            "strategy_variants": ["baseline", "high_win_rate_v1"],
+            "strategy_variants": list(REQUIRED_REPLAY_STRATEGY_VARIANTS),
+            "high_win_v2_min_target_to_cost_ratio": 1.35, "high_win_v2_min_target_over_cost_bps": 35.0, "high_win_v2_min_probability": 0.54, "high_win_v2_min_score": 54.0, "high_win_v2_max_spread_bps": 22.0, "high_win_v2_require_momentum_either": True, "high_win_v2_min_momentum_either_bps": 0.0, "high_win_v2_block_low_room": True, "high_win_v2_block_low_volume_above_value": True, "high_win_v2_stop_loss_pct": 0.004, "high_win_v2_profit_pullback_pct": 0.0018,
+            "coinbase_survival_min_target_to_cost_ratio": 2.25, "coinbase_survival_min_target_over_cost_bps": 140.0, "coinbase_survival_min_probability": 0.56, "coinbase_survival_min_score": 58.0, "coinbase_survival_max_spread_bps": 22.0, "coinbase_survival_stop_loss_pct": 0.0035, "coinbase_survival_profit_pullback_pct": 0.0015,
+            "low_fee_scalp_min_target_to_cost_ratio": 1.15, "low_fee_scalp_min_target_over_cost_bps": 15.0, "low_fee_scalp_min_probability": 0.52, "low_fee_scalp_min_score": 50.0, "low_fee_scalp_max_spread_bps": 22.0, "low_fee_scalp_stop_loss_pct": 0.004, "low_fee_scalp_profit_pullback_pct": 0.0015,
+            "enable_early_adverse_exit": True, "early_adverse_exit_bps": 18.0, "early_adverse_min_age_bars": 2, "early_adverse_requires_negative_momentum": True, "early_adverse_momentum_lookback": 5,
         }
 
     def _build_process_worker_payload(self, job: Dict[str, Any]) -> Dict[str, Any]:
@@ -16482,15 +16537,22 @@ class TradingBot:
         return int(counts.get((str(product_id), str(timeframe)), 0))
 
     def _job_already_satisfied_in_master(self, product_id: str, timeframe: str) -> Tuple[bool, str, int]:
-        rows = self._master_replay_row_count_for_job(product_id, timeframe)
-        if timeframe == "primary_15m_90d":
-            required = int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)
-        elif timeframe == "regime_1h_365d":
-            required = int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)
-        else:
-            required = 120
-        ok = rows >= max(1, required)
-        return bool(ok), f"master_replay_rows={rows};required={required}", int(rows)
+        try:
+            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=750000)
+            if frame.empty or "product_id" not in frame.columns or "timeframe" not in frame.columns:
+                return False, "master_missing_or_empty", 0
+            sub = frame[frame["product_id"].astype(str).eq(str(product_id)) & frame["timeframe"].astype(str).eq(str(timeframe))].copy()
+            if sub.empty:
+                return False, "no_rows_for_job", 0
+            if "strategy_variant" not in sub.columns:
+                sub["strategy_variant"] = "baseline"
+            variant_counts = sub["strategy_variant"].fillna("baseline").astype(str).value_counts().to_dict()
+            missing = [f"{v}:{int(variant_counts.get(v, 0))}" for v in REQUIRED_REPLAY_STRATEGY_VARIANTS if int(variant_counts.get(v, 0)) < int(MIN_REPLAY_ROWS_PER_VARIANT_PER_JOB)]
+            if missing:
+                return False, f"missing_variant_coverage {';'.join(missing)}", int(len(sub))
+            return True, f"variant_coverage_ok rows={len(sub)};variants={variant_counts}", int(len(sub))
+        except Exception as exc:
+            return False, f"master_check_failed:{exc}", 0
 
     def _read_worker_output_rows(self, output_path: str) -> List[Dict[str, Any]]:
         try:
@@ -16588,8 +16650,9 @@ class TradingBot:
                 if "exit_reason" in group.columns:
                     row["hard_stop_rate"] = float(group["exit_reason"].astype(str).eq("historical_hard_stop").mean())
                     row["profit_pullback_rate"] = float(group["exit_reason"].astype(str).eq("historical_profit_pullback").mean())
+                    row["early_adverse_exit_rate"] = float(group["exit_reason"].astype(str).eq("historical_early_adverse_exit").mean())
                 else:
-                    row["hard_stop_rate"] = 0.0; row["profit_pullback_rate"] = 0.0
+                    row["hard_stop_rate"] = 0.0; row["profit_pullback_rate"] = 0.0; row["early_adverse_exit_rate"] = 0.0
                 row["avg_mfe_bps"] = float(pd.to_numeric(group.get("max_favorable_bps"), errors="coerce").dropna().mean()) if "max_favorable_bps" in group.columns else 0.0
                 row["avg_mae_bps"] = float(pd.to_numeric(group.get("max_adverse_bps"), errors="coerce").dropna().mean()) if "max_adverse_bps" in group.columns else 0.0
                 rows_to_write.append(row)
@@ -17586,6 +17649,116 @@ class TradingBot:
             update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates=updates)
         return result
 
+
+    def _ensure_csv_header(self, path: str, columns: List[str]) -> None:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(columns)
+
+    def _ensure_agent_component_replay_attribution_header(self) -> None:
+        self._ensure_csv_header(AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH, AGENT_COMPONENT_REPLAY_ATTRIBUTION_COLUMNS)
+
+    def _ensure_agent_trade_policy_header(self) -> None:
+        self._ensure_csv_header(AGENT_TRADE_POLICY_CSV_PATH, AGENT_TRADE_POLICY_COLUMNS)
+
+    def _write_agent_component_replay_attribution(self) -> None:
+        try:
+            self._ensure_agent_component_replay_attribution_header()
+            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=750000)
+            if frame.empty: return
+            component_map = {"volume_profile_leader_buy_score": "volume_profile_leader", "price_action_buy_score": "price_action", "market_structure_buy_score": "market_structure", "quant_buy_score": "quant_context"}
+            rows = []
+            for score_col, component in component_map.items():
+                if score_col not in frame.columns: continue
+                df = frame.copy(); df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+                df["coinbase_mm"] = pd.to_numeric(df.get("coinbase_maker_maker_net_pnl_bps"), errors="coerce"); df["binance_mm"] = pd.to_numeric(df.get("binance_maker_maker_net_pnl_bps"), errors="coerce")
+                valid = df.dropna(subset=[score_col, "coinbase_mm", "binance_mm"])
+                if valid.empty: continue
+                threshold = float(valid[score_col].quantile(0.70)); high = valid[valid[score_col] >= threshold]; low = valid[valid[score_col] < threshold]
+                if high.empty or low.empty: continue
+                high_cb = float(high["coinbase_mm"].mean()); low_cb = float(low["coinbase_mm"].mean()); high_bn = float(high["binance_mm"].mean()); low_bn = float(low["binance_mm"].mean())
+                high_stop = float(high["exit_reason"].astype(str).eq("historical_hard_stop").mean()) if "exit_reason" in high.columns else 0.0; low_stop = float(low["exit_reason"].astype(str).eq("historical_hard_stop").mean()) if "exit_reason" in low.columns else 0.0
+                edge_cb = high_cb - low_cb; edge_bn = high_bn - low_bn
+                role = "entry_confirmer" if (edge_cb > 10 or edge_bn > 10) else "risk_filter" if (high_stop < low_stop and (edge_cb > 0 or edge_bn > 0)) else "veto_or_low_value"
+                rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "component": component, "rows": int(len(valid)), "high_score_rows": int(len(high)), "low_score_rows": int(len(low)), "high_score_avg_coinbase_maker_maker_bps": high_cb, "low_score_avg_coinbase_maker_maker_bps": low_cb, "high_score_avg_binance_maker_maker_bps": high_bn, "low_score_avg_binance_maker_maker_bps": low_bn, "high_score_hard_stop_rate": high_stop, "low_score_hard_stop_rate": low_stop, "edge_vs_low_coinbase_bps": edge_cb, "edge_vs_low_binance_bps": edge_bn, "recommended_role": role, "reason": f"component_attribution;score_col={score_col};threshold={threshold:.4f}"})
+            if rows:
+                with open(AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=AGENT_COMPONENT_REPLAY_ATTRIBUTION_COLUMNS); [writer.writerow({col: row.get(col, "") for col in AGENT_COMPONENT_REPLAY_ATTRIBUTION_COLUMNS}) for row in rows]
+        except Exception as exc:
+            module_exception(MODULE_NAME, "write_agent_component_replay_attribution_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+    def _write_agent_trade_policy(self) -> None:
+        try:
+            self._ensure_agent_trade_policy_header(); frame = self._read_csv_tail_for_bot(AGENT_PERFORMANCE_CSV_PATH, max_lines=200000)
+            if frame.empty or "agent" not in frame.columns: return
+            frame["move"] = pd.to_numeric(frame.get("outcome_move_bps"), errors="coerce"); frame["weighted_credit"] = pd.to_numeric(frame.get("weighted_agent_credit_score"), errors="coerce"); frame["success"] = pd.to_numeric(frame.get("outcome_success"), errors="coerce")
+            rows = []
+            for agent, group in frame.groupby(frame["agent"].astype(str)):
+                direction = group.get("agent_direction", pd.Series(dtype=str)).astype(str).str.upper(); buy = group[direction.eq("BUY")]; wait_hold = group[direction.isin(["WAIT", "HOLD"])]
+                buy_rows = int(len(buy)); wait_rows = int(len(wait_hold)); buy_avg = float(buy["move"].mean()) if buy_rows else 0.0; buy_success = float(buy["success"].mean()) if buy_rows else 0.0; wait_avg = float(wait_hold["move"].mean()) if wait_rows else 0.0; wait_success = float(wait_hold["success"].mean()) if wait_rows else 0.0; avg_credit = float(group["weighted_credit"].mean()) if "weighted_credit" in group.columns else 0.0
+                if buy_rows >= 10 and buy_avg > 1.5 and buy_success >= 0.55: role, entry_mult, veto_mult = "entry_confirmer", 1.25, 1.0
+                elif buy_rows >= 10 and buy_avg < -2.0: role, entry_mult, veto_mult = "buy_signal_penalty_veto_filter", 0.70, 1.25
+                elif wait_rows >= 20 and wait_success >= 0.88: role, entry_mult, veto_mult = "avoidance_veto_filter", 0.85, 1.20
+                else: role, entry_mult, veto_mult = "neutral", 1.0, 1.0
+                rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "agent": agent, "rows": int(len(group)), "buy_rows": buy_rows, "buy_avg_move_bps": buy_avg, "buy_success_rate": buy_success, "wait_hold_rows": wait_rows, "wait_hold_avg_move_bps": wait_avg, "wait_hold_success_rate": wait_success, "avg_weighted_credit": avg_credit, "recommended_role": role, "entry_weight_multiplier": entry_mult, "veto_weight_multiplier": veto_mult, "reason": "runtime_agent_policy_from_observed_outcomes"})
+            if rows:
+                with open(AGENT_TRADE_POLICY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=AGENT_TRADE_POLICY_COLUMNS); [writer.writerow({col: row.get(col, "") for col in AGENT_TRADE_POLICY_COLUMNS}) for row in rows]
+        except Exception as exc:
+            module_exception(MODULE_NAME, "write_agent_trade_policy_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+    def _latest_agent_trade_policy(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            frame = self._read_csv_tail_for_bot(AGENT_TRADE_POLICY_CSV_PATH, max_lines=5000)
+            if frame.empty or "agent" not in frame.columns: return {}
+            frame = frame.sort_values("ts").groupby("agent", as_index=False).tail(1); out = {}
+            for _, r in frame.iterrows():
+                agent = str(r.get("agent") or "")
+                if agent: out[agent] = {"recommended_role": str(r.get("recommended_role") or "neutral"), "entry_weight_multiplier": float(r.get("entry_weight_multiplier", 1.0) or 1.0), "veto_weight_multiplier": float(r.get("veto_weight_multiplier", 1.0) or 1.0), "buy_avg_move_bps": float(r.get("buy_avg_move_bps", 0.0) or 0.0), "buy_success_rate": float(r.get("buy_success_rate", 0.0) or 0.0)}
+            return out
+        except Exception: return {}
+
+    def _latest_strategy_variant_policy(self) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+        try:
+            frame = self._read_csv_tail_for_bot(STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH, max_lines=10000)
+            if frame.empty: return {}
+            frame = frame.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1); out = {}
+            for _, r in frame.iterrows():
+                key = (str(r.get("product_id") or ""), str(r.get("timeframe") or ""), str(r.get("strategy_variant") or "baseline"))
+                out[key] = {"rows": int(r.get("rows", 0) or 0), "coinbase_mm_avg": float(r.get("coinbase_maker_maker_avg_bps", 0.0) or 0.0), "coinbase_mm_win": float(r.get("coinbase_maker_maker_win_rate", 0.0) or 0.0), "binance_mm_avg": float(r.get("binance_maker_maker_avg_bps", 0.0) or 0.0), "binance_mm_win": float(r.get("binance_maker_maker_win_rate", 0.0) or 0.0), "hard_stop_rate": float(r.get("hard_stop_rate", 1.0) or 1.0), "profit_pullback_rate": float(r.get("profit_pullback_rate", 0.0) or 0.0)}
+            return out
+        except Exception: return {}
+
+    def _write_backtest_setup_performance_from_replay(self) -> None:
+        try:
+            self._ensure_csv_header(BACKTEST_SETUP_PERFORMANCE_CSV_PATH, BACKTEST_SETUP_PERFORMANCE_COLUMNS); frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=750000)
+            if frame.empty: return
+            for col in ["product_id", "timeframe", "setup_tag", "regime_tag", "strategy_variant"]:
+                if col not in frame.columns: frame[col] = ""
+            scenario = "coinbase_maker_maker_net_pnl_bps" if "coinbase_maker_maker_net_pnl_bps" in frame.columns else "net_pnl_bps"; frame[scenario] = pd.to_numeric(frame[scenario], errors="coerce"); rows=[]
+            for keys, group in frame.groupby(["product_id", "timeframe", "strategy_variant", "setup_tag", "regime_tag"]):
+                if len(group) < 10: continue
+                pnl = group[scenario].dropna()
+                if pnl.empty: continue
+                rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": keys[0], "timeframe": keys[1], "strategy": keys[2], "setup_tag": keys[3], "market_regime": keys[4], "rows": int(len(group)), "win_rate": float((pnl > 0).mean()), "avg_move_bps": float(pnl.mean()), "median_move_bps": float(pnl.median()), "confidence": min(1.0, len(group) / 100.0), "recommended_action": "allow" if float(pnl.mean()) > 0 and float((pnl > 0).mean()) > 0.50 else "block", "reason": "historical_replay_setup_performance"})
+            if rows:
+                with open(BACKTEST_SETUP_PERFORMANCE_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                    writer=csv.DictWriter(f, fieldnames=BACKTEST_SETUP_PERFORMANCE_COLUMNS); [writer.writerow({col: row.get(col, "") for col in BACKTEST_SETUP_PERFORMANCE_COLUMNS}) for row in rows]
+        except Exception as exc: module_exception(MODULE_NAME, "write_backtest_setup_performance_from_replay_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+    def _write_agent_ablation_from_component_attribution(self) -> None:
+        try:
+            self._ensure_csv_header(AGENT_ABLATION_CSV_PATH, AGENT_ABLATION_COLUMNS); frame = self._read_csv_tail_for_bot(AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH, max_lines=5000)
+            if frame.empty: return
+            rows=[]
+            for _, r in frame.iterrows():
+                edge_cb=float(pd.to_numeric(pd.Series([r.get("edge_vs_low_coinbase_bps")]), errors="coerce").fillna(0).iloc[0]); edge_bn=float(pd.to_numeric(pd.Series([r.get("edge_vs_low_binance_bps")]), errors="coerce").fillna(0).iloc[0])
+                rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "agent": str(r.get("component") or ""), "rows": int(r.get("rows", 0) or 0), "with_agent_avg_bps": float(r.get("high_score_avg_coinbase_maker_maker_bps", 0.0) or 0.0), "without_agent_avg_bps": float(r.get("low_score_avg_coinbase_maker_maker_bps", 0.0) or 0.0), "delta_bps": edge_cb, "binance_delta_bps": edge_bn, "recommended_weight_adjustment": "increase" if edge_cb > 5 or edge_bn > 5 else "decrease" if edge_cb < -5 and edge_bn < -5 else "neutral", "reason": "component_replay_ablation_proxy"})
+            if rows:
+                with open(AGENT_ABLATION_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                    writer=csv.DictWriter(f, fieldnames=AGENT_ABLATION_COLUMNS); [writer.writerow({col: row.get(col, "") for col in AGENT_ABLATION_COLUMNS}) for row in rows]
+        except Exception as exc: module_exception(MODULE_NAME, "write_agent_ablation_from_component_attribution_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
     async def _merge_completed_worker_outputs(self) -> Dict[str, Any]:
         if not bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE):
             return {"merged_jobs": 0, "rows_appended": 0}
@@ -17633,6 +17806,22 @@ class TradingBot:
                     pass
                 try:
                     self._write_strategy_variant_replay_summary_for_product(product_id=str(job.get("product_id") or ""), timeframe=str(job.get("timeframe") or ""))
+                except Exception:
+                    pass
+                try:
+                    self._write_agent_component_replay_attribution()
+                except Exception:
+                    pass
+                try:
+                    self._write_agent_trade_policy()
+                except Exception:
+                    pass
+                try:
+                    self._write_backtest_setup_performance_from_replay()
+                except Exception:
+                    pass
+                try:
+                    self._write_agent_ablation_from_component_attribution()
                 except Exception:
                     pass
                 if self._historical_worker_pool is not None and process_worker_output_summary is not None:
@@ -17980,10 +18169,9 @@ class TradingBot:
             phase_totals["replay_calibration_verdicts"] = sum(product_status[p]["calibration_verdict_progress"] for p in PRODUCTS) / product_count
             all_products_complete = all(bool(product_status[p]["complete"]) for p in PRODUCTS)
             calculation_work_complete = bool(all_products_complete and phase_totals["micro_backlog"] >= 1.0 and phase_totals["historical_candle_backlog"] >= 1.0 and phase_totals["historical_replay"] >= 1.0 and phase_totals["replay_calibration_verdicts"] >= 1.0)
-            live_unlock_ok = phase_totals["live_data"] >= 1.0 if bool(CALCULATION_UNLOCK_REQUIRES_LIVE_DATA_FRESHNESS) else True
             latch = self._load_calculation_complete_latch()
             latched_complete = bool(latch.get("calculation_complete_latched"))
-            full_viewer_unlocked = bool((not VIEWER_REQUIRE_FULL_STARTUP_CALCULATION) or latched_complete or (calculation_work_complete and live_unlock_ok))
+            full_viewer_unlocked = bool((not VIEWER_REQUIRE_FULL_STARTUP_CALCULATION) or latched_complete or calculation_work_complete)
             overall_progress = phase_totals["live_data"] * 0.10 + phase_totals["micro_backlog"] * 0.15 + phase_totals["historical_candle_backlog"] * 0.20 + phase_totals["historical_replay"] * 0.35 + phase_totals["replay_calibration_verdicts"] * 0.20
             complete_products = sum(1 for p in PRODUCTS if bool(product_status[p]["complete"])); profit_ready_products = sum(1 for p in PRODUCTS if bool(product_status[p]["profit_ready"])); blocked_products = sum(1 for p in PRODUCTS if product_status[p]["verdict"] == "replay_complete_unprofitable_or_unqualified")
             worker_manifest_progress = self._historical_replay_manifest_progress()
@@ -18883,6 +19071,32 @@ class TradingBot:
                 also_overall=True,
             )
 
+    def _top_of_book_age_sec(self, product_id: str) -> Optional[float]:
+        try:
+            tob = self.tob.get(str(product_id))
+            if tob is None or float(tob.bid) <= 0 or float(tob.ask) <= 0:
+                return None
+            return max(0.0, now_ts() - float(tob.ts))
+        except Exception:
+            return None
+
+    async def _repair_top_of_book_product(self, product_id: str) -> None:
+        await asyncio.to_thread(self._rest_backfill_top_of_book, [product_id])
+
+    async def _repair_top_of_book_for_products(self, product_ids: List[str]) -> Dict[str, Any]:
+        sem = asyncio.Semaphore(int(TOP_OF_BOOK_REPAIR_CONCURRENCY))
+        results = {"attempted": 0, "refreshed": 0, "failed": 0}
+        async def one(product_id: str) -> None:
+            async with sem:
+                results["attempted"] += 1
+                try:
+                    await asyncio.wait_for(self._repair_top_of_book_product(product_id), timeout=float(TOP_OF_BOOK_REPAIR_TIMEOUT_SEC))
+                    results["refreshed"] += 1
+                except Exception:
+                    results["failed"] += 1
+        await asyncio.gather(*(one(p) for p in product_ids), return_exceptions=True)
+        return results
+
     async def top_of_book_keeper_loop(self) -> None:
         """
         Keep bid/ask fresh without letting REST quote repair stall the event loop.
@@ -18910,15 +19124,8 @@ class TradingBot:
                     if age > float(TOP_OF_BOOK_MAX_STALE_SEC):
                         stale_products.append(product_id)
                 to_repair = stale_products[:max_repairs_per_cycle]
-                refreshed = 0
-                for product_id in to_repair:
-                    try:
-                        await asyncio.wait_for(asyncio.to_thread(self._rest_backfill_top_of_book, [product_id]), timeout=repair_timeout_sec)
-                        refreshed += 1
-                    except asyncio.TimeoutError:
-                        module_debug(MODULE_NAME, "top_of_book_keeper_repair_timeout", data={"product_id": product_id, "timeout_sec": repair_timeout_sec}, level="WARN", also_overall=False)
-                    except Exception as exc:
-                        module_exception(MODULE_NAME, "top_of_book_keeper_product_failed", exc, data={"product_id": product_id}, also_overall=False)
+                repair_results = await self._repair_top_of_book_for_products(to_repair) if to_repair else {"attempted": 0, "refreshed": 0, "failed": 0}
+                refreshed = int(repair_results.get("refreshed", 0))
                 self._last_tob_keeper_cycle_ts = now_ts()
                 module_debug(MODULE_NAME, "top_of_book_keeper_cycle", data={"products": len(PRODUCTS), "stale_before": len(stale_products), "attempted_repairs": len(to_repair), "refreshed": refreshed, "elapsed_sec": round(time.perf_counter() - cycle_started, 3), "remaining_stale": max(0, len(stale_products) - len(to_repair))}, level="DEBUG", also_overall=False)
             except Exception as exc:

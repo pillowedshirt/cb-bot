@@ -56,6 +56,7 @@ ADAPTIVE_THRESHOLDS_CSV = os.path.join(BASE_DIR, "adaptive_thresholds.csv")
 SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
 AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
 AGENT_ABLATION_CSV = os.path.join(BASE_DIR, "agent_ablation.csv")
+AGENT_TRADE_POLICY_CSV = os.path.join(BASE_DIR, "agent_trade_policy.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
 LEVEL8_CSV_TAIL_LIMITS = {
@@ -1384,6 +1385,26 @@ class Level8Council:
             "missed_opportunity_relief": missed_relief,
         }
 
+
+    def _latest_agent_trade_policy(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            frame = _read_csv_tail_direct(AGENT_TRADE_POLICY_CSV, 5000)
+            if frame.empty or "agent" not in frame.columns:
+                return {}
+            frame = frame.sort_values("ts").groupby("agent", as_index=False).tail(1)
+            out: Dict[str, Dict[str, Any]] = {}
+            for _, r in frame.iterrows():
+                agent = str(r.get("agent") or "")
+                if not agent:
+                    continue
+                out[agent] = {
+                    "recommended_role": str(r.get("recommended_role") or "neutral"),
+                    "entry_weight_multiplier": float(r.get("entry_weight_multiplier", 1.0) or 1.0),
+                    "veto_weight_multiplier": float(r.get("veto_weight_multiplier", 1.0) or 1.0),
+                }
+            return out
+        except Exception:
+            return {}
     def _weighted_vote_pairs(
         self,
         adjusted_votes: list[AgentVote],
@@ -1392,8 +1413,20 @@ class Level8Council:
     ) -> list[tuple[AgentVote, float]]:
         """Return vote weights after redundancy-group caps."""
         raw_pairs: list[tuple[AgentVote, float, str]] = []
+        agent_policy = self._latest_agent_trade_policy() if hasattr(self, "_latest_agent_trade_policy") else {}
         for vote in adjusted_votes:
             raw_weight = max(0.0, float(vote.confidence) * float(vote.reliability))
+            direction = dominant_vote_direction(asdict(vote)).upper()
+            policy = agent_policy.get(str(vote.agent), {})
+            role = str(policy.get("recommended_role", "neutral"))
+            entry_mult = float(policy.get("entry_weight_multiplier", 1.0) or 1.0)
+            veto_mult = float(policy.get("veto_weight_multiplier", 1.0) or 1.0)
+            if direction == "BUY":
+                raw_weight *= entry_mult
+                if role == "buy_signal_penalty_veto_filter":
+                    raw_weight *= 0.70
+            if direction in {"WAIT", "HOLD"} and role in {"avoidance_veto_filter", "buy_signal_penalty_veto_filter"}:
+                raw_weight *= veto_mult
             group = agent_redundancy_group(vote.agent)
             raw_pairs.append((vote, raw_weight, group))
 

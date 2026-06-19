@@ -10,7 +10,7 @@ import json
 import time
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import csv
 import math
@@ -31,6 +31,35 @@ from dotenv import load_dotenv
 
 from coinbase.rest import RESTClient
 from coinbase import jwt_generator
+
+
+try:
+    from exchange_catalog import (
+        PRODUCT_SYMBOL_MAP,
+        LIVE_EXECUTION_EXCHANGE,
+        EXCHANGE_COINBASE,
+        EXCHANGE_BINANCE,
+        coinbase_to_binance_symbol,
+        product_mapping_rows,
+    )
+except Exception:
+    PRODUCT_SYMBOL_MAP = {}
+    LIVE_EXECUTION_EXCHANGE = "coinbase"
+    EXCHANGE_COINBASE = "coinbase"
+    EXCHANGE_BINANCE = "binance"
+    def coinbase_to_binance_symbol(product_id: str, *, prefer_us: bool = False):
+        return None
+    def product_mapping_rows():
+        return []
+
+try:
+    from historical_data_provider import (
+        BinanceBulkHistoricalProvider,
+        write_normalized_candles_to_bot_cache,
+    )
+except Exception:
+    BinanceBulkHistoricalProvider = None
+    write_normalized_candles_to_bot_cache = None
 
 try:
     from ai_brain import LocalAIBrain, FEATURE_COLUMNS as AI_FEATURE_COLUMNS
@@ -207,6 +236,27 @@ CHART_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1d_2y.csv")
 HIST_REPLAY_15M_90D_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_15m_90d.csv")
 HIST_REPLAY_1H_365D_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1h_365d.csv")
 HIST_REPLAY_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1d_2y.csv")
+
+# ============================================================
+# HISTORICAL DATA PROVIDER CONFIG
+# ============================================================
+ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL: bool = True
+# Keep Coinbase live execution until intentionally replaced later.
+LIVE_EXECUTION_EXCHANGE_ID: str = LIVE_EXECUTION_EXCHANGE
+# Historical data source priority: local cache -> Binance bulk public files -> Coinbase fallback
+HISTORICAL_CANDLE_SOURCE_PRIORITY: List[str] = [
+    "local_cache",
+    "binance_bulk",
+    "coinbase_fallback",
+]
+BINANCE_BULK_TIMEOUT_SEC: float = 45.0
+BINANCE_BULK_PREFER_BINANCE_US: bool = False
+# Keep this false until you intentionally build Binance signed API execution.
+ENABLE_BINANCE_LIVE_EXECUTION: bool = False
+# Source quality labels.
+HISTORICAL_SOURCE_LOCAL_CACHE: str = "local_cache"
+HISTORICAL_SOURCE_BINANCE_BULK: str = "binance_bulk"
+HISTORICAL_SOURCE_COINBASE_FALLBACK: str = "coinbase_fallback"
 EXTENDED_CHART_REFRESH_EVERY_SEC: int = 30 * 60
 EXTENDED_CHART_FETCH_CONCURRENCY: int = 1
 EXTENDED_CHART_PRODUCTS_PER_PASS: int = 1
@@ -221,6 +271,7 @@ HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "historical_rep
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
+EXCHANGE_PRODUCT_MAP_CSV_PATH: str = os.path.join(BASE_DIR, "exchange_product_map.csv")
 HISTORY_FETCH_CONCURRENCY: int = 2
 MACRO_FETCH_CONCURRENCY: int = 1
 MACRO_DAY_REFRESH_EVERY_SEC = 180
@@ -300,7 +351,8 @@ HISTORICAL_SHADOW_REPLAY_COLUMNS: List[str] = [
     "price_action_buy_score", "market_structure_buy_score", "quant_buy_score",
     "setup_tag", "regime_tag", "replay_candidate_qualified",
     "replay_candidate_quality", "replay_filter_reason", "accepted_for_calibration",
-    "replay_source", "reason",
+    "replay_source", "historical_source_exchange", "historical_source_symbol",
+    "historical_source_note", "reason",
 ]
 
 HISTORICAL_REPLAY_SUMMARY_COLUMNS: List[str] = [
@@ -4625,6 +4677,27 @@ class ExecutionResult:
         }
 
 
+
+# ============================================================
+# FUTURE BINANCE LIVE EXECUTION ROADMAP
+# ============================================================
+# Current live execution is Coinbase through LivePortfolio.
+#
+# Binance is currently used only as a public historical data source.
+#
+# To replace Coinbase with Binance later:
+# 1. Implement Binance signed REST authentication in exchange_adapters.py.
+# 2. Implement Binance account snapshot.
+# 3. Implement Binance top-of-book / order book calls.
+# 4. Implement Binance market and limit buy/sell methods.
+# 5. Normalize Binance fills into the existing ExecutionResult shape.
+# 6. Replace LivePortfolio usage with a selected exchange adapter.
+# 7. Set LIVE_EXECUTION_EXCHANGE=binance in .env only after paper/testnet validation.
+# 8. Keep Coinbase and Binance product mappings in exchange_catalog.py.
+#
+# Until that future update:
+# ENABLE_BINANCE_LIVE_EXECUTION must remain False.
+
 class LivePortfolio:
     """Live-portfolio wrapper for Coinbase Advanced Trade.
 
@@ -5967,6 +6040,36 @@ class TradingBot:
         self._ensure_shadow_sell_replay_header()
         self._ensure_historical_shadow_replay_header()
         self._ensure_historical_replay_summary_header()
+
+        self.binance_bulk_provider = None
+        if bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL) and BinanceBulkHistoricalProvider is not None:
+            try:
+                self.binance_bulk_provider = BinanceBulkHistoricalProvider(
+                    base_dir=BASE_DIR,
+                    timeout_sec=float(BINANCE_BULK_TIMEOUT_SEC),
+                    prefer_binance_us=bool(BINANCE_BULK_PREFER_BINANCE_US),
+                )
+                module_debug(
+                    MODULE_NAME,
+                    "binance_bulk_provider_enabled",
+                    data={
+                        "enabled": True,
+                        "prefer_binance_us": bool(BINANCE_BULK_PREFER_BINANCE_US),
+                        "mapped_products": product_mapping_rows(),
+                    },
+                    level="INFO",
+                    also_overall=True,
+                )
+            except Exception as exc:
+                self.binance_bulk_provider = None
+                module_exception(
+                    MODULE_NAME,
+                    "binance_bulk_provider_init_failed",
+                    exc,
+                    data={"traceback": traceback.format_exc()},
+                    also_overall=True,
+                )
+        self._write_exchange_product_map()
         self._last_shadow_sell_replay_ts = 0.0
         self._shadow_sell_replay_running = False
         self._historical_replay_running = False
@@ -14423,6 +14526,10 @@ class TradingBot:
 
     def _live_readiness_status(self, *, include_calculation: bool = True) -> Dict[str, Any]:
         status = {"viewer_snapshot_recent": False, "websocket_recent": False, "market_csv_recent": False, "council_recent": False, "no_duplicate_process": True, "fee_tier_ready": False, "risk_pause_active": False, "drawdown_brake_active": False, "open_positions_count": 0, "learning_files_writable": False, "sqlite_writable": False, "safe_to_run_overnight": False}
+        status["live_execution_exchange"] = str(LIVE_EXECUTION_EXCHANGE_ID)
+        status["binance_bulk_historical_backfill_enabled"] = bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL)
+        status["binance_live_execution_enabled"] = bool(ENABLE_BINANCE_LIVE_EXECUTION)
+        status["historical_source_priority"] = list(HISTORICAL_CANDLE_SOURCE_PRIORITY)
         maker_fee_bps = getattr(self, "current_maker_fee_bps", None)
         taker_fee_bps = getattr(self, "current_taker_fee_bps", None)
         mode = str(TRADING_AGGRESSION_MODE or "PROFIT_FIRST_FEE_AWARE").upper()
@@ -16050,6 +16157,10 @@ class TradingBot:
             frame = frame.drop_duplicates(subset=["product_id", "ts"], keep="last")
             frame = frame.sort_values(["product_id", "ts"])
             columns = ["ts", "dt_mst", "product_id", "open", "high", "low", "close", "volume"]
+            source_columns = ["historical_source", "source_exchange", "source_symbol", "source_interval"]
+            for col in source_columns:
+                if col in frame.columns and col not in columns:
+                    columns.append(col)
             tmp = path + ".compact.tmp"
             with open(tmp, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=columns)
@@ -16072,25 +16183,98 @@ class TradingBot:
         except Exception as exc:
             module_exception(MODULE_NAME, "compact_historical_replay_caches_if_due_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
+
+    def _write_exchange_product_map(self) -> None:
+        try:
+            rows = product_mapping_rows()
+            if not rows:
+                return
+            columns = [
+                "canonical_product_id", "coinbase_product_id", "binance_symbol",
+                "binance_us_symbol", "base_asset", "coinbase_quote",
+                "binance_quote", "note",
+            ]
+            with open(EXCHANGE_PRODUCT_MAP_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=columns)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({col: row.get(col, "") for col in columns})
+            module_debug(MODULE_NAME, "exchange_product_map_written", data={"path": EXCHANGE_PRODUCT_MAP_CSV_PATH, "rows": len(rows)}, level="INFO", also_overall=True)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "exchange_product_map_write_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+    async def _try_binance_bulk_historical_backfill(
+        self,
+        *,
+        product_id: str,
+        timeframe: str,
+        cache_path: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> Tuple[List[Candle], Dict[str, Any]]:
+        """Try to fill historical replay cache using Binance public bulk data only."""
+        meta: Dict[str, Any] = {"ok": False, "source": HISTORICAL_SOURCE_BINANCE_BULK, "product_id": product_id, "timeframe": timeframe, "cache_path": cache_path}
+        try:
+            provider = getattr(self, "binance_bulk_provider", None)
+            if provider is None:
+                meta["reason"] = "binance_bulk_provider_not_available"
+                return [], meta
+            binance_symbol = coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US))
+            if not binance_symbol:
+                meta["reason"] = "missing_binance_symbol_mapping"
+                return [], meta
+            normalized, provider_meta = provider.fetch_bulk_candles(product_id=product_id, timeframe=timeframe, start_ts=int(start_ts), end_ts=int(end_ts))
+            meta.update(provider_meta or {})
+            if not normalized:
+                meta["reason"] = meta.get("reason") or "binance_bulk_returned_no_candles"
+                return [], meta
+            rows_written = write_normalized_candles_to_bot_cache(path=cache_path, product_id=product_id, candles=normalized, min_ts=int(start_ts)) if write_normalized_candles_to_bot_cache is not None else 0
+            candles = self._read_candles_from_csv_for_replay(path=cache_path, product_id=product_id, min_ts=float(start_ts))
+            meta.update({"ok": bool(candles), "reason": "binance_bulk_backfill_complete" if candles else "binance_bulk_write_or_read_failed", "binance_symbol": binance_symbol, "normalized_candles": len(normalized), "rows_written": rows_written, "cache_candles_after_write": len(candles)})
+            module_debug(MODULE_NAME, "binance_bulk_historical_backfill_completed", data=meta, level="INFO", also_overall=False)
+            return candles, meta
+        except Exception as exc:
+            meta["reason"] = "binance_bulk_backfill_exception"
+            meta["error"] = str(exc)
+            module_exception(MODULE_NAME, "binance_bulk_historical_backfill_failed", exc, data={**meta, "traceback": traceback.format_exc()}, also_overall=True)
+            return [], meta
+
     async def _get_historical_replay_candles(self, *, product_id: str, timeframe: str) -> Tuple[List[Candle], str, str]:
         now_i = int(now_ts())
         tf = str(timeframe)
         if tf == "primary_15m_90d":
-            granularity = HIST_REPLAY_PRIMARY_GRANULARITY; lookback_sec = int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS) * 86400; fallback_path = HIST_REPLAY_15M_90D_CSV_PATH
+            granularity = HIST_REPLAY_PRIMARY_GRANULARITY
+            lookback_sec = int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS) * 86400
+            fallback_path = HIST_REPLAY_15M_90D_CSV_PATH
+            min_needed = int(STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT)
         elif tf == "regime_1h_365d":
-            granularity = HIST_REPLAY_REGIME_GRANULARITY; lookback_sec = int(HIST_REPLAY_REGIME_LOOKBACK_DAYS) * 86400; fallback_path = HIST_REPLAY_1H_365D_CSV_PATH
+            granularity = HIST_REPLAY_REGIME_GRANULARITY
+            lookback_sec = int(HIST_REPLAY_REGIME_LOOKBACK_DAYS) * 86400
+            fallback_path = HIST_REPLAY_1H_365D_CSV_PATH
+            min_needed = int(STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT)
         else:
-            granularity = HIST_REPLAY_DAILY_GRANULARITY; lookback_sec = int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400; fallback_path = HIST_REPLAY_1D_2Y_CSV_PATH
-        start_ts = now_i - lookback_sec
-        cached = self._read_candles_from_csv_for_replay(path=fallback_path, product_id=product_id, min_ts=start_ts)
-        min_needed = 200 if granularity != "ONE_DAY" else 120
-        if len(cached) >= min_needed:
-            return cached, granularity, "csv_cache"
+            granularity = HIST_REPLAY_DAILY_GRANULARITY
+            lookback_sec = int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400
+            fallback_path = HIST_REPLAY_1D_2Y_CSV_PATH
+            min_needed = 120
+        start_ts = now_i - int(lookback_sec)
+        cached = self._read_candles_from_csv_for_replay(path=fallback_path, product_id=product_id, min_ts=float(start_ts))
+        if len(cached) >= max(1, int(min_needed)):
+            return cached, granularity, HISTORICAL_SOURCE_LOCAL_CACHE
+        if bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL) and "binance_bulk" in HISTORICAL_CANDLE_SOURCE_PRIORITY:
+            binance_candles, binance_meta = await self._try_binance_bulk_historical_backfill(product_id=product_id, timeframe=tf, cache_path=fallback_path, start_ts=int(start_ts), end_ts=int(now_i))
+            if len(binance_candles) >= max(1, int(min_needed)):
+                return binance_candles, granularity, HISTORICAL_SOURCE_BINANCE_BULK
+            module_debug(MODULE_NAME, "binance_bulk_historical_backfill_insufficient", data={"product_id": product_id, "timeframe": tf, "needed": int(min_needed), "received": len(binance_candles), "meta": binance_meta}, level="WARN", also_overall=False)
+        module_debug(MODULE_NAME, "historical_replay_coinbase_fallback_start", data={"product_id": product_id, "timeframe": tf, "granularity": granularity, "start_ts": start_ts, "end_ts": now_i, "cached_rows": len(cached), "needed": int(min_needed)}, level="INFO", also_overall=False)
         candles = await self.fetcher.fetch_chunked(product_id, start_ts, now_i, granularity, max_candles_per_req=300)
         if candles:
             self._write_historical_replay_candle_cache(path=fallback_path, product_id=product_id, candles=candles, min_ts=start_ts)
         await asyncio.sleep(float(HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC))
-        return candles or cached, granularity, "rest_fetch" if candles else "csv_cache_partial"
+        final_cached = self._read_candles_from_csv_for_replay(path=fallback_path, product_id=product_id, min_ts=float(start_ts))
+        if final_cached:
+            return final_cached, granularity, HISTORICAL_SOURCE_COINBASE_FALLBACK
+        return candles or cached, granularity, HISTORICAL_SOURCE_COINBASE_FALLBACK if candles else "csv_cache_partial"
 
 
     def _historical_replay_job_queue(self) -> List[Tuple[str, str]]:
@@ -16261,7 +16445,7 @@ class TradingBot:
             gross_proceeds = synthetic_qty * float(exit_price); exit_fee = fee_usd(gross_proceeds, exit_fee_bps); gross_pnl = gross_proceeds - synthetic_notional; net_pnl = gross_proceeds - synthetic_notional - entry_fee_usd - exit_fee; net_pnl_bps = (net_pnl / max(synthetic_notional, 1e-12)) * 10000.0
             max_favorable_bps = ((peak_price / entry_price) - 1.0) * 10000.0; max_adverse_bps = ((trough_price / entry_price) - 1.0) * 10000.0
             replay_key = f"{product_id}|{timeframe}|{replay_ts}|{int(float(signal.score) * 1000000)}"
-            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
+            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "historical_source_exchange": ("binance" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else ("coinbase" if str(replay_source) == HISTORICAL_SOURCE_COINBASE_FALLBACK else "local_cache")), "historical_source_symbol": (coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US)) if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else product_id), "historical_source_note": ("Historical replay used Binance public bulk USDT-pair candles as a proxy for Coinbase USD-pair execution." if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else "Historical replay used local cache or Coinbase fallback candles."), "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
         except Exception as exc:
             module_exception(MODULE_NAME, "simulate_historical_replay_candidate_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "traceback": traceback.format_exc()}, also_overall=False)
             return None
@@ -16778,7 +16962,7 @@ class TradingBot:
             elif phase_totals["replay_calibration_verdicts"] < 1.0: phase_label = "Calculating replay-based product verdicts"
             elif not full_viewer_unlocked: phase_label = "Final readiness checks"
             else: phase_label = "Complete"
-            status = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE)}}
+            status = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY)}}
             self._calculation_status_cache = dict(status)
             self._calculation_status_cache_ts = now_ts()
             return status

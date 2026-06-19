@@ -57,6 +57,7 @@ SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
 SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
 HISTORICAL_SHADOW_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_summary.csv")
+REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
 EXCHANGE_PRODUCT_MAP_CSV_PATH = os.path.join(BASE_DIR, "exchange_product_map.csv")
 MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
 CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
@@ -1844,6 +1845,12 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     startup_cols[2].metric("Parallel fetches", int(policy.get("historical_replay_max_parallel_fetches", 0) or 0))
     startup_cols[3].metric("CPU worker replay", str(policy.get("full_replay_math_in_process_workers", False)))
     startup_cols[4].metric("Worker import", str(policy.get("historical_replay_worker_import_ok", False)))
+    st.markdown("### Replay fee comparison")
+    fee_cols = st.columns(4)
+    fee_cols[0].metric("Fee comparison", str(policy.get("replay_exchange_fee_comparison_enabled", False)))
+    fee_cols[1].metric("Primary model", str(policy.get("replay_primary_fee_model", "coinbase")))
+    fee_cols[2].metric("Comparison model", str(policy.get("replay_comparison_fee_model", "binance_us")))
+    fee_cols[3].metric("Binance taker", f"{float(policy.get('binance_us_comparison_taker_fee_bps', 0.0) or 0.0):.2f} bps")
     worker_import_error = str(policy.get("historical_replay_worker_import_error", "") or "")
     if worker_import_error:
         st.error(f"CPU worker import error: {worker_import_error}")
@@ -1881,6 +1888,28 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         st.json(calc_status)
     st.info("When this reaches 100%, refreshing localhost will show the normal All-Coin Command Deck. If a product is replay-complete but unprofitable, it still counts as calculated, but live buys remain blocked for that product.")
 
+
+def render_replay_fee_comparison_panel():
+    df = load_csv_tail(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, max_lines=5000)
+    st.markdown("### Coinbase vs Binance Replay Fee Comparison")
+    if df is None or df.empty:
+        st.info("No replay fee comparison summary yet. It will populate after historical worker outputs merge.")
+        return
+    numeric_cols = ["rows", "primary_avg_net_bps", "primary_median_net_bps", "primary_win_rate", "comparison_avg_net_bps", "comparison_median_net_bps", "comparison_win_rate", "avg_improvement_bps", "median_improvement_bps", "rows_flipped_to_profit_by_comparison"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    latest = df.sort_values("ts").groupby(["product_id", "timeframe"], as_index=False).tail(1) if all(c in df.columns for c in ["ts", "product_id", "timeframe"]) else df.tail(200)
+    total_rows = int(latest["rows"].sum()) if "rows" in latest.columns else 0
+    avg_improvement = float(latest["avg_improvement_bps"].mean()) if "avg_improvement_bps" in latest.columns and not latest.empty else 0.0
+    flipped = int(latest["rows_flipped_to_profit_by_comparison"].sum()) if "rows_flipped_to_profit_by_comparison" in latest.columns else 0
+    cols = st.columns(4)
+    cols[0].metric("Compared rows", total_rows)
+    cols[1].metric("Avg Binance improvement", f"{avg_improvement:.2f} bps")
+    cols[2].metric("Rows flipped profitable", flipped)
+    cols[3].metric("Products/timeframes", len(latest))
+    show_cols = [c for c in ["product_id", "timeframe", "rows", "primary_avg_net_bps", "comparison_avg_net_bps", "avg_improvement_bps", "primary_win_rate", "comparison_win_rate", "rows_flipped_to_profit_by_comparison", "primary_fee_model", "comparison_fee_model"] if c in latest.columns]
+    st.dataframe(latest[show_cols], width="stretch", hide_index=True)
 
 def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
@@ -1962,6 +1991,14 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
                 if c in historical_replay_df.columns
             ]
             st.dataframe(historical_replay_df.tail(200)[show_cols], width="stretch", hide_index=True)
+
+    with st.expander("Coinbase vs Binance replay fee comparison", expanded=False):
+        render_replay_fee_comparison_panel()
+
+    fee_comparison_df = load_csv_tail(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, max_lines=5000)
+    if fee_comparison_df is not None and not fee_comparison_df.empty:
+        with st.expander("replay_fee_comparison_summary.csv", expanded=False):
+            st.dataframe(fee_comparison_df, width="stretch", hide_index=True)
 
     explanations = readiness.get("readiness_explanation") or []
     if explanations:

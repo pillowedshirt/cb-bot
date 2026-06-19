@@ -304,6 +304,21 @@ BINANCE_BULK_TIMEOUT_SEC: float = 45.0
 BINANCE_BULK_PREFER_BINANCE_US: bool = False
 # Keep this false until you intentionally build Binance signed API execution.
 ENABLE_BINANCE_LIVE_EXECUTION: bool = False
+
+# ============================================================
+# REPLAY FEE MODEL COMPARISON
+# ============================================================
+ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON: bool = True
+REPLAY_PRIMARY_FEE_MODEL: str = "coinbase"
+REPLAY_COMPARISON_FEE_MODEL: str = "binance_us"
+BINANCE_US_COMPARISON_MAKER_FEE_BPS: float = 0.0
+BINANCE_US_COMPARISON_TAKER_FEE_BPS: float = 2.0
+BINANCE_US_TIER0_MAKER_FEE_BPS: float = 0.0
+BINANCE_US_TIER0_TAKER_FEE_BPS: float = 1.0
+REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY: str = "taker"
+REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY: str = "taker"
+BINANCE_US_TIER0_PRODUCTS: Set[str] = set()
+
 # Source quality labels.
 HISTORICAL_SOURCE_LOCAL_CACHE: str = "local_cache"
 HISTORICAL_SOURCE_BINANCE_BULK: str = "binance_bulk"
@@ -328,6 +343,7 @@ ENABLE_HISTORICAL_REPLAY_PROCESS_POOL: bool = True
 HISTORICAL_REPLAY_PROCESS_WORKERS: int = 3
 ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS: bool = True
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_summary.csv")
+REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
@@ -403,7 +419,17 @@ HISTORICAL_SHADOW_REPLAY_COLUMNS: List[str] = [
     "min_profitable_exit_price", "hard_stop_price", "exit_ts", "exit_price",
     "exit_reason", "held_seconds", "max_favorable_bps", "max_adverse_bps",
     "peak_price", "trough_price", "gross_pnl_usd", "exit_fee_usd",
-    "net_pnl_usd", "net_pnl_bps", "would_have_won", "would_have_hit_stop",
+    "net_pnl_usd", "net_pnl_bps",
+    "primary_fee_model", "comparison_fee_model",
+    "primary_entry_fee_bps", "primary_exit_fee_bps",
+    "primary_entry_fee_usd", "primary_exit_fee_usd",
+    "primary_net_pnl_usd", "primary_net_pnl_bps", "primary_would_have_won",
+    "comparison_entry_fee_bps", "comparison_exit_fee_bps",
+    "comparison_entry_fee_usd", "comparison_exit_fee_usd",
+    "comparison_net_pnl_usd", "comparison_net_pnl_bps", "comparison_would_have_won",
+    "comparison_net_improvement_usd", "comparison_net_improvement_bps",
+    "comparison_break_even_reduction_bps",
+    "would_have_won", "would_have_hit_stop",
     "would_have_hit_min_profit", "score", "probability", "expected_net_edge_bps",
     "target_bps", "cost_bps", "spread_bps", "session_liquidity_setup",
     "value_acceptance_state", "volume_node_state", "poc_distance_bps",
@@ -421,6 +447,16 @@ HISTORICAL_REPLAY_SUMMARY_COLUMNS: List[str] = [
     "worst_net_pnl_bps", "median_mfe_bps", "median_mae_bps", "days_covered",
     "calibration_ready", "recommended_min_score", "recommended_min_probability",
     "recommended_min_expected_value_bps", "reason",
+]
+
+REPLAY_FEE_COMPARISON_SUMMARY_COLUMNS: List[str] = [
+    "ts", "dt_mst", "product_id", "timeframe", "rows",
+    "primary_fee_model", "comparison_fee_model",
+    "primary_avg_net_bps", "primary_median_net_bps", "primary_win_rate",
+    "comparison_avg_net_bps", "comparison_median_net_bps", "comparison_win_rate",
+    "avg_improvement_bps", "median_improvement_bps",
+    "primary_profitable_rows", "comparison_profitable_rows",
+    "rows_flipped_to_profit_by_comparison", "reason",
 ]
 
 RUNTIME_CSV_COMPACT_EVERY_SEC = 15 * 60
@@ -458,6 +494,7 @@ STARTUP_STATE_CSV_PATHS: List[str] = [
     ADAPTIVE_GUARDRAILS_CSV_PATH,
     BACKTEST_SUMMARY_CSV_PATH,
     SHADOW_SELL_REPLAY_CSV_PATH,
+    REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH,
 ]
 
 
@@ -6121,6 +6158,10 @@ class TradingBot:
         self._ensure_shadow_sell_replay_header()
         self._ensure_historical_shadow_replay_header()
         self._ensure_historical_replay_summary_header()
+        try:
+            self._ensure_replay_fee_comparison_summary_header()
+        except Exception:
+            pass
 
         self.binance_bulk_provider = None
         if bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL) and BinanceBulkHistoricalProvider is not None:
@@ -14646,6 +14687,11 @@ class TradingBot:
         status["binance_bulk_historical_backfill_enabled"] = bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL)
         status["binance_live_execution_enabled"] = bool(ENABLE_BINANCE_LIVE_EXECUTION)
         status["historical_source_priority"] = list(HISTORICAL_CANDLE_SOURCE_PRIORITY)
+        status["replay_exchange_fee_comparison_enabled"] = bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON)
+        status["replay_primary_fee_model"] = str(REPLAY_PRIMARY_FEE_MODEL)
+        status["replay_comparison_fee_model"] = str(REPLAY_COMPARISON_FEE_MODEL)
+        status["binance_us_comparison_maker_fee_bps"] = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS)
+        status["binance_us_comparison_taker_fee_bps"] = float(BINANCE_US_COMPARISON_TAKER_FEE_BPS)
         maker_fee_bps = getattr(self, "current_maker_fee_bps", None)
         taker_fee_bps = getattr(self, "current_taker_fee_bps", None)
         mode = str(TRADING_AGGRESSION_MODE or "PROFIT_FIRST_FEE_AWARE").upper()
@@ -16187,9 +16233,20 @@ class TradingBot:
 
     def _process_worker_replay_config(self, product_id: str) -> Dict[str, Any]:
         profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
+        if str(product_id) in BINANCE_US_TIER0_PRODUCTS:
+            binance_entry_fee_bps = float(BINANCE_US_TIER0_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY == "maker" else BINANCE_US_TIER0_TAKER_FEE_BPS)
+            binance_exit_fee_bps = float(BINANCE_US_TIER0_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY == "maker" else BINANCE_US_TIER0_TAKER_FEE_BPS)
+        else:
+            binance_entry_fee_bps = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY == "maker" else BINANCE_US_COMPARISON_TAKER_FEE_BPS)
+            binance_exit_fee_bps = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY == "maker" else BINANCE_US_COMPARISON_TAKER_FEE_BPS)
         return {
             "entry_fee_bps": float(self._entry_fee_bps_for_mode(execution_mode=ENTRY_EXECUTION_MODE)),
             "exit_fee_bps": float(self._exit_fee_bps_for_mode()),
+            "primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL),
+            "comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL),
+            "enable_exchange_fee_comparison": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON),
+            "comparison_entry_fee_bps": float(binance_entry_fee_bps),
+            "comparison_exit_fee_bps": float(binance_exit_fee_bps),
             "max_spread_bps": float(MAX_SPREAD_BPS),
             "est_slippage_bps": float(EST_SLIPPAGE_BPS),
             "est_adverse_fill_bps": float(EST_ADVERSE_FILL_BPS),
@@ -16354,6 +16411,63 @@ class TradingBot:
                 csv.writer(f).writerow(HISTORICAL_REPLAY_SUMMARY_COLUMNS)
         except Exception as exc:
             module_exception(MODULE_NAME, "ensure_historical_replay_summary_header_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+
+    def _ensure_replay_fee_comparison_summary_header(self) -> None:
+        try:
+            if os.path.exists(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH) and os.path.getsize(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH) > 0:
+                return
+            with open(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(REPLAY_FEE_COMPARISON_SUMMARY_COLUMNS)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "ensure_replay_fee_comparison_summary_header_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+    def _write_replay_fee_comparison_summary_for_product(self, product_id: str, timeframe: str) -> None:
+        try:
+            self._ensure_replay_fee_comparison_summary_header()
+            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=500000)
+            if frame.empty or "product_id" not in frame.columns or "timeframe" not in frame.columns:
+                return
+            sub = frame[frame["product_id"].astype(str).eq(str(product_id)) & frame["timeframe"].astype(str).eq(str(timeframe))].copy()
+            if sub.empty:
+                return
+            required_cols = ["primary_net_pnl_bps", "comparison_net_pnl_bps", "comparison_net_improvement_bps"]
+            if not all(c in sub.columns for c in required_cols):
+                return
+            primary = pd.to_numeric(sub["primary_net_pnl_bps"], errors="coerce")
+            comparison = pd.to_numeric(sub["comparison_net_pnl_bps"], errors="coerce")
+            improvement = pd.to_numeric(sub["comparison_net_improvement_bps"], errors="coerce").dropna()
+            valid = primary.notna() & comparison.notna()
+            primary = primary[valid]
+            comparison = comparison[valid]
+            if primary.empty or comparison.empty:
+                return
+            flipped = int(((primary <= 0) & (comparison > 0)).sum())
+            row = {
+                "ts": now_ts(),
+                "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                "product_id": product_id,
+                "timeframe": timeframe,
+                "rows": int(len(sub)),
+                "primary_fee_model": str(sub["primary_fee_model"].dropna().iloc[-1]) if "primary_fee_model" in sub.columns and not sub["primary_fee_model"].dropna().empty else "coinbase",
+                "comparison_fee_model": str(sub["comparison_fee_model"].dropna().iloc[-1]) if "comparison_fee_model" in sub.columns and not sub["comparison_fee_model"].dropna().empty else "binance_us",
+                "primary_avg_net_bps": float(primary.mean()),
+                "primary_median_net_bps": float(primary.median()),
+                "primary_win_rate": float((primary > 0).mean()),
+                "comparison_avg_net_bps": float(comparison.mean()),
+                "comparison_median_net_bps": float(comparison.median()),
+                "comparison_win_rate": float((comparison > 0).mean()),
+                "avg_improvement_bps": float(improvement.mean()) if not improvement.empty else 0.0,
+                "median_improvement_bps": float(improvement.median()) if not improvement.empty else 0.0,
+                "primary_profitable_rows": int((primary > 0).sum()),
+                "comparison_profitable_rows": int((comparison > 0).sum()),
+                "rows_flipped_to_profit_by_comparison": flipped,
+                "reason": "same_entry_same_exit_fee_comparison;primary=coinbase_current_fee_model;comparison=binance_us_configurable_fee_model",
+            }
+            with open(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=REPLAY_FEE_COMPARISON_SUMMARY_COLUMNS)
+                writer.writerow({col: row.get(col, "") for col in REPLAY_FEE_COMPARISON_SUMMARY_COLUMNS})
+        except Exception as exc:
+            module_exception(MODULE_NAME, "write_replay_fee_comparison_summary_for_product_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "traceback": traceback.format_exc()}, also_overall=False)
 
     def _historical_replay_existing_keys(self, max_lines: int = 150000, *, force: bool = False) -> Set[str]:
         try:
@@ -16840,10 +16954,21 @@ class TradingBot:
                 if age_sec >= float(LEVEL8_MAX_HOLD_SEC): exit_ts = ts_val; exit_price = close; exit_reason = "historical_max_hold_exit"; break
             if exit_ts is None:
                 last = future[-1]; exit_ts = float(last.ts); exit_price = float(last.close); exit_reason = "historical_window_end"
-            gross_proceeds = synthetic_qty * float(exit_price); exit_fee = fee_usd(gross_proceeds, exit_fee_bps); gross_pnl = gross_proceeds - synthetic_notional; net_pnl = gross_proceeds - synthetic_notional - entry_fee_usd - exit_fee; net_pnl_bps = (net_pnl / max(synthetic_notional, 1e-12)) * 10000.0
+            gross_proceeds = synthetic_qty * float(exit_price); gross_pnl = gross_proceeds - synthetic_notional
+            primary_entry_fee_usd = fee_usd(synthetic_notional, entry_fee_bps); primary_exit_fee_usd = fee_usd(gross_proceeds, exit_fee_bps)
+            net_pnl = gross_proceeds - synthetic_notional - primary_entry_fee_usd - primary_exit_fee_usd; net_pnl_bps = (net_pnl / max(synthetic_notional, 1e-12)) * 10000.0
+            if str(product_id) in BINANCE_US_TIER0_PRODUCTS:
+                comparison_entry_fee_bps = float(BINANCE_US_TIER0_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY == "maker" else BINANCE_US_TIER0_TAKER_FEE_BPS)
+                comparison_exit_fee_bps = float(BINANCE_US_TIER0_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY == "maker" else BINANCE_US_TIER0_TAKER_FEE_BPS)
+            else:
+                comparison_entry_fee_bps = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY == "maker" else BINANCE_US_COMPARISON_TAKER_FEE_BPS)
+                comparison_exit_fee_bps = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY == "maker" else BINANCE_US_COMPARISON_TAKER_FEE_BPS)
+            comparison_entry_fee_usd = fee_usd(synthetic_notional, comparison_entry_fee_bps); comparison_exit_fee_usd = fee_usd(gross_proceeds, comparison_exit_fee_bps)
+            comparison_net_pnl = gross_proceeds - synthetic_notional - comparison_entry_fee_usd - comparison_exit_fee_usd; comparison_net_pnl_bps = (comparison_net_pnl / max(synthetic_notional, 1e-12)) * 10000.0
+            exit_fee = primary_exit_fee_usd
             max_favorable_bps = ((peak_price / entry_price) - 1.0) * 10000.0; max_adverse_bps = ((trough_price / entry_price) - 1.0) * 10000.0
             replay_key = f"{product_id}|{timeframe}|{replay_ts}|{int(float(signal.score) * 1000000)}"
-            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "historical_source_exchange": ("binance" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else ("coinbase" if str(replay_source) == HISTORICAL_SOURCE_COINBASE_FALLBACK else "local_cache")), "historical_source_symbol": (coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US)) if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else product_id), "historical_source_note": ("Historical replay used Binance public bulk USDT-pair candles as a proxy for Coinbase USD-pair execution." if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else "Historical replay used local cache or Coinbase fallback candles."), "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
+            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "primary_entry_fee_bps": entry_fee_bps, "primary_exit_fee_bps": exit_fee_bps, "primary_entry_fee_usd": primary_entry_fee_usd, "primary_exit_fee_usd": primary_exit_fee_usd, "primary_net_pnl_usd": net_pnl, "primary_net_pnl_bps": net_pnl_bps, "primary_would_have_won": int(net_pnl > 0), "comparison_entry_fee_bps": comparison_entry_fee_bps, "comparison_exit_fee_bps": comparison_exit_fee_bps, "comparison_entry_fee_usd": comparison_entry_fee_usd, "comparison_exit_fee_usd": comparison_exit_fee_usd, "comparison_net_pnl_usd": comparison_net_pnl, "comparison_net_pnl_bps": comparison_net_pnl_bps, "comparison_would_have_won": int(comparison_net_pnl > 0), "comparison_net_improvement_usd": float(comparison_net_pnl - net_pnl), "comparison_net_improvement_bps": float(comparison_net_pnl_bps - net_pnl_bps), "comparison_break_even_reduction_bps": float(entry_fee_bps + exit_fee_bps - comparison_entry_fee_bps - comparison_exit_fee_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "historical_source_exchange": ("binance" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else ("coinbase" if str(replay_source) == HISTORICAL_SOURCE_COINBASE_FALLBACK else "local_cache")), "historical_source_symbol": (coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US)) if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else product_id), "historical_source_note": ("Historical replay used Binance public bulk USDT-pair candles as a proxy for Coinbase USD-pair execution." if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else "Historical replay used local cache or Coinbase fallback candles."), "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
         except Exception as exc:
             module_exception(MODULE_NAME, "simulate_historical_replay_candidate_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "traceback": traceback.format_exc()}, also_overall=False)
             return None
@@ -17279,6 +17404,10 @@ class TradingBot:
                                 writer.writerow({col: row.get(col, "") for col in HISTORICAL_SHADOW_REPLAY_COLUMNS})
                 async with self._historical_replay_manifest_lock:
                     update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates={"status": JOB_MERGED, "merged_ts": now_ts(), "rows_written": int(len(rows)), "rows_appended_to_master": int(len(new_rows)), "merge_note": ("merged_with_new_rows" if new_rows else "merged_but_all_rows_already_existed")})
+                try:
+                    self._write_replay_fee_comparison_summary_for_product(product_id=str(job.get("product_id") or ""), timeframe=str(job.get("timeframe") or ""))
+                except Exception:
+                    pass
                 if self._historical_worker_pool is not None and process_worker_output_summary is not None:
                     try:
                         loop = asyncio.get_running_loop()
@@ -17635,7 +17764,7 @@ class TradingBot:
             else: phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None)}}
+            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "replay_comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             self._calculation_status_cache = dict(status)
             self._calculation_status_cache_ts = now_ts()
             return status

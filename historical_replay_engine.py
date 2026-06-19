@@ -109,6 +109,36 @@ class ReplayEngineConfig:
     high_win_stop_loss_pct: float = 0.006
     high_win_profit_pullback_pct: float = 0.0015
     high_win_min_profit_over_cost_bps: float = 25.0
+    high_win_v2_min_target_to_cost_ratio: float = 1.35
+    high_win_v2_min_target_over_cost_bps: float = 35.0
+    high_win_v2_min_probability: float = 0.54
+    high_win_v2_min_score: float = 54.0
+    high_win_v2_max_spread_bps: float = 22.0
+    high_win_v2_require_momentum_either: bool = True
+    high_win_v2_min_momentum_either_bps: float = 0.0
+    high_win_v2_block_low_room: bool = True
+    high_win_v2_block_low_volume_above_value: bool = True
+    high_win_v2_stop_loss_pct: float = 0.004
+    high_win_v2_profit_pullback_pct: float = 0.0018
+    coinbase_survival_min_target_to_cost_ratio: float = 2.25
+    coinbase_survival_min_target_over_cost_bps: float = 140.0
+    coinbase_survival_min_probability: float = 0.56
+    coinbase_survival_min_score: float = 58.0
+    coinbase_survival_max_spread_bps: float = 22.0
+    coinbase_survival_stop_loss_pct: float = 0.0035
+    coinbase_survival_profit_pullback_pct: float = 0.0015
+    low_fee_scalp_min_target_to_cost_ratio: float = 1.15
+    low_fee_scalp_min_target_over_cost_bps: float = 15.0
+    low_fee_scalp_min_probability: float = 0.52
+    low_fee_scalp_min_score: float = 50.0
+    low_fee_scalp_max_spread_bps: float = 22.0
+    low_fee_scalp_stop_loss_pct: float = 0.004
+    low_fee_scalp_profit_pullback_pct: float = 0.0015
+    enable_early_adverse_exit: bool = True
+    early_adverse_exit_bps: float = 18.0
+    early_adverse_min_age_bars: int = 2
+    early_adverse_requires_negative_momentum: bool = True
+    early_adverse_momentum_lookback: int = 5
 
 
 def _dt_mst(ts: float) -> str:
@@ -375,21 +405,52 @@ def _variant_entry_filter(*, variant: str, signal: ReplaySignal, candles: List[R
     target_to_cost = float(signal.target_bps) / max(float(signal.cost_bps), 1e-9)
     target_over_cost = float(signal.target_bps) - float(signal.cost_bps)
     metrics = {"target_to_cost_ratio": float(target_to_cost), "target_over_cost_bps": float(target_over_cost), "momentum_5_bps": float(momentum_5), "momentum_15_bps": float(momentum_15)}
-    if str(variant) in {"baseline", "", "current"}:
+    variant = str(variant or "baseline")
+    if variant in {"baseline", "", "current"}:
         return True, "baseline_allowed", metrics
-    reasons = []
-    if target_to_cost < float(config.high_win_min_target_to_cost_ratio): reasons.append(f"target_to_cost_low {target_to_cost:.3f}")
-    if target_over_cost < float(config.high_win_min_target_over_cost_bps): reasons.append(f"target_over_cost_low {target_over_cost:.2f}")
-    if float(signal.estimated_prob_up) < float(config.high_win_min_probability): reasons.append(f"probability_low {float(signal.estimated_prob_up):.3f}")
-    if float(signal.score) < float(config.high_win_min_score): reasons.append(f"score_low {float(signal.score):.2f}")
-    if float(signal.spread_bps) > float(config.high_win_max_spread_bps): reasons.append(f"spread_high {float(signal.spread_bps):.2f}")
-    if bool(config.high_win_require_positive_momentum_5) and momentum_5 < float(config.high_win_min_momentum_5_bps): reasons.append(f"momentum_5_low {momentum_5:.2f}")
-    if bool(config.high_win_require_positive_momentum_15) and momentum_15 < float(config.high_win_min_momentum_15_bps): reasons.append(f"momentum_15_low {momentum_15:.2f}")
-    if bool(config.high_win_block_inside_value_high_volume) and "inside" in str(signal.value_acceptance_state).lower() and "high" in str(signal.volume_node_state).lower(): reasons.append("inside_value_high_volume_chop")
+
+    def fail_reasons(*, min_ratio: float, min_over: float, min_prob: float, min_score: float, max_spread: float, require_momentum_either: bool, min_momentum_either: float) -> List[str]:
+        reasons: List[str] = []
+        if target_to_cost < float(min_ratio): reasons.append(f"target_to_cost_low {target_to_cost:.3f}")
+        if target_over_cost < float(min_over): reasons.append(f"target_over_cost_low {target_over_cost:.2f}")
+        if float(signal.estimated_prob_up) < float(min_prob): reasons.append(f"probability_low {float(signal.estimated_prob_up):.3f}")
+        if float(signal.score) < float(min_score): reasons.append(f"score_low {float(signal.score):.2f}")
+        if float(signal.spread_bps) > float(max_spread): reasons.append(f"spread_high {float(signal.spread_bps):.2f}")
+        if require_momentum_either and max(momentum_5, momentum_15) < float(min_momentum_either): reasons.append(f"momentum_either_low m5={momentum_5:.2f};m15={momentum_15:.2f}")
+        return reasons
+
+    if variant == "high_win_rate_v1":
+        reasons = fail_reasons(min_ratio=float(config.high_win_min_target_to_cost_ratio), min_over=float(config.high_win_min_target_over_cost_bps), min_prob=float(config.high_win_min_probability), min_score=float(config.high_win_min_score), max_spread=float(config.high_win_max_spread_bps), require_momentum_either=False, min_momentum_either=0.0)
+        if bool(config.high_win_require_positive_momentum_5) and momentum_5 < float(config.high_win_min_momentum_5_bps): reasons.append(f"momentum_5_low {momentum_5:.2f}")
+        if bool(config.high_win_require_positive_momentum_15) and momentum_15 < float(config.high_win_min_momentum_15_bps): reasons.append(f"momentum_15_low {momentum_15:.2f}")
+    elif variant == "high_win_rate_v2":
+        reasons = fail_reasons(min_ratio=float(config.high_win_v2_min_target_to_cost_ratio), min_over=float(config.high_win_v2_min_target_over_cost_bps), min_prob=float(config.high_win_v2_min_probability), min_score=float(config.high_win_v2_min_score), max_spread=float(config.high_win_v2_max_spread_bps), require_momentum_either=bool(config.high_win_v2_require_momentum_either), min_momentum_either=float(config.high_win_v2_min_momentum_either_bps))
+        if bool(config.high_win_v2_block_low_room) and "low_room" in str(_setup_tag_from_signal(signal)[1]).lower(): reasons.append("low_room_blocked")
+        if bool(config.high_win_v2_block_low_volume_above_value) and "above" in str(signal.value_acceptance_state).lower() and "low" in str(signal.volume_node_state).lower(): reasons.append("above_value_low_volume_blocked")
+    elif variant == "coinbase_survival_v1":
+        reasons = fail_reasons(min_ratio=float(config.coinbase_survival_min_target_to_cost_ratio), min_over=float(config.coinbase_survival_min_target_over_cost_bps), min_prob=float(config.coinbase_survival_min_probability), min_score=float(config.coinbase_survival_min_score), max_spread=float(config.coinbase_survival_max_spread_bps), require_momentum_either=True, min_momentum_either=0.0)
+    elif variant == "low_fee_scalp_v1":
+        reasons = fail_reasons(min_ratio=float(config.low_fee_scalp_min_target_to_cost_ratio), min_over=float(config.low_fee_scalp_min_target_over_cost_bps), min_prob=float(config.low_fee_scalp_min_probability), min_score=float(config.low_fee_scalp_min_score), max_spread=float(config.low_fee_scalp_max_spread_bps), require_momentum_either=True, min_momentum_either=0.0)
+    else:
+        reasons = [f"unknown_variant {variant}"]
+    if "inside" in str(signal.value_acceptance_state).lower() and "high" in str(signal.volume_node_state).lower() and abs(float(signal.poc_distance_bps)) <= float(config.max_poc_distance_for_chop_bps):
+        reasons.append("inside_high_volume_near_poc_chop")
     if reasons:
         return False, ";".join(reasons), metrics
-    return True, "high_win_rate_v1_allowed", metrics
+    return True, f"{variant}_allowed", metrics
 
+
+def _variant_sell_settings(variant: str, config: ReplayEngineConfig) -> Dict[str, float]:
+    variant = str(variant or "baseline")
+    if variant == "high_win_rate_v1":
+        return {"stop_loss_pct": float(config.high_win_stop_loss_pct), "pullback_pct": float(config.high_win_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
+    if variant == "high_win_rate_v2":
+        return {"stop_loss_pct": float(config.high_win_v2_stop_loss_pct), "pullback_pct": float(config.high_win_v2_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
+    if variant == "coinbase_survival_v1":
+        return {"stop_loss_pct": float(config.coinbase_survival_stop_loss_pct), "pullback_pct": float(config.coinbase_survival_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
+    if variant == "low_fee_scalp_v1":
+        return {"stop_loss_pct": float(config.low_fee_scalp_stop_loss_pct), "pullback_pct": float(config.low_fee_scalp_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
+    return {"stop_loss_pct": float(config.max_position_loss_pct), "pullback_pct": float(config.scalp_pullback_pct), "early_adverse_exit_bps": 0.0}
 
 def _fee_scenario_matrix_results(*, notional: float, qty: float, exit_price: float, fee_scenario_matrix: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -437,14 +498,23 @@ def _simulate_candidate(*, product_id: str, timeframe: str, granularity: str, pr
     qty = notional / max(entry_price, 1e-12)
     all_in_entry = (notional + entry_fee) / max(qty, 1e-12)
     min_exit = _required_exit_price_for_net_gain(effective_entry_price=all_in_entry, exit_fee_bps=config.exit_fee_bps, est_slippage_bps=config.est_slippage_bps, est_adverse_fill_bps=config.est_adverse_fill_bps, min_net_gain_bps=config.min_net_profit_bps)
-    stop_loss_pct = float(config.high_win_stop_loss_pct) if str(variant) == "high_win_rate_v1" else float(config.max_position_loss_pct)
-    pullback_pct = float(config.high_win_profit_pullback_pct) if str(variant) == "high_win_rate_v1" else float(config.scalp_pullback_pct)
+    sell_settings = _variant_sell_settings(str(variant), config)
+    stop_loss_pct = float(sell_settings["stop_loss_pct"])
+    pullback_pct = float(sell_settings["pullback_pct"])
+    early_adverse_exit_bps = float(sell_settings.get("early_adverse_exit_bps", 0.0) or 0.0)
     hard_stop = all_in_entry * (1.0 - float(stop_loss_pct))
     peak = entry_price; trough = entry_price; profit_armed = False; exit_ts = None; exit_price = None; exit_reason = ""
+    bars_seen = 0
     for candle in future:
         age = float(candle.ts) - float(replay_ts); high = float(candle.high); low = float(candle.low); close = float(candle.close)
+        bars_seen += 1
         if high > 0: peak = max(peak, high)
         if low > 0: trough = min(trough, low)
+        adverse_bps = ((low / entry_price) - 1.0) * 10000.0 if low > 0 and entry_price > 0 else 0.0
+        if bool(config.enable_early_adverse_exit) and early_adverse_exit_bps > 0 and not profit_armed and bars_seen >= int(config.early_adverse_min_age_bars) and adverse_bps <= -abs(float(early_adverse_exit_bps)):
+            recent_momentum = _recent_close_momentum_bps(prefix + future[:bars_seen], lookback=int(config.early_adverse_momentum_lookback))
+            if (not bool(config.early_adverse_requires_negative_momentum)) or recent_momentum < 0:
+                exit_ts = float(candle.ts); exit_price = close if close > 0 else low; exit_reason = "historical_early_adverse_exit"; break
         if low > 0 and low <= hard_stop:
             exit_ts = float(candle.ts); exit_price = hard_stop; exit_reason = "historical_hard_stop"; break
         if age >= float(config.level8_min_hold_sec) and high >= min_exit:

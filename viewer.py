@@ -1812,6 +1812,11 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     exchange_cols[1].metric("Binance bulk history", str(policy.get("binance_bulk_historical_backfill_enabled") or readiness.get("binance_bulk_historical_backfill_enabled")))
     exchange_cols[2].metric("Binance live trading", str(policy.get("binance_live_execution_enabled") or readiness.get("binance_live_execution_enabled")))
     exchange_cols[3].metric("Historical priority", " → ".join(policy.get("historical_source_priority") or readiness.get("historical_source_priority") or []))
+    st.markdown("### Startup engine")
+    startup_cols = st.columns(3)
+    startup_cols[0].metric("Parallel replay", str(policy.get("historical_replay_parallel_startup_enabled", False)))
+    startup_cols[1].metric("Parallel jobs", int(policy.get("historical_replay_startup_parallel_jobs", 0) or 0))
+    startup_cols[2].metric("Parallel fetches", int(policy.get("historical_replay_max_parallel_fetches", 0) or 0))
     exchange_map_df = load_csv(EXCHANGE_PRODUCT_MAP_CSV_PATH)
     if exchange_map_df is not None and not exchange_map_df.empty:
         with st.expander("Coinbase ↔ Binance product mapping", expanded=False):

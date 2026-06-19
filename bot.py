@@ -193,7 +193,8 @@ VIEWER_SNAPSHOT_PATH: str = os.path.join(BASE_DIR, "viewer_snapshot.json")
 VIEWER_SNAPSHOT_JSON: str = VIEWER_SNAPSHOT_PATH
 VIEWER_SNAPSHOT_WRITE_EVERY_SEC: float = 2.0
 CALCULATION_STATUS_JSON_PATH: str = os.path.join(BASE_DIR, "calculation_status.json")
-CALCULATION_STATUS_WRITE_EVERY_SEC: float = 2.0
+CALCULATION_STATUS_WRITE_EVERY_SEC: float = 5.0
+CALCULATION_STATUS_RESCAN_EVERY_SEC: float = 10.0
 MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
 MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
@@ -880,9 +881,14 @@ HIST_REPLAY_DAILY_GRANULARITY: str = "ONE_DAY"
 HIST_REPLAY_FAST_BOOTSTRAP_MODE: bool = True
 HIST_REPLAY_BOOTSTRAP_ROWS_PER_PRODUCT_TARGET: int = 300
 HIST_REPLAY_PRODUCTS_PER_PASS: int = 1
+HIST_REPLAY_STARTUP_ACCELERATION_ENABLED: bool = True
+HIST_REPLAY_STARTUP_JOBS_PER_CYCLE: int = 6
+HIST_REPLAY_STARTUP_SLEEP_SEC: float = 1.0
+HIST_REPLAY_NORMAL_SLEEP_SEC: float = 90.0
 HIST_REPLAY_MAX_CANDIDATES_PER_PASS: int = 300
 HIST_REPLAY_MAX_RUNTIME_SEC: float = 45.0
 HIST_REPLAY_EVERY_SEC: float = 120.0
+HIST_REPLAY_CACHE_COMPACT_EVERY_SEC: float = 30 * 60.0
 HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC: float = 1.0
 HIST_REPLAY_PRIORITIZE_PRODUCTS_WITH_FEWEST_ROWS: bool = True
 HIST_REPLAY_STEP_BARS_15M: int = 1
@@ -5969,6 +5975,13 @@ class TradingBot:
         self._historical_replay_timeframe_index = 0
         self._historical_replay_job_index = 0
         self._historical_replay_ready_by_product: Dict[str, bool] = {p: False for p in PRODUCTS}
+        self._calculation_status_cache: Dict[str, Any] = {}
+        self._calculation_status_cache_ts: float = 0.0
+        self._historical_replay_counts_cache: Dict[str, Dict[str, int]] = {}
+        self._historical_replay_counts_cache_ts: float = 0.0
+        self._historical_replay_existing_keys_cache: Set[str] = set()
+        self._historical_replay_existing_keys_cache_ts: float = 0.0
+        self._last_historical_replay_cache_compact_ts: float = 0.0
         self._level8_product_rotation_index = 0
 
         log(
@@ -8878,7 +8891,7 @@ class TradingBot:
         self._startup_calibration_ready = all(bool(v) for v in self._product_calibration_ready.values()) if self._product_calibration_ready else False
         log("[calibration] startup walk-forward calibration finished")
         try:
-            self._write_calculation_status()
+            self._write_calculation_status(force=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "calculation_status_after_startup_calibration_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
@@ -15898,14 +15911,25 @@ class TradingBot:
         except Exception as exc:
             module_exception(MODULE_NAME, "ensure_historical_replay_summary_header_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
 
-    def _historical_replay_existing_keys(self, max_lines: int = 150000) -> Set[str]:
+    def _historical_replay_existing_keys(self, max_lines: int = 150000, *, force: bool = False) -> Set[str]:
         try:
+            now_value = now_ts()
+            if (
+                not bool(force)
+                and getattr(self, "_historical_replay_existing_keys_cache", None)
+                and now_value - float(getattr(self, "_historical_replay_existing_keys_cache_ts", 0.0) or 0.0) < float(CALCULATION_STATUS_RESCAN_EVERY_SEC)
+            ):
+                return set(self._historical_replay_existing_keys_cache)
             existing = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=max_lines)
             if existing.empty or "replay_key" not in existing.columns:
-                return set()
-            return set(existing["replay_key"].dropna().astype(str).tolist())
+                keys: Set[str] = set()
+            else:
+                keys = set(existing["replay_key"].dropna().astype(str).tolist())
+            self._historical_replay_existing_keys_cache = set(keys)
+            self._historical_replay_existing_keys_cache_ts = now_ts()
+            return keys
         except Exception:
-            return set()
+            return set(getattr(self, "_historical_replay_existing_keys_cache", set()) or set())
 
     def _historical_replay_existing_prefixes(self, existing_keys: Set[str]) -> Set[str]:
         prefixes: Set[str] = set()
@@ -15953,56 +15977,100 @@ class TradingBot:
             for col in ["open", "high", "low", "close", "volume"]:
                 frame[col] = pd.to_numeric(frame.get(col), errors="coerce")
             frame = frame.dropna(subset=["open", "high", "low", "close"]).sort_values("ts")
-            return [Candle(ts=int(float(r["ts"])), open=float(r["open"]), high=float(r["high"]), low=float(r["low"]), close=float(r["close"]), volume=float(r.get("volume", 0.0) or 0.0)) for _, r in frame.iterrows()]
+            deduped: Dict[int, Candle] = {}
+            for _, r in frame.iterrows():
+                try:
+                    c = Candle(
+                        ts=int(float(r["ts"])),
+                        open=float(r["open"]),
+                        high=float(r["high"]),
+                        low=float(r["low"]),
+                        close=float(r["close"]),
+                        volume=float(r.get("volume", 0.0) or 0.0),
+                    )
+                    deduped[int(c.ts)] = c
+                except Exception:
+                    continue
+            candles = list(deduped.values())
+            candles.sort(key=lambda c: int(c.ts))
+            return candles
         except Exception as exc:
             module_exception(MODULE_NAME, "read_candles_from_csv_for_replay_failed", exc, data={"path": path, "product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
             return []
 
     def _write_historical_replay_candle_cache(self, *, path: str, product_id: str, candles: List[Candle], min_ts: float) -> None:
+        """
+        Fast append-only candle cache writer. It preserves data, avoids rewriting
+        giant shared CSVs after every product fetch, and relies on read-time dedupe
+        plus periodic compaction.
+        """
         try:
             if not candles:
                 return
-            existing = self._read_candles_from_csv_for_replay(path=path, product_id=product_id, min_ts=min_ts)
-            by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
-            for c in existing + list(candles):
+            file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+            columns = ["ts", "dt_mst", "product_id", "open", "high", "low", "close", "volume"]
+            existing_ts: Set[int] = set()
+            try:
+                existing = self._read_candles_from_csv_for_replay(path=path, product_id=product_id, min_ts=min_ts)
+                existing_ts = {int(c.ts) for c in existing}
+            except Exception:
+                existing_ts = set()
+            rows = []
+            for c in candles:
                 try:
                     ts_i = int(c.ts)
-                    if ts_i < int(min_ts):
+                    if ts_i < int(min_ts) or ts_i in existing_ts:
                         continue
-                    by_key[(product_id, ts_i)] = {
-                        "ts": ts_i,
-                        "dt_mst": datetime.fromtimestamp(ts_i, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                        "product_id": product_id,
-                        "open": float(c.open),
-                        "high": float(c.high),
-                        "low": float(c.low),
-                        "close": float(c.close),
-                        "volume": float(getattr(c, "volume", 0.0) or 0.0),
-                    }
+                    rows.append({"ts": ts_i, "dt_mst": datetime.fromtimestamp(ts_i, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(getattr(c, "volume", 0.0) or 0.0)})
+                    existing_ts.add(ts_i)
                 except Exception:
                     continue
-            rows = sorted(by_key.values(), key=lambda r: (r["product_id"], int(r["ts"])))
-            other_rows = []
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                try:
-                    frame = self._read_csv_tail_for_bot(path, max_lines=250000)
-                    if not frame.empty and "product_id" in frame.columns:
-                        frame = frame[~frame["product_id"].astype(str).eq(str(product_id))].copy()
-                        other_rows = frame.to_dict("records")
-                except Exception:
-                    other_rows = []
-            all_rows = other_rows + rows
-            tmp = path + ".tmp"
+            if not rows:
+                return
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=columns)
+                if not file_exists:
+                    writer.writeheader()
+                for row in rows:
+                    writer.writerow({col: row.get(col, "") for col in columns})
+            module_debug(MODULE_NAME, "historical_replay_candle_cache_appended", data={"path": path, "product_id": product_id, "rows_appended": len(rows)}, level="INFO", also_overall=False)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "write_historical_replay_candle_cache_failed", exc, data={"path": path, "product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
+
+    def _compact_historical_replay_candle_cache(self, path: str) -> None:
+        try:
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                return
+            frame = self._read_csv_tail_for_bot(path, max_lines=500000)
+            if frame.empty or "product_id" not in frame.columns or "ts" not in frame.columns:
+                return
+            frame["ts_num"] = pd.to_numeric(frame.get("ts"), errors="coerce")
+            frame = frame.dropna(subset=["ts_num"]).copy()
+            frame["ts"] = frame["ts_num"].astype(int)
+            frame = frame.drop_duplicates(subset=["product_id", "ts"], keep="last")
+            frame = frame.sort_values(["product_id", "ts"])
             columns = ["ts", "dt_mst", "product_id", "open", "high", "low", "close", "volume"]
+            tmp = path + ".compact.tmp"
             with open(tmp, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=columns)
                 writer.writeheader()
-                for row in all_rows:
+                for _, row in frame.iterrows():
                     writer.writerow({col: row.get(col, "") for col in columns})
             os.replace(tmp, path)
-            module_debug(MODULE_NAME, "historical_replay_candle_cache_written", data={"path": path, "product_id": product_id, "rows_for_product": len(rows), "total_rows_written": len(all_rows)}, level="INFO", also_overall=False)
+            module_debug(MODULE_NAME, "historical_replay_candle_cache_compacted", data={"path": path, "rows": int(len(frame))}, level="INFO", also_overall=False)
         except Exception as exc:
-            module_exception(MODULE_NAME, "write_historical_replay_candle_cache_failed", exc, data={"path": path, "product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
+            module_exception(MODULE_NAME, "compact_historical_replay_candle_cache_failed", exc, data={"path": path, "traceback": traceback.format_exc()}, also_overall=False)
+
+    def _compact_historical_replay_caches_if_due(self) -> None:
+        try:
+            now_value = now_ts()
+            if now_value - float(getattr(self, "_last_historical_replay_cache_compact_ts", 0.0) or 0.0) < float(HIST_REPLAY_CACHE_COMPACT_EVERY_SEC):
+                return
+            self._last_historical_replay_cache_compact_ts = now_value
+            for path in [HIST_REPLAY_15M_90D_CSV_PATH, HIST_REPLAY_1H_365D_CSV_PATH, HIST_REPLAY_1D_2Y_CSV_PATH]:
+                self._compact_historical_replay_candle_cache(path)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "compact_historical_replay_caches_if_due_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
     async def _get_historical_replay_candles(self, *, product_id: str, timeframe: str) -> Tuple[List[Candle], str, str]:
         now_i = int(now_ts())
@@ -16055,12 +16123,20 @@ class TradingBot:
 
     def _historical_replay_counts_by_product(self) -> Dict[str, Dict[str, int]]:
         try:
+            now_value = now_ts()
+            if (
+                getattr(self, "_historical_replay_counts_cache", None)
+                and now_value - float(getattr(self, "_historical_replay_counts_cache_ts", 0.0) or 0.0) < float(CALCULATION_STATUS_RESCAN_EVERY_SEC)
+            ):
+                return dict(self._historical_replay_counts_cache)
             frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=200000)
             counts: Dict[str, Dict[str, int]] = {
                 p: {"all": 0, "primary_15m_90d": 0, "regime_1h_365d": 0, "daily_1d_2y": 0, "qualified": 0}
                 for p in PRODUCTS
             }
             if frame.empty or "product_id" not in frame.columns:
+                self._historical_replay_counts_cache = dict(counts)
+                self._historical_replay_counts_cache_ts = now_ts()
                 return counts
             if "timeframe" not in frame.columns:
                 frame["timeframe"] = ""
@@ -16077,6 +16153,8 @@ class TradingBot:
                     counts[product_id][timeframe] += 1
                 if qualified:
                     counts[product_id]["qualified"] += 1
+            self._historical_replay_counts_cache = dict(counts)
+            self._historical_replay_counts_cache_ts = now_ts()
             return counts
         except Exception as exc:
             module_exception(MODULE_NAME, "historical_replay_counts_by_product_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
@@ -16391,11 +16469,11 @@ class TradingBot:
             module_exception(MODULE_NAME, "review_shadow_sell_replay_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
 
 
-    async def _run_historical_shadow_replay_pass(self) -> None:
+    async def _run_historical_shadow_replay_pass(self, *, force: bool = False) -> None:
         if not bool(ENABLE_HISTORICAL_SHADOW_REPLAY): return
         if bool(getattr(self, "_historical_replay_running", False)): return
         now_value = now_ts()
-        if now_value - float(getattr(self, "_last_historical_replay_ts", 0.0) or 0.0) < float(HIST_REPLAY_EVERY_SEC): return
+        if (not bool(force) and now_value - float(getattr(self, "_last_historical_replay_ts", 0.0) or 0.0) < float(HIST_REPLAY_EVERY_SEC)): return
         self._historical_replay_running = True
         self._last_historical_replay_ts = now_value
         pass_started = time.perf_counter()
@@ -16442,8 +16520,18 @@ class TradingBot:
                 with open(HISTORICAL_SHADOW_REPLAY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=HISTORICAL_SHADOW_REPLAY_COLUMNS)
                     for row in rows_to_write: writer.writerow({col: row.get(col, "") for col in HISTORICAL_SHADOW_REPLAY_COLUMNS})
+                try:
+                    for row in rows_to_write:
+                        key = str(row.get("replay_key") or "")
+                        if key:
+                            self._historical_replay_existing_keys_cache.add(key)
+                    self._historical_replay_counts_cache_ts = 0.0
+                    self._calculation_status_cache_ts = 0.0
+                except Exception:
+                    pass
             self._write_historical_replay_summary(product_id)
-            self._write_calculation_status()
+            self._write_calculation_status(force=True)
+            self._compact_historical_replay_caches_if_due()
             module_debug(MODULE_NAME, "historical_shadow_replay_pass_completed", data={"product_id": product_id, "timeframe": timeframe, "granularity": granularity, "source": replay_source, "candles": len(candles), "evaluated": evaluated, "rows_written": len(rows_to_write), "fetch_elapsed_sec": round(fetch_elapsed_sec, 3), "eval_elapsed_sec": round(time.perf_counter() - eval_started, 3), "total_elapsed_sec": round(time.perf_counter() - pass_started, 3), "next_job_index": self._historical_replay_job_index, "job_count": len(jobs)}, level="INFO", also_overall=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "historical_shadow_replay_pass_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
@@ -16451,11 +16539,25 @@ class TradingBot:
             self._historical_replay_running = False
 
     async def historical_shadow_replay_loop(self) -> None:
-        await asyncio.sleep(60.0)
+        await asyncio.sleep(10.0)
         while not self._stop_event.is_set():
-            try: await self._run_historical_shadow_replay_pass()
-            except Exception as exc: module_exception(MODULE_NAME, "historical_shadow_replay_loop_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
-            await asyncio.sleep(90.0)
+            try:
+                calc_status = self._calculation_status(force=False)
+                unlocked = bool(calc_status.get("full_viewer_unlocked"))
+                if bool(HIST_REPLAY_STARTUP_ACCELERATION_ENABLED) and not unlocked:
+                    jobs_to_run = int(HIST_REPLAY_STARTUP_JOBS_PER_CYCLE)
+                    module_debug(MODULE_NAME, "historical_replay_startup_acceleration_cycle", data={"jobs_to_run": jobs_to_run, "progress_pct": round(float(calc_status.get("overall_progress_pct", 0.0)), 2), "phase": calc_status.get("phase_label")}, level="INFO", also_overall=False)
+                    for _ in range(max(1, jobs_to_run)):
+                        if self._stop_event.is_set():
+                            break
+                        await self._run_historical_shadow_replay_pass(force=True)
+                        await asyncio.sleep(float(HIST_REPLAY_STARTUP_SLEEP_SEC))
+                else:
+                    await self._run_historical_shadow_replay_pass(force=False)
+                    await asyncio.sleep(float(HIST_REPLAY_NORMAL_SLEEP_SEC))
+            except Exception as exc:
+                module_exception(MODULE_NAME, "historical_shadow_replay_loop_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+                await asyncio.sleep(10.0)
 
     def _historical_replay_rows_for_product(self, product_id: str) -> pd.DataFrame:
         try:
@@ -16635,7 +16737,10 @@ class TradingBot:
         except Exception as exc:
             module_exception(MODULE_NAME, "write_historical_replay_summary_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
 
-    def _calculation_status(self, *, include_readiness: bool = True, readiness_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _calculation_status(self, *, include_readiness: bool = True, readiness_override: Optional[Dict[str, Any]] = None, force: bool = False) -> Dict[str, Any]:
+        now_value = now_ts()
+        if (not bool(force) and getattr(self, "_calculation_status_cache", None) and now_value - float(getattr(self, "_calculation_status_cache_ts", 0.0) or 0.0) < float(CALCULATION_STATUS_RESCAN_EVERY_SEC)):
+            return dict(self._calculation_status_cache)
         try:
             micro_counts = self._count_rows_by_product_from_csv(MICRO_HISTORY_CSV_PATH, max_lines=200000)
             candle_15m_counts = self._count_rows_by_product_from_csv(HIST_REPLAY_15M_90D_CSV_PATH, max_lines=250000)
@@ -16673,13 +16778,16 @@ class TradingBot:
             elif phase_totals["replay_calibration_verdicts"] < 1.0: phase_label = "Calculating replay-based product verdicts"
             elif not full_viewer_unlocked: phase_label = "Final readiness checks"
             else: phase_label = "Complete"
-            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE)}}
+            status = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE)}}
+            self._calculation_status_cache = dict(status)
+            self._calculation_status_cache_ts = now_ts()
+            return status
         except Exception as exc:
             module_exception(MODULE_NAME, "calculation_status_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
             return {"ts": now_ts(), "full_viewer_unlocked": False, "overall_progress": 0.0, "overall_progress_pct": 0.0, "phase_label": "Calculation status unavailable", "phase_progress": {}, "product_status": {}, "error": str(exc)}
 
-    def _write_calculation_status(self) -> Dict[str, Any]:
-        status = self._calculation_status()
+    def _write_calculation_status(self, *, force: bool = False) -> Dict[str, Any]:
+        status = self._calculation_status(force=force)
         try:
             tmp = CALCULATION_STATUS_JSON_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -17468,7 +17576,7 @@ class TradingBot:
                     try:
                         if now_ts() - float(getattr(self, "_last_calculation_status_write_ts", 0.0) or 0.0) >= float(CALCULATION_STATUS_WRITE_EVERY_SEC):
                             self._last_calculation_status_write_ts = now_ts()
-                            self._write_calculation_status()
+                            self._write_calculation_status(force=False)
                     except Exception as exc:
                         module_exception(MODULE_NAME, "calculation_status_heartbeat_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 

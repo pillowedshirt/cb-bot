@@ -1795,6 +1795,9 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         unsafe_allow_html=True,
     )
     st.progress(progress)
+    status_ts = float(calc_status.get("ts", 0.0) or 0.0)
+    age_sec = max(0.0, time.time() - status_ts) if status_ts > 0 else 0.0
+    st.caption(f"Status age: {age_sec:.1f}s · The bot updates this from calculation_status.json.")
     cols = st.columns(4)
     cols[0].metric("Complete products", f"{complete_products}/{product_count}")
     cols[1].metric("Profit-ready products", profit_ready_products)

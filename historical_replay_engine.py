@@ -87,6 +87,11 @@ class ReplayEngineConfig:
     micro_trend_down_bps: float = -25.0
     min_required_net_edge_bps: float = 15.0
     vwap_reclaim_buffer_bps: float = 3.0
+    primary_fee_model: str = "coinbase"
+    comparison_fee_model: str = "binance_us"
+    comparison_entry_fee_bps: float = 0.0
+    comparison_exit_fee_bps: float = 2.0
+    enable_exchange_fee_comparison: bool = True
 
 
 def _dt_mst(ts: float) -> str:
@@ -107,6 +112,28 @@ def _score_from_bps(value_bps: float, *, center_bps: float, width_bps: float) ->
 
 def _fee_usd(notional: float, fee_bps: float) -> float:
     return float(notional) * float(fee_bps) / 10000.0
+
+
+def _same_timing_fee_result(
+    *,
+    notional: float,
+    qty: float,
+    exit_price: float,
+    entry_fee_bps: float,
+    exit_fee_bps: float,
+) -> Dict[str, float]:
+    entry_fee = _fee_usd(notional, entry_fee_bps)
+    gross_proceeds = float(qty) * float(exit_price)
+    exit_fee = _fee_usd(gross_proceeds, exit_fee_bps)
+    net_pnl = gross_proceeds - float(notional) - entry_fee - exit_fee
+    net_bps = (net_pnl / max(float(notional), 1e-12)) * 10000.0
+    return {
+        "entry_fee_usd": float(entry_fee),
+        "exit_fee_usd": float(exit_fee),
+        "net_pnl_usd": float(net_pnl),
+        "net_pnl_bps": float(net_bps),
+        "would_have_won": int(net_pnl > 0.0),
+    }
 
 
 def _required_exit_price_for_net_gain(*, effective_entry_price: float, exit_fee_bps: float, est_slippage_bps: float, est_adverse_fill_bps: float, min_net_gain_bps: float) -> float:
@@ -370,13 +397,34 @@ def _simulate_candidate(*, product_id: str, timeframe: str, granularity: str, pr
     if exit_ts is None:
         exit_ts = float(future[-1].ts); exit_price = float(future[-1].close); exit_reason = "historical_window_end"
     gross_proceeds = qty * float(exit_price)
-    exit_fee = _fee_usd(gross_proceeds, config.exit_fee_bps)
-    net_pnl = gross_proceeds - notional - entry_fee - exit_fee
-    net_bps = (net_pnl / max(notional, 1e-12)) * 10000.0
+    primary_fee_result = _same_timing_fee_result(
+        notional=notional,
+        qty=qty,
+        exit_price=float(exit_price),
+        entry_fee_bps=float(config.entry_fee_bps),
+        exit_fee_bps=float(config.exit_fee_bps),
+    )
+    if bool(config.enable_exchange_fee_comparison):
+        comparison_fee_result = _same_timing_fee_result(
+            notional=notional,
+            qty=qty,
+            exit_price=float(exit_price),
+            entry_fee_bps=float(config.comparison_entry_fee_bps),
+            exit_fee_bps=float(config.comparison_exit_fee_bps),
+        )
+    else:
+        comparison_fee_result = dict(primary_fee_result)
+    entry_fee = float(primary_fee_result["entry_fee_usd"])
+    exit_fee = float(primary_fee_result["exit_fee_usd"])
+    net_pnl = float(primary_fee_result["net_pnl_usd"])
+    net_bps = float(primary_fee_result["net_pnl_bps"])
+    comparison_net_improvement_usd = float(comparison_fee_result["net_pnl_usd"]) - float(primary_fee_result["net_pnl_usd"])
+    comparison_net_improvement_bps = float(comparison_fee_result["net_pnl_bps"]) - float(primary_fee_result["net_pnl_bps"])
+    comparison_break_even_reduction_bps = float(config.entry_fee_bps) + float(config.exit_fee_bps) - float(config.comparison_entry_fee_bps) - float(config.comparison_exit_fee_bps)
     mfe = ((peak / entry_price) - 1.0) * 10000.0; mae = ((trough / entry_price) - 1.0) * 10000.0
     replay_key = f"{product_id}|{timeframe}|{replay_ts}|{int(float(signal.score) * 1000000)}"
     now = time.time()
-    row = {"ts": now, "dt_mst": _dt_mst(now), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": float(config.entry_fee_bps), "exit_fee_bps": float(config.exit_fee_bps), "synthetic_notional_usd": notional, "synthetic_qty": qty, "all_in_entry_price": all_in_entry, "min_profitable_exit_price": min_exit, "hard_stop_price": hard_stop, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": mfe, "max_adverse_bps": mae, "peak_price": peak, "trough_price": trough, "gross_pnl_usd": gross_proceeds - notional, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_bps, "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak >= min_exit), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(signal.spread_bps), "session_liquidity_setup": str(signal.session_liquidity_setup), "value_acceptance_state": str(signal.value_acceptance_state), "volume_node_state": str(signal.volume_node_state), "poc_distance_bps": float(signal.poc_distance_bps), "volume_profile_leader_buy_score": float(signal.volume_profile_leader_buy_score), "volume_profile_leader_wait_score": float(signal.volume_profile_leader_wait_score), "price_action_buy_score": float(signal.price_action_buy_score), "market_structure_buy_score": float(signal.market_structure_buy_score), "quant_buy_score": float(signal.quant_buy_score), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and timeframe in {"primary_15m_90d", "regime_1h_365d"}), "replay_source": replay_source, "historical_source_exchange": "binance" if str(replay_source) == "binance_bulk" else "local_cache", "historical_source_symbol": product_id, "historical_source_note": "process_worker_replay", "reason": f"process_worker_replay;exit={exit_reason};net_bps={net_bps:.2f};mfe={mfe:.2f};mae={mae:.2f};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};qualified={qualified};qualification={qualification_reason};setup={setup_tag};regime={regime_tag}"}
+    row = {"ts": now, "dt_mst": _dt_mst(now), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": float(config.entry_fee_bps), "exit_fee_bps": float(config.exit_fee_bps), "synthetic_notional_usd": notional, "synthetic_qty": qty, "all_in_entry_price": all_in_entry, "min_profitable_exit_price": min_exit, "hard_stop_price": hard_stop, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": mfe, "max_adverse_bps": mae, "peak_price": peak, "trough_price": trough, "gross_pnl_usd": gross_proceeds - notional, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_bps, "primary_fee_model": str(config.primary_fee_model), "comparison_fee_model": str(config.comparison_fee_model), "primary_entry_fee_bps": float(config.entry_fee_bps), "primary_exit_fee_bps": float(config.exit_fee_bps), "primary_entry_fee_usd": float(primary_fee_result["entry_fee_usd"]), "primary_exit_fee_usd": float(primary_fee_result["exit_fee_usd"]), "primary_net_pnl_usd": float(primary_fee_result["net_pnl_usd"]), "primary_net_pnl_bps": float(primary_fee_result["net_pnl_bps"]), "primary_would_have_won": int(primary_fee_result["would_have_won"]), "comparison_entry_fee_bps": float(config.comparison_entry_fee_bps), "comparison_exit_fee_bps": float(config.comparison_exit_fee_bps), "comparison_entry_fee_usd": float(comparison_fee_result["entry_fee_usd"]), "comparison_exit_fee_usd": float(comparison_fee_result["exit_fee_usd"]), "comparison_net_pnl_usd": float(comparison_fee_result["net_pnl_usd"]), "comparison_net_pnl_bps": float(comparison_fee_result["net_pnl_bps"]), "comparison_would_have_won": int(comparison_fee_result["would_have_won"]), "comparison_net_improvement_usd": float(comparison_net_improvement_usd), "comparison_net_improvement_bps": float(comparison_net_improvement_bps), "comparison_break_even_reduction_bps": float(comparison_break_even_reduction_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak >= min_exit), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(signal.spread_bps), "session_liquidity_setup": str(signal.session_liquidity_setup), "value_acceptance_state": str(signal.value_acceptance_state), "volume_node_state": str(signal.volume_node_state), "poc_distance_bps": float(signal.poc_distance_bps), "volume_profile_leader_buy_score": float(signal.volume_profile_leader_buy_score), "volume_profile_leader_wait_score": float(signal.volume_profile_leader_wait_score), "price_action_buy_score": float(signal.price_action_buy_score), "market_structure_buy_score": float(signal.market_structure_buy_score), "quant_buy_score": float(signal.quant_buy_score), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and timeframe in {"primary_15m_90d", "regime_1h_365d"}), "replay_source": replay_source, "historical_source_exchange": "binance" if str(replay_source) == "binance_bulk" else "local_cache", "historical_source_symbol": product_id, "historical_source_note": "process_worker_replay", "reason": f"process_worker_replay;exit={exit_reason};net_bps={net_bps:.2f};mfe={mfe:.2f};mae={mae:.2f};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};qualified={qualified};qualification={qualification_reason};setup={setup_tag};regime={regime_tag}"}
     return {col: row.get(col, "") for col in columns}
 
 

@@ -1813,10 +1813,11 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     exchange_cols[2].metric("Binance live trading", str(policy.get("binance_live_execution_enabled") or readiness.get("binance_live_execution_enabled")))
     exchange_cols[3].metric("Historical priority", " → ".join(policy.get("historical_source_priority") or readiness.get("historical_source_priority") or []))
     st.markdown("### Startup engine")
-    startup_cols = st.columns(3)
+    startup_cols = st.columns(4)
     startup_cols[0].metric("Parallel replay", str(policy.get("historical_replay_parallel_startup_enabled", False)))
     startup_cols[1].metric("Parallel jobs", int(policy.get("historical_replay_startup_parallel_jobs", 0) or 0))
     startup_cols[2].metric("Parallel fetches", int(policy.get("historical_replay_max_parallel_fetches", 0) or 0))
+    startup_cols[3].metric("CPU worker replay", str(policy.get("full_replay_math_in_process_workers", False)))
     worker_manifest = calc_status.get("historical_replay_worker_manifest", {}) or {}
     if worker_manifest:
         st.markdown("### Replay worker manifest")

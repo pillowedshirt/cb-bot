@@ -98,10 +98,15 @@ except Exception:
         return {}
 
 try:
-    from historical_replay_worker import worker_health_check, process_worker_output_summary
+    from historical_replay_worker import (
+        worker_health_check,
+        process_worker_output_summary,
+        run_full_replay_worker_job,
+    )
 except Exception:
     worker_health_check = None
     process_worker_output_summary = None
+    run_full_replay_worker_job = None
 
 try:
     from ai_brain import LocalAIBrain, FEATURE_COLUMNS as AI_FEATURE_COLUMNS
@@ -317,7 +322,7 @@ ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE: bool = True
 HISTORICAL_REPLAY_WORKER_MAX_ATTEMPTS: int = 3
 ENABLE_HISTORICAL_REPLAY_PROCESS_POOL: bool = True
 HISTORICAL_REPLAY_PROCESS_WORKERS: int = 3
-ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS: bool = False
+ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS: bool = True
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_summary.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
@@ -16134,6 +16139,91 @@ class TradingBot:
         job_id = safe_job_id(product_id, timeframe)
         return os.path.join(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, f"historical_shadow_replay.{job_id}.csv")
 
+    def _replay_cache_path_for_timeframe(self, timeframe: str) -> str:
+        tf = str(timeframe)
+        if tf == "primary_15m_90d":
+            return HIST_REPLAY_15M_90D_CSV_PATH
+        if tf == "regime_1h_365d":
+            return HIST_REPLAY_1H_365D_CSV_PATH
+        if tf == "daily_1d_2y":
+            return HIST_REPLAY_1D_2Y_CSV_PATH
+        return HIST_REPLAY_15M_90D_CSV_PATH
+
+    def _granularity_for_replay_timeframe(self, timeframe: str) -> str:
+        tf = str(timeframe)
+        if tf == "primary_15m_90d":
+            return HIST_REPLAY_PRIMARY_GRANULARITY
+        if tf == "regime_1h_365d":
+            return HIST_REPLAY_REGIME_GRANULARITY
+        return HIST_REPLAY_DAILY_GRANULARITY
+
+    def _lookback_sec_for_replay_timeframe(self, timeframe: str) -> int:
+        tf = str(timeframe)
+        if tf == "primary_15m_90d":
+            return int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS) * 86400
+        if tf == "regime_1h_365d":
+            return int(HIST_REPLAY_REGIME_LOOKBACK_DAYS) * 86400
+        return int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400
+
+    def _process_worker_replay_config(self, product_id: str) -> Dict[str, Any]:
+        profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
+        return {
+            "entry_fee_bps": float(self._entry_fee_bps_for_mode(execution_mode=ENTRY_EXECUTION_MODE)),
+            "exit_fee_bps": float(self._exit_fee_bps_for_mode()),
+            "max_spread_bps": float(MAX_SPREAD_BPS),
+            "est_slippage_bps": float(EST_SLIPPAGE_BPS),
+            "est_adverse_fill_bps": float(EST_ADVERSE_FILL_BPS),
+            "min_net_profit_bps": float(max(MIN_NET_PROFIT_BPS_FOR_DISCRETIONARY_EXIT, MIN_NET_GAIN_AFTER_FEES_BPS)),
+            "max_position_loss_pct": float(MAX_POSITION_LOSS_BEFORE_FORCED_SELL_PCT),
+            "synthetic_notional_usd": float(SHADOW_SELL_REPLAY_SYNTHETIC_NOTIONAL_USD),
+            "level8_min_hold_sec": float(LEVEL8_MIN_HOLD_SEC),
+            "level8_max_hold_sec": float(LEVEL8_MAX_HOLD_SEC),
+            "scalp_pullback_pct": float(getattr(profile, "scalp_pullback_pct", 0.0025) or 0.0025),
+            "hist_replay_max_runtime_sec": float(HIST_REPLAY_MAX_RUNTIME_SEC),
+            "hist_replay_max_candidates_per_pass": int(HIST_REPLAY_MAX_CANDIDATES_PER_PASS),
+            "hist_replay_min_prefix_15m": int(HIST_REPLAY_MIN_PREFIX_15M),
+            "hist_replay_min_prefix_1h": int(HIST_REPLAY_MIN_PREFIX_1H),
+            "hist_replay_forward_bars_15m": list(HIST_REPLAY_FORWARD_BARS_15M),
+            "hist_replay_forward_bars_1h": list(HIST_REPLAY_FORWARD_BARS_1H),
+            "hist_replay_step_bars_15m": int(HIST_REPLAY_STEP_BARS_15M),
+            "hist_replay_step_bars_1h": int(HIST_REPLAY_STEP_BARS_1H),
+            "min_target_over_cost_bps": float(HIST_REPLAY_MIN_TARGET_OVER_COST_BPS),
+            "min_target_to_cost_ratio": float(HIST_REPLAY_MIN_TARGET_TO_COST_RATIO),
+            "min_score_for_calibration": float(HIST_REPLAY_MIN_SCORE_FOR_CALIBRATION),
+            "min_probability_for_calibration": float(HIST_REPLAY_MIN_PROBABILITY_FOR_CALIBRATION),
+            "min_expected_edge_bps_for_calibration": float(HIST_REPLAY_MIN_EXPECTED_EDGE_BPS_FOR_CALIBRATION),
+            "block_near_poc_chop": bool(HIST_REPLAY_BLOCK_NEAR_POC_CHOP),
+            "max_poc_distance_for_chop_bps": float(HIST_REPLAY_MAX_POC_DISTANCE_FOR_CHOP_BPS),
+            "resist_buffer_bps": float(RESIST_BUFFER_BPS),
+            "micro_trend_lookback_min": int(MICRO_TREND_LOOKBACK_MIN),
+            "micro_trend_down_bps": float(MICRO_TREND_DOWN_BPS),
+            "min_required_net_edge_bps": float(MIN_REQUIRED_NET_EDGE_BPS),
+            "vwap_reclaim_buffer_bps": float(VWAP_RECLAIM_BUFFER_BPS),
+        }
+
+    def _build_process_worker_payload(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        product_id = str(job.get("product_id") or "")
+        timeframe = str(job.get("timeframe") or "")
+        output_path = str(job.get("output_path") or self._worker_output_path_for_job(product_id, timeframe))
+        return {
+            "product_id": product_id,
+            "timeframe": timeframe,
+            "granularity": self._granularity_for_replay_timeframe(timeframe),
+            "cache_path": self._replay_cache_path_for_timeframe(timeframe),
+            "output_path": output_path,
+            "min_ts": int(now_ts()) - self._lookback_sec_for_replay_timeframe(timeframe),
+            "replay_source": HISTORICAL_SOURCE_LOCAL_CACHE,
+            "columns": list(HISTORICAL_SHADOW_REPLAY_COLUMNS),
+            "config": self._process_worker_replay_config(product_id),
+            "existing_prefixes": list(self._historical_replay_existing_prefixes(self._historical_replay_existing_keys())),
+        }
+
+    async def _ensure_replay_candle_cache_for_job(self, product_id: str, timeframe: str) -> Tuple[bool, str, int]:
+        candles, _granularity, source = await self._get_historical_replay_candles(product_id=product_id, timeframe=timeframe)
+        required = int(self._required_candle_rows_for_timeframe(timeframe))
+        ok = len(candles) >= max(1, required)
+        return bool(ok), str(source), int(len(candles))
+
     def _write_worker_replay_rows(self, *, output_path: str, rows: List[Dict[str, Any]]) -> int:
         try:
             if not rows:
@@ -17013,6 +17103,39 @@ class TradingBot:
             return result
 
 
+    async def _run_manifest_job_in_process_worker(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        product_id = str(job.get("product_id") or "")
+        timeframe = str(job.get("timeframe") or "")
+        job_id = str(job.get("job_id") or safe_job_id(product_id, timeframe))
+        output_path = str(job.get("output_path") or self._worker_output_path_for_job(product_id, timeframe))
+        async with self._historical_replay_manifest_lock:
+            update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates={"status": JOB_RUNNING, "attempts": int(job.get("attempts", 0) or 0) + 1, "started_ts": now_ts(), "error": "", "output_path": output_path, "worker_mode": "process"})
+        try:
+            cache_ok, source, candle_rows = await self._ensure_replay_candle_cache_for_job(product_id=product_id, timeframe=timeframe)
+            if not cache_ok:
+                updates = {"status": JOB_FAILED, "finished_ts": now_ts(), "candle_rows": int(candle_rows), "source": source, "error": f"insufficient candle cache rows={candle_rows}"}
+                async with self._historical_replay_manifest_lock:
+                    update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates=updates)
+                return {"ok": False, "worker_mode": "process", "product_id": product_id, "timeframe": timeframe, "error": updates["error"], "candle_rows": int(candle_rows), "source": source}
+            if self._historical_worker_pool is None or run_full_replay_worker_job is None:
+                raise RuntimeError("Process worker pool or run_full_replay_worker_job unavailable")
+            payload = self._build_process_worker_payload({**job, "output_path": output_path})
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(self._historical_worker_pool, run_full_replay_worker_job, payload)
+            updates = {"finished_ts": now_ts(), "rows_written": int(result.get("rows_written", 0) or 0), "evaluated": int(result.get("evaluated", 0) or 0), "candle_rows": int(result.get("candles", candle_rows) or 0), "qualified_rows": int(result.get("qualified_rows", 0) or 0), "accepted_rows": int(result.get("accepted_rows", 0) or 0), "avg_net_pnl_bps": float(result.get("avg_net_pnl_bps", 0.0) or 0.0), "median_net_pnl_bps": float(result.get("median_net_pnl_bps", 0.0) or 0.0), "source": source, "output_path": output_path, "worker_mode": "process"}
+            if bool(result.get("ok")) and int(result.get("rows_written", 0) or 0) > 0:
+                updates["status"] = JOB_DONE; updates["error"] = ""
+            else:
+                updates["status"] = JOB_FAILED; updates["error"] = str(result.get("error") or "process worker wrote zero rows")
+            async with self._historical_replay_manifest_lock:
+                update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates=updates)
+            return result
+        except Exception as exc:
+            async with self._historical_replay_manifest_lock:
+                update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates={"status": JOB_FAILED, "finished_ts": now_ts(), "worker_mode": "process", "error": str(exc)})
+            module_exception(MODULE_NAME, "run_manifest_job_in_process_worker_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "job_id": job_id, "traceback": traceback.format_exc()}, also_overall=True)
+            return {"ok": False, "worker_mode": "process", "product_id": product_id, "timeframe": timeframe, "error": str(exc)}
+
     async def _run_manifest_job_to_worker_file(self, job: Dict[str, Any]) -> Dict[str, Any]:
         product_id = str(job.get("product_id") or "")
         timeframe = str(job.get("timeframe") or "")
@@ -17068,7 +17191,7 @@ class TradingBot:
                             for row in new_rows:
                                 writer.writerow({col: row.get(col, "") for col in HISTORICAL_SHADOW_REPLAY_COLUMNS})
                 async with self._historical_replay_manifest_lock:
-                    update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates={"status": JOB_MERGED, "merged_ts": now_ts(), "rows_written": int(len(rows))})
+                    update_job(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, job_id=job_id, updates={"status": JOB_MERGED, "merged_ts": now_ts(), "rows_written": int(len(rows)), "rows_appended_to_master": int(len(new_rows)), "merge_note": ("merged_with_new_rows" if new_rows else "merged_but_all_rows_already_existed")})
                 if self._historical_worker_pool is not None and process_worker_output_summary is not None:
                     try:
                         loop = asyncio.get_running_loop()
@@ -17093,7 +17216,10 @@ class TradingBot:
             merge_result = await self._merge_completed_worker_outputs()
             return {"used_manifest_workers": True, "jobs_started": 0, "merge_result": merge_result}
         module_debug(MODULE_NAME, "historical_replay_manifest_worker_batch_started", data={"jobs_started": len(jobs), "jobs": [{"job_id": j.get("job_id"), "product_id": j.get("product_id"), "timeframe": j.get("timeframe"), "attempts": j.get("attempts")} for j in jobs]}, level="INFO", also_overall=False)
-        tasks = [asyncio.create_task(self._run_manifest_job_to_worker_file(job)) for job in jobs]
+        if (bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS) and self._historical_worker_pool is not None and run_full_replay_worker_job is not None):
+            tasks = [asyncio.create_task(self._run_manifest_job_in_process_worker(job)) for job in jobs]
+        else:
+            tasks = [asyncio.create_task(self._run_manifest_job_to_worker_file(job)) for job in jobs]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         failures = 0
         clean_results = []
@@ -17420,7 +17546,7 @@ class TradingBot:
             elif phase_totals["replay_calibration_verdicts"] < 1.0: phase_label = "Calculating replay-based product verdicts"
             elif not full_viewer_unlocked: phase_label = "Final readiness checks"
             else: phase_label = "Complete"
-            status = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS)}}
+            status = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS)}}
             self._calculation_status_cache = dict(status)
             self._calculation_status_cache_ts = now_ts()
             return status

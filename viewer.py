@@ -43,6 +43,7 @@ load_dotenv(ENV_PATH, override=True)
 VIEWER_SNAPSHOT_PATH = os.path.join(BASE_DIR, "viewer_snapshot.json")
 VIEWER_SNAPSHOT_CSV_SAFE_PATH = VIEWER_SNAPSHOT_PATH
 CALCULATION_STATUS_JSON_PATH = os.path.join(BASE_DIR, "calculation_status.json")
+CALCULATION_COMPLETE_LATCH_JSON_PATH = os.path.join(BASE_DIR, "calculation_complete_latch.json")
 MARKET_CSV_PATH = os.path.join(BASE_DIR, "market.csv")
 TRADES_CSV_PATH = os.path.join(BASE_DIR, "trades.csv")
 POSITION_TARGETS_PATH = os.path.join(BASE_DIR, "position_targets.csv")
@@ -580,6 +581,70 @@ def _viewer_manifest_progress(manifest: dict) -> dict:
     }
 
 
+def _load_calculation_complete_latch_for_viewer() -> dict:
+    try:
+        if (
+            not os.path.exists(CALCULATION_COMPLETE_LATCH_JSON_PATH)
+            or os.path.getsize(CALCULATION_COMPLETE_LATCH_JSON_PATH) <= 0
+        ):
+            return {}
+        with open(CALCULATION_COMPLETE_LATCH_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _status_is_startup_complete(status: dict) -> bool:
+    try:
+        if not isinstance(status, dict):
+            return False
+        return bool(
+            status.get("calculation_complete_latched")
+            or status.get("calculation_work_complete")
+            or status.get("full_viewer_unlocked")
+        )
+    except Exception:
+        return False
+
+
+def _normalize_completed_calculation_status(status: dict, *, source: str) -> dict:
+    """Force completed startup status to stay completed.
+
+    Once startup is latched, the viewer must not go back to a fake loading bar
+    because live data freshness temporarily looks stale.
+    """
+    out = dict(status or {})
+    now_value = time.time()
+
+    out["ts"] = float(out.get("ts", 0.0) or now_value)
+    out["full_viewer_unlocked"] = True
+    out["calculation_work_complete"] = True
+    out["calculation_complete_latched"] = True
+    out["overall_progress"] = 1.0
+    out["overall_progress_pct"] = 100.0
+    out["phase_label"] = "Complete"
+
+    phase_progress = dict(out.get("phase_progress") or {})
+    phase_progress["micro_backlog"] = 1.0
+    phase_progress["historical_candle_backlog"] = 1.0
+    phase_progress["historical_replay"] = 1.0
+    phase_progress["replay_calibration_verdicts"] = 1.0
+    phase_progress["live_data"] = max(0.0, min(1.0, float(phase_progress.get("live_data", 1.0) or 1.0)))
+    out["phase_progress"] = phase_progress
+
+    product_status = out.get("product_status") or {}
+    if isinstance(product_status, dict):
+        out["product_count"] = int(out.get("product_count", len(product_status)) or len(product_status))
+        out["complete_products"] = int(out.get("complete_products", len(product_status)) or len(product_status))
+        out["incomplete_products"] = 0
+
+    out["viewer_status_source"] = source
+    out["viewer_status_reason"] = "startup completion latch exists, so viewer remains unlocked even if calculation_status.json is stale"
+
+    return out
+
+
 def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
     """Viewer-side fallback when bot has not written calculation_status.json yet.
 
@@ -736,7 +801,26 @@ def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
 def load_calculation_status(snapshot: dict | None = None) -> dict:
     sig = file_signature(CALCULATION_STATUS_JSON_PATH)
     status = _load_calculation_status_cached(sig[0], sig[1], sig[2], sig[3])
+    latch = _load_calculation_complete_latch_for_viewer()
 
+    # Permanent completion latch wins over everything.
+    # This prevents the viewer from falling back into fake loading mode.
+    if _status_is_startup_complete(latch):
+        merged = dict(status or {})
+        merged.update(latch)
+        return _normalize_completed_calculation_status(
+            merged,
+            source="calculation_complete_latch.json",
+        )
+
+    # Fresh completed calculation status also wins.
+    if _status_is_startup_complete(status or {}):
+        return _normalize_completed_calculation_status(
+            status,
+            source="calculation_status.json",
+        )
+
+    # If the status file is fresh and not complete yet, use it normally.
     if status:
         try:
             status_ts = float(status.get("ts", 0.0) or 0.0)
@@ -745,6 +829,7 @@ def load_calculation_status(snapshot: dict | None = None) -> dict:
         except Exception:
             return status
 
+    # Only synthesize fallback progress when there is no completed latch/status.
     synthesized = _synthesize_calculation_status_for_viewer(snapshot or load_viewer_snapshot())
 
     if status:
@@ -2101,7 +2186,7 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     blocked_products = int(calc_status.get("blocked_products", 0) or 0)
     incomplete_products = int(calc_status.get("incomplete_products", 0) or 0)
     st.markdown(
-        f"""<div class=\"calibration-gate\"><div class=\"calibration-title\">Calculating and calibrating</div><div class=\"calibration-subtitle\">The full viewer is locked until every tracked coin has completed backlogs, historical replay, and replay-based calibration verdicts.</div><div class=\"calibration-phase-card\"><b>Current phase:</b> {_html(phase_label)}<br><b>Overall completion:</b> {progress_pct:.1f}%</div></div>""",
+        f"""<div class=\"calibration-gate\"><div class=\"calibration-title\">Calculating and calibrating</div><div class=\"calibration-subtitle\">The full viewer is locked only until startup calculation is complete. After that, the bot may still block live buys if replay profitability is not strong enough.</div><div class=\"calibration-phase-card\"><b>Current phase:</b> {_html(phase_label)}<br><b>Overall completion:</b> {progress_pct:.1f}%</div></div>""",
         unsafe_allow_html=True,
     )
     calculation_started_ts = float(calc_status.get("calculation_started_ts", 0.0) or 0.0)
@@ -2518,37 +2603,39 @@ def render_live_dashboard(selected, refresh_config):
 def render_viewer_tick(refresh_config: dict) -> None:
     """Render one live viewer tick.
 
-    This function intentionally handles both states:
-    1. locked calculation/loading screen
-    2. unlocked live dashboard
-
-    It must run inside the auto-refresh fragment so the loading screen updates
-    without requiring browser refreshes.
+    The calculation gate must be checked before selecting/rendering coins.
+    Once the completion latch exists, the viewer should enter the live dashboard
+    even if all products are blocked by profitability.
     """
     snapshot = load_viewer_snapshot()
-    selected = pick_selected_coin(snapshot)
+    calc_status = load_calculation_status(snapshot)
 
-    if not selected:
-        calc_status = load_calculation_status(snapshot)
-
-        if not bool(calc_status.get("full_viewer_unlocked", False)):
-            render_calibration_loading_screen(calc_status, snapshot)
-            return
-
-        # The calculation status says the viewer can unlock, but the current
-        # snapshot may not have populated coin rows yet. Re-read once, then try
-        # to enter the live dashboard.
-        snapshot = load_viewer_snapshot()
-        selected = pick_selected_coin(snapshot)
-
-        if selected:
-            render_live_dashboard(selected, refresh_config)
-            return
-
-        st.info("Waiting for bot data. The calculation gate is unlocked, but viewer_snapshot.json has not exposed selectable coins yet.")
+    if not bool(calc_status.get("full_viewer_unlocked", False)):
+        render_calibration_loading_screen(calc_status, snapshot)
         return
 
-    render_live_dashboard(selected, refresh_config)
+    selected = pick_selected_coin(snapshot)
+
+    if selected:
+        render_live_dashboard(selected, refresh_config)
+        return
+
+    st.success("Startup calculation is complete and the viewer is unlocked.")
+    st.info("Waiting for selectable coin rows in viewer_snapshot.json, market.csv, or products_active.csv.")
+
+    product_status = calc_status.get("product_status", {}) or {}
+    if isinstance(product_status, dict) and product_status:
+        rows = []
+        for product_id, row in product_status.items():
+            rows.append({
+                "product_id": product_id,
+                "complete": bool(row.get("complete")),
+                "profit_ready": bool(row.get("profit_ready")),
+                "live_trade_allowed": bool(row.get("live_trade_allowed")),
+                "verdict": str(row.get("verdict") or ""),
+                "reason": str(row.get("reason") or ""),
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def main() -> None:

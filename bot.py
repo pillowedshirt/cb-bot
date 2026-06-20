@@ -18249,18 +18249,50 @@ class TradingBot:
             latch = self._load_calculation_complete_latch()
             latched_complete = bool(latch.get("calculation_complete_latched"))
             full_viewer_unlocked = bool((not VIEWER_REQUIRE_FULL_STARTUP_CALCULATION) or latched_complete or calculation_work_complete)
-            overall_progress = phase_totals["live_data"] * 0.10 + phase_totals["micro_backlog"] * 0.15 + phase_totals["historical_candle_backlog"] * 0.20 + phase_totals["historical_replay"] * 0.35 + phase_totals["replay_calibration_verdicts"] * 0.20
-            complete_products = sum(1 for p in PRODUCTS if bool(product_status[p]["complete"])); profit_ready_products = sum(1 for p in PRODUCTS if bool(product_status[p]["profit_ready"])); blocked_products = sum(1 for p in PRODUCTS if product_status[p]["verdict"] == "replay_complete_unprofitable_or_unqualified")
+            complete_products = sum(1 for p in PRODUCTS if bool(product_status[p]["complete"]))
+            profit_ready_products = sum(1 for p in PRODUCTS if bool(product_status[p]["profit_ready"]))
+            blocked_products = sum(
+                1
+                for p in PRODUCTS
+                if product_status[p]["verdict"] == "replay_complete_unprofitable_or_unqualified"
+            )
             worker_manifest_progress = self._historical_replay_manifest_progress()
-            if overall_progress < 0.15: phase_label = "Starting live data and micro-history backlogs"
-            elif phase_totals["historical_candle_backlog"] < 1.0: phase_label = "Building historical candle backlogs"
-            elif phase_totals["historical_replay"] < 1.0: phase_label = "Running historical replay across all products"
-            elif phase_totals["replay_calibration_verdicts"] < 1.0: phase_label = "Calculating replay-based product verdicts"
-            elif not full_viewer_unlocked: phase_label = "Final readiness checks"
-            else: phase_label = "Complete"
+
+            # Once the calculation latch exists, startup is done.
+            # Do not let temporary live-data freshness make the startup loading bar regress.
+            if latched_complete:
+                calculation_work_complete = True
+                full_viewer_unlocked = True
+                phase_totals["micro_backlog"] = 1.0
+                phase_totals["historical_candle_backlog"] = 1.0
+                phase_totals["historical_replay"] = 1.0
+                phase_totals["replay_calibration_verdicts"] = 1.0
+                overall_progress = 1.0
+                phase_label = "Complete"
+            else:
+                overall_progress = (
+                    phase_totals["live_data"] * 0.10
+                    + phase_totals["micro_backlog"] * 0.15
+                    + phase_totals["historical_candle_backlog"] * 0.20
+                    + phase_totals["historical_replay"] * 0.35
+                    + phase_totals["replay_calibration_verdicts"] * 0.20
+                )
+
+                if overall_progress < 0.15:
+                    phase_label = "Starting live data and micro-history backlogs"
+                elif phase_totals["historical_candle_backlog"] < 1.0:
+                    phase_label = "Building historical candle backlogs"
+                elif phase_totals["historical_replay"] < 1.0:
+                    phase_label = "Running historical replay across all products"
+                elif phase_totals["replay_calibration_verdicts"] < 1.0:
+                    phase_label = "Calculating replay-based product verdicts"
+                elif not full_viewer_unlocked:
+                    phase_label = "Final readiness checks"
+                else:
+                    phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(data=status)
                 latch = self._load_calculation_complete_latch()
@@ -18275,6 +18307,21 @@ class TradingBot:
 
     def _write_calculation_status(self, *, force: bool = False) -> Dict[str, Any]:
         status = self._calculation_status(force=force)
+        latch = self._load_calculation_complete_latch()
+        if bool(latch.get("calculation_complete_latched")):
+            status.update(latch)
+            status["full_viewer_unlocked"] = True
+            status["calculation_work_complete"] = True
+            status["calculation_complete_latched"] = True
+            status["overall_progress"] = 1.0
+            status["overall_progress_pct"] = 100.0
+            status["phase_label"] = "Complete"
+            phase_progress = dict(status.get("phase_progress") or {})
+            phase_progress["micro_backlog"] = 1.0
+            phase_progress["historical_candle_backlog"] = 1.0
+            phase_progress["historical_replay"] = 1.0
+            phase_progress["replay_calibration_verdicts"] = 1.0
+            status["phase_progress"] = phase_progress
         try:
             tmp = CALCULATION_STATUS_JSON_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:

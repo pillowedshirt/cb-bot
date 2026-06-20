@@ -24,6 +24,7 @@ class BinanceUSClient:
     def account(self): return self._request("GET","/api/v3/account", signed=True)
     def trading_fee(self, symbol=None): return self._request("GET","/sapi/v1/asset/query/trading-fee", params={"symbol": symbol} if symbol else {}, signed=True)
     def book_ticker(self, symbol=None): return self._request("GET","/api/v3/ticker/bookTicker", params={"symbol": symbol} if symbol else {})
+    def depth(self, symbol: str, limit: int = 25): return self._request("GET", "/api/v3/depth", params={"symbol": str(symbol).upper(), "limit": int(limit)})
     def klines(self, symbol, interval, start_ms=None, end_ms=None, limit=1000):
         p={"symbol":symbol,"interval":interval,"limit":int(limit)}; 
         if start_ms is not None: p["startTime"]=int(start_ms)

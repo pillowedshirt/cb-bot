@@ -44,6 +44,17 @@ class BinanceUSAdapter(BaseExchangeAdapter):
     def get_top_of_book(self, product_id):
         symbol=self.product_to_symbol(product_id); raw=self.client.book_ticker(symbol=symbol); bid=float(raw.get("bidPrice") or 0.0); ask=float(raw.get("askPrice") or 0.0); mid=(bid+ask)/2 if bid>0 and ask>0 else 0.0
         return {"exchange":self.exchange_id,"product_id":product_id,"symbol":symbol,"bid":bid,"ask":ask,"mid":mid,"spread_bps":((ask-bid)/mid*10000 if mid>0 else 0.0),"bid_qty":float(raw.get("bidQty") or 0.0),"ask_qty":float(raw.get("askQty") or 0.0),"ts":time.time(),"raw":raw}
+    def get_order_book_snapshot(self, product_id: str, limit: int = 25):
+        symbol=self.product_to_symbol(product_id); raw=self.client.depth(symbol=symbol, limit=int(limit))
+        bids=[[float(price), float(qty)] for price, qty in raw.get("bids", []) if float(price)>0 and float(qty)>0]
+        asks=[[float(price), float(qty)] for price, qty in raw.get("asks", []) if float(price)>0 and float(qty)>0]
+        bid_notional=sum(price*qty for price, qty in bids); ask_notional=sum(price*qty for price, qty in asks); denom=bid_notional+ask_notional
+        imbalance=((bid_notional-ask_notional)/denom) if denom>0 else 0.0
+        return {"exchange":self.exchange_id,"product_id":product_id,"symbol":symbol,"bids":bids,"asks":asks,"bid_notional":float(bid_notional),"ask_notional":float(ask_notional),"imbalance":float(imbalance),"ts":time.time(),"raw":raw}
+    def get_order(self, product_id: str, order_id: str):
+        symbol=self.product_to_symbol(product_id); return self.client.get_order(symbol=symbol, order_id=str(order_id))
+    def cancel_product_order(self, product_id: str, order_id: str) -> bool:
+        symbol=self.product_to_symbol(product_id); raw=self.client.cancel_order(symbol=symbol, order_id=str(order_id)); return bool(raw)
     def fee_bps_for_symbol(self, symbol):
         symbol=str(symbol).upper()
         if symbol not in self.fee_cache:
@@ -69,8 +80,10 @@ class BinanceUSAdapter(BaseExchangeAdapter):
         if self.dry_run or not self.allow_real_orders: return ExchangeOrderResult(True,self.exchange_id,product_id,"BUY",float(quote_usd),status="DRY_RUN_TEST_OK",raw={"test_order":self.client.test_order(**params),"params":params,"top_of_book":tob})
         return self._result_from_order(product_id=product_id, side="BUY", requested_quote_usd=float(quote_usd), raw=self.client.new_order(**params))
     def place_market_sell(self, product_id, base_qty):
-        symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); params={"symbol":symbol,"side":"SELL","type":"MARKET","quantity":format_quantity(base_qty, rules, market=True),"newOrderRespType":"FULL","newClientOrderId":f"bot-sell-{uuid.uuid4().hex[:20]}"}
-        if self.dry_run or not self.allow_real_orders: return ExchangeOrderResult(True,self.exchange_id,product_id,"SELL",status="DRY_RUN_TEST_OK",raw={"test_order":self.client.test_order(**params),"params":params,"top_of_book":self.get_top_of_book(product_id)})
+        symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); qty=format_quantity(base_qty, rules, market=True); tob=self.get_top_of_book(product_id); price=float(tob.get("bid",0.0) or 0.0)
+        if not order_meets_minimums(quote_usd=float(qty)*price, qty=qty, price=price, rules=rules): raise RuntimeError(f"Market sell does not meet Binance.US filters symbol={symbol} qty={qty} price={price}")
+        params={"symbol":symbol,"side":"SELL","type":"MARKET","quantity":qty,"newOrderRespType":"FULL","newClientOrderId":f"bot-sell-{uuid.uuid4().hex[:20]}"}
+        if self.dry_run or not self.allow_real_orders: return ExchangeOrderResult(True,self.exchange_id,product_id,"SELL",status="DRY_RUN_TEST_OK",raw={"test_order":self.client.test_order(**params),"params":params,"top_of_book":tob})
         return self._result_from_order(product_id=product_id, side="SELL", raw=self.client.new_order(**params))
     def place_limit_buy(self, product_id, quote_usd, limit_price):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); price=format_price(limit_price, rules); qty=quantity_from_quote(float(quote_usd), float(limit_price), rules)

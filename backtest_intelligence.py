@@ -144,14 +144,33 @@ FOUR_PASS_FINAL_AGENT_RATINGS_COLUMNS: List[str] = [
     "reason",
 ]
 
-BUY_LEAD_AGENT_SCORE_COLUMNS = {
+BUY_AGENT_SCORE_COLUMNS = {
+    "price_action": "price_action_buy_score",
+    "market_structure_agent": "market_structure_buy_score",
+    "validated_liquidity_agent": "validated_liquidity_buy_score",
+    "fresh_zone_retest_agent": "fresh_zone_buy_score",
+    "fair_value_gap_agent": "fvg_buy_score",
+    "volume_profile_agent": "volume_profile_buy_score",
+    "volume_profile_leader": "volume_profile_leader_buy_score",
     "previous_session_volume_profile_agent": "previous_session_profile_buy_score",
     "trend": "trend_buy_score",
+    "quant_boundary_agent": "quant_buy_score",
+    "candle_sequence_agent": "candle_sequence_score",
+    "candle_continuation_agent": "candle_continuation_score",
 }
 
-BUY_LEAD_AGENT_FALLBACK_WEIGHTS = {
-    "previous_session_volume_profile_agent": 70.0,
-    "trend": 30.0,
+SELL_AGENT_SCORE_COLUMNS = {
+    "price_action": "price_action_sell_score",
+    "volume_profile_leader": "volume_profile_leader_sell_score",
+    "previous_session_volume_profile_agent": "previous_session_profile_sell_score",
+    "quant_boundary_agent": "quant_sell_score",
+    "candle_exhaustion_agent": "candle_exhaustion_score",
+    "exit_truth": "exit_truth_sell_score",
+    "sell_utility_leader": "sell_utility_score",
+    "drawdown_exit": "drawdown_exit_score",
+    "fee_recovery": "fee_recovery_score",
+    "market_structure_agent": "market_structure_sell_score",
+    "volume_profile_harvest": "volume_profile_sell_score",
 }
 
 
@@ -858,23 +877,46 @@ def _softmax_weights(scored_rows: List[Dict[str, Any]], *, score_key: str, raw_k
 
 
 def _buy_agent_score_columns(frame: pd.DataFrame) -> Dict[str, str]:
-    return {agent: col for agent, col in BUY_LEAD_AGENT_SCORE_COLUMNS.items() if col in frame.columns}
+    """
+    Return every buy-capable analyst that has a score column in the replay frame.
+
+    This intentionally does not pre-select winners.
+    Every logged buy analyst competes in BUY Pass 1.
+    """
+    out = {}
+
+    for agent, col in BUY_AGENT_SCORE_COLUMNS.items():
+        if col in frame.columns:
+            out[agent] = col
+
+    for col in frame.columns:
+        col_text = str(col)
+        if col_text.endswith("_buy_score"):
+            agent = col_text.replace("_buy_score", "")
+            out.setdefault(agent, col_text)
+
+    return out
+
 
 def _sell_agent_score_columns(frame: pd.DataFrame) -> Dict[str, str]:
-    candidates = {
-        "exit_truth": "exit_truth_sell_score",
-        "sell_utility_leader": "sell_utility_score",
-        "drawdown_exit": "drawdown_exit_score",
-        "fee_recovery": "fee_recovery_score",
-        "candle_exhaustion_agent": "candle_exhaustion_score",
-        "market_structure_agent": "market_structure_sell_score",
-        "volume_profile_leader": "volume_profile_leader_sell_score",
-        "quant_boundary_agent": "quant_sell_score",
-        "volume_profile_harvest": "volume_profile_sell_score",
-        "price_action_exit": "price_action_sell_score",
-        "previous_session_profile_exit": "previous_session_profile_sell_score",
-    }
-    return {agent: col for agent, col in candidates.items() if col in frame.columns}
+    """
+    Return every sell-capable analyst that has a score column in the sell frame.
+
+    Sell pass remains open to all sell agents.
+    """
+    out = {}
+
+    for agent, col in SELL_AGENT_SCORE_COLUMNS.items():
+        if col in frame.columns:
+            out[agent] = col
+
+    for col in frame.columns:
+        col_text = str(col)
+        if col_text.endswith("_sell_score"):
+            agent = col_text.replace("_sell_score", "")
+            out.setdefault(agent, col_text)
+
+    return out
 
 
 def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
@@ -894,92 +936,179 @@ def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
             frame["buy_net_bps"] = _numeric(frame, "binance_taker_taker_net_pnl_bps", 0.0)
         else:
             frame["buy_net_bps"] = _numeric(frame, "max_favorable_bps", 0.0) - _numeric(frame, "cost_bps", 0.0)
-    frame["buy_success"] = ((frame["buy_net_bps"] > 0.0) | (_bool_series(frame, "survived_to_profit")) | (_bool_series(frame, "reached_min_profit")))
+    # True BUY success must be cost-aware and directional.
+    # Do not use generic reached_min_profit/survived_to_profit flags as an OR condition,
+    # because those can inflate accuracy when the final net result was not actually profitable.
+    frame["buy_success"] = frame["buy_net_bps"] > 0.0
     frame["buy_adverse_bps"] = _numeric(frame, "max_adverse_bps", 0.0).abs()
     return frame
 
 
 def _four_pass_buy_agent_rows(base_dir: str) -> Tuple[List[List[Any]], Dict[str, float], pd.DataFrame]:
-    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); frame = _build_buy_training_frame(base_dir)
-    if frame.empty: return [], {}, pd.DataFrame()
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+    frame = _build_buy_training_frame(base_dir)
+
+    if frame.empty:
+        return [], {}, pd.DataFrame()
+
     score_cols = _buy_agent_score_columns(frame)
-    if not score_cols: return [], {}, frame
+
+    if not score_cols:
+        return [], {}, frame
+
     rows_for_weighting: List[Dict[str, Any]] = []
+
     for agent, col in score_cols.items():
-        frame[col] = _numeric(frame, col, 0.0); valid = frame.dropna(subset=[col]).copy()
-        if valid.empty: continue
+        frame[col] = _numeric(frame, col, 0.0)
+        valid = frame.dropna(subset=[col]).copy()
+
+        if valid.empty:
+            continue
+
+        if float(valid[col].max()) > 1.50:
+            valid[col] = valid[col] / 100.0
+
+        valid[col] = valid[col].clip(0.0, 1.0)
+
         best = None
-        for q in [0.50, 0.60, 0.70, 0.80, 0.90, 0.95]:
-            threshold = float(valid[col].quantile(q)); selected = valid[valid[col] >= threshold].copy(); selected_count = int(len(selected))
-            if selected_count < 25: continue
-            win_rate = float(selected["buy_success"].mean()); avg_net = float(selected["buy_net_bps"].mean()); median_net = float(selected["buy_net_bps"].median()); avg_adverse = float(selected["buy_adverse_bps"].mean())
+
+        for q in [0.45, 0.55, 0.65, 0.75, 0.85, 0.92, 0.97]:
+            threshold = float(valid[col].quantile(q))
+            selected = valid[valid[col] >= threshold].copy()
+            selected_count = int(len(selected))
+
+            if selected_count < 20:
+                continue
+
+            win_rate = float(selected["buy_success"].mean())
+            avg_net = float(selected["buy_net_bps"].mean())
+            median_net = float(selected["buy_net_bps"].median())
+            avg_adverse = float(selected["buy_adverse_bps"].mean())
+
             sample_factor = min(1.0, math.sqrt(selected_count / 100.0))
-            score = max(0.05, min(0.95, 0.50 + (win_rate - 0.50) * 0.90 * sample_factor + max(-150.0, min(250.0, avg_net)) / 700.0 + max(-150.0, min(250.0, median_net)) / 1000.0 - max(0.0, avg_adverse - 90.0) / 900.0))
+            score = max(0.03, min(0.97, 0.50 + (win_rate - 0.50) * 0.80 * sample_factor + max(-200.0, min(300.0, avg_net)) / 650.0 + max(-200.0, min(300.0, median_net)) / 900.0 - max(0.0, avg_adverse - 100.0) / 850.0))
             candidate = {"agent": agent, "source_column": col, "sample_count": int(len(valid)), "selected_count": selected_count, "threshold": threshold, "win_rate": win_rate, "avg_net_bps": avg_net, "median_net_bps": median_net, "avg_adverse_bps": avg_adverse, "score": score}
-            if best is None or score > float(best["score"]): best = candidate
-        if best is not None: rows_for_weighting.append(best)
-    if len(rows_for_weighting) < 2:
-        for agent, fallback_weight in BUY_LEAD_AGENT_FALLBACK_WEIGHTS.items():
-            if not any(str(r.get("agent")) == agent for r in rows_for_weighting):
-                rows_for_weighting.append({
-                    "agent": agent,
-                    "source_column": BUY_LEAD_AGENT_SCORE_COLUMNS.get(agent, ""),
-                    "sample_count": 0,
-                    "selected_count": 0,
-                    "threshold": 0.0,
-                    "win_rate": 0.50,
-                    "avg_net_bps": 0.0,
-                    "median_net_bps": 0.0,
-                    "avg_adverse_bps": 0.0,
-                    "score": 0.50,
-                    "raw_authority": fallback_weight,
-                    "buy_weight_pct": fallback_weight,
-                })
+
+            if best is None or score > float(best["score"]):
+                best = candidate
+
+        if best is not None:
+            rows_for_weighting.append(best)
 
     rows_for_weighting = _softmax_weights(rows_for_weighting, score_key="score", raw_key="raw_authority", weight_key="buy_weight_pct")
-    output_rows: List[List[Any]] = []; weights: Dict[str, float] = {}
+    output_rows: List[List[Any]] = []
+    weights: Dict[str, float] = {}
+
     for row in rows_for_weighting:
-        weights[str(row["agent"])] = float(row["buy_weight_pct"])
-        output_rows.append([f"{ts_value:.6f}", dt_value, "buy_pass_1_agent_only_lead_buy_agents", row["agent"], row["source_column"], int(row["sample_count"]), int(row["selected_count"]), f"{float(row['threshold']):.6f}", f"{float(row['win_rate']):.6f}", f"{float(row['avg_net_bps']):.6f}", f"{float(row['median_net_bps']):.6f}", f"{float(row['avg_adverse_bps']):.6f}", f"{float(row['score']):.6f}", f"{float(row['raw_authority']):.6f}", f"{float(row['buy_weight_pct']):.6f}", f"lead_buy_agent_pass;agent={row['agent']};source={row['source_column']};score={float(row['score']):.4f};weight={float(row['buy_weight_pct']):.2f}"])
+        agent = str(row["agent"])
+        weights[agent] = float(row["buy_weight_pct"])
+        output_rows.append([f"{ts_value:.6f}", dt_value, "buy_pass_1_agent_only_all_agents", agent, row["source_column"], int(row["sample_count"]), int(row["selected_count"]), f"{float(row['threshold']):.6f}", f"{float(row['win_rate']):.6f}", f"{float(row['avg_net_bps']):.6f}", f"{float(row['median_net_bps']):.6f}", f"{float(row['avg_adverse_bps']):.6f}", f"{float(row['score']):.6f}", f"{float(row['raw_authority']):.6f}", f"{float(row['buy_weight_pct']):.6f}", f"buy_agent_pass_all_agents;agent={agent};source={row['source_column']};win_rate={float(row['win_rate']):.4f};avg_net={float(row['avg_net_bps']):.2f};median_net={float(row['median_net_bps']):.2f};weight={float(row['buy_weight_pct']):.2f}%"])
+
     return output_rows, weights, frame
 
 
 def _four_pass_council_buy_rows(base_dir: str, buy_weights: Dict[str, float], buy_frame: pd.DataFrame) -> Tuple[List[List[Any]], pd.DataFrame]:
-    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
-    if buy_frame is None or buy_frame.empty: return [], pd.DataFrame()
-    frame = buy_frame.copy(); score_cols = _buy_agent_score_columns(frame); weighted_score = pd.Series(0.0, index=frame.index); total_weight = 0.0
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+
+    if buy_frame is None or buy_frame.empty or not buy_weights:
+        return [], pd.DataFrame()
+
+    frame = buy_frame.copy()
+    score_cols = _buy_agent_score_columns(frame)
+    weighted_score = pd.Series(0.0, index=frame.index)
+    total_weight = 0.0
+
     for agent, col in score_cols.items():
-        weight = float(buy_weights.get(agent, BUY_LEAD_AGENT_FALLBACK_WEIGHTS.get(agent, 0.0)) or 0.0)
-        if weight <= 0: continue
-        normalized = _numeric(frame, col, 0.0)
-        if normalized.max() > 1.50: normalized = normalized / 100.0
-        weighted_score += normalized.clip(0.0, 1.0) * weight; total_weight += weight
-    if total_weight <= 0: return [], pd.DataFrame()
+        weight = float(buy_weights.get(agent, 0.0) or 0.0)
+        if weight <= 0:
+            continue
+        values = _numeric(frame, col, 0.0)
+        if float(values.max()) > 1.50:
+            values = values / 100.0
+        values = values.clip(0.0, 1.0)
+        weighted_score += values * weight
+        total_weight += weight
+
+    if total_weight <= 0:
+        return [], pd.DataFrame()
+
     frame["four_pass_buy_council_score"] = weighted_score / total_weight
-    rows: List[List[Any]] = []; base_selected = pd.DataFrame()
+    rows: List[List[Any]] = []
+    selected_all = pd.DataFrame()
+
     for product_id, group in frame.groupby(frame["product_id"].astype(str)):
-        group = group.copy(); best = None
-        for q in [0.55, 0.65, 0.75, 0.85, 0.92]:
-            threshold = float(group["four_pass_buy_council_score"].quantile(q)); selected = group[group["four_pass_buy_council_score"] >= threshold].copy(); selected_count = int(len(selected))
-            if selected_count < 10: continue
-            win_rate = float(selected["buy_success"].mean()); avg_net = float(selected["buy_net_bps"].mean()); median_net = float(selected["buy_net_bps"].median()); avg_adverse = float(selected["buy_adverse_bps"].mean()); portfolio_return_pct = float(selected["buy_net_bps"].sum() * 5.0 / 10000.0)
-            sample_factor = min(1.0, math.sqrt(selected_count / 80.0)); score = max(0.05, min(0.95, 0.50 + (win_rate - 0.50) * 0.85 * sample_factor + max(-150.0, min(250.0, avg_net)) / 700.0 + max(-150.0, min(250.0, median_net)) / 1000.0 - max(0.0, avg_adverse - 90.0) / 900.0))
+        group = group.copy()
+        best = None
+        for q in [0.50, 0.60, 0.70, 0.80, 0.88, 0.94]:
+            threshold = float(group["four_pass_buy_council_score"].quantile(q))
+            selected = group[group["four_pass_buy_council_score"] >= threshold].copy()
+            selected_count = int(len(selected))
+            if selected_count < 10:
+                continue
+            win_rate = float(selected["buy_success"].mean())
+            avg_net = float(selected["buy_net_bps"].mean())
+            median_net = float(selected["buy_net_bps"].median())
+            avg_adverse = float(selected["buy_adverse_bps"].mean())
+            portfolio_return_pct = float(selected["buy_net_bps"].sum() * 5.0 / 10000.0)
+            sample_factor = min(1.0, math.sqrt(selected_count / 80.0))
+            score = max(0.03, min(0.97, 0.50 + (win_rate - 0.50) * 0.85 * sample_factor + max(-200.0, min(300.0, avg_net)) / 650.0 + max(-200.0, min(300.0, median_net)) / 900.0 - max(0.0, avg_adverse - 100.0) / 850.0))
             candidate = {"product_id": product_id, "sample_count": int(len(group)), "selected_count": selected_count, "threshold": threshold, "win_rate": win_rate, "avg_net_bps": avg_net, "median_net_bps": median_net, "avg_adverse_bps": avg_adverse, "portfolio_return_pct_100_ref": portfolio_return_pct, "score": score, "selected": selected}
-            if best is None or score > float(best["score"]): best = candidate
-        if best is None: continue
-        selected = best.pop("selected"); base_selected = pd.concat([base_selected, selected], ignore_index=True, sort=False)
-        rows.append([f"{ts_value:.6f}", dt_value, "buy_pass_2_weighted_prior_session_plus_trend", best["product_id"], int(best["sample_count"]), int(best["selected_count"]), f"{float(best['threshold']):.6f}", f"{float(best['win_rate']):.6f}", f"{float(best['avg_net_bps']):.6f}", f"{float(best['median_net_bps']):.6f}", f"{float(best['avg_adverse_bps']):.6f}", f"{float(best['portfolio_return_pct_100_ref']):.6f}", f"{float(best['score']):.6f}", f"weighted_lead_buy_council;product={best['product_id']};threshold={float(best['threshold']):.4f};win_rate={float(best['win_rate']):.4f};avg_net={float(best['avg_net_bps']):.2f}"])
-    return rows, base_selected
+            if best is None or score > float(best["score"]):
+                best = candidate
+        if best is None:
+            continue
+        selected = best.pop("selected")
+        selected["four_pass_buy_selected"] = 1
+        selected["four_pass_buy_product_threshold"] = float(best["threshold"])
+        selected["four_pass_buy_product_score"] = float(best["score"])
+        selected_all = pd.concat([selected_all, selected], ignore_index=True, sort=False)
+        rows.append([f"{ts_value:.6f}", dt_value, "buy_pass_2_weighted_council_all_agents", best["product_id"], int(best["sample_count"]), int(best["selected_count"]), f"{float(best['threshold']):.6f}", f"{float(best['win_rate']):.6f}", f"{float(best['avg_net_bps']):.6f}", f"{float(best['median_net_bps']):.6f}", f"{float(best['avg_adverse_bps']):.6f}", f"{float(best['portfolio_return_pct_100_ref']):.6f}", f"{float(best['score']):.6f}", f"weighted_buy_council_all_agents;product={best['product_id']};threshold={float(best['threshold']):.4f};win_rate={float(best['win_rate']):.4f};avg_net={float(best['avg_net_bps']):.2f};median_net={float(best['median_net_bps']):.2f}"])
+
+    return rows, selected_all
 
 
 def _build_sell_training_frame(base_dir: str, council_buy_entries: pd.DataFrame) -> pd.DataFrame:
-    sell_outcomes = _read_csv(os.path.join(base_dir, "sell_outcomes.csv"))
-    if sell_outcomes.empty:
-        sell_outcomes = _read_csv(os.path.join(base_dir, "shadow_sell_replay.csv"))
-    if sell_outcomes.empty or "product_id" not in sell_outcomes.columns: return pd.DataFrame()
-    sell_outcomes = sell_outcomes.copy(); sell_outcomes["move_after_sell_bps"] = _numeric(sell_outcomes, "move_after_sell_bps", 0.0); sell_outcomes["realized_net_pnl_bps"] = _numeric(sell_outcomes, "realized_net_pnl_bps", 0.0); sell_outcomes["earnings_quality_score"] = _numeric(sell_outcomes, "earnings_quality_score", 0.5)
-    sell_outcomes["good_sell_success"] = ((sell_outcomes["move_after_sell_bps"] <= 30.0) | (sell_outcomes["realized_net_pnl_bps"] > 0.0) | (sell_outcomes["earnings_quality_score"] >= 0.55)); sell_outcomes["too_early"] = sell_outcomes["move_after_sell_bps"] >= 80.0
-    return sell_outcomes
+    """SELL training frame based on weighted council BUY entries from Pass 2."""
+    if council_buy_entries is None or council_buy_entries.empty:
+        return pd.DataFrame()
+    buys = council_buy_entries.copy()
+    if "product_id" not in buys.columns:
+        return pd.DataFrame()
+    for col in ["replay_ts", "ts", "buy_net_bps", "net_pnl_bps", "max_favorable_bps", "max_adverse_bps"]:
+        if col in buys.columns:
+            buys[col] = pd.to_numeric(buys[col], errors="coerce")
+    if "buy_net_bps" not in buys.columns:
+        buys["buy_net_bps"] = _numeric(buys, "net_pnl_bps", 0.0) if "net_pnl_bps" in buys.columns else 0.0
+    sell_frame = buys.copy()
+    sell_frame["realized_net_pnl_bps"] = _numeric(sell_frame, "buy_net_bps", 0.0)
+    if "move_after_sell_bps" not in sell_frame.columns:
+        sell_frame["move_after_sell_bps"] = _numeric(sell_frame, "max_favorable_bps", 0.0) - _numeric(sell_frame, "buy_net_bps", 0.0).clip(lower=0.0)
+    sell_frame["good_sell_success"] = (sell_frame["realized_net_pnl_bps"] > 0.0) & (sell_frame["move_after_sell_bps"] <= 80.0)
+    sell_frame["too_early"] = sell_frame["move_after_sell_bps"] >= 120.0
+
+    external_frames = []
+    for path in [os.path.join(base_dir, "sell_outcomes.csv"), os.path.join(base_dir, "shadow_sell_replay.csv")]:
+        ext = _read_csv(path)
+        if not ext.empty and "product_id" in ext.columns:
+            external_frames.append(ext.copy())
+    if external_frames:
+        external = pd.concat(external_frames, ignore_index=True, sort=False)
+        for col in ["decision_ts", "entry_ts", "replay_ts", "ts", "move_after_sell_bps", "realized_net_pnl_bps"]:
+            if col in external.columns:
+                external[col] = pd.to_numeric(external[col], errors="coerce")
+        if "realized_net_pnl_bps" not in external.columns:
+            external["realized_net_pnl_bps"] = _numeric(external, "net_pnl_bps", 0.0) if "net_pnl_bps" in external.columns else 0.0
+        if "move_after_sell_bps" not in external.columns:
+            external["move_after_sell_bps"] = 0.0
+        external["good_sell_success"] = (external["realized_net_pnl_bps"] > 0.0) & (external["move_after_sell_bps"] <= 80.0)
+        external["too_early"] = external["move_after_sell_bps"] >= 120.0
+        allowed_products = set(buys["product_id"].astype(str).unique())
+        external = external[external["product_id"].astype(str).isin(allowed_products)].copy()
+        if not external.empty:
+            sell_frame = external
+    return sell_frame
 
 
 def _four_pass_sell_agent_rows(base_dir: str, council_buy_entries: pd.DataFrame) -> Tuple[List[List[Any]], Dict[str, float], pd.DataFrame]:
@@ -1044,7 +1173,7 @@ def _four_pass_final_agent_rating_rows(buy_agent_rows: List[List[Any]], sell_age
     rows: List[List[Any]] = []
     for agent in sorted(set(buy_by_agent.keys()) | set(sell_by_agent.keys())):
         buy = buy_by_agent.get(agent, {}); sell = sell_by_agent.get(agent, {})
-        rows.append([f"{ts_value:.6f}", dt_value, agent, int(buy.get("rows", 0)), f"{float(buy.get('accuracy', 0.50)):.6f}", f"{float(buy.get('avg', 0.0)):.6f}", f"{float(buy.get('score', 0.50)):.6f}", f"{float(buy.get('weight', 0.0)):.6f}", int(sell.get("rows", 0)), f"{float(sell.get('accuracy', 0.50)):.6f}", f"{float(sell.get('avg', 0.0)):.6f}", f"{float(sell.get('score', 0.50)):.6f}", f"{float(sell.get('weight', 0.0)):.6f}", "four_pass_final_agent_rating;buy_leads_are_prior_session_and_trend;sell_uses_all_available_sell_agents"])
+        rows.append([f"{ts_value:.6f}", dt_value, agent, int(buy.get("rows", 0)), f"{float(buy.get('accuracy', 0.50)):.6f}", f"{float(buy.get('avg', 0.0)):.6f}", f"{float(buy.get('score', 0.50)):.6f}", f"{float(buy.get('weight', 0.0)):.6f}", int(sell.get("rows", 0)), f"{float(sell.get('accuracy', 0.50)):.6f}", f"{float(sell.get('avg', 0.0)):.6f}", f"{float(sell.get('score', 0.50)):.6f}", f"{float(sell.get('weight', 0.0)):.6f}", "four_pass_final_agent_rating;buy_uses_all_available_agents;sell_is_based_on_weighted_council_buy_entries"])
     return rows
 
 

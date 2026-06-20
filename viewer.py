@@ -532,7 +532,7 @@ def render_section(name: str):
 
 
 def render_crypto_header() -> None:
-    st.markdown('<div class="hud-header"><div class="hud-title">🛰️ Crypto Strategy HUD</div><div class="hud-subtitle">Strategy Arena for live crypto learning, agent consensus, and Coinbase-style chart context.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hud-header"><div class="hud-title">🛰️ Crypto Strategy HUD</div><div class="hud-subtitle">Strategy Arena for live crypto learning, agent consensus, and Binance.US chart context.</div></div>', unsafe_allow_html=True)
 
 
 def get_available_products(snapshot: Dict[str, Any]) -> list[str]:
@@ -1080,7 +1080,7 @@ def agent_full_plain_summary(row: dict) -> str:
     observations = []
     patterns = [
         (("entry_mode=no_position", "no position", "owns_position=false"), "It is judging this as a fresh-entry situation because the bot does not currently hold the coin, so sell pressure is being interpreted as a reason to avoid a new buy rather than as an instruction to exit an existing position."),
-        (("expected_utility_too_low", "expected_utility="), "The most important issue is expected utility: after Coinbase fees, spread, uncertainty, wait utility, and context penalties, the setup does not appear to offer enough net reward for live execution."),
+        (("expected_utility_too_low", "expected_utility="), "The most important issue is expected utility: after Binance.US fees, spread, uncertainty, wait utility, and context penalties, the setup does not appear to offer enough net reward for live execution."),
         (("maker_adjusted_ev_too_low", "maker_ev"), "Even if the bot tries to enter with maker-style execution, the maker-adjusted edge is still weak, so the analyst is not convinced that the trade can overcome costs cleanly."),
         (("inside_value_area", "inside_value"), "Price appears to be inside the main value area, which often means the market is balanced or choppy rather than clearly trending. That makes a new buy less attractive unless price breaks and accepts outside value."),
         (("near_poc", "poc_distance"), "Price is near the point of control, where a lot of trading has already happened. That can make the market more likely to chop around instead of moving cleanly toward a target."),
@@ -1428,7 +1428,7 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
     readiness = snapshot.get("readiness", {}) or {}
     updated_ts = _safe_float(snapshot.get("updated_ts"))
     age = max(0.0, time.time() - updated_ts) if updated_ts > 0 else 999999.0
-    st.markdown('<div class="hud-header"><div class="hud-title"><span class="live-pulse"></span>All-Coin Command Deck</div><div class="hud-subtitle">One-glance live stance across every tracked Coinbase product.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hud-header"><div class="hud-title"><span class="live-pulse"></span>All-Coin Command Deck</div><div class="hud-subtitle">One-glance live stance across every tracked Binance.US product.</div></div>', unsafe_allow_html=True)
     cols = st.columns(5)
     cols[0].metric("Tracked Coins", len(rows))
     cols[1].metric("Top Candidate", rows[0]["product_id"] if rows else "None")
@@ -1439,7 +1439,7 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
         st.caption(f'Continuously sorted by viability score. Current leader: {rows[0]["product_id"]} — {rows[0]["viability_reason"]}')
     render_leadership_verdicts(rows, decisions_df, council_votes_df)
     if readiness.get("high_fee_tier_active"):
-        st.warning("Profit-First Fee-Aware Mode is active because Coinbase fees are high. The bot can still trade, but projected net profit must clear maker/taker fees, spread, and execution cost.")
+        st.warning("Profit-First Fee-Aware Mode is active because Binance.US fees are high. The bot can still trade, but projected net profit must clear maker/taker fees, spread, and execution cost.")
     render_held_positions(snapshot, market_df, trades_df, targets_df)
     st.markdown('<div class="muted">Tap a coin card to open it in Strategy Arena.</div>', unsafe_allow_html=True)
     for i in range(0, len(rows), 3):
@@ -1596,7 +1596,7 @@ def render_topic_explanation(topic, selected_coin, votes, decisions_df, market_d
     if topic == "Why the bot is not buying live": st.info(plain_reason(coin.get("main_blocker") or coin.get("buy_blocker") or drow.get("reason", "No live-buy blocker is currently published.")))
     elif topic == "What would need to change": st.info("The bot needs fresher data, stronger expected utility, lower spread/fees, stronger agent confidence, or removal of the currently published blocker.")
     elif topic == "Chart levels": st.info(f"Published levels: POC {_safe_float(coin.get('point_of_control')):.8f}, VAH {_safe_float(coin.get('value_area_high')):.8f}, VAL {_safe_float(coin.get('value_area_low')):.8f}.")
-    elif topic == "Fee impact": st.info("Profit-First Fee-Aware Mode is active: entries need projected net profit after Coinbase fees and spread." if coin.get("high_fee_tier_active") else "No explicit fee blocker is present in the selected snapshot row.")
+    elif topic == "Fee impact": st.info("Profit-First Fee-Aware Mode is active: entries need projected net profit after Binance.US fees and spread." if coin.get("high_fee_tier_active") else "No explicit fee blocker is present in the selected snapshot row.")
     elif topic == "Agent disagreement": render_agent_disagreement_summary(votes)
 
 
@@ -1683,7 +1683,7 @@ def build_watch_items(selected_coin: str, coin: dict, market: dict, decision: di
     if "stale_market_data" in blocker:
         main_watch = "Top-of-book quote freshness is the immediate issue. Patch the keeper loop so the bot can trust live bid/ask."
     elif utility < 35:
-        main_watch = "Utility is the main weakness. The bot needs more upside after Coinbase fees and spread."
+        main_watch = "Utility is the main weakness. The bot needs more upside after Binance.US fees and spread."
     elif score < threshold:
         main_watch = "Score is the main weakness. Wait for stronger alignment across agents."
     elif boolish(market.get("buy_gate_tradeable")):
@@ -1871,7 +1871,7 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         st.progress(float(worker_manifest.get("progress", 0.0) or 0.0))
     exchange_map_df = load_csv(EXCHANGE_PRODUCT_MAP_CSV_PATH)
     if exchange_map_df is not None and not exchange_map_df.empty:
-        with st.expander("Coinbase ↔ Binance product mapping", expanded=False):
+        with st.expander("Canonical product ↔ Binance.US symbol mapping", expanded=False):
             st.dataframe(exchange_map_df, width="stretch", hide_index=True)
     phase = calc_status.get("phase_progress", {}) or {}
     st.markdown("### Phase progress")
@@ -1896,7 +1896,7 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
 
 def render_replay_fee_comparison_panel():
     df = load_csv_tail(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, max_lines=5000)
-    st.markdown("### Coinbase vs Binance Replay Fee Comparison")
+    st.markdown("### Binance.US Replay Fee Scenarios")
     if df is None or df.empty:
         st.info("No replay fee comparison summary yet. It will populate after historical worker outputs merge.")
         return
@@ -1997,7 +1997,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
             ]
             st.dataframe(historical_replay_df.tail(200)[show_cols], width="stretch", hide_index=True)
 
-    with st.expander("Coinbase vs Binance replay fee comparison", expanded=False):
+    with st.expander("Binance.US replay fee scenarios", expanded=False):
         render_replay_fee_comparison_panel()
 
     fee_comparison_df = load_csv_tail(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, max_lines=5000)
@@ -2040,8 +2040,8 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
             st.write({"actions": actions, "blockers": counts})
 
         if counts["expected_utility_too_low"] > 0:
-            st.warning("The main reason no trades are firing is expected_utility_too_low. That means Level 8 thinks the setup does not make enough net profit after Coinbase fees, spread, uncertainty, wait utility, and context penalties.")
-            st.info("This is not a viewer failure. It means the bot is finding activity, but Level 8 does not believe the setups are net-profitable enough yet after Coinbase costs and context penalties.")
+            st.warning("The main reason no trades are firing is expected_utility_too_low. That means Level 8 thinks the setup does not make enough net profit after Binance.US fees, spread, uncertainty, wait utility, and context penalties.")
+            st.info("This is not a viewer failure. It means the bot is finding activity, but Level 8 does not believe the setups are net-profitable enough yet after Binance.US costs and context penalties.")
 
 
     st.markdown("### Shadow Sell Replay")

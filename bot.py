@@ -690,20 +690,48 @@ STRATEGY_VARIANT_REPLAY_SUMMARY_COLUMNS: List[str] = [
     "hard_stop_rate", "profit_pullback_rate", "early_adverse_exit_rate", "avg_mfe_bps", "avg_mae_bps", "reason",
 ]
 
-REQUIRED_REPLAY_STRATEGY_VARIANTS: List[str] = ["baseline", "high_win_rate_v1", "high_win_rate_v2", "high_fee_survival_v1", "low_fee_scalp_v1"]
+REQUIRED_REPLAY_STRATEGY_VARIANTS: List[str] = [
+    "baseline",
+    "high_win_rate_v1",
+    "high_win_rate_v2",
+    "high_fee_survival_v1",
+    "low_fee_scalp_v1",
+]
+
 MIN_REPLAY_ROWS_PER_VARIANT_PER_JOB: int = 25
+
 ENABLE_REPLAY_POLICY_LIVE_BUY_GATE: bool = True
+REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW: bool = True
+
+# Strict profitability mode intentionally trades less often.
+# The goal is not maximum trade count. The goal is higher-quality live entries.
+PROFITABILITY_STRICT_MODE: bool = True
+
+# Replay data showed the best practical live-buy path was 15m first.
+PROFITABILITY_REQUIRE_PRIMARY_15M_EDGE: bool = True
+PROFITABILITY_PRIMARY_TIMEFRAME: str = "primary_15m_90d"
+
+PROFITABILITY_PREFERRED_STRATEGY_VARIANTS: List[str] = [
+    "high_fee_survival_v1",
+    "high_win_rate_v2",
+]
+
+# These are stricter than the previous permissive replay gate.
+# They are designed to block volatility that scores high but historically turns into hard stops.
 REPLAY_POLICY_MIN_ROWS: int = 30
-REPLAY_POLICY_MAX_HARD_STOP_RATE: float = 0.35
-REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_AVG_BPS: float = 15.0
-REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_WIN_RATE: float = 0.52
-# Since live execution is MARKET/MARKET, approve only if taker/taker replay is positive.
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 2.0
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.30
-REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 2.0
-REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.25
-REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = 0.58
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 3.5
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.34
+REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 3.5
+REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.30
+REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = 0.48
+
+# Exception rules let a normally weaker product trade only when the replay edge is unusually strong.
+REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS: float = 8.0
+REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP: float = 0.38
+REPLAY_POLICY_EXCEPTION_MIN_PROFIT_PULLBACK_RATE: float = 0.34
+
 REPLAY_POLICY_USE_PRODUCT_ALLOWLIST: bool = True
+
 REPLAY_POLICY_ALLOWED_PRODUCTS = {
     "DOGE-USD",
     "XLM-USD",
@@ -713,6 +741,7 @@ REPLAY_POLICY_ALLOWED_PRODUCTS = {
     "AVAX-USD",
     "ADA-USD",
 }
+
 REPLAY_POLICY_BLOCKED_UNLESS_EXCEPTION_PRODUCTS = {
     "DOT-USD",
     "SOL-USD",
@@ -723,9 +752,43 @@ REPLAY_POLICY_BLOCKED_UNLESS_EXCEPTION_PRODUCTS = {
     "ETH-USD",
     "BNB-USD",
 }
-REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS: float = 7.5
-REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP: float = 0.45
-REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW: bool = True
+
+# Position sizing multipliers based on replay results.
+# Stronger products can use normal size.
+# Weaker products need exceptional replay approval and smaller size.
+PROFITABILITY_PRODUCT_SIZE_MULTIPLIER = {
+    "DOGE-USD": 1.10,
+    "XLM-USD": 1.05,
+    "SUI-USD": 1.05,
+    "LINK-USD": 1.00,
+    "LTC-USD": 1.00,
+    "AVAX-USD": 1.00,
+    "ADA-USD": 1.00,
+
+    "ETH-USD": 0.60,
+    "BTC-USD": 0.50,
+    "BNB-USD": 0.50,
+    "BCH-USD": 0.45,
+    "XRP-USD": 0.40,
+    "SOL-USD": 0.40,
+    "DOT-USD": 0.35,
+    "SHIB-USD": 0.30,
+}
+
+# Live context hard blocks based on worst-buy replay conditions.
+PROFITABILITY_BLOCK_LOW_VOLUME_NODE: bool = True
+PROFITABILITY_BLOCK_ACCEPTED_ABOVE_VALUE: bool = True
+PROFITABILITY_BLOCK_INSIDE_FAIR_VALUE_UNLESS_STRONG: bool = True
+PROFITABILITY_BLOCK_NEAR_POC_CHOP_UNLESS_STRONG: bool = True
+
+PROFITABILITY_MIN_EXPECTED_UTILITY_BPS: float = 35.0
+PROFITABILITY_MIN_TRUTH_FOR_LIVE_BUY: float = 0.66
+PROFITABILITY_MIN_MARGIN_FOR_LIVE_BUY: float = 0.12
+PROFITABILITY_MIN_BUY_VS_WAIT_EDGE_BPS: float = 12.0
+PROFITABILITY_MAX_STRICT_SPREAD_BPS: float = 35.0
+
+PROFITABILITY_EXCEPTION_MIN_EXPECTED_UTILITY_BPS: float = 55.0
+PROFITABILITY_EXCEPTION_MIN_TRUTH: float = 0.72
 COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY: bool = True
 COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE: bool = False
 POST_ONLY_ENTRY_TIMEOUT_SEC: float = 20.0
@@ -1158,11 +1221,11 @@ TRADING_AGGRESSION_MODE: str = "PROFIT_FIRST_FEE_AWARE"
 PROFIT_FIRST_DISABLE_NON_ECONOMIC_HARD_BLOCKS: bool = True
 PROFIT_FIRST_KEEP_OPERATIONAL_BLOCKS: bool = True
 PROFIT_FIRST_MIN_PROJECTED_NET_AFTER_COST_BPS: float = 35.0
-PROFIT_FIRST_MIN_EXPECTED_UTILITY_BPS: float = 20.0
-PROFIT_FIRST_MIN_MAKER_ADJUSTED_EV_BPS: float = 5.0
-PROFIT_FIRST_MIN_CALIBRATED_P_WIN: float = 0.42
-PROFIT_FIRST_MIN_PAYOFF_RATIO: float = 0.70
-PROFIT_FIRST_BUY_MUST_BEAT_WAIT_BY_BPS: float = 5.0
+PROFIT_FIRST_MIN_EXPECTED_UTILITY_BPS: float = 35.0
+PROFIT_FIRST_MIN_MAKER_ADJUSTED_EV_BPS: float = 10.0
+PROFIT_FIRST_MIN_CALIBRATED_P_WIN: float = 0.48
+PROFIT_FIRST_MIN_PAYOFF_RATIO: float = 0.90
+PROFIT_FIRST_BUY_MUST_BEAT_WAIT_BY_BPS: float = 12.0
 
 # Level 8 can still learn from weak ideas, but weak ideas become SHADOW.
 # Live buys require stronger evidence because real Coinbase fees are expensive.
@@ -1179,11 +1242,12 @@ LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS: float = 25.0
 LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE: float = 80.0
 
 # Raw signal floors prevent Level 8 exploration from live-buying extremely weak setups.
-LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY: float = 0.36
-LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY: float = 22.0
+LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY: float = 0.40
+LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY: float = 28.0
 
-# Spread is still a learning input, but live money should not chase very wide books.
-LEVEL8_MAX_LIVE_BUY_SPREAD_BPS: float = 60.0
+# Replay showed that high score/probability can still just be volatility.
+# Keep spread tighter so live buys do not chase bad fills.
+LEVEL8_MAX_LIVE_BUY_SPREAD_BPS: float = 35.0
 
 # Live buys need stable or improving momentum plus a small real-time upturn.
 LEVEL8_BLOCK_LIVE_BUY_WHILE_MOMENTUM_FALLING: bool = True
@@ -1200,15 +1264,28 @@ LEVEL8_MIN_REALTIME_UPTURN_GREEN_CANDLES: int = 1
 # ============================================================
 # The run showed fee churn: buy, then sell too soon.
 # These settings force the bot to give positions enough time unless there is a real hard-stop.
-LEVEL8_MIN_HOLD_SEC: float = 10 * 60
-LEVEL8_TARGET_HOLD_SEC: float = 30 * 60
-LEVEL8_MAX_HOLD_SEC: float = 90 * 60
-LEVEL8_HARD_STOP_UNREALIZED_BPS: float = -420.0
-LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL: float = 12.0
-PROFIT_LOCK_ARM_NET_AFTER_EXIT_BPS: float = 8.0
-PROFIT_LOCK_MIN_PEAK_UNREALIZED_BPS: float = 14.0
-PROFIT_LOCK_PULLBACK_FROM_PEAK_BPS: float = 6.0
+LEVEL8_MIN_HOLD_SEC: float = 3 * 60
+LEVEL8_TARGET_HOLD_SEC: float = 20 * 60
+LEVEL8_MAX_HOLD_SEC: float = 75 * 60
+
+# The old live hard stop was far too wide for a scalping bot.
+# Replay losses were dominated by hard-stop exits after trades had already gone green.
+LEVEL8_HARD_STOP_UNREALIZED_BPS: float = -85.0
+
+LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL: float = 8.0
+
+# Earlier profit lock: protect green trades before they decay into hard stops.
+PROFIT_LOCK_ARM_NET_AFTER_EXIT_BPS: float = 5.0
+PROFIT_LOCK_MIN_PEAK_UNREALIZED_BPS: float = 10.0
+PROFIT_LOCK_PULLBACK_FROM_PEAK_BPS: float = 4.0
 PROFIT_LOCK_SELL_FRACTION: float = 1.0
+
+# Strong green giveback protection.
+PROFIT_GIVEBACK_EXIT_MIN_NET_BPS: float = 3.0
+PROFIT_GIVEBACK_STRONG_PEAK_BPS: float = 28.0
+PROFIT_GIVEBACK_STRONG_PULLBACK_BPS: float = 8.0
+PROFIT_GIVEBACK_BIG_PEAK_BPS: float = 60.0
+PROFIT_GIVEBACK_BIG_PULLBACK_FRACTION: float = 0.30
 LEVEL8_ALLOW_EARLY_PROFIT_CAPTURE: bool = True
 LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS: bool = True
 
@@ -7700,27 +7777,28 @@ class TradingBot:
 
         replay_component_score_bonus = 0.0
 
-        # Replay attribution showed market_structure and price_action helped.
-        replay_component_score_bonus += max(0.0, market_structure_buy_score - 0.57) * 9.0
-        replay_component_score_bonus += max(0.0, price_action_buy_score - 0.45) * 5.0
+        # Replay attribution showed market_structure and price_action were the useful buy drivers.
+        replay_component_score_bonus += max(0.0, market_structure_buy_score - 0.54) * 14.0
+        replay_component_score_bonus += max(0.0, price_action_buy_score - 0.43) * 8.0
 
-        # Replay attribution showed volume_profile_leader was harmful as a direct buy booster.
-        replay_component_score_bonus -= max(0.0, volume_profile_leader_buy_score - 0.33) * 4.0
+        # Replay attribution showed volume_profile_leader was harmful when treated as a direct buy reason.
+        # Keep volume profile as context, not as a blind buy booster.
+        replay_component_score_bonus -= max(0.0, volume_profile_leader_buy_score - 0.30) * 8.0
 
         value_acceptance_state_l = str(value_acceptance_state or "").lower()
         volume_node_state_l = str(volume_node_state or "").lower()
 
         if value_acceptance_state_l in {"reclaimed_value_low", "inside_value_near_poc"}:
-            replay_component_score_bonus += 4.0
+            replay_component_score_bonus += 8.0
 
         if value_acceptance_state_l in {"accepted_above_value", "inside_fair_value"}:
-            replay_component_score_bonus -= 3.0
+            replay_component_score_bonus -= 8.0
 
         if volume_node_state_l == "high_volume_node":
-            replay_component_score_bonus += 3.0
+            replay_component_score_bonus += 5.0
 
         if volume_node_state_l == "low_volume_node":
-            replay_component_score_bonus -= 6.0
+            replay_component_score_bonus -= 14.0
 
         raw_score = (
             support_score * 0.14
@@ -9615,27 +9693,28 @@ class TradingBot:
         price_action_score_bonus = combined_price_action_buy * price_action_confidence * float(PRICE_ACTION_SCORE_BONUS_WEIGHT)
         replay_component_score_bonus = 0.0
 
-        # Replay attribution showed market_structure and price_action helped.
-        replay_component_score_bonus += max(0.0, market_structure_buy_score - 0.57) * 9.0
-        replay_component_score_bonus += max(0.0, price_action_buy_score - 0.45) * 5.0
+        # Replay attribution showed market_structure and price_action were the useful buy drivers.
+        replay_component_score_bonus += max(0.0, market_structure_buy_score - 0.54) * 14.0
+        replay_component_score_bonus += max(0.0, price_action_buy_score - 0.43) * 8.0
 
-        # Replay attribution showed volume_profile_leader was harmful as a direct buy booster.
-        replay_component_score_bonus -= max(0.0, volume_profile_leader_buy_score - 0.33) * 4.0
+        # Replay attribution showed volume_profile_leader was harmful when treated as a direct buy reason.
+        # Keep volume profile as context, not as a blind buy booster.
+        replay_component_score_bonus -= max(0.0, volume_profile_leader_buy_score - 0.30) * 8.0
 
         value_acceptance_state_l = str(value_acceptance_state or "").lower()
         volume_node_state_l = str(volume_node_state or "").lower()
 
         if value_acceptance_state_l in {"reclaimed_value_low", "inside_value_near_poc"}:
-            replay_component_score_bonus += 4.0
+            replay_component_score_bonus += 8.0
 
         if value_acceptance_state_l in {"accepted_above_value", "inside_fair_value"}:
-            replay_component_score_bonus -= 3.0
+            replay_component_score_bonus -= 8.0
 
         if volume_node_state_l == "high_volume_node":
-            replay_component_score_bonus += 3.0
+            replay_component_score_bonus += 5.0
 
         if volume_node_state_l == "low_volume_node":
-            replay_component_score_bonus -= 6.0
+            replay_component_score_bonus -= 14.0
 
         price_action_prob_bonus = combined_price_action_buy * price_action_confidence * float(PRICE_ACTION_PROB_BONUS_WEIGHT)
 
@@ -12800,6 +12879,170 @@ class TradingBot:
         except Exception as exc:
             return {"utility_adjust_bps": 0.0, "truth_adjust": 0.0, "margin_adjust": 0.0, "reason": f"adaptive_guardrail_error:{exc}"}
 
+    def _profitability_replay_gate_for_candidate(
+        self,
+        *,
+        product_id: str,
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Strict replay gate for live Binance buys."""
+        product_id = str(product_id or "")
+        policy = self._latest_strategy_variant_policy()
+
+        preferred_variants = list(PROFITABILITY_PREFERRED_STRATEGY_VARIANTS)
+        fallback_variants = ["low_fee_scalp_v1", "baseline"]
+        candidate_variants = preferred_variants + [v for v in fallback_variants if v not in preferred_variants]
+
+        if bool(PROFITABILITY_REQUIRE_PRIMARY_15M_EDGE):
+            timeframes = [str(PROFITABILITY_PRIMARY_TIMEFRAME)]
+        else:
+            timeframes = ["primary_15m_90d", "regime_1h_365d"]
+
+        product_allowed = (
+            not bool(REPLAY_POLICY_USE_PRODUCT_ALLOWLIST)
+            or product_id in set(REPLAY_POLICY_ALLOWED_PRODUCTS)
+        )
+        product_blocked_unless_exception = product_id in set(REPLAY_POLICY_BLOCKED_UNLESS_EXCEPTION_PRODUCTS)
+
+        checked: List[str] = []
+        approved: List[Tuple[str, str, Dict[str, Any]]] = []
+        best_score = -999999.0
+        best_detail: Dict[str, Any] = {}
+
+        for timeframe in timeframes:
+            for variant in candidate_variants:
+                row = policy.get((product_id, timeframe, variant))
+                if not row:
+                    checked.append(f"{timeframe}/{variant}:missing")
+                    continue
+
+                rows = int(row.get("rows", 0) or 0)
+                bn_taker_avg = float(row.get("binance_taker_taker_avg", row.get("binance_taker_taker_avg_bps", 0.0)) or 0.0)
+                bn_taker_win = float(row.get("binance_taker_taker_win", row.get("binance_taker_taker_win_rate", 0.0)) or 0.0)
+                bn_maker_taker_avg = float(row.get("binance_maker_taker_avg", row.get("binance_maker_taker_avg_bps", 0.0)) or 0.0)
+                hard_stop = float(row.get("hard_stop_rate", 1.0) or 1.0)
+                profit_pullback = float(row.get("profit_pullback_rate", 0.0) or 0.0)
+                avg_mfe = float(row.get("avg_mfe_bps", 0.0) or 0.0)
+                avg_mae = float(row.get("avg_mae_bps", 0.0) or 0.0)
+
+                replay_score = (
+                    bn_taker_avg * 1.00
+                    + bn_maker_taker_avg * 0.50
+                    + bn_taker_win * 10.0
+                    + profit_pullback * 16.0
+                    - hard_stop * 30.0
+                    + max(0.0, avg_mfe) * 0.03
+                    - abs(min(0.0, avg_mae)) * 0.02
+                )
+
+                exceptional_variant = bool(
+                    rows >= int(REPLAY_POLICY_MIN_ROWS)
+                    and bn_taker_avg >= float(REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS)
+                    and bn_maker_taker_avg >= float(REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS)
+                    and hard_stop <= float(REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP)
+                    and profit_pullback >= float(REPLAY_POLICY_EXCEPTION_MIN_PROFIT_PULLBACK_RATE)
+                )
+
+                product_ok = bool(product_allowed or exceptional_variant)
+                if product_blocked_unless_exception and not exceptional_variant:
+                    product_ok = False
+
+                approved_policy = bool(
+                    rows >= int(REPLAY_POLICY_MIN_ROWS)
+                    and bn_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS)
+                    and bn_taker_win >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE)
+                    and bn_maker_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS)
+                    and hard_stop <= float(REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE)
+                    and profit_pullback >= float(REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE)
+                    and product_ok
+                )
+
+                if replay_score > best_score:
+                    best_score = float(replay_score)
+                    best_detail = {
+                        "timeframe": str(timeframe),
+                        "variant": str(variant),
+                        "rows": int(rows),
+                        "binance_taker_avg_bps": float(bn_taker_avg),
+                        "binance_taker_win_rate": float(bn_taker_win),
+                        "binance_maker_taker_avg_bps": float(bn_maker_taker_avg),
+                        "hard_stop_rate": float(hard_stop),
+                        "profit_pullback_rate": float(profit_pullback),
+                        "avg_mfe_bps": float(avg_mfe),
+                        "avg_mae_bps": float(avg_mae),
+                        "replay_score": float(replay_score),
+                        "exceptional_variant": bool(exceptional_variant),
+                        "product_allowed": bool(product_allowed),
+                        "product_blocked_unless_exception": bool(product_blocked_unless_exception),
+                        "approved": bool(approved_policy),
+                    }
+
+                checked.append(
+                    f"{timeframe}/{variant}:"
+                    f"rows={rows},"
+                    f"avg={bn_taker_avg:.2f},"
+                    f"win={bn_taker_win:.3f},"
+                    f"maker_taker={bn_maker_taker_avg:.2f},"
+                    f"hard={hard_stop:.3f},"
+                    f"pullback={profit_pullback:.3f},"
+                    f"score={replay_score:.2f},"
+                    f"exceptional={exceptional_variant},"
+                    f"product_ok={product_ok},"
+                    f"approved={approved_policy}"
+                )
+
+                if approved_policy:
+                    approved.append((timeframe, variant, row))
+
+        base_size_multiplier = float(PROFITABILITY_PRODUCT_SIZE_MULTIPLIER.get(product_id, 0.50))
+        hard_stop_rate = float(best_detail.get("hard_stop_rate", 1.0) or 1.0)
+        profit_pullback_rate = float(best_detail.get("profit_pullback_rate", 0.0) or 0.0)
+        best_avg = float(best_detail.get("binance_taker_avg_bps", 0.0) or 0.0)
+
+        size_multiplier = base_size_multiplier
+        if hard_stop_rate > 0.42:
+            size_multiplier *= 0.70
+        if profit_pullback_rate >= 0.40:
+            size_multiplier *= 1.05
+        if best_avg >= 8.0:
+            size_multiplier *= 1.10
+        size_multiplier = clamp_float(size_multiplier, 0.15, 1.15)
+
+        candidate["profitability_replay_best"] = str(best_detail)
+        candidate["profitability_replay_score"] = float(best_score)
+        candidate["profitability_replay_timeframe"] = str(best_detail.get("timeframe", ""))
+        candidate["profitability_replay_variant"] = str(best_detail.get("variant", ""))
+        candidate["profitability_replay_avg_bps"] = float(best_avg)
+        candidate["profitability_replay_hard_stop_rate"] = float(hard_stop_rate)
+        candidate["profitability_replay_profit_pullback_rate"] = float(profit_pullback_rate)
+        candidate["profitability_replay_exceptional"] = bool(best_detail.get("exceptional_variant", False))
+        candidate["profitability_size_multiplier"] = float(size_multiplier)
+        candidate["replay_policy_checked"] = " | ".join(checked[-16:])
+        candidate["replay_policy_approvals"] = str(approved)
+
+        if approved:
+            return {
+                "approved": True,
+                "approved_rows": approved,
+                "best": best_detail,
+                "checked": checked,
+                "reason": f"profitability_replay_approved product={product_id};best={best_detail};size_multiplier={size_multiplier:.3f}",
+            }
+
+        return {
+            "approved": False,
+            "approved_rows": [],
+            "best": best_detail,
+            "checked": checked,
+            "reason": (
+                f"profitability_replay_blocked product={product_id};"
+                f"product_allowed={product_allowed};"
+                f"product_blocked_unless_exception={product_blocked_unless_exception};"
+                f"best={best_detail};"
+                f"checked={' | '.join(checked[-8:])}"
+            ),
+        }
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -12834,65 +13077,14 @@ class TradingBot:
                 if tob_age is None or tob_age > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
                     return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age}")
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
-                policy = self._latest_strategy_variant_policy()
-                candidate_variants = [
-                    "high_win_rate_v2",
-                    "high_fee_survival_v1",
-                    "low_fee_scalp_v1",
-                    "baseline",
-                ]
-                approved = []
-                checked = []
-                product_allowed = (
-                    not bool(REPLAY_POLICY_USE_PRODUCT_ALLOWLIST)
-                    or product_id in set(REPLAY_POLICY_ALLOWED_PRODUCTS)
+                replay_gate = self._profitability_replay_gate_for_candidate(
+                    product_id=product_id,
+                    candidate=candidate,
                 )
-                for timeframe in ["primary_15m_90d", "regime_1h_365d"]:
-                    for variant in candidate_variants:
-                        row = policy.get((product_id, timeframe, variant))
-                        if not row:
-                            continue
-                        rows = int(row.get("rows", 0) or 0)
-                        bn_taker_avg = float(row.get("binance_taker_taker_avg", row.get("binance_taker_taker_avg_bps", 0.0)) or 0.0)
-                        bn_taker_win = float(row.get("binance_taker_taker_win", row.get("binance_taker_taker_win_rate", 0.0)) or 0.0)
-                        bn_maker_taker_avg = float(row.get("binance_maker_taker_avg", row.get("binance_maker_taker_avg_bps", 0.0)) or 0.0)
-                        hard_stop = float(row.get("hard_stop_rate", 1.0) or 1.0)
-                        profit_pullback = float(row.get("profit_pullback_rate", 0.0) or 0.0)
-                        exceptional_variant = bool(
-                            bn_taker_avg >= float(REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS)
-                            and bn_maker_taker_avg >= float(REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS)
-                            and hard_stop <= float(REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP)
-                        )
-                        approved_policy = bool(
-                            rows >= int(REPLAY_POLICY_MIN_ROWS)
-                            and bn_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS)
-                            and bn_taker_win >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE)
-                            and bn_maker_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS)
-                            and hard_stop <= float(REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE)
-                            and profit_pullback >= float(REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE)
-                            and (product_allowed or exceptional_variant)
-                        )
-                        checked.append(
-                            f"{timeframe}/{variant}:"
-                            f"rows={rows},"
-                            f"avg={bn_taker_avg:.2f},"
-                            f"win={bn_taker_win:.3f},"
-                            f"hard={hard_stop:.3f},"
-                            f"pullback={profit_pullback:.3f},"
-                            f"product_allowed={product_allowed},"
-                            f"exceptional={exceptional_variant},"
-                            f"approved={approved_policy}"
-                        )
-                        if approved_policy:
-                            approved.append((timeframe, variant, row))
-                candidate["replay_policy_approvals"] = str(approved)
-                candidate["replay_policy_checked"] = " | ".join(checked[-12:])
-                if not approved:
+                if not bool(replay_gate.get("approved", False)):
                     return False, (
-                        f"live_buy_blocked:no_binance_replay_policy_approval "
-                        f"product_id={product_id};"
-                        f"product_allowed={product_allowed};"
-                        f"checked={' | '.join(checked[-8:])}"
+                        f"live_buy_blocked:no_strict_profitability_replay_approval "
+                        f"{replay_gate.get('reason', '')}"
                     )
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
                 calc_status = self._calculation_status()
@@ -13009,6 +13201,65 @@ class TradingBot:
             volume_profile_leader_wait_score = float(candidate.get("volume_profile_leader_wait_score", 0.50) or 0.50)
             volume_profile_utility_adjust_bps = float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0)
 
+            if bool(PROFITABILITY_STRICT_MODE):
+                replay_exceptional = bool(candidate.get("profitability_replay_exceptional", False))
+                replay_avg_bps = float(candidate.get("profitability_replay_avg_bps", 0.0) or 0.0)
+                replay_hard_stop_rate = float(candidate.get("profitability_replay_hard_stop_rate", 1.0) or 1.0)
+                replay_profit_pullback_rate = float(candidate.get("profitability_replay_profit_pullback_rate", 0.0) or 0.0)
+
+                strong_live_exception = bool(
+                    replay_exceptional
+                    and expected_utility_bps >= float(PROFITABILITY_EXCEPTION_MIN_EXPECTED_UTILITY_BPS)
+                    and truth >= float(PROFITABILITY_EXCEPTION_MIN_TRUTH)
+                )
+
+                if spread_bps > float(PROFITABILITY_MAX_STRICT_SPREAD_BPS):
+                    return False, (
+                        f"live_buy_blocked:strict_spread_too_wide "
+                        f"spread_bps={spread_bps:.2f};"
+                        f"max={float(PROFITABILITY_MAX_STRICT_SPREAD_BPS):.2f}"
+                    )
+
+                if bool(PROFITABILITY_BLOCK_LOW_VOLUME_NODE) and volume_node_state == "low_volume_node" and not strong_live_exception:
+                    return False, (
+                        f"live_buy_blocked:strict_low_volume_node "
+                        f"volume_node_state={volume_node_state};expected_utility={expected_utility_bps:.2f};"
+                        f"truth={truth:.3f};replay_avg={replay_avg_bps:.2f};"
+                        f"replay_hard_stop={replay_hard_stop_rate:.3f};exception={strong_live_exception}"
+                    )
+
+                if bool(PROFITABILITY_BLOCK_ACCEPTED_ABOVE_VALUE) and value_acceptance_state == "accepted_above_value" and not strong_live_exception:
+                    return False, (
+                        f"live_buy_blocked:strict_accepted_above_value_chase "
+                        f"value_acceptance_state={value_acceptance_state};expected_utility={expected_utility_bps:.2f};"
+                        f"truth={truth:.3f};replay_avg={replay_avg_bps:.2f};exception={strong_live_exception}"
+                    )
+
+                if (
+                    bool(PROFITABILITY_BLOCK_INSIDE_FAIR_VALUE_UNLESS_STRONG)
+                    and value_acceptance_state == "inside_fair_value"
+                    and expected_utility_bps < float(PROFITABILITY_EXCEPTION_MIN_EXPECTED_UTILITY_BPS)
+                    and not strong_live_exception
+                ):
+                    return False, (
+                        f"live_buy_blocked:strict_inside_fair_value_chop "
+                        f"value_acceptance_state={value_acceptance_state};expected_utility={expected_utility_bps:.2f};"
+                        f"replay_pullback={replay_profit_pullback_rate:.3f};exception={strong_live_exception}"
+                    )
+
+                if (
+                    bool(PROFITABILITY_BLOCK_NEAR_POC_CHOP_UNLESS_STRONG)
+                    and poc_distance_bps <= 10.0
+                    and volume_profile_leader_wait_score >= 0.58
+                    and value_acceptance_state != "inside_value_near_poc"
+                    and not strong_live_exception
+                ):
+                    return False, (
+                        f"live_buy_blocked:strict_near_poc_chop "
+                        f"poc_distance_bps={poc_distance_bps:.2f};wait_score={volume_profile_leader_wait_score:.3f};"
+                        f"value_acceptance_state={value_acceptance_state};exception={strong_live_exception}"
+                    )
+
             regime_adj = self._regime_specific_adjustments(candidate)
             adaptive_adj = self._adaptive_guardrail_adjustments()
 
@@ -13031,9 +13282,19 @@ class TradingBot:
                 + float(adaptive_adj.get("margin_adjust", 0.0) or 0.0)
             )
             if profit_first:
-                effective_min_utility_bps = min(float(effective_min_utility_bps), float(PROFIT_FIRST_MIN_EXPECTED_UTILITY_BPS))
-                effective_min_truth = min(float(effective_min_truth), 0.50)
-                effective_min_margin = min(float(effective_min_margin), 0.04)
+                effective_min_utility_bps = max(
+                    float(effective_min_utility_bps),
+                    float(PROFIT_FIRST_MIN_EXPECTED_UTILITY_BPS),
+                    float(PROFITABILITY_MIN_EXPECTED_UTILITY_BPS),
+                )
+                effective_min_truth = max(
+                    float(effective_min_truth),
+                    float(PROFITABILITY_MIN_TRUTH_FOR_LIVE_BUY),
+                )
+                effective_min_margin = max(
+                    float(effective_min_margin),
+                    float(PROFITABILITY_MIN_MARGIN_FOR_LIVE_BUY),
+                )
 
             setup_tag_text = str(
                 candidate.get("setup_tag", "")
@@ -13100,7 +13361,14 @@ class TradingBot:
                         f"adaptive={adaptive_adj.get('reason', '')};"
                     )
 
-                min_buy_vs_wait = (float(PROFIT_FIRST_BUY_MUST_BEAT_WAIT_BY_BPS) if profit_first else float(BUY_MUST_BEAT_WAIT_BY_BPS))
+                min_buy_vs_wait = (
+                    max(
+                        float(PROFIT_FIRST_BUY_MUST_BEAT_WAIT_BY_BPS),
+                        float(PROFITABILITY_MIN_BUY_VS_WAIT_EDGE_BPS),
+                    )
+                    if profit_first
+                    else float(BUY_MUST_BEAT_WAIT_BY_BPS)
+                )
                 if bool(ENABLE_WAIT_UTILITY_SCORING) and buy_vs_wait_edge_bps < min_buy_vs_wait:
                     return False, (
                         f"live_buy_shadowed:buy_does_not_beat_wait_enough "
@@ -13934,9 +14202,17 @@ class TradingBot:
                 float(UTILITY_MIN_SIZE_MULTIPLIER),
                 float(UTILITY_MAX_SIZE_MULTIPLIER),
             )
+            profitability_size_multiplier = clamp_float(
+                float(candidate.get("profitability_size_multiplier", 1.0) or 1.0),
+                0.15,
+                1.15,
+            )
             raw_position_pct = float(decision.get("position_pct", 0.0) or 0.0)
             adjusted_position_pct = clamp_float(
-                raw_position_pct * setup_size_multiplier * utility_size_multiplier,
+                raw_position_pct
+                * setup_size_multiplier
+                * utility_size_multiplier
+                * profitability_size_multiplier,
                 0.0,
                 float(LEVEL8_MAX_SINGLE_TRADE_PCT),
             )
@@ -15255,6 +15531,35 @@ class TradingBot:
         pullback_for_profit_lock = float(
             hold_state.get("pullback_from_peak_bps", 0.0) or 0.0
         )
+
+        big_peak_dynamic_pullback_bps = max(
+            float(PROFIT_GIVEBACK_STRONG_PULLBACK_BPS),
+            peak_unrealized_for_profit_lock * float(PROFIT_GIVEBACK_BIG_PULLBACK_FRACTION),
+        )
+
+        strong_green_giveback_hit = bool(
+            net_after_exit_for_hard_check >= float(PROFIT_GIVEBACK_EXIT_MIN_NET_BPS)
+            and (
+                (
+                    peak_unrealized_for_profit_lock >= float(PROFIT_GIVEBACK_STRONG_PEAK_BPS)
+                    and pullback_for_profit_lock >= float(PROFIT_GIVEBACK_STRONG_PULLBACK_BPS)
+                )
+                or (
+                    peak_unrealized_for_profit_lock >= float(PROFIT_GIVEBACK_BIG_PEAK_BPS)
+                    and pullback_for_profit_lock >= float(big_peak_dynamic_pullback_bps)
+                )
+            )
+        )
+
+        if strong_green_giveback_hit:
+            return True, (
+                f"level8_profit_giveback_exit;"
+                f"net_after_exit_bps={net_after_exit_for_hard_check:.2f};"
+                f"peak_unrealized_bps={peak_unrealized_for_profit_lock:.2f};"
+                f"pullback_from_peak_bps={pullback_for_profit_lock:.2f};"
+                f"dynamic_pullback_bps={big_peak_dynamic_pullback_bps:.2f};"
+                f"{default_exit_reason}"
+            ), 1.0
 
         profit_lock_hit = bool(
             net_after_exit_for_hard_check >= float(PROFIT_LOCK_ARM_NET_AFTER_EXIT_BPS)

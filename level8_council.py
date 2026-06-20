@@ -1463,9 +1463,13 @@ class Level8Council:
             side_rating = side_ratings.get(str(vote.agent), {})
             side = str(decision_side).upper()
             if side == "BUY":
-                raw_weight *= float(side_rating.get("buy_weight_multiplier", 1.0) or 1.0)
+                buy_rows = float(side_rating.get("buy_rows", 0.0) or 0.0)
+                if buy_rows >= 10:
+                    raw_weight *= float(side_rating.get("buy_weight_multiplier", 1.0) or 1.0)
             elif side == "SELL":
-                raw_weight *= float(side_rating.get("sell_weight_multiplier", 1.0) or 1.0)
+                sell_rows = float(side_rating.get("sell_rows", 0.0) or 0.0)
+                if sell_rows >= 5:
+                    raw_weight *= float(side_rating.get("sell_weight_multiplier", 1.0) or 1.0)
             direction = dominant_vote_direction(asdict(vote)).upper()
             policy = agent_policy.get(str(vote.agent), {})
             role = str(policy.get("recommended_role", "neutral"))

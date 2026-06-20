@@ -1560,7 +1560,7 @@ TOP_OF_BOOK_MAX_STALE_SEC: float = 6.0
 TOP_OF_BOOK_REPAIR_TIMEOUT_SEC: float = 8.0
 TOP_OF_BOOK_REPAIR_CONCURRENCY: int = 4
 TOP_OF_BOOK_STALE_WARN_SEC: float = 45.0
-TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC: float = 90.0
+TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC: float = 45.0
 
 # Still do not buy with stale or missing bid/ask.
 REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY: bool = True
@@ -4018,6 +4018,7 @@ class LiveSignal:
     smt_peer: str = ""
     smt_reason: str = ""
     previous_session_profile_buy_score: float = 0.0
+    trend_buy_score: float = 0.0
     previous_session_profile_sell_score: float = 0.0
     previous_session_profile_hold_score: float = 0.50
     previous_session_profile_wait_score: float = 0.50
@@ -4118,6 +4119,7 @@ class CalibrationObservation:
     smt_peer: str = ""
     smt_reason: str = ""
     previous_session_profile_buy_score: float = 0.0
+    trend_buy_score: float = 0.0
     previous_session_profile_sell_score: float = 0.0
     previous_session_profile_hold_score: float = 0.50
     previous_session_profile_wait_score: float = 0.50
@@ -4222,6 +4224,7 @@ class CandidateReplayLogger:
 
         "smt_state", "smt_peer", "smt_reason",
         "previous_session_profile_buy_score",
+        "trend_buy_score",
         "previous_session_profile_sell_score",
         "previous_session_profile_hold_score",
         "previous_session_profile_wait_score",
@@ -4354,6 +4357,7 @@ class CandidateReplayLogger:
                     str(o.smt_peer),
                     str(o.smt_reason),
                     f"{float(o.previous_session_profile_buy_score):.6f}",
+                    f"{float(getattr(o, 'trend_buy_score', 0.0)):.6f}",
                     f"{float(o.previous_session_profile_sell_score):.6f}",
                     f"{float(o.previous_session_profile_hold_score):.6f}",
                     f"{float(o.previous_session_profile_wait_score):.6f}",
@@ -7883,6 +7887,14 @@ class TradingBot:
             except Exception:
                 quant_context = {}
 
+        trend_buy_score = clamp_float(
+            0.50
+            + float(momentum_5_bps or 0.0) / 180.0
+            + float(momentum_15_bps or 0.0) / 300.0,
+            0.0,
+            1.0,
+        )
+
         return LiveSignal(
             ok_to_trade=False,
             score=float(score),
@@ -7948,6 +7960,7 @@ class TradingBot:
             smt_peer=str(smt_context.get("peer", "")),
             smt_reason=str(smt_context.get("reason", "")),
             previous_session_profile_buy_score=float(previous_session_profile.get("buy_score", 0.0) or 0.0),
+            trend_buy_score=float(trend_buy_score),
             previous_session_profile_sell_score=float(previous_session_profile.get("sell_score", 0.0) or 0.0),
             previous_session_profile_hold_score=float(previous_session_profile.get("hold_score", 0.50) or 0.50),
             previous_session_profile_wait_score=float(previous_session_profile.get("wait_score", 0.50) or 0.50),
@@ -8288,6 +8301,7 @@ class TradingBot:
                 post_profit_extra_gain_bps=float(post_profit_extra_gain_bps),
                 adverse_before_profit_bps=float(adverse_before_profit_bps),
                 survived_to_profit=bool(survived_to_profit),
+                trend_buy_score=float(getattr(signal, "trend_buy_score", 0.0)),
                 **setup_context,
             ))
         return observations
@@ -10098,6 +10112,14 @@ class TradingBot:
         )
         quant_context = self._quant_context_for_product(product_id=product_id)
 
+        trend_buy_score = clamp_float(
+            0.50
+            + float(momentum_5_bps or 0.0) / 180.0
+            + float(momentum_15_bps or 0.0) / 300.0,
+            0.0,
+            1.0,
+        )
+
         return LiveSignal(
             ok_to_trade=bool(ok_to_trade),
             score=float(score),
@@ -10171,6 +10193,7 @@ class TradingBot:
             smt_peer=str(smt_context.get("peer", "")),
             smt_reason=str(smt_context.get("reason", "")),
             previous_session_profile_buy_score=float(previous_session_profile.get("buy_score", 0.0) or 0.0),
+            trend_buy_score=float(trend_buy_score),
             previous_session_profile_sell_score=float(previous_session_profile.get("sell_score", 0.0) or 0.0),
             previous_session_profile_hold_score=float(previous_session_profile.get("hold_score", 0.50) or 0.50),
             previous_session_profile_wait_score=float(previous_session_profile.get("wait_score", 0.50) or 0.50),
@@ -11142,6 +11165,32 @@ class TradingBot:
                 self.level8_council._clear_level8_memory_cache()
         except Exception as exc:
             log_exception("backtest intelligence update failed", exc)
+
+    def _maybe_run_backtest_intelligence_background(self, *, force_when_replay_complete: bool = False) -> None:
+        """Re-run backtest intelligence after replay data exists."""
+        try:
+            now_value = now_ts()
+            last_run = float(getattr(self, "_last_backtest_intelligence_run_ts", 0.0) or 0.0)
+            candidate_path = os.path.join(BASE_DIR, "candidate_replay.csv")
+            historical_path = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
+            candidate_ready = os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 5000
+            historical_ready = os.path.exists(historical_path) and os.path.getsize(historical_path) > 5000
+            if not candidate_ready and not historical_ready:
+                return
+            if not force_when_replay_complete and now_value - last_run < 600:
+                return
+            self._last_backtest_intelligence_run_ts = now_value
+            self._run_backtest_intelligence_if_due(force=True)
+            try:
+                self._write_agent_side_ratings()
+            except Exception:
+                pass
+            try:
+                self._maybe_reload_backtest_background()
+            except Exception:
+                pass
+        except Exception as exc:
+            module_exception(MODULE_NAME, "maybe_run_backtest_intelligence_background_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
     def _load_backtest_recommendations(self) -> None:
         """Load latest backtest recommendations into memory."""
@@ -13096,10 +13145,31 @@ class TradingBot:
                     candidate=candidate,
                 )
                 if not bool(replay_gate.get("approved", False)):
-                    return False, (
-                        f"live_buy_blocked:no_strict_profitability_replay_approval "
-                        f"{replay_gate.get('reason', '')}"
-                    )
+                    four_pass_ok = False
+                    try:
+                        four_pass_path = os.path.join(BASE_DIR, "four_pass_council_buy_timing.csv")
+                        if os.path.exists(four_pass_path) and os.path.getsize(four_pass_path) > 0:
+                            fp = pd.read_csv(four_pass_path)
+                            if not fp.empty and "product_id" in fp.columns:
+                                product_rows = fp[fp["product_id"].astype(str).eq(str(product_id))].copy()
+                                if not product_rows.empty:
+                                    for col in ["win_rate", "avg_net_bps", "median_net_bps", "selected_count"]:
+                                        if col in product_rows.columns:
+                                            product_rows[col] = pd.to_numeric(product_rows[col], errors="coerce")
+                                    latest = product_rows.tail(1).iloc[0]
+                                    four_pass_ok = (
+                                        float(latest.get("selected_count", 0) or 0) >= 10
+                                        and float(latest.get("win_rate", 0.0) or 0.0) >= 0.56
+                                        and float(latest.get("avg_net_bps", 0.0) or 0.0) > 0.0
+                                        and float(latest.get("median_net_bps", 0.0) or 0.0) > 0.0
+                                    )
+                    except Exception:
+                        four_pass_ok = False
+                    if not four_pass_ok:
+                        return False, (
+                            f"live_buy_blocked:no_strict_profitability_replay_approval "
+                            f"{replay_gate.get('reason', '')}"
+                        )
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
                 calc_status = self._calculation_status()
                 if not bool(calc_status.get("full_viewer_unlocked")):
@@ -18285,7 +18355,7 @@ class TradingBot:
             try:
                 replay_ts = int(float(row.get("replay_ts") or 0)); net_bps = float(row.get("net_pnl_bps") or 0.0); mfe = float(row.get("max_favorable_bps") or 0.0); mae = float(row.get("max_adverse_bps") or 0.0)
                 age_days = max(0.0, (now_value - float(replay_ts)) / 86400.0); recency_weight = 0.5 ** (age_days / max(float(HIST_REPLAY_RECENCY_HALFLIFE_DAYS), 1.0))
-                obs = CalibrationObservation(product_id=product_id, timeframe=str(row.get("timeframe") or "historical_replay"), ts=replay_ts, score=float(row.get("score") or 0.0), probability=float(row.get("probability") or 0.0), expected_net_edge_bps=float(row.get("expected_net_edge_bps") or 0.0), target_bps=float(row.get("target_bps") or 0.0), cost_bps=float(row.get("cost_bps") or 0.0), spread_bps=float(row.get("spread_bps") or 0.0), max_favorable_bps=float(mfe), max_adverse_bps=float(mae), reached_min_profit=bool(net_bps > 0.0), reached_target=bool(row.get("would_have_hit_min_profit", 0)), expected_value_bps=float(net_bps), win_bps=max(0.0, float(net_bps)), loss_bps=max(0.0, -float(net_bps)), time_to_min_profit_bars=None, time_to_min_profit_minutes=None, forward_window_minutes=float(row.get("held_seconds") or 0.0) / 60.0, projected_forward_gain_bps=float(net_bps), selected_forward_window_minutes=float(row.get("held_seconds") or 0.0) / 60.0, post_profit_max_favorable_bps=float(mfe), post_profit_extra_gain_bps=max(0.0, float(mfe) - max(0.0, float(net_bps))), adverse_before_profit_bps=abs(min(0.0, float(mae))), survived_to_profit=bool(net_bps > 0.0 and not bool(row.get("would_have_hit_stop", 0))), accepted_by_calibration=bool(row.get("accepted_for_calibration", 1)), volume_profile_leader_buy_score=float(row.get("volume_profile_leader_buy_score") or 0.0), volume_profile_leader_wait_score=float(row.get("volume_profile_leader_wait_score") or 0.5), price_action_buy_score=float(row.get("price_action_buy_score") or 0.0), market_structure_buy_score=float(row.get("market_structure_buy_score") or 0.0), quant_buy_score=float(row.get("quant_buy_score") or 0.0), value_acceptance_state=str(row.get("value_acceptance_state") or ""), volume_node_state=str(row.get("volume_node_state") or ""), poc_distance_bps=float(row.get("poc_distance_bps") or 0.0))
+                obs = CalibrationObservation(product_id=product_id, timeframe=str(row.get("timeframe") or "historical_replay"), ts=replay_ts, score=float(row.get("score") or 0.0), probability=float(row.get("probability") or 0.0), expected_net_edge_bps=float(row.get("expected_net_edge_bps") or 0.0), target_bps=float(row.get("target_bps") or 0.0), cost_bps=float(row.get("cost_bps") or 0.0), spread_bps=float(row.get("spread_bps") or 0.0), max_favorable_bps=float(mfe), max_adverse_bps=float(mae), reached_min_profit=bool(net_bps > 0.0), reached_target=bool(row.get("would_have_hit_min_profit", 0)), expected_value_bps=float(net_bps), win_bps=max(0.0, float(net_bps)), loss_bps=max(0.0, -float(net_bps)), time_to_min_profit_bars=None, time_to_min_profit_minutes=None, forward_window_minutes=float(row.get("held_seconds") or 0.0) / 60.0, projected_forward_gain_bps=float(net_bps), selected_forward_window_minutes=float(row.get("held_seconds") or 0.0) / 60.0, post_profit_max_favorable_bps=float(mfe), post_profit_extra_gain_bps=max(0.0, float(mfe) - max(0.0, float(net_bps))), adverse_before_profit_bps=abs(min(0.0, float(mae))), survived_to_profit=bool(net_bps > 0.0 and not bool(row.get("would_have_hit_stop", 0))), accepted_by_calibration=bool(row.get("accepted_for_calibration", 1)), trend_buy_score=float(row.get("trend_buy_score") or 0.0), volume_profile_leader_buy_score=float(row.get("volume_profile_leader_buy_score") or 0.0), volume_profile_leader_wait_score=float(row.get("volume_profile_leader_wait_score") or 0.5), price_action_buy_score=float(row.get("price_action_buy_score") or 0.0), market_structure_buy_score=float(row.get("market_structure_buy_score") or 0.0), quant_buy_score=float(row.get("quant_buy_score") or 0.0), value_acceptance_state=str(row.get("value_acceptance_state") or ""), volume_node_state=str(row.get("volume_node_state") or ""), poc_distance_bps=float(row.get("poc_distance_bps") or 0.0))
                 setattr(obs, "historical_replay_recency_weight", float(recency_weight)); out.append(obs)
             except Exception: continue
         return out
@@ -22031,7 +22101,7 @@ class TradingBot:
             ):
                 self.last_agent_performance_update_ts = ts_now
 
-                _t = time.perf_counter(); self._maybe_reload_backtest_background(); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["backtest_reload_scheduling"] = round(_e, 4); self._log_hot_loop_timing("backtest_reload_scheduling", _e)
+                _t = time.perf_counter(); self._maybe_reload_backtest_background(); self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["backtest_reload_scheduling"] = round(_e, 4); self._log_hot_loop_timing("backtest_reload_scheduling", _e)
 
                 try:
                     _t = time.perf_counter(); self._schedule_background_work("sell_outcome_classification", "_sell_outcome_classification_running", self._classify_level8_sell_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_outcome_classification"] = round(_e, 4); self._log_hot_loop_timing("sell_outcome_classification", _e)

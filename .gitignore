@@ -1,0 +1,14 @@
+.env
+*.env
+.env.local
+.env.production
+secrets.json
+api_keys.json
+binance_keys.json
+coinbase_keys.json
+debug/secrets*
+debug/*secret*
+debug/*api_key*
+
+__pycache__/
+*.py[cod]

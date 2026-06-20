@@ -476,6 +476,12 @@ HIST_REPLAY_15M_90D_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_15
 HIST_REPLAY_1H_365D_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1h_365d.csv")
 HIST_REPLAY_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1d_2y.csv")
 
+# Compatibility aliases used by the historical replay process-worker path.
+# Keep both names because older helper functions still reference HISTORICAL_REPLAY_*.
+HISTORICAL_REPLAY_15M_90D_CSV_PATH: str = HIST_REPLAY_15M_90D_CSV_PATH
+HISTORICAL_REPLAY_1H_365D_CSV_PATH: str = HIST_REPLAY_1H_365D_CSV_PATH
+HISTORICAL_REPLAY_1D_2Y_CSV_PATH: str = HIST_REPLAY_1D_2Y_CSV_PATH
+
 # ============================================================
 # HISTORICAL DATA PROVIDER CONFIG
 # ============================================================
@@ -16155,7 +16161,8 @@ class TradingBot:
             attempts = int(job.get("attempts", 0) or 0)
             if status == JOB_PENDING or (status == JOB_FAILED and attempts < int(HISTORICAL_REPLAY_WORKER_MAX_ATTEMPTS)):
                 candidates.append(job)
-        candidates.sort(key=lambda j: (int(j.get("rows_written", 0) or 0), str(j.get("timeframe") or ""), str(j.get("product_id") or "")))
+        timeframe_rank = {"primary_15m_90d": 0, "regime_1h_365d": 1, "daily_1d_2y": 2}
+        candidates.sort(key=lambda j: (timeframe_rank.get(str(j.get("timeframe") or ""), 99), int(j.get("rows_written", 0) or 0), str(j.get("product_id") or "")))
         filtered = []
         for job in candidates:
             product_id = str(job.get("product_id") or "")
@@ -21062,31 +21069,85 @@ class TradingBot:
 
     def _historical_replay_manifest_progress(self) -> Dict[str, Any]:
         try:
-            return manifest_progress(self._load_historical_replay_manifest())
+            manifest = self._load_historical_replay_manifest()
+            progress = manifest_progress(manifest)
+            jobs = list((manifest.get("jobs", {}) or {}).values())
+
+            failed = [j for j in jobs if str(j.get("status") or "") == JOB_FAILED]
+            running = [j for j in jobs if str(j.get("status") or "") == JOB_RUNNING]
+            pending = [j for j in jobs if str(j.get("status") or JOB_PENDING) == JOB_PENDING]
+
+            progress["failed_job_errors"] = [
+                {
+                    "job_id": str(j.get("job_id") or ""),
+                    "product_id": str(j.get("product_id") or ""),
+                    "timeframe": str(j.get("timeframe") or ""),
+                    "attempts": int(j.get("attempts", 0) or 0),
+                    "error": str(j.get("error") or ""),
+                }
+                for j in failed[-10:]
+            ]
+
+            progress["running_jobs_detail"] = [
+                {
+                    "job_id": str(j.get("job_id") or ""),
+                    "product_id": str(j.get("product_id") or ""),
+                    "timeframe": str(j.get("timeframe") or ""),
+                    "started_ts": float(j.get("started_ts", 0.0) or 0.0),
+                }
+                for j in running[:10]
+            ]
+
+            progress["next_pending_jobs"] = [
+                {
+                    "job_id": str(j.get("job_id") or ""),
+                    "product_id": str(j.get("product_id") or ""),
+                    "timeframe": str(j.get("timeframe") or ""),
+                }
+                for j in pending[:10]
+            ]
+
+            return progress
         except Exception:
-            return {"total_jobs": 0, "done_jobs": 0, "merged_jobs": 0, "failed_jobs": 0, "running_jobs": 0, "pending_jobs": 0, "progress": 0.0, "progress_pct": 0.0}
+            return {
+                "total_jobs": 0,
+                "done_jobs": 0,
+                "merged_jobs": 0,
+                "failed_jobs": 0,
+                "running_jobs": 0,
+                "pending_jobs": 0,
+                "progress": 0.0,
+                "progress_pct": 0.0,
+                "failed_job_errors": [],
+            }
 
     def _worker_output_path_for_job(self, product_id: str, timeframe: str) -> str:
         os.makedirs(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, exist_ok=True)
         return os.path.join(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, f"historical_shadow_replay.{safe_job_id(product_id, timeframe)}.csv")
 
     def _replay_cache_path_for_timeframe(self, timeframe: str) -> str:
-        tf = str(timeframe)
+        tf = str(timeframe or "").lower()
+        if "daily" in tf or "1d" in tf or "2y" in tf:
+            return HIST_REPLAY_1D_2Y_CSV_PATH
         if "1h" in tf or "365" in tf or "regime" in tf:
-            return HISTORICAL_REPLAY_1H_365D_CSV_PATH
-        return HISTORICAL_REPLAY_15M_90D_CSV_PATH
+            return HIST_REPLAY_1H_365D_CSV_PATH
+        return HIST_REPLAY_15M_90D_CSV_PATH
 
     def _granularity_for_replay_timeframe(self, timeframe: str) -> str:
-        tf = str(timeframe).lower()
+        tf = str(timeframe or "").lower()
+        if "daily" in tf or "1d" in tf or "2y" in tf:
+            return HIST_REPLAY_DAILY_GRANULARITY
         if "1h" in tf or "365" in tf or "regime" in tf:
-            return "1h"
-        return "15m"
+            return HIST_REPLAY_REGIME_GRANULARITY
+        return HIST_REPLAY_PRIMARY_GRANULARITY
 
     def _lookback_sec_for_replay_timeframe(self, timeframe: str) -> int:
-        tf = str(timeframe).lower()
+        tf = str(timeframe or "").lower()
+        if "daily" in tf or "1d" in tf or "2y" in tf:
+            return int(HIST_REPLAY_DAILY_CONTEXT_DAYS * 24 * 60 * 60)
         if "1h" in tf or "365" in tf or "regime" in tf:
-            return int(365 * 24 * 60 * 60)
-        return int(90 * 24 * 60 * 60)
+            return int(HIST_REPLAY_REGIME_LOOKBACK_DAYS * 24 * 60 * 60)
+        return int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS * 24 * 60 * 60)
 
     def _load_calculation_complete_latch(self) -> Dict[str, Any]:
         try:

@@ -203,24 +203,105 @@ except Exception:
 MODULE_NAME = "bot"
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+ENV_PATH: str = os.path.join(BASE_DIR, ".env")
+# Always prefer the local .env beside bot.py.
+# override=True prevents stale Windows environment variables from overriding the file.
+load_dotenv(ENV_PATH, override=True)
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return bool(default)
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    return bool(default)
 
 def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return float(default)
     try:
-        return float(os.getenv(name, str(default)))
+        return float(str(value).strip())
     except Exception:
         return float(default)
 
+def env_str(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return str(default)
+    return str(value).strip()
+
+def reload_runtime_env_config() -> None:
+    """
+    Reload .env and refresh all live Binance runtime globals.
+
+    This prevents startup from using stale values if a previous shell/session had
+    old variables such as ENABLE_BINANCE_LIVE_EXECUTION=false.
+    """
+    global LIVE_EXECUTION_EXCHANGE_ID
+    global ENABLE_BINANCE_LIVE_EXECUTION
+    global BINANCE_US_ENABLE_SPOT_TRADING
+    global BINANCE_US_ALLOW_REAL_ORDERS
+    global BINANCE_US_DRY_RUN
+    global BOT_MIN_ORDER_USD
+    global BOT_MIN_ORDER_PORTFOLIO_PCT
+    global BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT
+    global BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT
+    global BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT
+    global RESERVE_USD
+    global BINANCE_US_COMPARISON_MAKER_FEE_BPS
+    global BINANCE_US_COMPARISON_TAKER_FEE_BPS
+    global BINANCE_US_TIER0_MAKER_FEE_BPS
+    global BINANCE_US_TIER0_TAKER_FEE_BPS
+
+    load_dotenv(ENV_PATH, override=True)
+
+    LIVE_EXECUTION_EXCHANGE_ID = env_str("LIVE_EXECUTION_EXCHANGE", "binance_us").lower()
+    ENABLE_BINANCE_LIVE_EXECUTION = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
+    BINANCE_US_ENABLE_SPOT_TRADING = env_bool("BINANCE_US_ENABLE_SPOT_TRADING", False)
+    BINANCE_US_ALLOW_REAL_ORDERS = env_bool("BINANCE_US_ALLOW_REAL_ORDERS", False)
+    # This is a live-only bot. Do not allow .env to turn dry-run back on.
+    BINANCE_US_DRY_RUN = False
+    BOT_MIN_ORDER_USD = env_float("BOT_MIN_ORDER_USD", 5.0)
+    BOT_MIN_ORDER_PORTFOLIO_PCT = env_float("BOT_MIN_ORDER_PORTFOLIO_PCT", 10.0)
+    BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT = env_float("BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT", 80.0)
+    BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT = env_float("BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT", 100.0)
+    BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT = env_float("BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT", 100.0)
+    RESERVE_USD = env_float("RESERVE_USD", 0.0)
+    BINANCE_US_COMPARISON_MAKER_FEE_BPS = env_float(
+        "BINANCE_US_FALLBACK_MAKER_FEE_BPS",
+        env_float("BINANCE_US_DEFAULT_MAKER_FEE_BPS", 0.0),
+    )
+    BINANCE_US_COMPARISON_TAKER_FEE_BPS = env_float(
+        "BINANCE_US_FALLBACK_TAKER_FEE_BPS",
+        env_float("BINANCE_US_DEFAULT_TAKER_FEE_BPS", 2.0),
+    )
+    BINANCE_US_TIER0_MAKER_FEE_BPS = env_float(
+        "BINANCE_US_TIER0_FALLBACK_MAKER_FEE_BPS",
+        0.0,
+    )
+    BINANCE_US_TIER0_TAKER_FEE_BPS = env_float(
+        "BINANCE_US_TIER0_FALLBACK_TAKER_FEE_BPS",
+        1.0,
+    )
+
 
 def require_live_binance_configuration() -> None:
-    """Live-only Binance.US startup guard."""
+    """
+    Live-only Binance.US startup guard.
+
+    This function intentionally refuses to run unless the .env file says live
+    Binance trading is enabled.
+    """
+    reload_runtime_env_config()
     errors = []
+    api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
+    api_secret = os.getenv("BINANCE_US_API_SECRET", "").strip()
+    if not os.path.exists(ENV_PATH):
+        errors.append(f".env file was not found at {ENV_PATH}")
     if str(LIVE_EXECUTION_EXCHANGE_ID).lower() != EXCHANGE_BINANCE_US:
         errors.append(f"LIVE_EXECUTION_EXCHANGE must be binance_us; got {LIVE_EXECUTION_EXCHANGE_ID}")
     if not bool(ENABLE_BINANCE_LIVE_EXECUTION):
@@ -229,27 +310,54 @@ def require_live_binance_configuration() -> None:
         errors.append("BINANCE_US_ENABLE_SPOT_TRADING must be true")
     if not bool(BINANCE_US_ALLOW_REAL_ORDERS):
         errors.append("BINANCE_US_ALLOW_REAL_ORDERS must be true")
-    api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
-    api_secret = os.getenv("BINANCE_US_API_SECRET", "").strip()
+    if bool(BINANCE_US_DRY_RUN):
+        errors.append("BINANCE_US_DRY_RUN must be false in this live-only build")
     if not api_key:
         errors.append("BINANCE_US_API_KEY is missing")
     if not api_secret:
         errors.append("BINANCE_US_API_SECRET is missing")
+    module_debug(
+        MODULE_NAME,
+        "live_binance_configuration_check",
+        data={
+            "env_path": ENV_PATH,
+            "env_file_exists": os.path.exists(ENV_PATH),
+            "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID),
+            "enable_binance_live_execution": bool(ENABLE_BINANCE_LIVE_EXECUTION),
+            "binance_us_enable_spot_trading": bool(BINANCE_US_ENABLE_SPOT_TRADING),
+            "binance_us_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS),
+            "binance_us_dry_run": bool(BINANCE_US_DRY_RUN),
+            "has_binance_api_key": bool(api_key),
+            "has_binance_api_secret": bool(api_secret),
+            "bot_min_order_usd": float(BOT_MIN_ORDER_USD),
+            "bot_min_order_portfolio_pct": float(BOT_MIN_ORDER_PORTFOLIO_PCT),
+            "bot_max_single_order_portfolio_pct": float(BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT),
+            "bot_max_total_exposure_portfolio_pct": float(BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT),
+            "bot_max_per_symbol_exposure_portfolio_pct": float(BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT),
+            "reserve_usd": float(RESERVE_USD),
+        },
+        level="INFO",
+        also_overall=True,
+    )
     if errors:
-        raise RuntimeError("Live Binance.US configuration is incomplete. This build is live-only and will not run unless real Binance trading is explicitly enabled. " + " | ".join(errors))
+        raise RuntimeError(
+            "Live Binance.US configuration is incomplete. "
+            "This build is live-only and will not run unless real Binance trading is explicitly enabled. "
+            + " | ".join(errors)
+        )
 
-LIVE_EXECUTION_EXCHANGE_ID = "binance_us"
-ENABLE_BINANCE_LIVE_EXECUTION = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
-BINANCE_US_ENABLE_SPOT_TRADING = env_bool("BINANCE_US_ENABLE_SPOT_TRADING", False)
-BINANCE_US_ALLOW_REAL_ORDERS = env_bool("BINANCE_US_ALLOW_REAL_ORDERS", False)
+LIVE_EXECUTION_EXCHANGE_ID: str = env_str("LIVE_EXECUTION_EXCHANGE", "binance_us").lower()
+ENABLE_BINANCE_LIVE_EXECUTION: bool = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
+BINANCE_US_ENABLE_SPOT_TRADING: bool = env_bool("BINANCE_US_ENABLE_SPOT_TRADING", False)
+BINANCE_US_ALLOW_REAL_ORDERS: bool = env_bool("BINANCE_US_ALLOW_REAL_ORDERS", False)
 # Live-only build.
-# Simulation and Binance validation-only order behavior are intentionally removed.
+# This is intentionally not controlled by .env.
 BINANCE_US_DRY_RUN: bool = False
-BOT_MIN_ORDER_USD = env_float("BOT_MIN_ORDER_USD", 5.0)
-BOT_MIN_ORDER_PORTFOLIO_PCT = env_float("BOT_MIN_ORDER_PORTFOLIO_PCT", 10.0)
-BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT = env_float("BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT", 80.0)
-BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT = env_float("BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT", 100.0)
-BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT = env_float("BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT", 100.0)
+BOT_MIN_ORDER_USD: float = env_float("BOT_MIN_ORDER_USD", 5.0)
+BOT_MIN_ORDER_PORTFOLIO_PCT: float = env_float("BOT_MIN_ORDER_PORTFOLIO_PCT", 10.0)
+BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT: float = env_float("BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT", 80.0)
+BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT: float = env_float("BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT", 100.0)
+BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT: float = env_float("BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT", 100.0)
 BOT_PROCESS_LOCK_PATH: str = os.path.join(BASE_DIR, "bot_live_process.lock")
 TZ_NAME: str = "America/Phoenix"
 TZ = ZoneInfo(TZ_NAME)
@@ -346,8 +454,8 @@ HIST_REPLAY_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1d_2
 # HISTORICAL DATA PROVIDER CONFIG
 # ============================================================
 ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL: bool = True
-# Keep Coinbase live execution until intentionally replaced later.
-LIVE_EXECUTION_EXCHANGE_ID: str = "binance_us"
+# LIVE_EXECUTION_EXCHANGE_ID is loaded from .env near startup.
+# Do not override it here.
 # Historical data source priority: local cache -> Binance bulk public files -> Coinbase fallback
 HISTORICAL_CANDLE_SOURCE_PRIORITY: List[str] = [
     "local_cache",
@@ -365,10 +473,22 @@ BINANCE_BULK_PREFER_BINANCE_US: bool = False
 ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON: bool = True
 REPLAY_PRIMARY_FEE_MODEL: str = "binance_us"
 REPLAY_COMPARISON_FEE_MODEL: str = "none"
-BINANCE_US_COMPARISON_MAKER_FEE_BPS: float = 0.0
-BINANCE_US_COMPARISON_TAKER_FEE_BPS: float = 2.0
-BINANCE_US_TIER0_MAKER_FEE_BPS: float = 0.0
-BINANCE_US_TIER0_TAKER_FEE_BPS: float = 1.0
+BINANCE_US_COMPARISON_MAKER_FEE_BPS: float = env_float(
+    "BINANCE_US_FALLBACK_MAKER_FEE_BPS",
+    env_float("BINANCE_US_DEFAULT_MAKER_FEE_BPS", 0.0),
+)
+BINANCE_US_COMPARISON_TAKER_FEE_BPS: float = env_float(
+    "BINANCE_US_FALLBACK_TAKER_FEE_BPS",
+    env_float("BINANCE_US_DEFAULT_TAKER_FEE_BPS", 2.0),
+)
+BINANCE_US_TIER0_MAKER_FEE_BPS: float = env_float(
+    "BINANCE_US_TIER0_FALLBACK_MAKER_FEE_BPS",
+    0.0,
+)
+BINANCE_US_TIER0_TAKER_FEE_BPS: float = env_float(
+    "BINANCE_US_TIER0_FALLBACK_TAKER_FEE_BPS",
+    1.0,
+)
 REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY: str = "taker"
 REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY: str = "taker"
 BINANCE_US_TIER0_PRODUCTS: Set[str] = set()
@@ -1221,7 +1341,7 @@ PROB_FOR_MAX_SIZE: float = 0.70
 
 # Dollar reserve is no longer the primary guardrail.
 # Level 8's 20% reserve is the real reserve model.
-RESERVE_USD: float = 0.00
+RESERVE_USD: float = env_float("RESERVE_USD", 0.0)
 
 # Capital rotation:
 # If available cash is insufficient for a stronger setup, the bot may sell weaker
@@ -23078,7 +23198,7 @@ class TopOfBook:
 
 def load_pem_secret_from_env() -> str:
     """Load the PEM private key from environment or file."""
-    load_dotenv()
+    load_dotenv(ENV_PATH, override=True)
     secret_file = (os.environ.get("COINBASE_API_SECRET_FILE") or "").strip()
     inline_secret = (os.environ.get("COINBASE_API_SECRET") or "").strip()
     pem = ""
@@ -23101,7 +23221,7 @@ def load_pem_secret_from_env() -> str:
 
 def LEGACY_UNUSED_load_removed_exchange_client() -> Any:
     """Instantiate the Coinbase REST client using env credentials."""
-    load_dotenv()
+    load_dotenv(ENV_PATH, override=True)
     api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
     pem = load_pem_secret_from_env()
     if not api_key:
@@ -23423,7 +23543,8 @@ async def main() -> None:
         log(f"[startup] process_lock_pid={process_lock_pid}")
         log(f"[startup] file={os.path.abspath(__file__)}")
         log("[startup] loading Binance.US exchange client")
-        load_dotenv(os.path.join(BASE_DIR, ".env"))
+        load_dotenv(ENV_PATH, override=True)
+        reload_runtime_env_config()
         require_live_binance_configuration()
         adapter = BinanceUSAdapter(dry_run=False, allow_real_orders=True)
         rest = adapter.client

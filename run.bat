@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 REM ============================================================
-REM Coinbase Level 8 Council Bot Launcher
+REM Binance.US Live Level 8 Council Bot Launcher
 REM Starts:
 REM - bot.py in one command window
 REM - viewer.py through one Streamlit server window
@@ -17,7 +17,7 @@ set "VIEWER_URL=http://localhost:%VIEWER_PORT%"
 
 echo.
 echo ============================================
-echo   Coinbase Level 8 Council Bot Launcher
+echo   Binance.US Live Level 8 Council Bot Launcher
 echo ============================================
 echo.
 
@@ -105,7 +105,7 @@ if not exist "level8_council.py" (
 if not exist ".env" (
     echo.
     echo [warning] No .env file found.
-    echo Make sure your Coinbase credentials are configured before live trading.
+    echo Make sure your Binance.US .env credentials are configured before live trading.
     echo.
 )
 
@@ -201,7 +201,7 @@ echo Notes:
 echo - Streamlit is started with --server.headless true, so it will not auto-open a second browser window.
 echo - Old CSV files are preserved and reused.
 echo - If meaningful old CSV rows existed before this launch, bot.py adopts holdings instead of startup-liquidating them.
-echo - If no meaningful old CSV rows existed before this launch, bot.py liquidates existing Coinbase holdings to cash.
+echo - If no meaningful old CSV rows existed before this launch, bot.py reconciles existing Binance.US holdings before live trading.
 echo ============================================
 echo.
 echo You can close this launcher window.

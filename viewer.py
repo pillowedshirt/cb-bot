@@ -1839,7 +1839,7 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     policy = calc_status.get("policy", {}) or {}
     st.markdown("### Historical data and exchange mode")
     exchange_cols = st.columns(4)
-    exchange_cols[0].metric("Live execution", str(policy.get("live_execution_exchange") or readiness.get("live_execution_exchange") or "coinbase"))
+    exchange_cols[0].metric("Live execution", str(policy.get("live_execution_exchange") or readiness.get("live_execution_exchange") or "binance_us"))
     exchange_cols[1].metric("Binance bulk history", str(policy.get("binance_bulk_historical_backfill_enabled") or readiness.get("binance_bulk_historical_backfill_enabled")))
     exchange_cols[2].metric("Binance live trading", str(policy.get("binance_live_execution_enabled") or readiness.get("binance_live_execution_enabled")))
     exchange_cols[3].metric("Historical priority", " → ".join(policy.get("historical_source_priority") or readiness.get("historical_source_priority") or []))
@@ -1853,7 +1853,7 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     st.markdown("### Replay fee comparison")
     fee_cols = st.columns(4)
     fee_cols[0].metric("Fee comparison", str(policy.get("replay_exchange_fee_comparison_enabled", False)))
-    fee_cols[1].metric("Primary model", str(policy.get("replay_primary_fee_model", "coinbase")))
+    fee_cols[1].metric("Primary model", str(policy.get("replay_primary_fee_model", "binance_us")))
     fee_cols[2].metric("Comparison model", str(policy.get("replay_comparison_fee_model", "binance_us")))
     fee_cols[3].metric("Binance taker", f"{float(policy.get('binance_us_comparison_taker_fee_bps', 0.0) or 0.0):.2f} bps")
     worker_import_error = str(policy.get("historical_replay_worker_import_error", "") or "")

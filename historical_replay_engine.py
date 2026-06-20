@@ -87,8 +87,8 @@ class ReplayEngineConfig:
     micro_trend_down_bps: float = -25.0
     min_required_net_edge_bps: float = 15.0
     vwap_reclaim_buffer_bps: float = 3.0
-    primary_fee_model: str = "coinbase"
-    comparison_fee_model: str = "binance_us"
+    primary_fee_model: str = "binance_us"
+    comparison_fee_model: str = "coinbase_legacy"
     comparison_entry_fee_bps: float = 0.0
     comparison_exit_fee_bps: float = 2.0
     enable_exchange_fee_comparison: bool = True

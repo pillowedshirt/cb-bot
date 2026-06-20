@@ -5,7 +5,7 @@ from typing import Dict, Optional, List
 EXCHANGE_COINBASE = "coinbase"
 EXCHANGE_BINANCE = "binance"
 EXCHANGE_BINANCE_US = "binance_us"
-LIVE_EXECUTION_EXCHANGE = os.getenv("LIVE_EXECUTION_EXCHANGE", EXCHANGE_COINBASE).strip().lower()
+LIVE_EXECUTION_EXCHANGE = os.getenv("LIVE_EXECUTION_EXCHANGE", EXCHANGE_BINANCE_US).strip().lower()
 HISTORICAL_DATA_SOURCE_PRIORITY: List[str] = ["local_cache", "binance_bulk", "coinbase_fallback"]
 
 @dataclass(frozen=True)
@@ -60,3 +60,26 @@ def product_mapping_rows() -> List[Dict[str, str]]:
     for product_id, mapping in PRODUCT_SYMBOL_MAP.items():
         rows.append({"canonical_product_id": mapping.canonical_product_id, "coinbase_product_id": mapping.coinbase_product_id, "binance_symbol": mapping.binance_symbol or "", "binance_us_symbol": mapping.binance_us_symbol or "", "base_asset": mapping.base_asset, "coinbase_quote": mapping.quote_asset_coinbase, "binance_quote": mapping.quote_asset_binance, "note": mapping.historical_source_note})
     return rows
+
+
+def canonical_product_id(product_id: str) -> str:
+    value = str(product_id or "").strip().upper()
+    if value in PRODUCT_SYMBOL_MAP:
+        return value
+    mapped = binance_to_coinbase_product(value)
+    return mapped or value
+
+def product_to_execution_symbol(product_id: str, exchange: str = EXCHANGE_BINANCE_US) -> Optional[str]:
+    mapping = get_symbol_map(product_id)
+    if not mapping:
+        return None
+    if str(exchange).lower() == EXCHANGE_BINANCE_US:
+        return mapping.binance_us_symbol or mapping.binance_symbol
+    if str(exchange).lower() == EXCHANGE_BINANCE:
+        return mapping.binance_symbol
+    return mapping.coinbase_product_id
+
+def execution_symbol_to_product(symbol: str, exchange: str = EXCHANGE_BINANCE_US) -> Optional[str]:
+    if str(exchange).lower() in {EXCHANGE_BINANCE_US, EXCHANGE_BINANCE}:
+        return binance_to_coinbase_product(symbol)
+    return str(symbol or "").strip().upper()

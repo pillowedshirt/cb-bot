@@ -30,8 +30,16 @@ import requests
 import websockets
 from dotenv import load_dotenv
 
-from coinbase.rest import RESTClient
-from coinbase import jwt_generator
+try:
+    from coinbase.rest import RESTClient
+    from coinbase import jwt_generator
+except Exception:
+    RESTClient = None
+    jwt_generator = None
+
+from binance_us_client import BinanceUSClient
+from exchange_adapters import BinanceUSAdapter, ExchangeOrderResult
+from exchange_catalog import EXCHANGE_BINANCE_US, product_to_execution_symbol, execution_symbol_to_product
 
 
 try:
@@ -45,7 +53,7 @@ try:
     )
 except Exception:
     PRODUCT_SYMBOL_MAP = {}
-    LIVE_EXECUTION_EXCHANGE = "coinbase"
+    LIVE_EXECUTION_EXCHANGE = "binance_us"
     EXCHANGE_COINBASE = "coinbase"
     EXCHANGE_BINANCE = "binance"
     def coinbase_to_binance_symbol(product_id: str, *, prefer_us: bool = False):
@@ -199,6 +207,30 @@ except Exception:
 MODULE_NAME = "bot"
 
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+LIVE_EXECUTION_EXCHANGE_ID = os.getenv("LIVE_EXECUTION_EXCHANGE", "binance_us").strip().lower()
+ENABLE_BINANCE_LIVE_EXECUTION = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
+BINANCE_US_ENABLE_SPOT_TRADING = env_bool("BINANCE_US_ENABLE_SPOT_TRADING", False)
+BINANCE_US_DRY_RUN = env_bool("BINANCE_US_DRY_RUN", True)
+BINANCE_US_ALLOW_REAL_ORDERS = env_bool("BINANCE_US_ALLOW_REAL_ORDERS", False)
+BOT_MIN_ORDER_USD = env_float("BOT_MIN_ORDER_USD", 5.0)
+BOT_MIN_ORDER_PORTFOLIO_PCT = env_float("BOT_MIN_ORDER_PORTFOLIO_PCT", 10.0)
+BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT = env_float("BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT", 80.0)
+BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT = env_float("BOT_MAX_TOTAL_EXPOSURE_PORTFOLIO_PCT", 100.0)
+BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT = env_float("BOT_MAX_PER_SYMBOL_EXPOSURE_PORTFOLIO_PCT", 100.0)
 BOT_PROCESS_LOCK_PATH: str = os.path.join(BASE_DIR, "bot_live_process.lock")
 TZ_NAME: str = "America/Phoenix"
 TZ = ZoneInfo(TZ_NAME)
@@ -295,7 +327,7 @@ HIST_REPLAY_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1d_2
 # ============================================================
 ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL: bool = True
 # Keep Coinbase live execution until intentionally replaced later.
-LIVE_EXECUTION_EXCHANGE_ID: str = LIVE_EXECUTION_EXCHANGE
+LIVE_EXECUTION_EXCHANGE_ID: str = os.getenv("LIVE_EXECUTION_EXCHANGE", LIVE_EXECUTION_EXCHANGE).strip().lower()
 # Historical data source priority: local cache -> Binance bulk public files -> Coinbase fallback
 HISTORICAL_CANDLE_SOURCE_PRIORITY: List[str] = [
     "local_cache",
@@ -311,8 +343,8 @@ ENABLE_BINANCE_LIVE_EXECUTION: bool = False
 # REPLAY FEE MODEL COMPARISON
 # ============================================================
 ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON: bool = True
-REPLAY_PRIMARY_FEE_MODEL: str = "coinbase"
-REPLAY_COMPARISON_FEE_MODEL: str = "binance_us"
+REPLAY_PRIMARY_FEE_MODEL: str = "binance_us"
+REPLAY_COMPARISON_FEE_MODEL: str = "coinbase_legacy"
 BINANCE_US_COMPARISON_MAKER_FEE_BPS: float = 0.0
 BINANCE_US_COMPARISON_TAKER_FEE_BPS: float = 2.0
 BINANCE_US_TIER0_MAKER_FEE_BPS: float = 0.0
@@ -462,6 +494,9 @@ HISTORICAL_SHADOW_REPLAY_COLUMNS: List[str] = [
     "binance_maker_maker_entry_fee_bps", "binance_maker_maker_exit_fee_bps", "binance_maker_maker_net_pnl_bps", "binance_maker_maker_net_pnl_usd", "binance_maker_maker_would_have_won",
     "binance_maker_taker_entry_fee_bps", "binance_maker_taker_exit_fee_bps", "binance_maker_taker_net_pnl_bps", "binance_maker_taker_net_pnl_usd", "binance_maker_taker_would_have_won",
     "binance_taker_taker_entry_fee_bps", "binance_taker_taker_exit_fee_bps", "binance_taker_taker_net_pnl_bps", "binance_taker_taker_net_pnl_usd", "binance_taker_taker_would_have_won",
+    "coinbase_legacy_maker_maker_entry_fee_bps", "coinbase_legacy_maker_maker_exit_fee_bps", "coinbase_legacy_maker_maker_net_pnl_bps", "coinbase_legacy_maker_maker_net_pnl_usd", "coinbase_legacy_maker_maker_would_have_won",
+    "coinbase_legacy_maker_taker_entry_fee_bps", "coinbase_legacy_maker_taker_exit_fee_bps", "coinbase_legacy_maker_taker_net_pnl_bps", "coinbase_legacy_maker_taker_net_pnl_usd", "coinbase_legacy_maker_taker_would_have_won",
+    "coinbase_legacy_taker_taker_entry_fee_bps", "coinbase_legacy_taker_taker_exit_fee_bps", "coinbase_legacy_taker_taker_net_pnl_bps", "coinbase_legacy_taker_taker_net_pnl_usd", "coinbase_legacy_taker_taker_would_have_won",
     "reason",
 ]
 
@@ -6214,7 +6249,7 @@ class TradingBot:
     - Daily macro to refine support and compute approximate activity-weighted value area for fair value.
     - Micro (per‑second) to place laddered entries and strength‑based exits.
     """
-    def __init__(self, rest: RESTClient, api_key: str, pem_secret: str) -> None:
+    def __init__(self, rest: Any, api_key: str = "", pem_secret: str = "") -> None:
         self.rest = rest
         self.api_key = api_key
         self.pem_secret = pem_secret
@@ -6225,6 +6260,8 @@ class TradingBot:
         # header-only CSV files or current-run rows.
         self.startup_had_existing_runtime_state: bool = has_existing_runtime_csv_state()
 
+        self.live_exchange = LIVE_EXECUTION_EXCHANGE_ID
+        self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS) if self.live_exchange == EXCHANGE_BINANCE_US else None
         self.fetcher = MacroFetcher(rest)
         self.macro = MacroManager()
         self.tlog = TradeLogger(TRADES_CSV_PATH)
@@ -7054,6 +7091,54 @@ class TradingBot:
         k = base * scale
         return float(min(max(k, TRAIL_K_MIN), TRAIL_K_MAX))
 
+
+
+    def _active_adapter(self):
+        if getattr(self, "live_exchange", "") == EXCHANGE_BINANCE_US:
+            if getattr(self, "exchange_adapter", None) is None:
+                self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+            return self.exchange_adapter
+        return None
+
+    def _get_live_fee_bps(self, product_id: str) -> Tuple[float, float]:
+        adapter = self._active_adapter()
+        if adapter is not None:
+            fees = adapter.fee_bps_for_symbol(adapter.product_to_symbol(product_id))
+            return float(fees["maker_bps"]), float(fees["taker_bps"])
+        return self.portfolio.get_fee_tier_bps()[:2]
+
+    def _get_top_of_book_live(self, product_id: str) -> Dict[str, Any]:
+        adapter = self._active_adapter()
+        if adapter is not None:
+            return adapter.get_top_of_book(product_id)
+        bid, ask = self.portfolio.get_best_bid_ask(product_id)
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+        return {"product_id": product_id, "bid": bid, "ask": ask, "mid": mid, "spread_bps": ((ask - bid) / mid * 10000.0) if mid > 0 else 0.0, "ts": now_ts()}
+
+    def _get_available_quote_live(self) -> float:
+        adapter = self._active_adapter()
+        return adapter.get_available_asset("USDT") if adapter is not None else self.portfolio.get_tradable_usd()
+
+    def _get_base_qty_live(self, product_id: str) -> float:
+        adapter = self._active_adapter()
+        if adapter is not None:
+            rules = adapter.symbol_rules(adapter.product_to_symbol(product_id))
+            return adapter.get_total_asset(rules.base_asset)
+        return self.portfolio.get_product_total_qty(product_id)
+
+    def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = True) -> ExchangeOrderResult:
+        adapter = self._active_adapter()
+        if adapter is not None:
+            tob = adapter.get_top_of_book(product_id)
+            return adapter.place_limit_buy(product_id, quote_usd, limit_price=float(tob["bid"])) if maker_first else adapter.place_market_buy(product_id, quote_usd)
+        return self.portfolio.buy_limit_post_only(product_id, quote_usd, limit_price=None) if maker_first else self.portfolio.buy_market(product_id, quote_usd)
+
+    def _place_live_sell(self, product_id: str, base_qty: float, *, maker_first: bool = True) -> ExchangeOrderResult:
+        adapter = self._active_adapter()
+        if adapter is not None:
+            tob = adapter.get_top_of_book(product_id)
+            return adapter.place_limit_sell(product_id, base_qty, limit_price=float(tob["ask"])) if maker_first else adapter.place_market_sell(product_id, base_qty)
+        return self.portfolio.sell_limit_post_only(product_id, base_qty, limit_price=None) if maker_first else self.portfolio.sell_market(product_id, base_qty)
 
     async def _refresh_coinbase_fee_tier_if_needed(self, *, force: bool = False) -> None:
         """
@@ -12766,6 +12851,13 @@ class TradingBot:
         excessive pass/fail rails here.
         """
         try:
+            if LIVE_EXECUTION_EXCHANGE_ID == EXCHANGE_BINANCE_US:
+                if not bool(ENABLE_BINANCE_LIVE_EXECUTION):
+                    return False, "live_buy_blocked:binance_live_execution_disabled"
+                if not bool(BINANCE_US_ENABLE_SPOT_TRADING):
+                    return False, "live_buy_blocked:binance_spot_trading_disabled"
+                if bool(BINANCE_US_DRY_RUN) or not bool(BINANCE_US_ALLOW_REAL_ORDERS):
+                    return False, "live_buy_blocked:binance_dry_run_or_real_orders_disabled"
             product_id = str(candidate.get("product_id", ""))
             if bool(REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY):
                 tob_age = self._top_of_book_age_sec(product_id)
@@ -16395,21 +16487,23 @@ class TradingBot:
         return int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400
 
     def _replay_fee_scenario_bps(self, product_id: str) -> Dict[str, Dict[str, float]]:
-        maker = float(self.current_maker_fee_bps)
-        taker = float(self.current_taker_fee_bps)
-        if str(product_id) in BINANCE_US_TIER0_PRODUCTS:
-            binance_maker = float(BINANCE_US_TIER0_MAKER_FEE_BPS)
-            binance_taker = float(BINANCE_US_TIER0_TAKER_FEE_BPS)
+        adapter = self._active_adapter()
+        if adapter is not None:
+            bn = adapter.fee_bps_for_symbol(adapter.product_to_symbol(product_id))
+            binance_maker = float(bn["maker_bps"])
+            binance_taker = float(bn["taker_bps"])
         else:
-            binance_maker = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS)
-            binance_taker = float(BINANCE_US_COMPARISON_TAKER_FEE_BPS)
+            binance_maker = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
+            binance_taker = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
+        coinbase_maker = float(getattr(self, "current_maker_fee_bps", 60.0))
+        coinbase_taker = float(getattr(self, "current_taker_fee_bps", 120.0))
         return {
-            "coinbase_maker_maker": {"entry_fee_bps": maker, "exit_fee_bps": maker},
-            "coinbase_maker_taker": {"entry_fee_bps": maker, "exit_fee_bps": taker},
-            "coinbase_taker_taker": {"entry_fee_bps": taker, "exit_fee_bps": taker},
             "binance_maker_maker": {"entry_fee_bps": binance_maker, "exit_fee_bps": binance_maker},
             "binance_maker_taker": {"entry_fee_bps": binance_maker, "exit_fee_bps": binance_taker},
             "binance_taker_taker": {"entry_fee_bps": binance_taker, "exit_fee_bps": binance_taker},
+            "coinbase_legacy_maker_maker": {"entry_fee_bps": coinbase_maker, "exit_fee_bps": coinbase_maker},
+            "coinbase_legacy_maker_taker": {"entry_fee_bps": coinbase_maker, "exit_fee_bps": coinbase_taker},
+            "coinbase_legacy_taker_taker": {"entry_fee_bps": coinbase_taker, "exit_fee_bps": coinbase_taker},
         }
 
     def _process_worker_replay_config(self, product_id: str) -> Dict[str, Any]:
@@ -18183,7 +18277,7 @@ class TradingBot:
             else: phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "replay_comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": str(LIVE_EXECUTION_EXCHANGE_ID), "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_dry_run": bool(BINANCE_US_DRY_RUN), "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "replay_comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(calc_status=status)
                 latch = self._load_calculation_complete_latch()
@@ -19254,7 +19348,15 @@ class TradingBot:
     # WebSocket loop
     # --------------------------------------------------------
     async def ws_loop(self) -> None:
-        """Connect to Coinbase WebSocket and update top‑of‑book and mid data."""
+        """Connect to exchange WebSocket and update top-of-book and mid data."""
+        if getattr(self, "live_exchange", "") == EXCHANGE_BINANCE_US:
+            from binance_us_websocket import BinanceUSBookTickerStream
+            def on_update(data: Dict[str, Any]):
+                product_id = data["product_id"]
+                self.top_of_book[product_id] = TopOfBook(bid=float(data["bid"]), ask=float(data["ask"]), ts=float(data["ts"]))
+            stream = BinanceUSBookTickerStream(PRODUCTS, on_update)
+            await stream.run_forever()
+            return
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(
@@ -24541,13 +24643,19 @@ async def main() -> None:
         log("[startup] bot.py launching")
         log(f"[startup] process_lock_pid={process_lock_pid}")
         log(f"[startup] file={os.path.abspath(__file__)}")
-        log("[startup] loading Coinbase client")
-        rest = load_coinbase_client()
-
-        log("[startup] loading environment")
-        load_dotenv()
-        api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
-        pem = load_pem_secret_from_env()
+        log("[startup] loading exchange client")
+        load_dotenv(os.path.join(BASE_DIR, ".env"))
+        if LIVE_EXECUTION_EXCHANGE_ID == EXCHANGE_BINANCE_US:
+            adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+            rest = adapter.client
+            api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
+            pem = ""
+        else:
+            if RESTClient is None:
+                raise RuntimeError("Coinbase SDK not installed, but LIVE_EXECUTION_EXCHANGE is not binance_us.")
+            rest = load_coinbase_client()
+            api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
+            pem = load_pem_secret_from_env()
 
         log("[startup] selecting products")
         if AUTO_SELECT_PRODUCTS:
@@ -24562,24 +24670,38 @@ async def main() -> None:
         else:
             PRODUCTS = list(PRODUCTS_DEFAULT)
 
-        # Currency safety: enforce USD quote pairs, then confirm Coinbase currently
-        # permits them before creating subscriptions or evaluating orders.
         PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
-        PRODUCTS = await asyncio.to_thread(
-            validate_configured_products_with_coinbase,
-            PRODUCTS,
-            rest,
-        )
+        if LIVE_EXECUTION_EXCHANGE_ID == EXCHANGE_BINANCE_US:
+            valid_products = []
+            for product_id in PRODUCTS:
+                symbol = product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
+                if not symbol:
+                    log(f"[config] no Binance.US symbol mapping for {product_id}; skipping")
+                    continue
+                try:
+                    info = adapter.client.exchange_info(symbol=symbol)
+                    symbol_info = info.get("symbols", [])[0]
+                    if str(symbol_info.get("status", "")).upper() == "TRADING":
+                        valid_products.append(product_id)
+                    else:
+                        log(f"[config] Binance.US symbol not TRADING: {product_id}->{symbol}")
+                except Exception as exc:
+                    log(f"[config] Binance.US validation failed for {product_id}->{symbol}: {exc}")
+            PRODUCTS = valid_products
+        else:
+            PRODUCTS = await asyncio.to_thread(validate_configured_products_with_coinbase, PRODUCTS, rest)
 
-        log(f"[config] product_count={len(PRODUCTS)} products={PRODUCTS}")
+        log(f"[config] live_exchange={LIVE_EXECUTION_EXCHANGE_ID} product_count={len(PRODUCTS)} products={PRODUCTS}")
         if len(PRODUCTS) < 15:
             log(
-                "[config] warning: fewer than 15 products active after Coinbase "
+                "[config] warning: fewer than 15 products active after exchange "
                 f"validation; active_count={len(PRODUCTS)}"
             )
         log("[startup] creating TradingBot instance")
         bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
-        log("[startup] LIVE-ONLY MODE: this bot can place real Coinbase orders.")
+        log(f"[startup] LIVE-ONLY MODE: live_exchange={LIVE_EXECUTION_EXCHANGE_ID} dry_run={BINANCE_US_DRY_RUN} allow_real_orders={BINANCE_US_ALLOW_REAL_ORDERS}")
+        if LIVE_EXECUTION_EXCHANGE_ID == EXCHANGE_BINANCE_US:
+            bot.exchange_adapter = adapter
 
         if not hasattr(bot, "run"):
             raise RuntimeError("TradingBot instance has no run(); ensure you are running the updated bot.py file.")

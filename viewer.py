@@ -289,7 +289,7 @@ def inject_crypto_game_css() -> None:
 .pill-value { color: #e8fbff; font-size: 1.05rem; font-weight: 800; }
 .arena-grid { display: grid; grid-template-columns: 1.05fr 1.95fr; gap: 0.85rem; margin-bottom: 1rem; }
 .chief-card { border: 1px solid rgba(0, 255, 194, 0.35); border-radius: 20px; padding: 1rem; background: linear-gradient(180deg, rgba(0, 73, 92, 0.44), rgba(6, 13, 24, 0.94)); }
-.leadership-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; margin: 1rem 0 1.1rem 0; }
+.leadership-grid { display: grid; grid-template-columns: 1fr; gap: 0.9rem; margin: 1rem 0 1.1rem 0; }
 .leadership-card { border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 20px; padding: 1rem; background: linear-gradient(180deg, rgba(6, 18, 32, 0.96), rgba(4, 12, 24, 0.94)); box-shadow: 0 0 22px rgba(80, 220, 255, 0.06); }
 .leadership-card.oracle { border-color: rgba(255, 214, 102, 0.35); box-shadow: 0 0 22px rgba(255, 214, 102, 0.07); }
 .leadership-title { font-size: 1.15rem; font-weight: 900; margin-bottom: 0.2rem; }
@@ -304,16 +304,16 @@ def inject_crypto_game_css() -> None:
     border-radius: 16px;
     padding: 0.85rem;
     background: rgba(7, 18, 32, 0.92);
-    height: 260px;
-    min-height: 260px;
-    max-height: 260px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
+    min-height: 420px !important;
+    height: 420px !important;
+    max-height: 420px !important;
+    overflow-y: auto !important;
+    display: flex !important;
+    flex-direction: column !important;
     justify-content: flex-start;
 }
 .agent-card .agent-title { font-weight: 900; margin-bottom: 0.35rem; }
-.agent-card .agent-summary { flex: 1; overflow: hidden; color: #8db7c8; font-size: 0.88rem; line-height: 1.22rem; }
+.agent-card .agent-summary { flex: 1; overflow: visible !important; color: #8db7c8; font-size: 0.88rem; line-height: 1.22rem; }
 .agent-card .agent-metrics { margin-top: 0.45rem; font-size: 0.85rem; }
 .agent-card-buy { border-color: rgba(0, 255, 160, 0.45); } .agent-card-sell { border-color: rgba(255, 87, 116, 0.45); } .agent-card-hold { border-color: rgba(255, 214, 102, 0.42); } .agent-card-wait { border-color: rgba(135, 159, 180, 0.38); }
 .inquiry-panel { border: 1px solid rgba(0, 255, 194, 0.25); border-radius: 18px; padding: 1rem; background: rgba(3, 22, 30, 0.88); margin-top: 0.8rem; }
@@ -417,7 +417,7 @@ div[data-testid="stButton"] button:focus {
 .rank-badge { display: inline-block; border: 1px solid rgba(57, 245, 163, 0.45); border-radius: 999px; padding: 0.18rem 0.5rem; font-size: 0.78rem; color: #39f5a3; background: rgba(57, 245, 163, 0.08); margin-right: 0.35rem; }
 .viability-score { font-size: 1.35rem; font-weight: 900; color: #e8fbff; }
 .viability-reason { color: #8db7c8; font-size: 0.86rem; line-height: 1.25rem; }
-.leadership-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; margin: 1rem 0 1.1rem 0; }
+.leadership-grid { display: grid; grid-template-columns: 1fr; gap: 0.9rem; margin: 1rem 0 1.1rem 0; }
 .leadership-card { border: 1px solid rgba(80, 220, 255, 0.22); border-radius: 20px; padding: 1rem; background: linear-gradient(180deg, rgba(6, 18, 32, 0.96), rgba(4, 12, 24, 0.94)); box-shadow: 0 0 22px rgba(80, 220, 255, 0.06); }
 .leadership-card.oracle { border-color: rgba(255, 214, 102, 0.35); box-shadow: 0 0 22px rgba(255, 214, 102, 0.07); }
 .leadership-title { font-size: 1.15rem; font-weight: 900; margin-bottom: 0.2rem; }
@@ -435,6 +435,26 @@ div[data-testid="stButton"] button:focus {
 .agent-row { border-left: 3px solid rgba(80, 220, 255, 0.35); padding: 0.55rem 0.75rem; margin: 0.45rem 0; background: rgba(6, 20, 34, 0.55); border-radius: 12px; }
 .agent-row.active { border-left-color: #39f5a3; box-shadow: 0 0 18px rgba(57, 245, 163, 0.12); }
 @media (max-width: 900px) { .overview-grid { grid-template-columns: 1fr; } .context-grid { grid-template-columns: 1fr; } }
+
+.leadership-grid {
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+}
+.leadership-card {
+    width: 100% !important;
+}
+.agent-card .agent-summary,
+.agent-card .agent-metrics,
+.agent-card .agent-description {
+    overflow: visible !important;
+}
+.agent-description {
+    margin-top: 8px;
+    margin-bottom: 10px;
+    font-size: 0.86rem;
+    line-height: 1.35;
+    opacity: 0.88;
+}
 </style>
     """, unsafe_allow_html=True)
 
@@ -2469,12 +2489,17 @@ def render_four_pass_backtest_box(
     cols[3].metric("SELL Pass 2 Council", sell_council_rows)
 
     if buy_agent_rows > 0:
-        st.markdown("#### Buy Timing Agent Weights")
+        st.markdown("#### Lead BUY Analysts")
         display_cols = [c for c in ["agent", "selected_count", "win_rate", "avg_net_bps", "median_net_bps", "score", "buy_weight_pct"] if c in four_pass_agent_buy_df.columns]
         st.dataframe(four_pass_agent_buy_df.sort_values("buy_weight_pct", ascending=False)[display_cols], use_container_width=True, hide_index=True)
 
+    if buy_council_rows > 0:
+        st.markdown("#### Weighted BUY Council")
+        display_cols = [c for c in ["product_id", "selected_count", "threshold", "win_rate", "avg_net_bps", "median_net_bps", "portfolio_return_pct_100_ref", "score"] if c in four_pass_council_buy_df.columns]
+        st.dataframe(four_pass_council_buy_df.sort_values("score", ascending=False)[display_cols], use_container_width=True, hide_index=True)
+
     if sell_agent_rows > 0:
-        st.markdown("#### Sell Timing Agent Weights")
+        st.markdown("#### SELL Analyst Weights")
         display_cols = [c for c in ["agent", "selected_count", "good_exit_rate", "too_early_rate", "avg_move_after_sell_bps", "score", "sell_weight_pct"] if c in four_pass_agent_sell_df.columns]
         st.dataframe(four_pass_agent_sell_df.sort_values("sell_weight_pct", ascending=False)[display_cols], use_container_width=True, hide_index=True)
     else:

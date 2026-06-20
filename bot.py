@@ -346,6 +346,32 @@ def require_live_binance_configuration() -> None:
             + " | ".join(errors)
         )
 
+
+def require_binance_signed_access(adapter: Any) -> None:
+    """Fail fast if Binance.US signed account access is not working.
+
+    Public market data can work while account/trading keys fail. This bot uses
+    live funds, so it must not continue unless /api/v3/account succeeds.
+    """
+    try:
+        adapter.client.sync_time()
+        account = adapter.client.account()
+        balances = account.get("balances", []) if isinstance(account, dict) else []
+        module_debug(
+            MODULE_NAME,
+            "binance_signed_access_ok",
+            data={"balance_rows": len(balances)},
+            level="INFO",
+            also_overall=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Binance.US signed account access failed. Public price data may still load, "
+            "but live trading cannot run until BINANCE_US_API_KEY / BINANCE_US_API_SECRET "
+            "are valid, Spot Trading is enabled on the key, and any Binance.US IP whitelist "
+            "includes this computer/network. Original error: " + str(exc)
+        ) from exc
+
 LIVE_EXECUTION_EXCHANGE_ID: str = env_str("LIVE_EXECUTION_EXCHANGE", "binance_us").lower()
 ENABLE_BINANCE_LIVE_EXECUTION: bool = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
 BINANCE_US_ENABLE_SPOT_TRADING: bool = env_bool("BINANCE_US_ENABLE_SPOT_TRADING", False)
@@ -1260,6 +1286,13 @@ HIST_REPLAY_DAILY_CONTEXT_DAYS: int = 730
 HIST_REPLAY_PRIMARY_GRANULARITY: str = "FIFTEEN_MINUTE"
 HIST_REPLAY_REGIME_GRANULARITY: str = "ONE_HOUR"
 HIST_REPLAY_DAILY_GRANULARITY: str = "ONE_DAY"
+
+HISTORICAL_REPLAY_TIMEFRAMES: List[str] = [
+    "primary_15m_90d",
+    "regime_1h_365d",
+    "daily_1d_2y",
+]
+
 HIST_REPLAY_FAST_BOOTSTRAP_MODE: bool = True
 HIST_REPLAY_BOOTSTRAP_ROWS_PER_PRODUCT_TARGET: int = 300
 HIST_REPLAY_PRODUCTS_PER_PASS: int = 1
@@ -1356,6 +1389,7 @@ ROTATION_SELL_FRACTION: float = 1.0
 # This bot requires real Coinbase-provided maker/taker fee rates before trading.
 AUTO_REFRESH_COINBASE_FEE_TIER: bool = True
 FEE_TIER_REFRESH_SEC: float = 60 * 60
+FEE_TIER_REFRESH_EVERY_SEC: float = FEE_TIER_REFRESH_SEC
 REQUIRE_COINBASE_FEE_TIER: bool = True
 
 # Binance.US portfolio source-of-truth behavior.
@@ -2569,6 +2603,7 @@ def select_diversified_products() -> List[str]:
     raise RuntimeError("Coinbase public product selection has been removed from Binance.US-only build.")
 
 
+@dataclass
 class Candle:
     ts: int
     open: float
@@ -7043,6 +7078,7 @@ class TradingBot:
             maker = max(maker_values); taker = max(taker_values); reason = "binance_fee_api_loaded"
         self.current_maker_fee_bps = float(maker); self.current_taker_fee_bps = float(taker)
         self.current_fee_tier_source = "binance_us"; self.current_fee_tier_reason = reason; self.current_fee_tier_loaded = True
+        self.last_fee_tier_reason = reason
         self.last_fee_tier_refresh_ts = now_value; self.binance_fee_bps_by_product = per_product
         module_debug(MODULE_NAME, "binance_fee_state_refreshed", data={"maker_bps": self.current_maker_fee_bps, "taker_bps": self.current_taker_fee_bps, "per_product": per_product, "reason": reason}, level="INFO", also_overall=True)
 
@@ -23547,6 +23583,7 @@ async def main() -> None:
         reload_runtime_env_config()
         require_live_binance_configuration()
         adapter = BinanceUSAdapter(dry_run=False, allow_real_orders=True)
+        require_binance_signed_access(adapter)
         rest = adapter.client
         api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
         pem = ""

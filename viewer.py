@@ -1872,6 +1872,22 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         cols[3].metric("Running", int(worker_manifest.get("running_jobs", 0) or 0))
         cols[4].metric("Failed", int(worker_manifest.get("failed_jobs", 0) or 0))
         st.progress(float(worker_manifest.get("progress", 0.0) or 0.0))
+
+        failed_errors = worker_manifest.get("failed_job_errors", []) or []
+        running_detail = worker_manifest.get("running_jobs_detail", []) or []
+        pending_detail = worker_manifest.get("next_pending_jobs", []) or []
+
+        if failed_errors:
+            st.error("Historical replay workers are failing. Open the table below before waiting longer; the loading bar will not advance while these jobs fail.")
+            st.dataframe(pd.DataFrame(failed_errors), width="stretch", hide_index=True)
+
+        if running_detail:
+            with st.expander("Currently running replay worker jobs", expanded=False):
+                st.dataframe(pd.DataFrame(running_detail), width="stretch", hide_index=True)
+
+        if pending_detail:
+            with st.expander("Next pending replay worker jobs", expanded=False):
+                st.dataframe(pd.DataFrame(pending_detail), width="stretch", hide_index=True)
     exchange_map_df = load_csv(EXCHANGE_PRODUCT_MAP_CSV_PATH)
     if exchange_map_df is not None and not exchange_map_df.empty:
         with st.expander("Canonical product ↔ Binance.US symbol mapping", expanded=False):

@@ -11132,7 +11132,11 @@ class TradingBot:
                 f"[backtest] intelligence updated "
                 f"buy_recs={result.get('buy_recommendations', 0)} "
                 f"sell_recs={result.get('sell_recommendations', 0)} "
-                f"agent_priors={result.get('agent_priors', 0)}"
+                f"agent_priors={result.get('agent_priors', 0)} "
+                f"four_pass_buy_agents={result.get('four_pass_agent_buy', 0)} "
+                f"four_pass_buy_council={result.get('four_pass_council_buy', 0)} "
+                f"four_pass_sell_agents={result.get('four_pass_agent_sell', 0)} "
+                f"four_pass_sell_council={result.get('four_pass_council_sell', 0)}"
             )
             if self.level8_council is not None and hasattr(self.level8_council, "_clear_level8_memory_cache"):
                 self.level8_council._clear_level8_memory_cache()
@@ -17773,81 +17777,84 @@ class TradingBot:
 
 
     def _write_agent_side_ratings(self) -> None:
-        """Build separate BUY and SELL analyst authority from performance rows."""
+        """
+        Write side-specific analyst weights.
+
+        Priority:
+        1. Use four_pass_final_agent_ratings.csv when available.
+        2. Fall back to directional movement from agent_performance.csv.
+        """
         try:
             self._ensure_agent_side_ratings_header()
+
+            four_pass_path = os.path.join(BASE_DIR, "four_pass_final_agent_ratings.csv")
+            if os.path.exists(four_pass_path) and os.path.getsize(four_pass_path) > 0:
+                four = pd.read_csv(four_pass_path)
+                if not four.empty and "agent" in four.columns:
+                    ts_val = now_ts()
+                    dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                    rows = []
+                    for _, r in four.iterrows():
+                        agent = str(r.get("agent") or "")
+                        if not agent:
+                            continue
+                        buy_rows = int(float(r.get("buy_rows", 0) or 0)); sell_rows = int(float(r.get("sell_rows", 0) or 0))
+                        buy_accuracy = float(r.get("buy_accuracy", 0.5) or 0.5); sell_accuracy = float(r.get("sell_accuracy", 0.5) or 0.5)
+                        buy_score = float(r.get("buy_score", 0.5) or 0.5); sell_score = float(r.get("sell_score", 0.5) or 0.5)
+                        buy_weight_pct = float(r.get("buy_weight_pct", 0.0) or 0.0); sell_weight_pct = float(r.get("sell_weight_pct", 0.0) or 0.0)
+                        rows.append({"ts": ts_val, "dt_mst": dt_mst, "agent": agent, "buy_rows": buy_rows, "buy_accuracy": buy_accuracy, "buy_avg_move_bps": float(r.get("buy_avg_net_bps", 0.0) or 0.0), "buy_avg_credit": buy_accuracy, "buy_score": buy_score, "buy_weight_pct": buy_weight_pct, "buy_weight_multiplier": 1.0, "sell_rows": sell_rows, "sell_accuracy": sell_accuracy, "sell_avg_move_bps": float(r.get("sell_avg_net_bps", 0.0) or 0.0), "sell_avg_credit": sell_accuracy, "sell_score": sell_score, "sell_weight_pct": sell_weight_pct, "sell_weight_multiplier": 1.0, "total_rows": buy_rows + sell_rows, "formula": "four_pass_backtest_authority", "reason": "source=four_pass_final_agent_ratings.csv"})
+                    if rows:
+                        buy_total = sum(float(x["buy_weight_pct"]) for x in rows) or 1.0
+                        sell_total = sum(float(x["sell_weight_pct"]) for x in rows) or 1.0
+                        equal_weight_pct = 100.0 / max(1, len(rows))
+                        for row in rows:
+                            row["buy_weight_pct"] = float(row["buy_weight_pct"]) / buy_total * 100.0 if buy_total > 0 else equal_weight_pct
+                            row["sell_weight_pct"] = float(row["sell_weight_pct"]) / sell_total * 100.0 if sell_total > 0 else equal_weight_pct
+                            row["buy_weight_multiplier"] = clamp_float(row["buy_weight_pct"] / max(equal_weight_pct, 1e-9), 0.20, 6.0)
+                            row["sell_weight_multiplier"] = clamp_float(row["sell_weight_pct"] / max(equal_weight_pct, 1e-9), 0.20, 6.0)
+                        with open(AGENT_SIDE_RATINGS_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.DictWriter(f, fieldnames=AGENT_SIDE_RATINGS_COLUMNS)
+                            for row in rows:
+                                writer.writerow({col: row.get(col, "") for col in AGENT_SIDE_RATINGS_COLUMNS})
+                        return
+
             frame = self._read_csv_tail_for_bot(AGENT_PERFORMANCE_CSV_PATH, max_lines=250000)
             if frame.empty or "agent" not in frame.columns or "agent_direction" not in frame.columns:
                 return
             frame = frame.copy()
-            frame["agent"] = frame["agent"].astype(str)
-            frame["agent_direction"] = frame["agent_direction"].astype(str).str.upper()
-            frame["strategy"] = frame.get("strategy", pd.Series("", index=frame.index)).astype(str).str.upper()
-            frame["outcome_source"] = frame.get("outcome_source", pd.Series("", index=frame.index)).astype(str).str.lower()
-            frame["_success"] = pd.to_numeric(frame.get("outcome_success", 0), errors="coerce").fillna(0.0)
-            frame["_credit"] = pd.to_numeric(frame.get("weighted_agent_credit_score", frame.get("agent_credit_score", 0.5)), errors="coerce").fillna(0.5)
+            frame["agent"] = frame["agent"].astype(str); frame["agent_direction"] = frame["agent_direction"].astype(str).str.upper()
             frame["_move"] = pd.to_numeric(frame.get("outcome_move_bps", 0.0), errors="coerce").fillna(0.0)
-            if "outcome_weight" in frame.columns:
-                frame["_source_weight"] = pd.to_numeric(frame["outcome_weight"], errors="coerce").fillna(0.35)
-            else:
-                frame["_source_weight"] = frame["outcome_source"].map({"trade_outcome": 1.00, "real_trade": 1.00, "sell_outcome": 1.00, "agent_performance": 0.80, "observation_outcome": 0.40, "level8_observation": 0.40}).fillna(0.35).astype(float)
+            frame["_credit"] = pd.to_numeric(frame.get("weighted_agent_credit_score", frame.get("agent_credit_score", 0.5)), errors="coerce").fillna(0.5)
             frame = frame[frame["agent"].ne("")].copy()
-            if frame.empty:
-                return
-
-            def weighted_mean(values, weights, default=0.0) -> float:
-                try:
-                    v = pd.to_numeric(values, errors="coerce").fillna(float(default))
-                    w = pd.to_numeric(weights, errors="coerce").fillna(0.0)
-                    total_w = float(w.sum())
-                    if total_w <= 0:
-                        return float(v.mean()) if len(v) else float(default)
-                    return float((v * w).sum() / total_w)
-                except Exception:
-                    return float(default)
 
             def side_stats(group: pd.DataFrame, side: str) -> Dict[str, float]:
                 side_u = str(side).upper()
                 if side_u == "BUY":
-                    rows = group[group["agent_direction"].eq("BUY")].copy()
+                    rows = group[group["agent_direction"].eq("BUY")].copy(); directional_success = rows["_move"] > 0.0; avg_edge = rows["_move"].mean() if not rows.empty else 0.0
                 else:
-                    rows = pd.concat([group[group["agent_direction"].eq("SELL")].copy(), group[group["strategy"].eq("EXIT_REVIEW")].copy()], ignore_index=True, sort=False)
-                    if not rows.empty:
-                        rows = rows.drop_duplicates()
+                    rows = group[group["agent_direction"].eq("SELL")].copy(); directional_success = rows["_move"] < 0.0; avg_edge = -rows["_move"].mean() if not rows.empty else 0.0
                 n = int(len(rows))
                 if n <= 0:
                     return {"rows": 0, "accuracy": 0.5, "avg_move_bps": 0.0, "avg_credit": 0.5, "score": 0.5, "authority_raw": 0.10}
-                weights = rows["_source_weight"]
-                accuracy = weighted_mean(rows["_success"], weights, 0.5)
-                avg_credit = weighted_mean(rows["_credit"], weights, 0.5)
-                avg_move = weighted_mean(rows["_move"], weights, 0.0)
-                edge_for_side = avg_move if side_u == "BUY" else -avg_move
-                sample_factor = clamp_float(n / 50.0, 0.0, 1.0)
-                edge_component = clamp_float(edge_for_side / 160.0, -0.16, 0.16)
-                score = clamp_float(0.50 + (accuracy - 0.50) * 0.75 * sample_factor + (avg_credit - 0.50) * 0.35 + edge_component * sample_factor, 0.05, 0.98)
-                if n < 5:
+                accuracy = float(directional_success.mean()); avg_credit = float(rows["_credit"].mean()); avg_move = float(rows["_move"].mean()); sample_factor = clamp_float(n / 80.0, 0.0, 1.0)
+                score = clamp_float(0.50 + (accuracy - 0.50) * 0.85 * sample_factor + (avg_credit - 0.50) * 0.15 + clamp_float(avg_edge / 180.0, -0.18, 0.18) * sample_factor, 0.05, 0.95)
+                if n < 10:
                     score = 0.50 + (score - 0.50) * 0.25
-                authority_raw = math.exp((score - 0.50) / 0.075) * max(0.10, sample_factor)
-                return {"rows": n, "accuracy": float(accuracy), "avg_move_bps": float(avg_move), "avg_credit": float(avg_credit), "score": float(score), "authority_raw": float(authority_raw)}
+                authority_raw = math.exp((score - 0.50) / 0.070) * max(0.05, sample_factor)
+                return {"rows": n, "accuracy": accuracy, "avg_move_bps": avg_move, "avg_credit": avg_credit, "score": score, "authority_raw": authority_raw}
 
-            rows = []
-            ts_val = now_ts()
-            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            rows = []; ts_val = now_ts(); dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
             for agent, group in frame.groupby(frame["agent"].astype(str)):
                 buy = side_stats(group, "BUY"); sell = side_stats(group, "SELL")
                 rows.append({"ts": ts_val, "dt_mst": dt_mst, "agent": agent, "buy_rows": int(buy["rows"]), "buy_accuracy": float(buy["accuracy"]), "buy_avg_move_bps": float(buy["avg_move_bps"]), "buy_avg_credit": float(buy["avg_credit"]), "buy_score": float(buy["score"]), "buy_authority_raw": float(buy["authority_raw"]), "sell_rows": int(sell["rows"]), "sell_accuracy": float(sell["accuracy"]), "sell_avg_move_bps": float(sell["avg_move_bps"]), "sell_avg_credit": float(sell["avg_credit"]), "sell_score": float(sell["score"]), "sell_authority_raw": float(sell["authority_raw"]), "total_rows": int(len(group))})
             if not rows:
                 return
-            buy_total = sum(float(r["buy_authority_raw"]) for r in rows) or 1.0
-            sell_total = sum(float(r["sell_authority_raw"]) for r in rows) or 1.0
-            equal_weight_pct = 100.0 / max(1, len(rows))
+            buy_total = sum(float(r["buy_authority_raw"]) for r in rows) or 1.0; sell_total = sum(float(r["sell_authority_raw"]) for r in rows) or 1.0; equal_weight_pct = 100.0 / max(1, len(rows))
             for row in rows:
-                row["buy_weight_pct"] = float(row["buy_authority_raw"]) / buy_total * 100.0
-                row["sell_weight_pct"] = float(row["sell_authority_raw"]) / sell_total * 100.0
-                row["buy_weight_multiplier"] = clamp_float(row["buy_weight_pct"] / max(equal_weight_pct, 1e-9), 0.25, 6.0)
-                row["sell_weight_multiplier"] = clamp_float(row["sell_weight_pct"] / max(equal_weight_pct, 1e-9), 0.25, 6.0)
-                row["formula"] = "score=shrunk_accuracy+weighted_credit+directional_edge; authority=exp((score-.50)/.075); weights normalized to 100pct separately for buy and sell"
-                row["reason"] = f"buy_score={row['buy_score']:.3f};buy_weight={row['buy_weight_pct']:.2f}%;sell_score={row['sell_score']:.3f};sell_weight={row['sell_weight_pct']:.2f}%;equal_weight={equal_weight_pct:.2f}%"
+                row["buy_weight_pct"] = float(row["buy_authority_raw"]) / buy_total * 100.0; row["sell_weight_pct"] = float(row["sell_authority_raw"]) / sell_total * 100.0
+                row["buy_weight_multiplier"] = clamp_float(row["buy_weight_pct"] / max(equal_weight_pct, 1e-9), 0.20, 6.0); row["sell_weight_multiplier"] = clamp_float(row["sell_weight_pct"] / max(equal_weight_pct, 1e-9), 0.20, 6.0)
+                row["formula"] = "directional_success_not_generic_outcome_success"
+                row["reason"] = f"buy_acc={row['buy_accuracy']:.3f};buy_avg={row['buy_avg_move_bps']:.2f};buy_weight={row['buy_weight_pct']:.2f}%;sell_acc={row['sell_accuracy']:.3f};sell_avg={row['sell_avg_move_bps']:.2f};sell_weight={row['sell_weight_pct']:.2f}%"
             with open(AGENT_SIDE_RATINGS_CSV_PATH, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=AGENT_SIDE_RATINGS_COLUMNS)
                 for row in rows:

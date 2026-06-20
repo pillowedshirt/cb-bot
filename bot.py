@@ -6497,6 +6497,7 @@ class TradingBot:
         self._ai_training_running: bool = False
         self._backtest_reload_running: bool = False
         self._last_backtest_reload_ts: float = 0.0
+        self._final_startup_backtest_intelligence_completed = False
         self._macro_refresh_running: bool = False
         self._macro_product_index = 0
         self._last_macro_day_fetch_ts = 0.0
@@ -11247,11 +11248,13 @@ class TradingBot:
             except Exception:
                 startup_complete = False
 
+            final_startup_already_done = bool(getattr(self, "_final_startup_backtest_intelligence_completed", False))
             final_startup_force = (
                 bool(force_when_replay_complete)
                 and bool(BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE)
                 and bool(startup_complete)
                 and current_rows > 0
+                and not final_startup_already_done
             )
 
             if not final_startup_force and not (enough_time and enough_new_rows):
@@ -11276,6 +11279,8 @@ class TradingBot:
             self._last_backtest_intelligence_training_rows = current_rows
 
             self._run_backtest_intelligence_if_due(force=True)
+            if final_startup_force:
+                self._final_startup_backtest_intelligence_completed = True
 
             try:
                 self._write_agent_side_ratings()
@@ -13263,6 +13268,7 @@ class TradingBot:
                                     latest = product_rows.tail(1).iloc[0]
                                     profitability_mode = str(latest.get("profitability_mode", "") or "").lower()
                                     realized_mode = "realized" in profitability_mode or "exit" in profitability_mode
+                                    proxy_mode = "proxy" in profitability_mode
 
                                     four_pass_ok = (
                                         float(latest.get("selected_count", 0) or 0) >= 10
@@ -13273,7 +13279,7 @@ class TradingBot:
 
                                     # Opportunity-proxy approval can help identify buy timing,
                                     # but live trading should be more careful than realized replay approval.
-                                    if four_pass_ok and not realized_mode:
+                                    if four_pass_ok and proxy_mode and not realized_mode:
                                         four_pass_ok = (
                                             float(latest.get("selected_count", 0) or 0) >= 25
                                             and float(latest.get("win_rate", 0.0) or 0.0) >= 0.60
@@ -18610,6 +18616,8 @@ class TradingBot:
             calculation_work_complete = bool(all_products_complete and phase_totals["micro_backlog"] >= 1.0 and phase_totals["historical_candle_backlog"] >= 1.0 and phase_totals["historical_replay"] >= 1.0 and phase_totals["replay_calibration_verdicts"] >= 1.0)
             latch = self._load_calculation_complete_latch()
             latched_complete = bool(latch.get("calculation_complete_latched"))
+            if not latched_complete and not calculation_work_complete:
+                self._final_startup_backtest_intelligence_completed = False
             full_viewer_unlocked = bool((not VIEWER_REQUIRE_FULL_STARTUP_CALCULATION) or latched_complete or calculation_work_complete)
             complete_products = sum(1 for p in PRODUCTS if bool(product_status[p]["complete"]))
             profit_ready_products = sum(1 for p in PRODUCTS if bool(product_status[p]["profit_ready"]))

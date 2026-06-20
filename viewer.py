@@ -94,6 +94,8 @@ FOUR_PASS_PROFITABILITY_SUMMARY_PATH = os.path.join(BASE_DIR, "four_pass_profita
 FOUR_PASS_AGENT_CONTEXT_RATINGS_PATH = os.path.join(BASE_DIR, "four_pass_agent_context_ratings.csv")
 FOUR_PASS_SELL_PATH_REPLAY_PATH = os.path.join(BASE_DIR, "four_pass_sell_path_replay.csv")
 FOUR_PASS_PURGED_WALK_FORWARD_PATH = os.path.join(BASE_DIR, "four_pass_purged_walk_forward.csv")
+FOUR_PASS_PRODUCT_LIVE_GATE_PATH = os.path.join(BASE_DIR, "four_pass_product_live_gate.csv")
+PRODUCT_COOLDOWNS_PATH = os.path.join(BASE_DIR, "product_cooldowns.csv")
 DECISION_AUDIT_PATH = os.path.join(BASE_DIR, "decision_audit.csv")
 
 SNAPSHOT_STALE_WARN_SEC = 20.0
@@ -2482,6 +2484,8 @@ def render_four_pass_backtest_box(
     four_pass_agent_context_ratings_df: pd.DataFrame = None,
     four_pass_sell_path_replay_df: pd.DataFrame = None,
     four_pass_purged_walk_forward_df: pd.DataFrame = None,
+    four_pass_product_live_gate_df: pd.DataFrame = None,
+    product_cooldowns_df: pd.DataFrame = None,
 ) -> None:
     st.markdown("### Four-Pass Council Backtest")
 
@@ -2597,12 +2601,44 @@ def render_four_pass_backtest_box(
             hide_index=True,
         )
 
+
+    if four_pass_product_live_gate_df is not None and not four_pass_product_live_gate_df.empty:
+        st.markdown("#### Product Live Buy Gates")
+        display_cols = [
+            c for c in [
+                "product_id", "approved_for_live_buy",
+                "buy_selected_count", "buy_win_rate",
+                "buy_avg_net_bps", "buy_median_net_bps",
+                "walk_forward_positive_folds",
+                "walk_forward_avg_validation_net_bps",
+                "sell_path_rows", "sell_path_avg_realized_net_bps",
+                "cooldown_minutes", "gate_reason",
+            ]
+            if c in four_pass_product_live_gate_df.columns
+        ]
+        st.dataframe(
+            four_pass_product_live_gate_df.sort_values(
+                ["approved_for_live_buy", "buy_avg_net_bps"],
+                ascending=[False, False],
+            )[display_cols],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if product_cooldowns_df is not None and not product_cooldowns_df.empty:
+        st.markdown("#### Product Cooldowns")
+        display_cols = [
+            c for c in ["product_id", "cooldown_until_ts", "cooldown_minutes", "reason"]
+            if c in product_cooldowns_df.columns
+        ]
+        st.dataframe(product_cooldowns_df[display_cols], use_container_width=True, hide_index=True)
+
     if four_pass_final_agent_ratings_df is not None and not four_pass_final_agent_ratings_df.empty:
         with st.expander("Final four-pass side-specific analyst ratings", expanded=False):
             st.dataframe(four_pass_final_agent_ratings_df.tail(200), width="stretch", hide_index=True)
 
 
-def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None, four_pass_agent_buy_df=None, four_pass_council_buy_df=None, four_pass_agent_sell_df=None, four_pass_council_sell_df=None, four_pass_final_agent_ratings_df=None, four_pass_profitability_summary_df=None, four_pass_agent_context_ratings_df=None, four_pass_sell_path_replay_df=None, four_pass_purged_walk_forward_df=None):
+def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None, four_pass_agent_buy_df=None, four_pass_council_buy_df=None, four_pass_agent_sell_df=None, four_pass_council_sell_df=None, four_pass_final_agent_ratings_df=None, four_pass_profitability_summary_df=None, four_pass_agent_context_ratings_df=None, four_pass_sell_path_replay_df=None, four_pass_purged_walk_forward_df=None, four_pass_product_live_gate_df=None, product_cooldowns_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
     st.metric("Trading Mode", readiness.get("live_trading_mode_label", readiness.get("trading_aggression_mode", "unknown")))
@@ -2634,6 +2670,8 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         four_pass_agent_context_ratings_df,
         four_pass_sell_path_replay_df,
         four_pass_purged_walk_forward_df,
+        four_pass_product_live_gate_df,
+        product_cooldowns_df,
     )
     hist_enabled = readiness.get("historical_replay_enabled")
     hist_running = readiness.get("historical_replay_running")
@@ -2902,6 +2940,8 @@ def render_live_dashboard(selected, refresh_config):
     four_pass_agent_context_ratings_df = load_csv_tail(FOUR_PASS_AGENT_CONTEXT_RATINGS_PATH, max_lines=10000)
     four_pass_sell_path_replay_df = load_csv_tail(FOUR_PASS_SELL_PATH_REPLAY_PATH, max_lines=10000)
     four_pass_purged_walk_forward_df = load_csv_tail(FOUR_PASS_PURGED_WALK_FORWARD_PATH, max_lines=10000)
+    four_pass_product_live_gate_df = load_csv_tail(FOUR_PASS_PRODUCT_LIVE_GATE_PATH, max_lines=10000)
+    product_cooldowns_df = load_csv_tail(PRODUCT_COOLDOWNS_PATH, max_lines=10000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
@@ -2909,7 +2949,7 @@ def render_live_dashboard(selected, refresh_config):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):
         render_strategy_variant_replay_panel()
-    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df, four_pass_agent_buy_df, four_pass_council_buy_df, four_pass_agent_sell_df, four_pass_council_sell_df, four_pass_final_agent_ratings_df, four_pass_profitability_summary_df, four_pass_agent_context_ratings_df, four_pass_sell_path_replay_df, four_pass_purged_walk_forward_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df, four_pass_agent_buy_df, four_pass_council_buy_df, four_pass_agent_sell_df, four_pass_council_sell_df, four_pass_final_agent_ratings_df, four_pass_profitability_summary_df, four_pass_agent_context_ratings_df, four_pass_sell_path_replay_df, four_pass_purged_walk_forward_df, four_pass_product_live_gate_df, product_cooldowns_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
 def render_viewer_tick(refresh_config: dict) -> None:

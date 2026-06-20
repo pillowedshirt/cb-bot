@@ -389,6 +389,13 @@ class AgentVote:
     leader_bonus: float = 0.0
     leader_penalty: float = 0.0
     reason: str = ""
+    product_id: str = ""
+    market_regime: str = "unknown"
+    momentum_15_bps: float = 0.0
+    momentum_30_bps: float = 0.0
+    volatility_bps: float = 0.0
+    atr_bps: float = 0.0
+    range_bps: float = 0.0
 
 
 class Level8Council:
@@ -1309,6 +1316,13 @@ class Level8Council:
             leader_bonus=float(adjustments.get("leader_bonus", 0.0)),
             leader_penalty=float(adjustments.get("leader_penalty", 0.0)),
             reason=str(vote.get("reason", "")),
+            product_id=str(vote.get("product_id", product_id) or product_id),
+            market_regime=str(vote.get("market_regime", "unknown") or "unknown"),
+            momentum_15_bps=float(vote.get("momentum_15_bps", 0.0) or 0.0),
+            momentum_30_bps=float(vote.get("momentum_30_bps", 0.0) or 0.0),
+            volatility_bps=float(vote.get("volatility_bps", 0.0) or 0.0),
+            atr_bps=float(vote.get("atr_bps", 0.0) or 0.0),
+            range_bps=float(vote.get("range_bps", 0.0) or 0.0),
         )
 
     def adaptive_thresholds(self, product_id: str, strategy: str) -> Dict[str, Any]:
@@ -1502,6 +1516,17 @@ class Level8Council:
     def _infer_live_market_regime_for_votes(self, adjusted_votes: list[AgentVote]) -> str:
         """Lightweight live regime inference from vote metadata."""
         try:
+            explicit_regimes = []
+            for vote in adjusted_votes:
+                try:
+                    regime = str(getattr(vote, "market_regime", "") or "")
+                    if regime and regime != "unknown":
+                        explicit_regimes.append(regime)
+                except Exception:
+                    pass
+            if explicit_regimes:
+                return max(set(explicit_regimes), key=explicit_regimes.count)
+
             momentum_values = []
             volatility_values = []
             for vote in adjusted_votes:

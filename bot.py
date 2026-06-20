@@ -30,12 +30,8 @@ import requests
 import websockets
 from dotenv import load_dotenv
 
-try:
-    from coinbase.rest import RESTClient
-    from coinbase import jwt_generator
-except Exception:
-    RESTClient = None
-    jwt_generator = None
+RESTClient = None
+jwt_generator = None
 
 from binance_us_client import BinanceUSClient
 from exchange_adapters import BinanceUSAdapter, ExchangeOrderResult
@@ -221,7 +217,7 @@ def env_float(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
-LIVE_EXECUTION_EXCHANGE_ID = os.getenv("LIVE_EXECUTION_EXCHANGE", "binance_us").strip().lower()
+LIVE_EXECUTION_EXCHANGE_ID = "binance_us"
 ENABLE_BINANCE_LIVE_EXECUTION = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
 BINANCE_US_ENABLE_SPOT_TRADING = env_bool("BINANCE_US_ENABLE_SPOT_TRADING", False)
 BINANCE_US_DRY_RUN = env_bool("BINANCE_US_DRY_RUN", True)
@@ -251,6 +247,7 @@ USE_USD_HOLD_AS_TRADABLE: bool = False
 
 # Optional session filter (UTC). Disabled by default to preserve existing behaviour.
 # If enabled, the entry gate will only allow buys during the configured UTC hours.
+ENABLE_PENDING_BALANCE_DELTA_RECONCILIATION: bool = False
 ENABLE_SESSION_FILTER: bool = False
 SESSION_ALLOWED_UTC_HOURS: Optional[List[int]] = list(range(13, 23))  # 13:00–22:59 UTC (US/EU overlap)
 
@@ -327,7 +324,7 @@ HIST_REPLAY_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1d_2
 # ============================================================
 ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL: bool = True
 # Keep Coinbase live execution until intentionally replaced later.
-LIVE_EXECUTION_EXCHANGE_ID: str = os.getenv("LIVE_EXECUTION_EXCHANGE", LIVE_EXECUTION_EXCHANGE).strip().lower()
+LIVE_EXECUTION_EXCHANGE_ID: str = "binance_us"
 # Historical data source priority: local cache -> Binance bulk public files -> Coinbase fallback
 HISTORICAL_CANDLE_SOURCE_PRIORITY: List[str] = [
     "local_cache",
@@ -337,7 +334,7 @@ HISTORICAL_CANDLE_SOURCE_PRIORITY: List[str] = [
 BINANCE_BULK_TIMEOUT_SEC: float = 45.0
 BINANCE_BULK_PREFER_BINANCE_US: bool = False
 # Keep this false until you intentionally build Binance signed API execution.
-ENABLE_BINANCE_LIVE_EXECUTION: bool = False
+# ENABLE_BINANCE_LIVE_EXECUTION is controlled by env near startup; do not override it here.
 
 # ============================================================
 # REPLAY FEE MODEL COMPARISON
@@ -354,12 +351,14 @@ REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY: str = "taker"
 BINANCE_US_TIER0_PRODUCTS: Set[str] = set()
 ENABLE_REPLAY_FEE_SCENARIO_MATRIX: bool = True
 REPLAY_FEE_SCENARIOS: List[str] = [
-    "coinbase_maker_maker",
-    "coinbase_maker_taker",
-    "coinbase_taker_taker",
     "binance_maker_maker",
     "binance_maker_taker",
     "binance_taker_taker",
+]
+REPLAY_LEGACY_COMPARISON_SCENARIOS: List[str] = [
+    "coinbase_legacy_maker_maker",
+    "coinbase_legacy_maker_taker",
+    "coinbase_legacy_taker_taker",
 ]
 
 # Source quality labels.
@@ -527,6 +526,11 @@ REPLAY_POLICY_MIN_ROWS: int = 30
 REPLAY_POLICY_MAX_HARD_STOP_RATE: float = 0.35
 REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_AVG_BPS: float = 15.0
 REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_WIN_RATE: float = 0.52
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 0.0
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.50
+REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 0.0
+REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = REPLAY_POLICY_MAX_HARD_STOP_RATE
+REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.0
 REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW: bool = True
 COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY: bool = True
 COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE: bool = False
@@ -3463,7 +3467,7 @@ class MacroFetcher:
                 log(f"[macro] get_candles {product_id} {granularity} start={int(start)} end={int(end)} span={(int(end)-int(start))}")
                 resp = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self.rest.get_candles(product_id=product_id, start=str(int(start)), end=str(int(end)), granularity=granularity)
+                    lambda: self.rest.legacy_candles(product_id=product_id, start=str(int(start)), end=str(int(end)), granularity=granularity)
                 )
                 candles = _parse_candles_response(resp)
                 if candles:
@@ -3543,6 +3547,36 @@ class MacroFetcher:
         merged.sort(key=lambda x: x.ts)
         return merged
 
+
+
+class BinanceKlineFetcher:
+    def __init__(self, client: BinanceUSClient):
+        self.client = client
+
+    async def fetch_chunked(self, product_id: str, start: int, end: int, granularity: str, max_candles_per_req: int = 1000) -> List[Candle]:
+        symbol = product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
+        if not symbol:
+            raise RuntimeError(f"No Binance.US symbol mapping for {product_id}")
+        interval = {"ONE_MINUTE":"1m","FIVE_MINUTE":"5m","FIFTEEN_MINUTE":"15m","ONE_HOUR":"1h","ONE_DAY":"1d","1m":"1m","5m":"5m","15m":"15m","1h":"1h","1d":"1d"}.get(str(granularity), "1m")
+        out: List[Candle] = []
+        cur_ms = int(start) * 1000
+        end_ms = int(end) * 1000
+        while cur_ms < end_ms:
+            data = await asyncio.to_thread(self.client.klines, symbol, interval, cur_ms, end_ms, min(1000, int(max_candles_per_req)))
+            if not data:
+                break
+            for row in data:
+                try:
+                    out.append(Candle(ts=int(row[0]) // 1000, open=float(row[1]), high=float(row[2]), low=float(row[3]), close=float(row[4]), volume=float(row[5])))
+                except Exception:
+                    continue
+            last_open_ms = int(data[-1][0])
+            next_ms = last_open_ms + 1
+            if next_ms <= cur_ms:
+                break
+            cur_ms = next_ms
+            await asyncio.sleep(0.05)
+        return sorted({int(c.ts): c for c in out}.values(), key=lambda c: c.ts)
 
 def _parse_candles_response(resp: Any) -> List[Candle]:
     """
@@ -6260,9 +6294,9 @@ class TradingBot:
         # header-only CSV files or current-run rows.
         self.startup_had_existing_runtime_state: bool = has_existing_runtime_csv_state()
 
-        self.live_exchange = LIVE_EXECUTION_EXCHANGE_ID
-        self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS) if self.live_exchange == EXCHANGE_BINANCE_US else None
-        self.fetcher = MacroFetcher(rest)
+        self.live_exchange = EXCHANGE_BINANCE_US
+        self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+        self.fetcher = BinanceKlineFetcher(self.exchange_adapter.client)
         self.macro = MacroManager()
         self.tlog = TradeLogger(TRADES_CSV_PATH)
         self.olog = OrderLogger(ORDERS_CSV_PATH)
@@ -6528,7 +6562,7 @@ class TradingBot:
         # Price-based re-entry gating (prevents rapid churn without using time)
         self.rearm_required: Dict[str, bool] = {p: False for p in PRODUCTS}
         # portfolio
-        self.portfolio = LivePortfolio(rest)
+        self.portfolio = None
         # last macro update time
         self.last_macro_update: float = 0.0
         # stop event
@@ -6546,12 +6580,12 @@ class TradingBot:
         self.product_trade_timestamps: Dict[str, Deque[float]] = {p: deque(maxlen=200) for p in PRODUCTS}
         self.scale_add_count: Dict[str, int] = {p: 0 for p in PRODUCTS}
 
-        # Dynamic Coinbase fee state.
-        # Defaults are conservative until Coinbase fee tier is successfully detected.
-        # Dynamic Coinbase fee state.
-        # None means the bot is not allowed to trade yet.
-        self.current_maker_fee_bps: Optional[float] = None
-        self.current_taker_fee_bps: Optional[float] = None
+        # Dynamic Binance.US fee state.
+        self.current_maker_fee_bps: Optional[float] = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
+        self.current_taker_fee_bps: Optional[float] = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
+        self.current_fee_tier_source: str = "binance_us"
+        self.current_fee_tier_reason: str = "fallback_until_refresh"
+        self.current_fee_tier_loaded: bool = False
         self.last_fee_tier_refresh_ts: float = 0.0
         self.last_fee_tier_reason: str = "not_refreshed_yet"
 
@@ -6699,6 +6733,10 @@ class TradingBot:
           - filled_qty > 0
           - avg_price determinable and > 0 (from avg_price or filled_notional/qty)
         """
+        if isinstance(r, ExchangeOrderResult):
+            if not r.ok:
+                raise RuntimeError(r.error or f"Binance {side} failed")
+            return (float(r.filled_qty or 0.0), float(r.avg_price or 0.0), float(r.fee_usd or 0.0), float(r.filled_qty or 0.0) * float(r.avg_price or 0.0), str(r.order_id or ""))
         side_u = str(side).upper().strip()
         if not isinstance(r, dict):
             log(f"[{side_u.lower()}] non-dict execution result for {product_id}: {type(r)}")
@@ -7093,129 +7131,84 @@ class TradingBot:
 
 
 
-    def _active_adapter(self):
-        if getattr(self, "live_exchange", "") == EXCHANGE_BINANCE_US:
-            if getattr(self, "exchange_adapter", None) is None:
-                self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
-            return self.exchange_adapter
-        return None
+    def _active_adapter(self) -> BinanceUSAdapter:
+        if getattr(self, "exchange_adapter", None) is None:
+            self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+        return self.exchange_adapter
 
     def _get_live_fee_bps(self, product_id: str) -> Tuple[float, float]:
         adapter = self._active_adapter()
-        if adapter is not None:
-            fees = adapter.fee_bps_for_symbol(adapter.product_to_symbol(product_id))
-            return float(fees["maker_bps"]), float(fees["taker_bps"])
-        return self.portfolio.get_fee_tier_bps()[:2]
+        fees = adapter.fee_bps_for_symbol(adapter.product_to_symbol(product_id))
+        return float(fees["maker_bps"]), float(fees["taker_bps"])
 
     def _get_top_of_book_live(self, product_id: str) -> Dict[str, Any]:
-        adapter = self._active_adapter()
-        if adapter is not None:
-            return adapter.get_top_of_book(product_id)
-        bid, ask = self.portfolio.get_best_bid_ask(product_id)
-        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
-        return {"product_id": product_id, "bid": bid, "ask": ask, "mid": mid, "spread_bps": ((ask - bid) / mid * 10000.0) if mid > 0 else 0.0, "ts": now_ts()}
+        return self._active_adapter().get_top_of_book(product_id)
+
+    def _get_account_balances_live(self) -> Dict[str, Any]:
+        return self._active_adapter().get_account_snapshot()
 
     def _get_available_quote_live(self) -> float:
-        adapter = self._active_adapter()
-        return adapter.get_available_asset("USDT") if adapter is not None else self.portfolio.get_tradable_usd()
+        return self._active_adapter().get_available_asset("USDT")
+
+    def _get_total_quote_live(self) -> float:
+        return self._active_adapter().get_total_asset("USDT")
 
     def _get_base_qty_live(self, product_id: str) -> float:
-        adapter = self._active_adapter()
-        if adapter is not None:
-            rules = adapter.symbol_rules(adapter.product_to_symbol(product_id))
-            return adapter.get_total_asset(rules.base_asset)
-        return self.portfolio.get_product_total_qty(product_id)
+        adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_total_asset(rules.base_asset)
+
+    def _get_available_base_qty_live(self, product_id: str) -> float:
+        adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_available_asset(rules.base_asset)
 
     def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = True) -> ExchangeOrderResult:
         adapter = self._active_adapter()
-        if adapter is not None:
+        if maker_first:
             tob = adapter.get_top_of_book(product_id)
-            return adapter.place_limit_buy(product_id, quote_usd, limit_price=float(tob["bid"])) if maker_first else adapter.place_market_buy(product_id, quote_usd)
-        return self.portfolio.buy_limit_post_only(product_id, quote_usd, limit_price=None) if maker_first else self.portfolio.buy_market(product_id, quote_usd)
+            return adapter.place_limit_buy(product_id, quote_usd, limit_price=float(tob["bid"]))
+        return adapter.place_market_buy(product_id, quote_usd)
 
     def _place_live_sell(self, product_id: str, base_qty: float, *, maker_first: bool = True) -> ExchangeOrderResult:
         adapter = self._active_adapter()
-        if adapter is not None:
+        if maker_first:
             tob = adapter.get_top_of_book(product_id)
-            return adapter.place_limit_sell(product_id, base_qty, limit_price=float(tob["ask"])) if maker_first else adapter.place_market_sell(product_id, base_qty)
-        return self.portfolio.sell_limit_post_only(product_id, base_qty, limit_price=None) if maker_first else self.portfolio.sell_market(product_id, base_qty)
+            return adapter.place_limit_sell(product_id, base_qty, limit_price=float(tob["ask"]))
+        return adapter.place_market_sell(product_id, base_qty)
 
-    async def _refresh_coinbase_fee_tier_if_needed(self, *, force: bool = False) -> None:
-        """
-        Refresh Coinbase maker/taker fee bps from transaction_summary.
-
-        This bot is live-only and fee-aware:
-        - If Coinbase fee tier cannot be detected, trading is blocked.
-        - No hardcoded maker/taker fallback is used.
-        """
-        if not AUTO_REFRESH_COINBASE_FEE_TIER:
-            raise RuntimeError("AUTO_REFRESH_COINBASE_FEE_TIER must remain True for live-only fee-aware mode.")
-
-        if not REQUIRE_COINBASE_FEE_TIER:
-            raise RuntimeError("REQUIRE_COINBASE_FEE_TIER must remain True for live-only fee-aware mode.")
-
-        if not isinstance(self.portfolio, LivePortfolio):
-            raise RuntimeError("Live-only bot requires LivePortfolio.")
-
-        t = now_ts()
-        if (
-            not force
-            and self.current_maker_fee_bps is not None
-            and self.current_taker_fee_bps is not None
-            and (t - float(self.last_fee_tier_refresh_ts or 0.0)) < float(FEE_TIER_REFRESH_SEC)
-        ):
+    async def _refresh_binance_fee_state_if_needed(self, *, force: bool = False) -> None:
+        now_value = now_ts()
+        last_ts = float(getattr(self, "last_fee_tier_refresh_ts", 0.0) or 0.0)
+        if not force and now_value - last_ts < float(FEE_TIER_REFRESH_EVERY_SEC):
             return
-
-        maker_bps, taker_bps, reason = await asyncio.to_thread(self.portfolio.get_fee_tier_bps)
-
-        if maker_bps is None or taker_bps is None:
-            log(
-                f"[fee-tier] unavailable maker={maker_bps} taker={taker_bps} "
-                f"reason={reason}"
-            )
-            self.current_maker_fee_bps = None
-            self.current_taker_fee_bps = None
-            self.last_fee_tier_reason = reason
-            self.last_fee_tier_refresh_ts = t
-            raise RuntimeError(f"Coinbase fee tier is required but unavailable: {reason}")
-
-        self.current_maker_fee_bps = float(maker_bps)
-        self.current_taker_fee_bps = float(taker_bps)
-        self.last_fee_tier_reason = reason
-        self.last_fee_tier_refresh_ts = t
-        log(
-            f"[fee-tier] refreshed from Coinbase: {reason} "
-            f"maker_bps={self.current_maker_fee_bps} "
-            f"taker_bps={self.current_taker_fee_bps}"
-        )
-        maker_bps = float(self._entry_fee_bps_for_mode("MAKER"))
-        taker_bps = float(self._entry_fee_bps_for_mode("MARKET"))
-        if maker_bps >= 50.0 or taker_bps >= 100.0:
-            log(
-                f"[fee-tier-warning] high fee tier active maker_bps={maker_bps:.2f};"
-                f"taker_bps={taker_bps:.2f};"
-                f"bot should prefer fewer higher-edge trades and maker-first entries"
-            )
+        maker_values = []; taker_values = []; per_product = {}
+        for product_id in PRODUCTS:
+            try:
+                maker, taker = await asyncio.to_thread(self._get_live_fee_bps, product_id)
+                maker_values.append(float(maker)); taker_values.append(float(taker))
+                per_product[product_id] = {"maker_bps": float(maker), "taker_bps": float(taker)}
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_fee_refresh_product_failed", data={"product_id": product_id, "error": str(exc)}, level="WARN", also_overall=False)
+        if not maker_values or not taker_values:
+            maker = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0")); taker = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0")); reason = "binance_fee_api_failed_using_fallback"
+        else:
+            maker = max(maker_values); taker = max(taker_values); reason = "binance_fee_api_loaded"
+        self.current_maker_fee_bps = float(maker); self.current_taker_fee_bps = float(taker)
+        self.current_fee_tier_source = "binance_us"; self.current_fee_tier_reason = reason; self.current_fee_tier_loaded = True
+        self.last_fee_tier_refresh_ts = now_value; self.binance_fee_bps_by_product = per_product
+        module_debug(MODULE_NAME, "binance_fee_state_refreshed", data={"maker_bps": self.current_maker_fee_bps, "taker_bps": self.current_taker_fee_bps, "per_product": per_product, "reason": reason}, level="INFO", also_overall=True)
 
     def _entry_fee_bps_for_mode(self, execution_mode: Optional[str] = None) -> float:
-        if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
-            raise RuntimeError("Coinbase fee tier has not been loaded; refusing to estimate entry fees.")
+        mode = str(execution_mode or ENTRY_EXECUTION_MODE).upper()
+        if mode in {"MAKER", "MAKER_FIRST", "LIMIT_MAKER", "POST_ONLY"}:
+            return float(self.current_maker_fee_bps or 0.0)
+        return float(self.current_taker_fee_bps or 0.0)
 
-        mode = str(execution_mode or ENTRY_EXECUTION_MODE).upper().strip()
+    def _exit_fee_bps_for_mode(self, execution_mode: Optional[str] = None) -> float:
+        mode = str(execution_mode or EXIT_EXECUTION_MODE).upper()
+        if mode in {"MAKER", "MAKER_FIRST", "LIMIT_MAKER", "POST_ONLY"}:
+            return float(self.current_maker_fee_bps or 0.0)
+        return float(self.current_taker_fee_bps or 0.0)
 
-        if mode in ("MARKET", "LIMIT_THEN_MARKET"):
-            return float(self.current_taker_fee_bps)
-
-        return float(self.current_maker_fee_bps)
-
-    def _exit_fee_bps_for_mode(self) -> float:
-        if self.current_maker_fee_bps is None or self.current_taker_fee_bps is None:
-            raise RuntimeError("Coinbase fee tier has not been loaded; refusing to estimate exit fees.")
-
-        mode = str(EXIT_EXECUTION_MODE).upper().strip()
-        if mode in ("MARKET", "LIMIT_THEN_MARKET"):
-            return float(self.current_taker_fee_bps)
-        return float(self.current_maker_fee_bps)
+    def _round_trip_cost_bps(self, *, entry_mode: Optional[str] = None, exit_mode: Optional[str] = None, spread_bps: float = 0.0) -> float:
+        return (float(self._entry_fee_bps_for_mode(entry_mode)) + float(self._exit_fee_bps_for_mode(exit_mode)) + float(spread_bps) + float(EST_SLIPPAGE_BPS) + float(EST_ADVERSE_FILL_BPS))
 
     def _position_gross_loss_pct(self, *, entry_price: float, exit_price: float) -> float:
         """Return the gross price loss from entry to the current exit price."""
@@ -12865,19 +12858,23 @@ class TradingBot:
                     return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age}")
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 policy = self._latest_strategy_variant_policy()
-                candidate_variants = ["coinbase_survival_v1", "high_win_rate_v2", "baseline"]
-                approved = []; shadow_only = []
+                candidate_variants = ["high_win_rate_v2", "low_fee_scalp_v1", "baseline"]
+                approved = []
                 for timeframe in ["primary_15m_90d", "regime_1h_365d"]:
                     for variant in candidate_variants:
                         row = policy.get((product_id, timeframe, variant))
-                        if not row: continue
-                        rows = int(row.get("rows", 0)); cb_avg = float(row.get("coinbase_mm_avg", 0.0)); cb_win = float(row.get("coinbase_mm_win", 0.0)); bn_avg = float(row.get("binance_mm_avg", 0.0)); hard_stop = float(row.get("hard_stop_rate", 1.0))
-                        if rows >= int(REPLAY_POLICY_MIN_ROWS) and cb_avg >= float(REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_AVG_BPS) and cb_win >= float(REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_WIN_RATE) and hard_stop <= float(REPLAY_POLICY_MAX_HARD_STOP_RATE):
+                        if not row:
+                            continue
+                        rows = int(row.get("rows", 0) or 0)
+                        bn_taker_avg = float(row.get("binance_taker_taker_avg", row.get("binance_taker_taker_avg_bps", 0.0)) or 0.0)
+                        bn_taker_win = float(row.get("binance_taker_taker_win", row.get("binance_taker_taker_win_rate", 0.0)) or 0.0)
+                        bn_maker_taker_avg = float(row.get("binance_maker_taker_avg", row.get("binance_maker_taker_avg_bps", 0.0)) or 0.0)
+                        hard_stop = float(row.get("hard_stop_rate", 1.0) or 1.0)
+                        profit_pullback = float(row.get("profit_pullback_rate", 0.0) or 0.0)
+                        if (rows >= int(REPLAY_POLICY_MIN_ROWS) and bn_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS) and bn_taker_win >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE) and bn_maker_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS) and hard_stop <= float(REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE) and profit_pullback >= float(REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE)):
                             approved.append((timeframe, variant, row))
-                        elif bool(REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW) and bn_avg > 0:
-                            shadow_only.append((timeframe, variant, row))
                 if not approved:
-                    return False, ("live_buy_blocked:no_coinbase_replay_policy_approval " f"product_id={product_id};shadow_only_binance_candidates={len(shadow_only)}")
+                    return False, ("live_buy_blocked:no_binance_replay_policy_approval " f"product_id={product_id};checked_variants={candidate_variants}")
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
                 calc_status = self._calculation_status()
                 if not bool(calc_status.get("full_viewer_unlocked")):
@@ -15925,52 +15922,57 @@ class TradingBot:
     # --------------------------------------------------------
     # Live execution helpers (avoid blocking asyncio loop)
     # --------------------------------------------------------
+    def _active_adapter(self) -> BinanceUSAdapter:
+        if getattr(self, "exchange_adapter", None) is None:
+            self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+        return self.exchange_adapter
+
+    def _get_top_of_book_live(self, product_id: str) -> Dict[str, Any]:
+        return self._active_adapter().get_top_of_book(product_id)
+
+    def _get_account_balances_live(self) -> Dict[str, Any]:
+        return self._active_adapter().get_account_snapshot()
+
+    def _get_available_quote_live(self) -> float:
+        return self._active_adapter().get_available_asset("USDT")
+
+    def _get_total_quote_live(self) -> float:
+        return self._active_adapter().get_total_asset("USDT")
+
+    def _get_base_qty_live(self, product_id: str) -> float:
+        adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_total_asset(rules.base_asset)
+
+    def _get_available_base_qty_live(self, product_id: str) -> float:
+        adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_available_asset(rules.base_asset)
+
+    def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = True) -> ExchangeOrderResult:
+        adapter = self._active_adapter()
+        if maker_first:
+            tob = adapter.get_top_of_book(product_id)
+            return adapter.place_limit_buy(product_id, quote_usd, limit_price=float(tob["bid"]))
+        return adapter.place_market_buy(product_id, quote_usd)
+
+    def _place_live_sell(self, product_id: str, base_qty: float, *, maker_first: bool = True) -> ExchangeOrderResult:
+        adapter = self._active_adapter()
+        if maker_first:
+            tob = adapter.get_top_of_book(product_id)
+            return adapter.place_limit_sell(product_id, base_qty, limit_price=float(tob["ask"]))
+        return adapter.place_market_sell(product_id, base_qty)
+
+    def _get_live_fee_bps(self, product_id: str) -> Tuple[float, float]:
+        adapter = self._active_adapter(); fees = adapter.fee_bps_for_symbol(adapter.product_to_symbol(product_id)); return float(fees["maker_bps"]), float(fees["taker_bps"])
+
     async def _live_buy_market(self, *, product_id: str, quote_usd: float) -> Any:
-        if not isinstance(self.portfolio, LivePortfolio):
-            raise RuntimeError("live market buy called without LivePortfolio")
-        return await asyncio.to_thread(
-            self.portfolio.buy_market,
-            product_id,
-            float(quote_usd),
-        )
+        return await asyncio.to_thread(self._place_live_buy, product_id, float(quote_usd), maker_first=False)
 
     async def _live_buy_maker(self, *, product_id: str, quote_usd: float, bid: float) -> Any:
-        if not isinstance(self.portfolio, LivePortfolio):
-            raise RuntimeError("live buy called without LivePortfolio")
-        # buy maker at bid (doesn't cross ask)
-        return await asyncio.to_thread(
-            self.portfolio.place_maker_with_reprice,
-            side="BUY",
-            product_id=product_id,
-            quote_usd=float(quote_usd),
-            start_price=float(bid),
-            max_wait_sec=MAKER_ENTRY_TIMEOUT_SEC,
-            reprice_every_sec=MAKER_FIRST_REPRICE_SEC,
-        )
-
-
-    async def _live_sell_maker(self, *, product_id: str, base_qty: float, ask: float) -> Any:
-        if not isinstance(self.portfolio, LivePortfolio):
-            raise RuntimeError("live sell called without LivePortfolio")
-        # sell maker at ask (doesn't cross bid)
-        return await asyncio.to_thread(
-            self.portfolio.place_maker_with_reprice,
-            side="SELL",
-            product_id=product_id,
-            base_qty=float(base_qty),
-            start_price=float(ask),
-            max_wait_sec=MAKER_FIRST_SELL_TIMEOUT_SEC,
-            reprice_every_sec=MAKER_FIRST_REPRICE_SEC,
-        )
+        return await asyncio.to_thread(self._place_live_buy, product_id, float(quote_usd), maker_first=True)
 
     async def _live_sell_market(self, *, product_id: str, base_qty: float) -> Any:
-        if not isinstance(self.portfolio, LivePortfolio):
-            raise RuntimeError("live market sell called without LivePortfolio")
-        return await asyncio.to_thread(
-            self.portfolio.sell_market,
-            product_id,
-            float(base_qty),
-        )
+        return await asyncio.to_thread(self._place_live_sell, product_id, float(base_qty), maker_first=False)
+
+    async def _live_sell_maker(self, *, product_id: str, base_qty: float, ask: float) -> Any:
+        return await asyncio.to_thread(self._place_live_sell, product_id, float(base_qty), maker_first=True)
 
     def _sell_reason_requires_market(self, reason: str, mode_override: Optional[str] = None) -> bool:
         text = str(reason or "").lower()
@@ -16238,50 +16240,25 @@ class TradingBot:
 
 
     async def _live_refresh_cash(self) -> float:
-        """Refresh live cash snapshot in a thread (API calls can block)."""
-        if not isinstance(self.portfolio, LivePortfolio):
-            raise RuntimeError("Live-only bot requires LivePortfolio.")
-        return await asyncio.to_thread(self.portfolio.refresh_cash)
-
-
+        return await asyncio.to_thread(self._get_available_quote_live)
 
     async def _live_can_afford(self, notional_usd: float, fee_bps: Optional[float] = None) -> bool:
-        """
-        Confirm there is enough available Coinbase USD for the requested buy.
-        Uses Coinbase available USD as the authority.
-        """
         if fee_bps is None:
-            fee_bps = self._entry_fee_bps_for_mode()
-
+            _maker, taker = self._get_live_fee_bps(PRODUCTS[0] if PRODUCTS else "BTC-USD")
+            fee_bps = taker
         notional_usd = float(max(0.0, notional_usd))
         if notional_usd <= 0:
             return False
+        available = await asyncio.to_thread(self._get_available_quote_live)
+        required = notional_usd * (1.0 + float(fee_bps) / 10000.0) + float(RESERVE_USD)
+        return float(available) >= float(required)
 
-        if not isinstance(self.portfolio, LivePortfolio):
-            return False
-
-        def _check() -> bool:
-            snap = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
-            available = self.portfolio.get_tradable_usd(snapshot=snap)
-            required = notional_usd * (1.0 + float(fee_bps) / 10000.0)
-            required += float(RESERVE_USD)
-            return available >= required
-
-        return bool(await asyncio.to_thread(_check))
-
-    async def _live_refresh_snapshot(self, *, force: bool = True, ttl_sec: float = 0.0) -> Optional[Dict[str, Dict[str, float]]]:
-        """Refresh live balances snapshot from Coinbase in a worker thread (non-blocking for event loop)."""
-        if not isinstance(self.portfolio, LivePortfolio):
-            return None
-        return await asyncio.to_thread(self.portfolio.refresh_snapshot, force=bool(force), ttl_sec=float(ttl_sec))
+    async def _live_refresh_snapshot(self, *, force: bool = True, ttl_sec: float = 0.0) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._get_account_balances_live)
 
     def _rest_backfill_top_of_book(self, product_ids: Optional[List[str]] = None) -> None:
-        """Fill missing or stale top-of-book data using Coinbase REST quotes."""
         if not ENABLE_REST_TOP_OF_BOOK_FALLBACK:
             return
-        if not isinstance(self.portfolio, LivePortfolio):
-            return
-
         requested_products = product_ids or list(PRODUCTS)
         now_value = now_ts()
         for product_id in requested_products:
@@ -16291,20 +16268,20 @@ class TradingBot:
                 is_stale = tob is not None and (now_value - float(tob.ts)) > float(TOP_OF_BOOK_MAX_STALE_SEC)
             except Exception:
                 is_stale = True
-
             if not is_missing and not is_stale:
                 continue
-
-            bid, ask = self.portfolio.get_best_bid_ask(product_id)
-            if bid is None or ask is None or bid <= 0 or ask <= 0:
-                continue
-
-            quote = TopOfBook(bid=float(bid), ask=float(ask), ts=now_value)
-            self.tob[product_id] = quote
-            log(
-                f"[tob-rest] {product_id} bid={bid:.8f} ask={ask:.8f} "
-                f"spread_bps={quote.spread_bps:.3f}"
-            )
+            try:
+                quote = self._get_top_of_book_live(product_id)
+                bid = float(quote.get("bid", 0.0) or 0.0); ask = float(quote.get("ask", 0.0) or 0.0)
+                if bid <= 0 or ask <= 0:
+                    continue
+                top = TopOfBook(bid=bid, ask=ask, ts=float(quote.get("ts", now_value)))
+                self.tob[product_id] = top
+                mid = (bid + ask) / 2.0; ts_i = int(top.ts)
+                self.mid_series[product_id].push(ts_i, mid); self.live_1m[product_id].push_mid(ts_i, mid)
+                log(f"[tob-rest-binance] {product_id} bid={bid:.8f} ask={ask:.8f} spread_bps={top.spread_bps:.3f}")
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_rest_top_of_book_backfill_failed", data={"product_id": product_id, "error": str(exc)}, level="WARN", also_overall=False)
 
     async def _wait_for_tob_ready(self, timeout_sec: float = TOP_OF_BOOK_WAIT_SEC) -> None:
         """Wait until the configured percentage of products have valid quotes."""
@@ -18650,9 +18627,9 @@ class TradingBot:
         """
         try:
             if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
-                snap = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                snap = self._removed_coinbase_portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
                 return float(
-                    self.portfolio.compute_equity_usd(
+                    self._removed_coinbase_portfolio.compute_equity_usd(
                         mid_by_product=self._live_mid_by_product(),
                         snapshot=snap,
                     )
@@ -18664,7 +18641,7 @@ class TradingBot:
             total = 0.0
 
             if isinstance(self.portfolio, LivePortfolio):
-                total += float(self.portfolio.cash_usd)
+                total += float(self._removed_coinbase_portfolio.cash_usd)
             else:
                 total += float(getattr(self.portfolio, "cash_usd", 0.0) or 0.0)
 
@@ -18706,7 +18683,7 @@ class TradingBot:
                 log(f"[startup-adopt] skipping {product_id}: no mid quote available")
                 continue
 
-            qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+            qty = self._removed_coinbase_portfolio.get_product_total_qty(product_id, snapshot=snap)
             usd_value = float(qty) * float(tob.mid)
             asset = product_base_asset(product_id)
             log(
@@ -18791,8 +18768,8 @@ class TradingBot:
                 skipped_count += 1
                 continue
 
-            available_qty = self.portfolio.get_product_available_qty(product_id, snapshot=snap)
-            total_qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+            available_qty = self._removed_coinbase_portfolio.get_product_available_qty(product_id, snapshot=snap)
+            total_qty = self._removed_coinbase_portfolio.get_product_total_qty(product_id, snapshot=snap)
             if available_qty <= 1e-12 and total_qty <= 1e-12:
                 continue
 
@@ -18855,7 +18832,7 @@ class TradingBot:
                     # to self.positions.
                     try:
                         snap_after_fail = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                        remaining_qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap_after_fail or {})
+                        remaining_qty = self._removed_coinbase_portfolio.get_product_total_qty(product_id, snapshot=snap_after_fail or {})
                         tob_after_fail = self.tob.get(product_id)
                         if remaining_qty > 1e-12 and tob_after_fail and tob_after_fail.mid > 0:
                             approx_entry = float(tob_after_fail.mid)
@@ -18913,8 +18890,8 @@ class TradingBot:
                 skipped_count += 1
 
         final_snap = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-        final_cash = self.portfolio.get_tradable_usd(snapshot=final_snap or {})
-        final_equity = self.portfolio.compute_equity_usd(
+        final_cash = self._removed_coinbase_portfolio.get_tradable_usd(snapshot=final_snap or {})
+        final_equity = self._removed_coinbase_portfolio.compute_equity_usd(
             mid_by_product=self._live_mid_by_product(),
             snapshot=final_snap,
         )
@@ -18936,8 +18913,8 @@ class TradingBot:
             log("[startup] unable to read Coinbase balances")
             return
 
-        cash = self.portfolio.get_tradable_usd(snapshot=snap)
-        equity = self.portfolio.compute_equity_usd(
+        cash = self._removed_coinbase_portfolio.get_tradable_usd(snapshot=snap)
+        equity = self._removed_coinbase_portfolio.compute_equity_usd(
             mid_by_product=self._live_mid_by_product(),
             snapshot=snap,
         )
@@ -19317,13 +19294,14 @@ class TradingBot:
         log("[run] waiting briefly for initial top-of-book data")
         await self._wait_for_tob_ready(timeout_sec=min(20.0, float(TOP_OF_BOOK_WAIT_SEC)))
 
-        await self._refresh_coinbase_fee_tier_if_needed(force=True)
+        await self._refresh_binance_fee_state_if_needed(force=True)
         await asyncio.to_thread(self._rest_backfill_top_of_book, PRODUCTS)
 
-        log("[run] reconciling live Coinbase portfolio before trading")
-        await self._startup_portfolio_reconcile()
+        log("[run] reconciling live Binance.US balances before trading")
+        await self._startup_binance_portfolio_reconcile()
 
         log("[run] starting telemetry and eval loops before slow calibration finishes")
+        user_stream_task = asyncio.create_task(self.binance_user_data_stream_loop())
         telemetry_task = asyncio.create_task(self.telemetry_loop())
         eval_task = asyncio.create_task(self.eval_loop())
         viewer_snapshot_heartbeat_task = asyncio.create_task(self.viewer_snapshot_heartbeat_loop())
@@ -19336,7 +19314,7 @@ class TradingBot:
         historical_replay_task = asyncio.create_task(self.historical_shadow_replay_loop())
 
         try:
-            await asyncio.gather(ws_task, tob_keeper_task, telemetry_task, eval_task, viewer_snapshot_heartbeat_task, history_task, macro_task, calibration_task, extended_chart_task, historical_replay_task)
+            await asyncio.gather(ws_task, user_stream_task, tob_keeper_task, telemetry_task, eval_task, viewer_snapshot_heartbeat_task, history_task, macro_task, calibration_task, extended_chart_task, historical_replay_task)
         finally:
             try:
                 if getattr(self, "_historical_worker_pool", None) is not None:
@@ -19348,76 +19326,26 @@ class TradingBot:
     # WebSocket loop
     # --------------------------------------------------------
     async def ws_loop(self) -> None:
-        """Connect to exchange WebSocket and update top-of-book and mid data."""
-        if getattr(self, "live_exchange", "") == EXCHANGE_BINANCE_US:
-            from binance_us_websocket import BinanceUSBookTickerStream
-            def on_update(data: Dict[str, Any]):
-                product_id = data["product_id"]
-                self.top_of_book[product_id] = TopOfBook(bid=float(data["bid"]), ask=float(data["ask"]), ts=float(data["ts"]))
-            stream = BinanceUSBookTickerStream(PRODUCTS, on_update)
-            await stream.run_forever()
-            return
+        """Connect to Binance.US WebSocket and update top-of-book and mid data."""
+        from binance_us_websocket import BinanceUSBookTickerStream
+        def on_update(data: Dict[str, Any]):
+            try:
+                product_id = str(data["product_id"]); bid = float(data["bid"]); ask = float(data["ask"]); ts = float(data["ts"])
+                mid = float(data.get("mid") or ((bid + ask) / 2.0))
+                if product_id not in PRODUCTS or bid <= 0 or ask <= 0:
+                    return
+                self.tob[product_id] = TopOfBook(bid=bid, ask=ask, ts=ts)
+                self.mid_series[product_id].push(int(ts), mid)
+                self.live_1m[product_id].push_mid(int(ts), mid)
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_book_ticker_update_failed", data={"error": str(exc), "data": data}, level="WARN", also_overall=False)
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(
-                    WS_MARKET_URL,
-                    ping_interval=WS_PING_INTERVAL,
-                    ping_timeout=WS_PING_TIMEOUT,
-                    close_timeout=5,
-                    max_queue=1024,
-                ) as ws:
-                    log(f"[ws] connected url={WS_MARKET_URL} products={PRODUCTS}")
-                    # authenticate and subscribe to ticker and heartbeats
-                    jwt_token = jwt_generator.build_ws_jwt(self.api_key, self.pem_secret)
-                    await ws.send(json.dumps({
-                        "type": "subscribe",
-                        "channel": "ticker",
-                        "product_ids": PRODUCTS,
-                        "jwt": jwt_token
-                    }))
-                    jwt_token = jwt_generator.build_ws_jwt(self.api_key, self.pem_secret)
-                    await ws.send(json.dumps({
-                        "type": "subscribe",
-                        "channel": "heartbeats",
-                        "jwt": jwt_token
-                    }))
-                    log("[ws] subscribed successfully")
-                    last_msg_ts = now_ts()
-                    async for message in ws:
-                        last_msg_ts = now_ts()
-                        if self._stop_event.is_set():
-                            break
-                        try:
-                            data = json.loads(message)
-                        except Exception:
-                            continue
-                        if data.get("type") in ("error", "subscriptions"):
-                            continue
-                        if data.get("channel") != "ticker":
-                            continue
-                        events = data.get("events") or []
-                        for ev in events:
-                            tickers = ev.get("tickers") or []
-                            for t in tickers:
-                                if not isinstance(t, dict):
-                                    continue
-                                product_id = t.get("product_id")
-                                if product_id not in PRODUCTS:
-                                    continue
-                                bid = safe_float(t.get("best_bid"))
-                                ask = safe_float(t.get("best_ask"))
-                                if bid is None or ask is None:
-                                    continue
-                                ts = now_ts_i()
-                                self.tob[product_id] = TopOfBook(bid=bid, ask=ask, ts=ts)
-                                mid = (bid + ask) / 2.0
-                                # update mid series and 1m candles
-                                self.mid_series[product_id].push(ts, mid)
-                                self.live_1m[product_id].push_mid(ts, mid)
-            except Exception as e:
-                module_debug(MODULE_NAME, "websocket_loop_reconnect", data={"error_type": type(e).__name__, "error": str(e), "reconnect_delay_sec": WS_RECONNECT_DELAY_SEC}, level="WARN", also_overall=False)
-                log(f"[ws] reconnecting in {WS_RECONNECT_DELAY_SEC}s")
-                await asyncio.sleep(WS_RECONNECT_DELAY_SEC)
+                stream = BinanceUSBookTickerStream(PRODUCTS, on_update)
+                await stream.run_forever()
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_book_ticker_stream_reconnect", data={"error": str(exc), "delay_sec": WS_RECONNECT_DELAY_SEC}, level="WARN", also_overall=False)
+                await asyncio.sleep(float(WS_RECONNECT_DELAY_SEC))
 
     # --------------------------------------------------------
     # Macro loop
@@ -19516,8 +19444,8 @@ class TradingBot:
 
         if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
             try:
-                snap = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
-                qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+                snap = self._removed_coinbase_portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                qty = self._removed_coinbase_portfolio.get_product_total_qty(product_id, snapshot=snap)
                 return float(qty) * float(tob.mid)
             except Exception:
                 pass
@@ -19566,10 +19494,10 @@ class TradingBot:
     def _open_position_count(self) -> int:
         if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
             try:
-                snap = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                snap = self._removed_coinbase_portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
                 count = 0
                 for product_id in PRODUCTS:
-                    qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap)
+                    qty = self._removed_coinbase_portfolio.get_product_total_qty(product_id, snapshot=snap)
                     if qty > 1e-12:
                         count += 1
                 return count
@@ -19655,7 +19583,7 @@ class TradingBot:
         snapshot: Optional[Dict[str, Dict[str, float]]] = None
         if SOURCE_OF_TRUTH_COINBASE:
             try:
-                snapshot = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                snapshot = self._removed_coinbase_portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
             except Exception:
                 snapshot = None
 
@@ -19669,7 +19597,7 @@ class TradingBot:
 
             held_qty = sum(l.qty for l in self.positions.get(held_product, []))
             if SOURCE_OF_TRUTH_COINBASE and snapshot is not None:
-                held_qty = self.portfolio.get_product_available_qty(held_product, snapshot=snapshot)
+                held_qty = self._removed_coinbase_portfolio.get_product_available_qty(held_product, snapshot=snapshot)
 
             if held_qty <= 1e-12:
                 continue
@@ -20374,9 +20302,9 @@ class TradingBot:
         # Coinbase available balance is the source of truth for what can actually be sold.
         try:
             if isinstance(self.portfolio, LivePortfolio):
-                snap = self.portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
+                snap = self._removed_coinbase_portfolio.refresh_snapshot(force=True, ttl_sec=0.0)
                 base_asset = product_base_asset(product_id)
-                available_qty = self.portfolio.get_available_asset(
+                available_qty = self._removed_coinbase_portfolio.get_available_asset(
                     base_asset,
                     snapshot=snap,
                 )
@@ -20904,7 +20832,7 @@ class TradingBot:
             if not hasattr(self, "portfolio") or self.portfolio is None:
                 context["order_book_reason"] = "portfolio_unavailable"
                 return context
-            book = self.portfolio.get_order_book_snapshot(product_id, limit=int(ORDER_BOOK_LEVELS))
+            book = self._removed_coinbase_portfolio.get_order_book_snapshot(product_id, limit=int(ORDER_BOOK_LEVELS))
             if not bool(book.get("ok", False)):
                 context["order_book_reason"] = str(book.get("reason", "book_not_ok"))
                 return context
@@ -20915,7 +20843,7 @@ class TradingBot:
             top_depth = sum(float(x.get("notional_usd", 0.0) or 0.0) for x in bids[:3]) + sum(float(x.get("notional_usd", 0.0) or 0.0) for x in asks[:3])
             total_depth = max(1e-9, bid_depth + ask_depth)
             imbalance = (bid_depth - ask_depth) / total_depth
-            bid, ask = self.portfolio.get_best_bid_ask(product_id)
+            bid, ask = self._removed_coinbase_portfolio.get_best_bid_ask(product_id)
             spread_bps = 0.0
             if bid is not None and ask is not None and bid > 0 and ask > 0:
                 mid = (float(bid) + float(ask)) / 2.0
@@ -22324,7 +22252,7 @@ class TradingBot:
                 )
             self.last_loop_lag_check_ts = ts_now
 
-            if self.pending_buy_reconciliations and isinstance(self.portfolio, LivePortfolio):
+            if ENABLE_PENDING_BALANCE_DELTA_RECONCILIATION and self.pending_buy_reconciliations:
                 for product_id_r, pending in list(self.pending_buy_reconciliations.items()):
                     age = ts_now - float(pending.get("ts", ts_now))
                     if age < 10.0:
@@ -22332,8 +22260,8 @@ class TradingBot:
                     try:
                         snapshot = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
                         base_asset = product_base_asset(product_id_r)
-                        qty_now = self.portfolio.get_total_asset(base_asset, snapshot=snapshot or {})
-                        cash_now = self.portfolio.get_tradable_usd(snapshot=snapshot or {})
+                        qty_now = self._removed_coinbase_portfolio.get_total_asset(base_asset, snapshot=snapshot or {})
+                        cash_now = self._removed_coinbase_portfolio.get_tradable_usd(snapshot=snapshot or {})
                         before_base = float(pending.get("before_base", 0.0))
                         before_cash = float(pending.get("before_cash", 0.0))
                         requested_quote = float(pending.get("requested_quote_usd", 0.0) or 0.0)
@@ -22458,9 +22386,9 @@ class TradingBot:
                 self.post_buy_review_queue = remaining_reviews
 
             try:
-                await self._refresh_coinbase_fee_tier_if_needed(force=False)
+                await self._refresh_binance_fee_state_if_needed(force=False)
             except Exception as e:
-                log_exception("[fee-tier] trading paused because real Coinbase fees are unavailable", e)
+                log_exception("[fee-tier] trading paused because Binance.US fees are unavailable", e)
                 await asyncio.sleep(EVAL_TICK_SEC)
                 continue
 
@@ -22496,7 +22424,7 @@ class TradingBot:
 
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:
-                    cash_usd = float(self.portfolio.cash_usd)
+                    cash_usd = float(self._removed_coinbase_portfolio.cash_usd)
                 except Exception:
                     cash_usd = float("nan")
 
@@ -22528,14 +22456,14 @@ class TradingBot:
             section_started = time.perf_counter()
             try:
                 snap_live = await asyncio.wait_for(
-                    asyncio.to_thread(self.portfolio.refresh_snapshot, True, 0.0),
+                    asyncio.to_thread(self._removed_coinbase_portfolio.refresh_snapshot, True, 0.0),
                     timeout=8.0,
                 )
                 self.cached_account_snapshot = snap_live
                 self.cached_account_snapshot_ts = now_ts()
-                cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
+                cash_usd = float(self._removed_coinbase_portfolio.get_tradable_usd(snapshot=snap_live))
                 equity_usd = float(
-                    self.portfolio.compute_equity_usd(
+                    self._removed_coinbase_portfolio.compute_equity_usd(
                         mid_by_product=self._live_mid_by_product(),
                         snapshot=snap_live,
                     )
@@ -22543,13 +22471,13 @@ class TradingBot:
             except asyncio.TimeoutError:
                 module_debug(MODULE_NAME, "eval_live_snapshot_refresh_timeout", data={"timeout_sec": 8.0}, level="WARN", also_overall=False)
                 snap_live = self.cached_account_snapshot or {}
-                cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
-                equity_usd = float(self.portfolio.compute_equity_usd(mid_by_product=self._live_mid_by_product(), snapshot=snap_live))
+                cash_usd = float(self._removed_coinbase_portfolio.get_tradable_usd(snapshot=snap_live))
+                equity_usd = float(self._removed_coinbase_portfolio.compute_equity_usd(mid_by_product=self._live_mid_by_product(), snapshot=snap_live))
             except Exception as e:
                 module_exception(MODULE_NAME, "eval_live_snapshot_refresh_failed", e, data={"traceback": traceback.format_exc()}, also_overall=False)
                 snap_live = self.cached_account_snapshot or {}
-                cash_usd = float(self.portfolio.get_tradable_usd(snapshot=snap_live))
-                equity_usd = float(self.portfolio.compute_equity_usd(mid_by_product=self._live_mid_by_product(), snapshot=snap_live))
+                cash_usd = float(self._removed_coinbase_portfolio.get_tradable_usd(snapshot=snap_live))
+                equity_usd = float(self._removed_coinbase_portfolio.compute_equity_usd(mid_by_product=self._live_mid_by_product(), snapshot=snap_live))
 
             mark_cycle_section("live_snapshot_refresh", section_started)
 
@@ -23392,7 +23320,7 @@ class TradingBot:
                 try:
                     if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
                         live_snapshot_for_buy = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                        live_cash_for_buy = self.portfolio.get_tradable_usd(snapshot=live_snapshot_for_buy or {})
+                        live_cash_for_buy = self._removed_coinbase_portfolio.get_tradable_usd(snapshot=live_snapshot_for_buy or {})
                         if live_cash_for_buy >= 0:
                             cash_usd = float(live_cash_for_buy)
                             equity_usd = float(self._equity_usd())
@@ -23401,8 +23329,8 @@ class TradingBot:
                 existing_qty = sum(l.qty for l in self.positions.get(product_id, []))
                 if SOURCE_OF_TRUTH_COINBASE and isinstance(self.portfolio, LivePortfolio):
                     try:
-                        snap_check = self.portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
-                        existing_qty = self.portfolio.get_product_total_qty(product_id, snapshot=snap_check)
+                        snap_check = self._removed_coinbase_portfolio.refresh_snapshot(force=False, ttl_sec=1.25)
+                        existing_qty = self._removed_coinbase_portfolio.get_product_total_qty(product_id, snapshot=snap_check)
                     except Exception:
                         existing_qty = sum(l.qty for l in self.positions.get(product_id, []))
                 product_exposure = self._current_product_exposure_usd(product_id)
@@ -23566,10 +23494,10 @@ class TradingBot:
                 try:
                     if isinstance(self.portfolio, LivePortfolio):
                         before_buy_snapshot = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                        before_buy_base = self.portfolio.get_product_total_qty(
+                        before_buy_base = self._removed_coinbase_portfolio.get_product_total_qty(
                             product_id, snapshot=before_buy_snapshot or {}
                         )
-                        before_buy_cash = self.portfolio.get_tradable_usd(
+                        before_buy_cash = self._removed_coinbase_portfolio.get_tradable_usd(
                             snapshot=before_buy_snapshot or {}
                         )
                 except Exception as exc:
@@ -24098,14 +24026,7 @@ class TradingBot:
                     >= TELEMETRY_ACCOUNT_REFRESH_TTL_SEC
                 ):
                     try:
-                        self.cached_account_snapshot = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self.portfolio.refresh_snapshot,
-                                True,
-                                0.0,
-                            ),
-                            timeout=8.0,
-                        )
+                        self.cached_account_snapshot = await asyncio.wait_for(asyncio.to_thread(self._get_account_balances_live), timeout=8.0)
                         self.cached_account_snapshot_ts = now_ts()
                     except asyncio.TimeoutError:
                         module_debug(
@@ -24119,13 +24040,10 @@ class TradingBot:
                         self.cached_account_snapshot_ts = float(getattr(self, "cached_account_snapshot_ts", 0.0) or 0.0)
 
                 snap_live = self.cached_account_snapshot
-                cash_usd = self.portfolio.get_tradable_usd(snapshot=snap_live)
-                equity_usd = self.portfolio.compute_equity_usd(
-                    mid_by_product=self._live_mid_by_product(),
-                    snapshot=snap_live,
-                )
+                cash_usd = await asyncio.to_thread(self._get_available_quote_live)
+                equity_usd = await asyncio.to_thread(self._portfolio_value_usdt_estimate)
             except Exception as e:
-                log(f"[telemetry] Coinbase equity refresh failed: {e}")
+                log(f"[telemetry] Binance.US equity refresh failed: {e}")
                 snap_live = None
                 cash_usd = 0.0
                 equity_usd = 0.0
@@ -24139,16 +24057,14 @@ class TradingBot:
                 positions = self.positions[product]
 
                 try:
-                    position_qty = self.portfolio.get_product_total_qty(
-                        product, snapshot=snap_live or {}
-                    )
+                    position_qty = await asyncio.to_thread(self._get_base_qty_live, product)
                     exposures_usd = float(position_qty) * float(mid)
 
                     local_qty = sum(lot.qty for lot in positions)
                     local_cost = sum(lot.qty * lot.price for lot in positions)
                     avg_entry_price = (local_cost / local_qty) if local_qty > 0 else None
                 except Exception as e:
-                    log(f"[telemetry] Coinbase position read failed for {product}: {e}")
+                    log(f"[telemetry] Binance.US position read failed for {product}: {e}")
                     exposures_usd = 0.0
                     position_qty = 0.0
                     avg_entry_price = None
@@ -24320,7 +24236,7 @@ def load_pem_secret_from_env() -> str:
     return pem
 
 
-def load_coinbase_client() -> RESTClient:
+def LEGACY_UNUSED_load_removed_exchange_client() -> Any:
     """Instantiate the Coinbase REST client using env credentials."""
     load_dotenv()
     api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
@@ -24329,7 +24245,7 @@ def load_coinbase_client() -> RESTClient:
         raise RuntimeError("Missing COINBASE_API_KEY in .env")
     if not api_key.startswith("organizations/"):
         raise RuntimeError("COINBASE_API_KEY must start with 'organizations/.../apiKeys/...'")
-    return RESTClient(api_key=api_key, api_secret=pem)
+    raise RuntimeError("Coinbase support has been removed from this Binance.US-only build.")
 
 
 def _coinbase_response_dict(response: Any) -> Dict[str, Any]:
@@ -24396,7 +24312,7 @@ def get_available_product_ids(
     return available
 
 
-def validate_configured_products_with_coinbase(
+def LEGACY_UNUSED_validate_removed_exchange_products(
     products: List[str],
     client: RESTClient,
 ) -> List[str]:
@@ -24643,19 +24559,13 @@ async def main() -> None:
         log("[startup] bot.py launching")
         log(f"[startup] process_lock_pid={process_lock_pid}")
         log(f"[startup] file={os.path.abspath(__file__)}")
-        log("[startup] loading exchange client")
+        log("[startup] loading Binance.US exchange client")
         load_dotenv(os.path.join(BASE_DIR, ".env"))
-        if LIVE_EXECUTION_EXCHANGE_ID == EXCHANGE_BINANCE_US:
-            adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
-            rest = adapter.client
-            api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
-            pem = ""
-        else:
-            if RESTClient is None:
-                raise RuntimeError("Coinbase SDK not installed, but LIVE_EXECUTION_EXCHANGE is not binance_us.")
-            rest = load_coinbase_client()
-            api_key = (os.environ.get("COINBASE_API_KEY") or "").strip()
-            pem = load_pem_secret_from_env()
+        adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+        rest = adapter.client
+        api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
+        pem = ""
+        log("[startup] Binance.US mode " f"dry_run={BINANCE_US_DRY_RUN} " f"allow_real_orders={BINANCE_US_ALLOW_REAL_ORDERS} " f"live_execution_enabled={ENABLE_BINANCE_LIVE_EXECUTION} " f"spot_trading_enabled={BINANCE_US_ENABLE_SPOT_TRADING}")
 
         log("[startup] selecting products")
         if AUTO_SELECT_PRODUCTS:
@@ -24671,25 +24581,29 @@ async def main() -> None:
             PRODUCTS = list(PRODUCTS_DEFAULT)
 
         PRODUCTS = [p for p in PRODUCTS if p.endswith("-USD")]
-        if LIVE_EXECUTION_EXCHANGE_ID == EXCHANGE_BINANCE_US:
-            valid_products = []
-            for product_id in PRODUCTS:
-                symbol = product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
-                if not symbol:
-                    log(f"[config] no Binance.US symbol mapping for {product_id}; skipping")
+        valid_products = []
+        for product_id in PRODUCTS:
+            symbol = product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
+            if not symbol:
+                log(f"[config] no Binance.US symbol mapping for {product_id}; skipping")
+                continue
+            try:
+                info = adapter.client.exchange_info(symbol=symbol)
+                symbols = info.get("symbols", [])
+                if not symbols:
+                    log(f"[config] Binance.US returned no exchangeInfo symbols for {product_id}->{symbol}")
                     continue
-                try:
-                    info = adapter.client.exchange_info(symbol=symbol)
-                    symbol_info = info.get("symbols", [])[0]
-                    if str(symbol_info.get("status", "")).upper() == "TRADING":
-                        valid_products.append(product_id)
-                    else:
-                        log(f"[config] Binance.US symbol not TRADING: {product_id}->{symbol}")
-                except Exception as exc:
-                    log(f"[config] Binance.US validation failed for {product_id}->{symbol}: {exc}")
-            PRODUCTS = valid_products
-        else:
-            PRODUCTS = await asyncio.to_thread(validate_configured_products_with_coinbase, PRODUCTS, rest)
+                symbol_info = symbols[0]
+                status = str(symbol_info.get("status", "")).upper()
+                if status == "TRADING":
+                    valid_products.append(product_id)
+                else:
+                    log(f"[config] Binance.US symbol not TRADING: {product_id}->{symbol}; status={status}")
+            except Exception as exc:
+                log(f"[config] Binance.US validation failed for {product_id}->{symbol}: {exc}")
+        PRODUCTS = valid_products
+        if not PRODUCTS:
+            raise RuntimeError("No configured products are currently available on Binance.US.")
 
         log(f"[config] live_exchange={LIVE_EXECUTION_EXCHANGE_ID} product_count={len(PRODUCTS)} products={PRODUCTS}")
         if len(PRODUCTS) < 15:
@@ -24700,8 +24614,7 @@ async def main() -> None:
         log("[startup] creating TradingBot instance")
         bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
         log(f"[startup] LIVE-ONLY MODE: live_exchange={LIVE_EXECUTION_EXCHANGE_ID} dry_run={BINANCE_US_DRY_RUN} allow_real_orders={BINANCE_US_ALLOW_REAL_ORDERS}")
-        if LIVE_EXECUTION_EXCHANGE_ID == EXCHANGE_BINANCE_US:
-            bot.exchange_adapter = adapter
+        bot.exchange_adapter = adapter
 
         if not hasattr(bot, "run"):
             raise RuntimeError("TradingBot instance has no run(); ensure you are running the updated bot.py file.")

@@ -12,9 +12,6 @@ class BaseExchangeAdapter:
     def place_market_sell(self, product_id: str, base_qty: float)->ExchangeOrderResult: raise NotImplementedError
     def place_limit_sell(self, product_id: str, base_qty: float, limit_price: float)->ExchangeOrderResult: raise NotImplementedError
     def cancel_order(self, order_id: str, product_id: Optional[str]=None, symbol: Optional[str]=None)->bool: raise NotImplementedError
-class CoinbaseAdapterPlaceholder(BaseExchangeAdapter):
-    exchange_id="coinbase"
-    def __init__(self, live_portfolio: Any): self.live_portfolio=live_portfolio
 import os, time, uuid
 from binance_us_client import BinanceUSClient
 from binance_symbol_filters import parse_symbol_rules, quantity_from_quote, format_price, format_quantity, order_meets_minimums
@@ -52,12 +49,18 @@ class BinanceUSAdapter(BaseExchangeAdapter):
         if symbol not in self.fee_cache:
             try:
                 row=self.client.trading_fee(symbol=symbol); row=row[0] if isinstance(row, list) else row; maker=float(row.get("makerCommission") or 0.0)*10000; taker=float(row.get("takerCommission") or 0.0)*10000
-            except Exception:
+                self.fee_cache[symbol]={"maker_bps":maker,"taker_bps":taker,"source":"api"}
+            except Exception as exc:
                 maker=float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS","0.0")); taker=float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS","2.0"))
-            self.fee_cache[symbol]={"maker_bps":maker,"taker_bps":taker}
+                self.fee_cache[symbol]={"maker_bps":maker,"taker_bps":taker,"source":"fallback","error":str(exc)}
         return self.fee_cache[symbol]
     def _result_from_order(self, *, product_id, side, requested_quote_usd=0.0, raw):
-        fills=raw.get("fills") or []; qty=float(raw.get("executedQty") or 0.0); quote=float(raw.get("cummulativeQuoteQty") or raw.get("cumQuote") or 0.0); fee=sum(float(f.get("commission") or 0.0) for f in fills if str(f.get("commissionAsset") or "") in {"USDT","USD","USDC"})
+        fills=raw.get("fills") or []; qty=float(raw.get("executedQty") or 0.0); quote=float(raw.get("cummulativeQuoteQty") or raw.get("cumQuote") or 0.0); fee=0.0; fee_assets=[]
+        for f in fills:
+            commission=float(f.get("commission") or 0.0); asset=str(f.get("commissionAsset") or "")
+            fee_assets.append({"asset":asset,"amount":commission})
+            if asset in {"USDT","USD","USDC"}: fee += commission
+        raw["fee_assets"] = fee_assets
         return ExchangeOrderResult(str(raw.get("status","")).upper() in {"FILLED","PARTIALLY_FILLED","NEW"}, self.exchange_id, product_id, side, float(requested_quote_usd), qty, quote/qty if qty>0 else 0.0, fee, str(raw.get("orderId") or ""), str(raw.get("status") or ""), raw, "")
     def place_market_buy(self, product_id, quote_usd):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); tob=self.get_top_of_book(product_id)
@@ -84,3 +87,9 @@ class BinanceUSAdapter(BaseExchangeAdapter):
             if not product_id: raise RuntimeError("cancel_order requires product_id or symbol")
             symbol=self.product_to_symbol(product_id)
         return bool(self.client.cancel_order(symbol=symbol, order_id=str(order_id)))
+
+# Binance.US order status helper
+def _binance_adapter_get_order(self, product_id: str, order_id: str) -> Dict[str, Any]:
+    symbol = self.product_to_symbol(product_id)
+    return self.client.get_order(symbol=symbol, order_id=str(order_id))
+BinanceUSAdapter.get_order = _binance_adapter_get_order

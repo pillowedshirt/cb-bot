@@ -61,15 +61,9 @@ AGENT_TRADE_POLICY_CSV = os.path.join(BASE_DIR, "agent_trade_policy.csv")
 AGENT_SIDE_RATINGS_CSV = os.path.join(BASE_DIR, "agent_side_ratings.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
-BUY_LEAD_ONLY_MODE = True
-BUY_LEAD_AGENT_NAMES = {
-    "previous_session_volume_profile_agent",
-    "trend",
-}
-BUY_LEAD_AGENT_FALLBACK_WEIGHT_PCT = {
-    "previous_session_volume_profile_agent": 70.0,
-    "trend": 30.0,
-}
+BUY_LEAD_ONLY_MODE = False
+BUY_LEAD_AGENT_NAMES = set()
+BUY_LEAD_AGENT_FALLBACK_WEIGHT_PCT = {}
 BUY_LEAD_AGENT_MIN_ROWS = 25
 
 LEVEL8_CSV_TAIL_LIMITS = {
@@ -1470,26 +1464,17 @@ class Level8Council:
         agent_policy = self._latest_agent_trade_policy() if hasattr(self, "_latest_agent_trade_policy") else {}
         side_ratings = self._latest_agent_side_ratings() if hasattr(self, "_latest_agent_side_ratings") else {}
         for vote in adjusted_votes:
-            if str(decision_side).upper() == "BUY" and BUY_LEAD_ONLY_MODE:
-                if str(vote.agent) not in BUY_LEAD_AGENT_NAMES:
-                    continue
+            # BUY_LEAD_ONLY_MODE is intentionally disabled.
+            # All analysts remain eligible for BUY voting.
+            # The four-pass model determines each analyst's actual buy weight.
 
             raw_weight = max(0.0, float(vote.confidence) * float(vote.reliability))
             side_rating = side_ratings.get(str(vote.agent), {})
             side = str(decision_side).upper()
             if side == "BUY":
-                if BUY_LEAD_ONLY_MODE:
-                    buy_rows = float(side_rating.get("buy_rows", 0.0) or 0.0)
-                    learned_pct = float(side_rating.get("buy_weight_pct", 0.0) or 0.0)
-                    if buy_rows >= BUY_LEAD_AGENT_MIN_ROWS and learned_pct > 0.0:
-                        lead_pct = learned_pct
-                    else:
-                        lead_pct = float(BUY_LEAD_AGENT_FALLBACK_WEIGHT_PCT.get(str(vote.agent), 0.0) or 0.0)
-                    raw_weight *= max(0.0, lead_pct) / 100.0
-                else:
-                    buy_rows = float(side_rating.get("buy_rows", 0.0) or 0.0)
-                    if buy_rows >= 10:
-                        raw_weight *= float(side_rating.get("buy_weight_multiplier", 1.0) or 1.0)
+                buy_rows = float(side_rating.get("buy_rows", 0.0) or 0.0)
+                if buy_rows >= 10:
+                    raw_weight *= float(side_rating.get("buy_weight_multiplier", 1.0) or 1.0)
             elif side == "SELL":
                 sell_rows = float(side_rating.get("sell_rows", 0.0) or 0.0)
                 if sell_rows >= 5:

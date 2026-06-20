@@ -228,6 +228,15 @@ def env_float(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return int(default)
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return int(default)
+
 def env_str(name: str, default: str = "") -> str:
     value = os.getenv(name)
     if value is None:
@@ -553,7 +562,13 @@ HISTORICAL_REPLAY_WORKER_INCLUDE_DAILY_CONTEXT: bool = False
 ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE: bool = True
 HISTORICAL_REPLAY_WORKER_MAX_ATTEMPTS: int = 3
 ENABLE_HISTORICAL_REPLAY_PROCESS_POOL: bool = True
-HISTORICAL_REPLAY_PROCESS_WORKERS: int = min(8, max(4, (os.cpu_count() or 4)))
+HISTORICAL_REPLAY_PROCESS_WORKERS: int = max(
+    4,
+    min(
+        env_int("HISTORICAL_REPLAY_PROCESS_WORKERS", 15),
+        max(4, (os.cpu_count() or 4) - 1),
+    ),
+)
 ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS: bool = True
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_summary.csv")
 REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
@@ -562,8 +577,8 @@ DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
 CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
 PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
 EXCHANGE_PRODUCT_MAP_CSV_PATH: str = os.path.join(BASE_DIR, "exchange_product_map.csv")
-HISTORY_FETCH_CONCURRENCY: int = 2
-MACRO_FETCH_CONCURRENCY: int = 1
+HISTORY_FETCH_CONCURRENCY: int = max(2, min(env_int("HISTORY_FETCH_CONCURRENCY", 8), 15))
+MACRO_FETCH_CONCURRENCY: int = max(1, min(env_int("MACRO_FETCH_CONCURRENCY", 6), 15))
 MACRO_DAY_REFRESH_EVERY_SEC = 180
 MACRO_WEEK_REFRESH_EVERY_SEC = 900
 MACRO_PRODUCTS_PER_PASS = 1
@@ -1430,10 +1445,22 @@ HIST_REPLAY_STARTUP_ACCELERATION_ENABLED: bool = True
 HIST_REPLAY_PARALLEL_STARTUP_ENABLED: bool = True
 # Number of product/timeframe replay jobs to execute concurrently while the viewer is locked.
 # Start with 4. Raising this too high can cause disk/API/network contention.
-HIST_REPLAY_STARTUP_PARALLEL_JOBS: int = HISTORICAL_REPLAY_PROCESS_WORKERS
+HIST_REPLAY_STARTUP_PARALLEL_JOBS: int = max(
+    4,
+    min(
+        env_int("HIST_REPLAY_STARTUP_PARALLEL_JOBS", HISTORICAL_REPLAY_PROCESS_WORKERS),
+        HISTORICAL_REPLAY_PROCESS_WORKERS,
+    ),
+)
 # Maximum simultaneous historical candle downloads/backfills.
 # This controls Binance bulk and Coinbase fallback pressure.
-HIST_REPLAY_MAX_PARALLEL_FETCHES: int = min(6, HISTORICAL_REPLAY_PROCESS_WORKERS)
+HIST_REPLAY_MAX_PARALLEL_FETCHES: int = max(
+    4,
+    min(
+        env_int("HIST_REPLAY_MAX_PARALLEL_FETCHES", 12),
+        HISTORICAL_REPLAY_PROCESS_WORKERS,
+    ),
+)
 # Keep output writes serialized.
 # Multiple workers can calculate at the same time, but only one should append to shared CSVs at a time.
 HIST_REPLAY_SERIALIZE_OUTPUT_WRITES: bool = True
@@ -13167,7 +13194,7 @@ class TradingBot:
                         four_pass_ok = False
                     if not four_pass_ok:
                         return False, (
-                            f"live_buy_blocked:no_strict_profitability_replay_approval "
+                            f"live_buy_blocked:no_weighted_all_agent_council_profitability_approval "
                             f"{replay_gate.get('reason', '')}"
                         )
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
@@ -17132,6 +17159,69 @@ class TradingBot:
         cached = self._read_candles_from_csv_for_replay(path=fallback_path, product_id=product_id, min_ts=float(start_ts))
         if len(cached) >= max(1, int(min_needed)) and self._candles_recent_enough_for_timeframe(cached, tf):
             return cached, granularity, HISTORICAL_SOURCE_LOCAL_CACHE
+        # Incremental gap-fill:
+        # If we already have most of the historical cache, do not refetch the entire window.
+        # Fetch only from the newest cached candle to now, then re-read the merged cache.
+        if cached:
+            try:
+                newest_cached_ts = max(int(c.ts) for c in cached)
+                gap_start_ts = newest_cached_ts + int(granularity)
+                gap_end_ts = int(now_i)
+
+                if gap_end_ts > gap_start_ts:
+                    async with self._historical_replay_fetch_sem:
+                        gap_candles = await self.fetcher.fetch_chunked(
+                            product_id,
+                            gap_start_ts,
+                            gap_end_ts,
+                            granularity,
+                            max_candles_per_req=300,
+                        )
+
+                    if gap_candles:
+                        async with self._historical_replay_cache_write_lock:
+                            await asyncio.to_thread(
+                                self._write_historical_replay_candle_cache,
+                                path=fallback_path,
+                                product_id=product_id,
+                                candles=gap_candles,
+                                min_ts=start_ts,
+                            )
+
+                        refreshed_cached = self._read_candles_from_csv_for_replay(
+                            path=fallback_path,
+                            product_id=product_id,
+                            min_ts=float(start_ts),
+                        )
+
+                        if (
+                            len(refreshed_cached) >= max(1, int(min_needed))
+                            and self._candles_recent_enough_for_timeframe(refreshed_cached, tf)
+                        ):
+                            module_debug(
+                                MODULE_NAME,
+                                "historical_replay_incremental_gapfill_used",
+                                data={
+                                    "product_id": product_id,
+                                    "timeframe": tf,
+                                    "cached_before": len(cached),
+                                    "gap_rows": len(gap_candles),
+                                    "cached_after": len(refreshed_cached),
+                                    "gap_start_ts": int(gap_start_ts),
+                                    "gap_end_ts": int(gap_end_ts),
+                                },
+                                level="INFO",
+                                also_overall=False,
+                            )
+                            return refreshed_cached, granularity, "local_cache_incremental_gapfill"
+            except Exception as gap_exc:
+                module_debug(
+                    MODULE_NAME,
+                    "historical_replay_incremental_gapfill_failed",
+                    data={"product_id": product_id, "timeframe": tf, "error": str(gap_exc)},
+                    level="WARN",
+                    also_overall=False,
+                )
         if bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL) and "binance_bulk" in HISTORICAL_CANDLE_SOURCE_PRIORITY:
             binance_candles, binance_meta = await self._try_binance_bulk_historical_backfill(product_id=product_id, timeframe=tf, cache_path=fallback_path, start_ts=int(start_ts), end_ts=int(now_i))
             if len(binance_candles) >= max(1, int(min_needed)) and self._candles_recent_enough_for_timeframe(binance_candles, tf):
@@ -18070,6 +18160,10 @@ class TradingBot:
                 except Exception:
                     pass
                 try:
+                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True)
+                except Exception:
+                    pass
+                try:
                     self._write_backtest_setup_performance_from_replay()
                 except Exception:
                     pass
@@ -18470,7 +18564,7 @@ class TradingBot:
                     phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(data=status)
                 latch = self._load_calculation_complete_latch()
@@ -22017,13 +22111,27 @@ class TradingBot:
         """Refresh macro day/week context using Binance klines."""
         while not self._stop_event.is_set():
             try:
-                for product_id in PRODUCTS:
-                    try:
-                        refresh = getattr(self, "_refresh_macro_context_for_product", None)
-                        if callable(refresh):
-                            await refresh(product_id)
-                    except Exception as product_exc:
-                        module_debug(MODULE_NAME, "macro_refresh_product_failed", data={"product_id": product_id, "error": str(product_exc)}, level="WARN", also_overall=False)
+                refresh = getattr(self, "_refresh_macro_context_for_product", None)
+                if callable(refresh):
+                    sem = asyncio.Semaphore(int(MACRO_FETCH_CONCURRENCY))
+
+                    async def _refresh_one(product_id: str) -> None:
+                        async with sem:
+                            try:
+                                await refresh(product_id)
+                            except Exception as product_exc:
+                                module_debug(
+                                    MODULE_NAME,
+                                    "macro_refresh_product_failed",
+                                    data={"product_id": product_id, "error": str(product_exc)},
+                                    level="WARN",
+                                    also_overall=False,
+                                )
+
+                    await asyncio.gather(
+                        *[asyncio.create_task(_refresh_one(product_id)) for product_id in PRODUCTS],
+                        return_exceptions=True,
+                    )
                 self._macro_ready = True
             except Exception as exc:
                 module_exception(MODULE_NAME, "macro_refresh_loop_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)

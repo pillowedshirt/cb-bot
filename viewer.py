@@ -2489,7 +2489,7 @@ def render_four_pass_backtest_box(
     cols[3].metric("SELL Pass 2 Council", sell_council_rows)
 
     if buy_agent_rows > 0:
-        st.markdown("#### Lead BUY Analysts")
+        st.markdown("#### BUY Agent Weights")
         display_cols = [c for c in ["agent", "selected_count", "win_rate", "avg_net_bps", "median_net_bps", "score", "buy_weight_pct"] if c in four_pass_agent_buy_df.columns]
         st.dataframe(four_pass_agent_buy_df.sort_values("buy_weight_pct", ascending=False)[display_cols], use_container_width=True, hide_index=True)
 

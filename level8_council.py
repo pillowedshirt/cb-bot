@@ -33,6 +33,7 @@ module_debug(
 
 import csv
 import json
+import math
 import os
 import sqlite3
 import uuid
@@ -57,6 +58,7 @@ SHADOW_TRADES_CSV = os.path.join(BASE_DIR, "shadow_trades.csv")
 AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
 AGENT_ABLATION_CSV = os.path.join(BASE_DIR, "agent_ablation.csv")
 AGENT_TRADE_POLICY_CSV = os.path.join(BASE_DIR, "agent_trade_policy.csv")
+AGENT_SIDE_RATINGS_CSV = os.path.join(BASE_DIR, "agent_side_ratings.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
 LEVEL8_CSV_TAIL_LIMITS = {
@@ -66,6 +68,7 @@ LEVEL8_CSV_TAIL_LIMITS = {
     "missed_opportunities.csv": 5000,
     "trades.csv": 5000,
     "agent_ablation.csv": 5000,
+    "agent_side_ratings.csv": 5000,
 }
 
 LEVEL8_CSV_USECOLS = {
@@ -74,6 +77,7 @@ LEVEL8_CSV_USECOLS = {
     "backtest_agent_priors.csv": ["ts", "product_id", "agent", "strategy", "setup_tag", "market_regime", "execution_state", "outcome_move_bps", "move_bps", "outcome_success", "success", "outcome_source"],
     "missed_opportunities.csv": ["ts", "product_id", "move_bps", "decision_action", "decision_strategy"],
     "trades.csv": ["ts", "event", "product_id", "side", "entry_price", "exit_price", "price", "move_bps", "net_pnl_usd", "pnl", "agent"],
+    "agent_side_ratings.csv": ["ts", "agent", "buy_rows", "buy_accuracy", "buy_score", "buy_weight_pct", "buy_weight_multiplier", "sell_rows", "sell_accuracy", "sell_score", "sell_weight_pct", "sell_weight_multiplier"],
 }
 
 
@@ -160,16 +164,16 @@ AGENT_UNPROVEN_MAX_DIRECTIONAL_ADJ: float = 0.07
 AGENT_PROVEN_MAX_DIRECTIONAL_ADJ: float = 0.24
 
 BUY_REDUNDANCY_GROUP_CAPS = {
-    "economics": 0.30, "volume": 0.34, "previous_session": 0.18,
-    "quant": 0.16, "price_action": 0.20, "session_liquidity": 0.18,
-    "cross_asset": 0.10, "risk_execution": 0.22, "learning": 0.20,
-    "other": 0.16,
+    "economics": 0.34, "volume": 0.34, "previous_session": 0.20,
+    "quant": 0.24, "price_action": 0.30, "session_liquidity": 0.26,
+    "cross_asset": 0.14, "risk_execution": 0.30, "learning": 0.30,
+    "other": 0.22,
 }
 SELL_REDUNDANCY_GROUP_CAPS = {
-    "economics": 0.30, "volume": 0.30, "previous_session": 0.18,
-    "quant": 0.18, "price_action": 0.22, "session_liquidity": 0.16,
-    "cross_asset": 0.10, "risk_execution": 0.24, "profit_capture": 0.36,
-    "learning": 0.18, "other": 0.16,
+    "economics": 0.34, "volume": 0.32, "previous_session": 0.22,
+    "quant": 0.24, "price_action": 0.30, "session_liquidity": 0.24,
+    "cross_asset": 0.14, "risk_execution": 0.30, "profit_capture": 0.38,
+    "learning": 0.28, "other": 0.22,
 }
 
 
@@ -414,6 +418,9 @@ class Level8Council:
         self._agent_leaderboard_cache: Dict[str, Dict[str, float]] = {}
         self._agent_leaderboard_cache_ts: float = 0.0
         self._agent_leaderboard_cache_sec: float = 60.0
+        self._agent_side_ratings_cache: Dict[str, Dict[str, float]] = {}
+        self._agent_side_ratings_cache_ts: float = 0.0
+        self._agent_side_ratings_cache_sec: float = 60.0
         self._agent_ablation_cache: Dict[str, Dict[str, float]] = {}
         self._agent_ablation_cache_ts: float = 0.0
         # Lightweight in-process caches prevent every agent vote from re-reading
@@ -1405,6 +1412,42 @@ class Level8Council:
             return out
         except Exception:
             return {}
+
+    def _latest_agent_side_ratings(self) -> Dict[str, Dict[str, Any]]:
+        """Latest separate buy/sell analyst authority."""
+        try:
+            now_value = utc_ts()
+            if self._agent_side_ratings_cache and now_value - float(self._agent_side_ratings_cache_ts) < float(self._agent_side_ratings_cache_sec):
+                return dict(self._agent_side_ratings_cache)
+            self._agent_side_ratings_cache = {}
+            self._agent_side_ratings_cache_ts = now_value
+            frame = _read_csv_tail_direct(AGENT_SIDE_RATINGS_CSV, 5000, usecols=LEVEL8_CSV_USECOLS.get("agent_side_ratings.csv"))
+            if frame.empty or "agent" not in frame.columns:
+                return {}
+            if "ts" in frame.columns:
+                frame["ts_num"] = pd.to_numeric(frame["ts"], errors="coerce")
+                frame = frame.sort_values("ts_num")
+            latest = frame.groupby(frame["agent"].astype(str), as_index=False).tail(1)
+            for _, row in latest.iterrows():
+                agent = str(row.get("agent") or "")
+                if not agent:
+                    continue
+                self._agent_side_ratings_cache[agent] = {
+                    "buy_rows": float(row.get("buy_rows", 0.0) or 0.0),
+                    "buy_accuracy": float(row.get("buy_accuracy", 0.5) or 0.5),
+                    "buy_score": float(row.get("buy_score", 0.5) or 0.5),
+                    "buy_weight_pct": float(row.get("buy_weight_pct", 0.0) or 0.0),
+                    "buy_weight_multiplier": float(row.get("buy_weight_multiplier", 1.0) or 1.0),
+                    "sell_rows": float(row.get("sell_rows", 0.0) or 0.0),
+                    "sell_accuracy": float(row.get("sell_accuracy", 0.5) or 0.5),
+                    "sell_score": float(row.get("sell_score", 0.5) or 0.5),
+                    "sell_weight_pct": float(row.get("sell_weight_pct", 0.0) or 0.0),
+                    "sell_weight_multiplier": float(row.get("sell_weight_multiplier", 1.0) or 1.0),
+                }
+            return dict(self._agent_side_ratings_cache)
+        except Exception:
+            return {}
+
     def _weighted_vote_pairs(
         self,
         adjusted_votes: list[AgentVote],
@@ -1414,8 +1457,15 @@ class Level8Council:
         """Return vote weights after redundancy-group caps."""
         raw_pairs: list[tuple[AgentVote, float, str]] = []
         agent_policy = self._latest_agent_trade_policy() if hasattr(self, "_latest_agent_trade_policy") else {}
+        side_ratings = self._latest_agent_side_ratings() if hasattr(self, "_latest_agent_side_ratings") else {}
         for vote in adjusted_votes:
             raw_weight = max(0.0, float(vote.confidence) * float(vote.reliability))
+            side_rating = side_ratings.get(str(vote.agent), {})
+            side = str(decision_side).upper()
+            if side == "BUY":
+                raw_weight *= float(side_rating.get("buy_weight_multiplier", 1.0) or 1.0)
+            elif side == "SELL":
+                raw_weight *= float(side_rating.get("sell_weight_multiplier", 1.0) or 1.0)
             direction = dominant_vote_direction(asdict(vote)).upper()
             policy = agent_policy.get(str(vote.agent), {})
             role = str(policy.get("recommended_role", "neutral"))

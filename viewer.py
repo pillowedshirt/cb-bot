@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
+from dotenv import load_dotenv
 
 try:
     from debug_tools import (
@@ -37,6 +38,8 @@ except Exception:
 
 MODULE_NAME = "viewer"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_PATH, override=True)
 VIEWER_SNAPSHOT_PATH = os.path.join(BASE_DIR, "viewer_snapshot.json")
 VIEWER_SNAPSHOT_CSV_SAFE_PATH = VIEWER_SNAPSHOT_PATH
 CALCULATION_STATUS_JSON_PATH = os.path.join(BASE_DIR, "calculation_status.json")

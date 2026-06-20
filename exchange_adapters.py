@@ -1,5 +1,8 @@
 from dataclasses import dataclass
+import os
 from typing import Any, Dict, Optional, List
+
+from dotenv import load_dotenv
 @dataclass
 class ExchangeOrderResult:
     ok: bool
@@ -45,7 +48,7 @@ class BaseExchangeAdapter:
     def place_market_sell(self, product_id: str, base_qty: float)->ExchangeOrderResult: raise NotImplementedError
     def place_limit_sell(self, product_id: str, base_qty: float, limit_price: float)->ExchangeOrderResult: raise NotImplementedError
     def cancel_order(self, order_id: str, product_id: Optional[str]=None, symbol: Optional[str]=None)->bool: raise NotImplementedError
-import os, time, uuid
+import time, uuid
 from binance_us_client import BinanceUSClient
 from binance_symbol_filters import parse_symbol_rules, quantity_from_quote, format_price, format_quantity, order_meets_minimums
 from exchange_catalog import product_to_execution_symbol, execution_symbol_to_product, EXCHANGE_BINANCE_US
@@ -54,10 +57,15 @@ try:
 except Exception:
     module_debug = None
     module_exception = None
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_PATH, override=True)
+
 class BinanceUSAdapter(BaseExchangeAdapter):
     exchange_id=EXCHANGE_BINANCE_US
     def __init__(self, *, dry_run: Optional[bool]=None, allow_real_orders: Optional[bool]=None):
-        self.client=BinanceUSClient(); self.client.sync_time(); self.allow_real_orders=True; self.symbol_rules_cache={}; self.fee_cache={}
+        self.client = BinanceUSClient(); self.client.sync_time(); self.dry_run = False; self.allow_real_orders = True; self.symbol_rules_cache = {}; self.fee_cache = {}
     def product_to_symbol(self, product_id):
         symbol=product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
         if not symbol: raise RuntimeError(f"No Binance.US symbol mapping for {product_id}")

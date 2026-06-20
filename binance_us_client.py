@@ -1,15 +1,32 @@
-import hashlib, hmac, os, time, urllib.parse
+import hashlib
+import hmac
+import os
+import time
+import urllib.parse
 from typing import Any, Dict, List, Optional
+
 import requests
 from dotenv import load_dotenv
+
 try:
     from debug_tools import module_debug, module_exception
 except Exception:
     module_debug = None
     module_exception = None
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
 class BinanceUSClient:
     def __init__(self, *, api_key: Optional[str]=None, api_secret: Optional[str]=None, base_url: Optional[str]=None, recv_window: int=5000, timeout_sec: float=20.0):
-        load_dotenv(); self.api_key=api_key or os.getenv("BINANCE_US_API_KEY", "").strip(); self.api_secret=api_secret or os.getenv("BINANCE_US_API_SECRET", "").strip(); self.base_url=(base_url or os.getenv("BINANCE_US_REST_BASE_URL", "https://api.binance.us")).rstrip("/"); self.recv_window=int(recv_window); self.timeout_sec=float(timeout_sec); self._time_offset_ms=0
+        load_dotenv(ENV_PATH, override=True)
+        self.api_key = api_key or os.getenv("BINANCE_US_API_KEY", "").strip()
+        self.api_secret = api_secret or os.getenv("BINANCE_US_API_SECRET", "").strip()
+        self.base_url = (
+            base_url or os.getenv("BINANCE_US_REST_BASE_URL", "https://api.binance.us")
+        ).rstrip("/")
+        self.recv_window = int(recv_window)
+        self.timeout_sec = float(timeout_sec)
+        self._time_offset_ms = 0
         if not self.api_key: raise RuntimeError("Missing BINANCE_US_API_KEY in .env")
         if not self.api_secret: raise RuntimeError("Missing BINANCE_US_API_SECRET in .env")
     def _headers(self): return {"X-MBX-APIKEY": self.api_key}

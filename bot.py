@@ -22,7 +22,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass, field
 from collections import deque
 from io import StringIO
-from typing import Dict, Deque, List, Optional, Set, Tuple, Any
+from typing import Dict, Deque, List, Optional, Set, Tuple, Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -329,7 +329,7 @@ LIVE_EXECUTION_EXCHANGE_ID: str = "binance_us"
 HISTORICAL_CANDLE_SOURCE_PRIORITY: List[str] = [
     "local_cache",
     "binance_bulk",
-    "coinbase_fallback",
+    "binance_api_gapfill",
 ]
 BINANCE_BULK_TIMEOUT_SEC: float = 45.0
 BINANCE_BULK_PREFER_BINANCE_US: bool = False
@@ -341,7 +341,7 @@ BINANCE_BULK_PREFER_BINANCE_US: bool = False
 # ============================================================
 ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON: bool = True
 REPLAY_PRIMARY_FEE_MODEL: str = "binance_us"
-REPLAY_COMPARISON_FEE_MODEL: str = "coinbase_legacy"
+REPLAY_COMPARISON_FEE_MODEL: str = "none"
 BINANCE_US_COMPARISON_MAKER_FEE_BPS: float = 0.0
 BINANCE_US_COMPARISON_TAKER_FEE_BPS: float = 2.0
 BINANCE_US_TIER0_MAKER_FEE_BPS: float = 0.0
@@ -355,16 +355,12 @@ REPLAY_FEE_SCENARIOS: List[str] = [
     "binance_maker_taker",
     "binance_taker_taker",
 ]
-REPLAY_LEGACY_COMPARISON_SCENARIOS: List[str] = [
-    "coinbase_legacy_maker_maker",
-    "coinbase_legacy_maker_taker",
-    "coinbase_legacy_taker_taker",
-]
+REPLAY_LEGACY_COMPARISON_SCENARIOS: List[str] = []
 
 # Source quality labels.
 HISTORICAL_SOURCE_LOCAL_CACHE: str = "local_cache"
 HISTORICAL_SOURCE_BINANCE_BULK: str = "binance_bulk"
-HISTORICAL_SOURCE_COINBASE_FALLBACK: str = "coinbase_fallback"
+HISTORICAL_SOURCE_BINANCE_API_GAPFILL: str = "binance_api_gapfill"
 EXTENDED_CHART_REFRESH_EVERY_SEC: int = 30 * 60
 EXTENDED_CHART_FETCH_CONCURRENCY: int = 1
 EXTENDED_CHART_PRODUCTS_PER_PASS: int = 1
@@ -2372,145 +2368,26 @@ def _iso_utc(ts: int) -> str:
 
 
 def _fetch_exchange_products() -> List[Dict[str, Any]]:
-    data = _http_get_json("https://removed.invalid/coinbase-public-endpoint/products")
-    if isinstance(data, list):
-        return [d for d in data if isinstance(d, dict)]
-    return []
+    raise RuntimeError("Coinbase public product selection has been removed from Binance.US-only build.")
 
 
 def _fetch_volume_summary() -> Dict[str, Dict[str, float]]:
-    # Docs: GET /products/volume-summary (Coinbase Exchange market-data)
-    # Returns 24h + 30d volumes for all products.
-    # Shape varies; we normalize into {product_id: {usd_vol_24h, base_vol_24h}}.
-    out: Dict[str, Dict[str, float]] = {}
-    data = _http_get_json("https://removed.invalid/coinbase-public-endpoint/products/volume-summary")
-    if not data:
-        return out
-
-    items = None
-    if isinstance(data, dict):
-        for k in ("data", "products", "volume_summary", "volumeSummary", "volume-summary"):
-            v = data.get(k)
-            if isinstance(v, list):
-                items = v
-                break
-    if items is None and isinstance(data, list):
-        items = data
-
-    if not isinstance(items, list):
-        return out
-
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        pid = it.get("product_id") or it.get("productId") or it.get("id")
-        if not isinstance(pid, str):
-            continue
-        # try a few likely keys
-        quote_vol = safe_float(it.get("quote_volume_24h") or it.get("quote_volume") or it.get("quoteVolume"))
-        base_vol = safe_float(it.get("base_volume_24h") or it.get("volume_24h") or it.get("volume") or it.get("baseVolume"))
-        if quote_vol is None:
-            quote_vol = 0.0
-        if base_vol is None:
-            base_vol = 0.0
-        out[pid] = {"usd_vol_24h": float(quote_vol), "base_vol_24h": float(base_vol)}
-    return out
+    raise RuntimeError("Coinbase public product selection has been removed from Binance.US-only build.")
 
 
 def _fetch_daily_closes(product_id: str, days: int) -> Optional[List[Tuple[int, float]]]:
-    # Docs: GET /products/{product_id}/candles with granularity=86400 for daily candles.
-    # Candle format is [time, low, high, open, close, volume].
-    end_ts = int(now_ts())
-    start_ts = end_ts - int(days) * 86400
-    url = f"https://removed.invalid/coinbase-public-endpoint/products/{product_id}/candles?granularity=86400&start={_iso(start_ts)}&end={_iso(end_ts)}"
-    data = _http_get_json(url)
-    if not isinstance(data, list):
-        return None
-    out: List[Tuple[int, float]] = []
-    for row in data:
-        if isinstance(row, (list, tuple)) and len(row) >= 5:
-            t = int(float(row[0]))
-            close = float(row[4])
-            if t > 0 and close > 0:
-                out.append((t, close))
-        elif isinstance(row, dict):
-            t = int(float(row.get("time") or row.get("start") or row.get("ts") or 0))
-            close = safe_float(row.get("close"))
-            if t > 0 and close is not None and close > 0:
-                out.append((t, float(close)))
-    if not out:
-        return None
-    out.sort(key=lambda x: x[0])
-    # Deduplicate timestamps
-    uniq: Dict[int, float] = {}
-    for t, c in out:
-        uniq[t] = c
-    merged = sorted(uniq.items(), key=lambda x: x[0])
-    return merged
+    raise RuntimeError("Coinbase public product selection has been removed from Binance.US-only build.")
 
 
 def _fetch_candles_public(
     *,
     product_id: str,
     granularity: int,
-    limit: int = 300,
     start: Optional[int] = None,
     end: Optional[int] = None,
-) -> List[List[float]]:
-    """Fetch public candles from Coinbase Exchange market-data endpoint.
-
-    Returns rows in the canonical Exchange format:
-        [time, low, high, open, close, volume]
-
-    Notes:
-      - This is a *public* endpoint used only for product universe selection / filters.
-      - It is intentionally synchronous because it's only used at startup / periodic selection.
-      - Callers must not assume ordering; we sort by time ascending before returning.
-    """
-    try:
-        pid = str(product_id)
-        gran = int(granularity)
-        lim = int(limit)
-        lim = max(1, min(lim, 300))  # Exchange endpoint returns up to ~300 rows per call
-
-        if end is None:
-            end_ts = int(now_ts())
-        else:
-            end_ts = int(end)
-        if start is None:
-            start_ts = end_ts - (lim * gran)
-        else:
-            start_ts = int(start)
-
-        url = (
-            f"https://removed.invalid/coinbase-public-endpoint/products/{pid}/candles"
-            f"?granularity={gran}&start={_iso(start_ts)}&end={_iso(end_ts)}"
-        )
-        data = _http_get_json(url)
-        if not isinstance(data, list):
-            return []
-        rows: List[List[float]] = []
-        for row in data:
-            if isinstance(row, (list, tuple)) and len(row) >= 6:
-                t = int(float(row[0]))
-                lo = float(row[1]); hi = float(row[2]); op = float(row[3]); cl = float(row[4]); vol = float(row[5])
-                rows.append([t, lo, hi, op, cl, vol])
-            elif isinstance(row, dict):
-                t = int(float(row.get("time") or row.get("start") or row.get("ts") or 0))
-                lo = safe_float(row.get("low")); hi = safe_float(row.get("high"))
-                op = safe_float(row.get("open")); cl = safe_float(row.get("close"))
-                vol = safe_float(row.get("volume")) or 0.0
-                if t > 0 and lo is not None and hi is not None and op is not None and cl is not None:
-                    rows.append([t, float(lo), float(hi), float(op), float(cl), float(vol)])
-        if not rows:
-            return []
-        rows.sort(key=lambda r: r[0])
-        # Keep only the most recent `limit` rows (ascending)
-        if len(rows) > lim:
-            rows = rows[-lim:]
-        return rows
-    except Exception:
-        return []
+    limit: Optional[int] = None,
+) -> List[List[Any]]:
+    raise RuntimeError("Coinbase public product selection has been removed from Binance.US-only build.")
 
 
 def _fetch_recent_daily_range_pct(product_id: str) -> Optional[float]:
@@ -2548,173 +2425,9 @@ def _series_to_returns(series: List[Tuple[int, float]]) -> pd.Series:
 
 
 def select_diversified_products() -> List[str]:
-    """Select USD products with (1) liquidity and (2) volatility when BTC is quiet, while reducing correlation."""
-    # Cache first
-    try:
-        if os.path.exists(PRODUCTS_CACHE_PATH):
-            with open(PRODUCTS_CACHE_PATH, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            if isinstance(cached, dict):
-                ts = safe_float(cached.get("ts"))
-                prods = cached.get("products")
-                if ts is not None and isinstance(prods, list) and (now_ts() - ts) < SELECTION_REFRESH_SEC:
-                    prods2 = [p for p in prods if isinstance(p, str)]
-                    if len(prods2) >= 2:
-                        return prods2
-    except Exception:
-        pass
-
-    # Pull Coinbase Exchange product list + volume summary (public market-data APIs).
-    products = _fetch_exchange_products()
-    vol_map = _fetch_volume_summary()
-
-    usd_pairs: List[str] = []
-    for p in products:
-        if p.get("quote_currency") != "USD":
-            continue
-        if p.get("status") not in (None, "online"):
-            continue
-        if p.get("trading_disabled") is True:
-            continue
-        pid = p.get("id")
-        if isinstance(pid, str) and "-" in pid:
-            usd_pairs.append(pid)
-
-    # Liquidity filter: keep top-N by quote (USD) volume when available.
-    scored: List[Tuple[str, float]] = []
-    for pid in usd_pairs:
-        v = vol_map.get(pid, {}).get("usd_vol_24h", 0.0)
-        scored.append((pid, float(v)))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    candidates = [pid for pid, _ in scored[:max(10, CANDIDATE_TOP_BY_USD_VOL)]]
-
-    # Hard volatility filter: require ~30% single-day range volatility (high-low)/close.
-    # This matches your request to trade ONLY coins with large 24h swings.
-    vol_ok: List[str] = []
-    for pid in candidates:
-        rng = _fetch_recent_daily_range_pct(pid)
-        if rng is None:
-            continue
-        if rng >= MIN_DAILY_RANGE_PCT:
-            vol_ok.append(pid)
-
-    # If the strict filter removes everything, fall back to the original candidates so the bot can still run.
-    # (You can tighten/loosen MIN_DAILY_RANGE_PCT at the top.)
-    if vol_ok:
-        candidates = vol_ok
-    else:
-        log("[selection] strict daily-range filter returned no products; using fallback candidate list")
-
-    # Ensure BTC is considered (anchor).
-    if "BTC-USD" not in candidates and "BTC-USD" in usd_pairs:
-        candidates = ["BTC-USD"] + candidates[:-1]
-
-    # Fetch daily returns for candidates.
-    rets: Dict[str, pd.Series] = {}
-    for pid in candidates:
-        series = _fetch_daily_closes(pid, SELECTION_LOOKBACK_DAYS)
-        if not series:
-            continue
-        r = _series_to_returns(series)
-        if len(r) >= 60:
-            rets[pid] = r
-
-    if "BTC-USD" not in rets:
-        # if BTC data missing, fall back
-        return list(PRODUCTS_DEFAULT)
-
-    # Align on common dates
-    df = pd.DataFrame({k: v for k, v in rets.items()}).dropna(how="any")
-    if df.empty or df.shape[0] < 60:
-        return list(PRODUCTS_DEFAULT)
-
-    # Liquidity proxy for scoring
-    usd_vol = pd.Series({pid: vol_map.get(pid, {}).get("usd_vol_24h", 0.0) for pid in df.columns}).replace(0.0, np.nan)
-    usd_vol = usd_vol.fillna(usd_vol.median() if not usd_vol.dropna().empty else 1.0)
-
-    # BTC "quiet" days = bottom quartile of rolling vol
-    btc = df["BTC-USD"]
-    btc_roll = btc.rolling(SELECTION_BTC_QUIET_ROLL_DAYS).std()
-    thresh = float(np.nanquantile(btc_roll.values, 0.25))
-    quiet_mask = (btc_roll <= thresh)
-    quiet_df = df[quiet_mask].dropna(how="any")
-    if quiet_df.shape[0] < 20:
-        quiet_df = df.copy()
-
-    # Volatility on quiet days (std of returns)
-    vol_quiet = quiet_df.std().replace(0.0, np.nan)
-
-    # Correlation matrix (full period)
-    corr = df.corr().fillna(0.0)
-
-    # BTC "stress" days = top quantile of rolling vol (risk-off cascades tend to synchronize here)
-    stress_thresh = float(np.nanquantile(btc_roll.values, SELECTION_BTC_STRESS_QUANTILE))
-    stress_mask = (btc_roll >= stress_thresh)
-    stress_df = df[stress_mask].dropna(how="any")
-    corr_stress = stress_df.corr().fillna(0.0) if stress_df.shape[0] >= 20 else corr
-
-    # Standardize scoring components
-    def zscore(s: pd.Series) -> pd.Series:
-        mu = float(s.mean())
-        sd = float(s.std()) if float(s.std()) > 1e-12 else 1.0
-        return (s - mu) / sd
-
-    vol_z = zscore(vol_quiet)
-    liq_z = zscore(np.log1p(usd_vol))
-
-    selected: List[str] = []
-    if "BTC-USD" in df.columns:
-        selected.append("BTC-USD")
-
-    # Greedy add: maximize volatility when BTC is quiet, penalize correlation to selected
-    while len(selected) < max(2, TARGET_PRODUCT_COUNT):
-        best_pid = None
-        best_score = -1e9
-        for pid in df.columns:
-            if pid in selected:
-                continue
-            # average absolute correlation to current basket
-            avg_corr = float(np.mean([abs(float(corr.loc[pid, s])) for s in selected])) if selected else 0.0
-            corr_to_btc = abs(float(corr.loc[pid, "BTC-USD"])) if "BTC-USD" in corr.columns else 0.0
-            avg_corr_stress = float(np.mean([abs(float(corr_stress.loc[pid, s])) for s in selected])) if selected else 0.0
-
-            # Hard correlation gate to avoid "everything dumps together" baskets.
-            if pid != "BTC-USD" and corr_to_btc > MAX_ABS_CORR_TO_BTC:
-                continue
-            if selected and avg_corr > MAX_AVG_ABS_CORR and len(selected) >= 2:
-                continue
-
-            # Score: prefer (a) volatility on BTC-quiet days, (b) liquidity, and
-            # penalize correlation both in normal conditions and in BTC stress regimes.
-            score = float(
-                0.55 * vol_z.get(pid, 0.0)
-                + 0.20 * liq_z.get(pid, 0.0)
-                - 0.22 * avg_corr
-                - 0.22 * avg_corr_stress
-                - 0.12 * corr_to_btc
-            )
-            if score > best_score:
-                best_score = score
-                best_pid = pid
-        if best_pid is None:
-            break
-        selected.append(best_pid)
-
-    # Cache
-    try:
-        with open(PRODUCTS_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"ts": now_ts(), "products": selected}, f, indent=2)
-    except Exception:
-        pass
-
-    return selected
+    raise RuntimeError("Coinbase public product selection has been removed from Binance.US-only build.")
 
 
-# ------------------------------------------------------------
-# Data structures
-# ------------------------------------------------------------
-
-@dataclass
 class Candle:
     ts: int
     open: float
@@ -3452,13 +3165,11 @@ class MacroLevelsCSVWriter:
         os.replace(tmp, self.path)
 
 
-class MacroFetcher:
-    """
-    Fetches historical candles via the Coinbase REST API.  Provides chunked fetch to
-    respect the <350 candle limit per request.
-    """
+class LEGACY_UNUSED_MacroFetcher:
+    """Removed Coinbase macro fetcher retained only as an import quarantine."""
 
     def __init__(self, rest: RESTClient) -> None:
+        raise RuntimeError("MacroFetcher has been removed. Use BinanceKlineFetcher.")
         self.rest = rest
 
     async def fetch(self, product_id: str, start: int, end: int, granularity: str) -> List[Candle]:
@@ -4943,7 +4654,7 @@ class ExecutionResult:
 # Until that future update:
 # ENABLE_BINANCE_LIVE_EXECUTION must remain False.
 
-class LivePortfolio:
+class LEGACY_UNUSED_LivePortfolio:
     """Live-portfolio wrapper for Coinbase Advanced Trade.
 
     Coinbase must be the source of truth for balances, fills, and fees.
@@ -4959,6 +4670,7 @@ class LivePortfolio:
     """
 
     def __init__(self, rest: RESTClient) -> None:
+        raise RuntimeError("LivePortfolio has been removed. Use BinanceUSAdapter.")
         self.rest = rest
         self.product_meta_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -6723,7 +6435,7 @@ class TradingBot:
         *,
         product_id: str,
         side: str,
-    ) -> Optional[Tuple[float, float, float, float, str]]:
+    ) -> Any:
         """Validate a live execution result and extract fill truth.
 
         Returns (filled_qty, avg_price, fee_usd, filled_notional_usd, order_id) or None.
@@ -6737,8 +6449,7 @@ class TradingBot:
         """
         if isinstance(r, ExchangeOrderResult):
             if str(r.status).upper() == "DRY_RUN_TEST_OK":
-                log(f"[{str(side).lower()}] Binance dry-run/test order validated for {product_id}; not mutating local positions")
-                return None
+                return {"dry_run_test_only": True, "filled_qty": 0.0, "avg_price": 0.0, "fee_usd": 0.0, "filled_notional_usd": 0.0, "order_id": str(r.order_id or "")}
             if not r.ok:
                 raise RuntimeError(r.error or f"Binance {side} failed")
             if float(r.filled_qty or 0.0) <= 0:
@@ -6899,6 +6610,10 @@ class TradingBot:
         if fill is None:
             return None
 
+        if isinstance(fill, dict) and fill.get("dry_run_test_only"):
+            log(f"[binance-order-test] {product_id} SELL order parameters validated; no live order placed and no local position closed")
+            return None
+
         filled_qty, avg_px, fee_val, _filled_notional, _order_id = fill
         sold_qty = float(min(qty_to_sell, filled_qty))
         return sold_qty, float(avg_px), float(fee_val)
@@ -6921,6 +6636,10 @@ class TradingBot:
             reason=note or "force_sell",
         )
         if fill is None:
+            return
+
+        if isinstance(fill, dict) and fill.get("dry_run_test_only"):
+            log(f"[binance-order-test] {product} SELL order parameters validated; no live order placed and no local position closed")
             return
 
         filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
@@ -12856,8 +12575,10 @@ class TradingBot:
                     return False, "live_buy_blocked:binance_live_execution_disabled"
                 if not bool(BINANCE_US_ENABLE_SPOT_TRADING):
                     return False, "live_buy_blocked:binance_spot_trading_disabled"
-                if bool(BINANCE_US_DRY_RUN) or not bool(BINANCE_US_ALLOW_REAL_ORDERS):
-                    return False, "live_buy_blocked:binance_dry_run_or_real_orders_disabled"
+                if bool(BINANCE_US_DRY_RUN) and not bool(BINANCE_US_ALLOW_ORDER_TEST):
+                    return False, "live_buy_blocked:binance_dry_run_order_test_disabled"
+                if (not bool(BINANCE_US_DRY_RUN)) and not bool(BINANCE_US_ALLOW_REAL_ORDERS):
+                    return False, "live_buy_blocked:binance_real_orders_disabled"
             product_id = str(candidate.get("product_id", ""))
             if bool(REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY):
                 tob_age = self._top_of_book_age_sec(product_id)
@@ -16143,7 +15864,7 @@ class TradingBot:
 
             mode = "MARKET"
             if str(LIVE_EXECUTION_EXCHANGE_ID) == "coinbase" and bool(COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY) and not bool(COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE):
-                log(f"[buy-skip] {product_id} coinbase_market_buy_blocked:maker_first_required")
+                log(f"[buy-skip] {product_id} binance_market_buy_blocked:maker_first_required")
                 return None
             result = await self._live_buy_market(product_id=product_id, quote_usd=float(quote_usd))
             self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
@@ -16471,41 +16192,44 @@ class TradingBot:
         return int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400
 
     def _replay_fee_scenario_bps(self, product_id: str) -> Dict[str, Dict[str, float]]:
-        adapter = self._active_adapter()
-        if adapter is not None:
-            bn = adapter.fee_bps_for_symbol(adapter.product_to_symbol(product_id))
-            binance_maker = float(bn["maker_bps"])
-            binance_taker = float(bn["taker_bps"])
-        else:
+        try:
+            adapter = self._active_adapter()
+            symbol = adapter.product_to_symbol(product_id)
+            fees = adapter.fee_bps_for_symbol(symbol)
+            binance_maker = float(fees["maker_bps"])
+            binance_taker = float(fees["taker_bps"])
+        except Exception:
             binance_maker = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
             binance_taker = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
-        coinbase_maker = float(getattr(self, "current_maker_fee_bps", 60.0))
-        coinbase_taker = float(getattr(self, "current_taker_fee_bps", 120.0))
         return {
             "binance_maker_maker": {"entry_fee_bps": binance_maker, "exit_fee_bps": binance_maker},
             "binance_maker_taker": {"entry_fee_bps": binance_maker, "exit_fee_bps": binance_taker},
             "binance_taker_taker": {"entry_fee_bps": binance_taker, "exit_fee_bps": binance_taker},
-            "coinbase_legacy_maker_maker": {"entry_fee_bps": coinbase_maker, "exit_fee_bps": coinbase_maker},
-            "coinbase_legacy_maker_taker": {"entry_fee_bps": coinbase_maker, "exit_fee_bps": coinbase_taker},
-            "coinbase_legacy_taker_taker": {"entry_fee_bps": coinbase_taker, "exit_fee_bps": coinbase_taker},
         }
 
     def _process_worker_replay_config(self, product_id: str) -> Dict[str, Any]:
         profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
-        if str(product_id) in BINANCE_US_TIER0_PRODUCTS:
-            binance_entry_fee_bps = float(BINANCE_US_TIER0_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY == "maker" else BINANCE_US_TIER0_TAKER_FEE_BPS)
-            binance_exit_fee_bps = float(BINANCE_US_TIER0_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY == "maker" else BINANCE_US_TIER0_TAKER_FEE_BPS)
-        else:
-            binance_entry_fee_bps = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_ENTRY_LIQUIDITY == "maker" else BINANCE_US_COMPARISON_TAKER_FEE_BPS)
-            binance_exit_fee_bps = float(BINANCE_US_COMPARISON_MAKER_FEE_BPS if REPLAY_BINANCE_COMPARISON_EXIT_LIQUIDITY == "maker" else BINANCE_US_COMPARISON_TAKER_FEE_BPS)
+        try:
+            adapter = self._active_adapter()
+            symbol = adapter.product_to_symbol(product_id)
+            fees = adapter.fee_bps_for_symbol(symbol)
+            maker_bps = float(fees["maker_bps"])
+            taker_bps = float(fees["taker_bps"])
+        except Exception:
+            maker_bps = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
+            taker_bps = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
+        entry_mode = str(ENTRY_EXECUTION_MODE).upper()
+        exit_mode = str(EXIT_EXECUTION_MODE).upper()
+        primary_entry_fee_bps = maker_bps if entry_mode in {"MAKER", "MAKER_FIRST", "LIMIT_MAKER", "POST_ONLY"} else taker_bps
+        primary_exit_fee_bps = maker_bps if exit_mode in {"MAKER", "MAKER_FIRST", "LIMIT_MAKER", "POST_ONLY"} else taker_bps
         return {
-            "entry_fee_bps": float(self._entry_fee_bps_for_mode(execution_mode=ENTRY_EXECUTION_MODE)),
-            "exit_fee_bps": float(self._exit_fee_bps_for_mode()),
-            "primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL),
-            "comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL),
+            "entry_fee_bps": float(primary_entry_fee_bps),
+            "exit_fee_bps": float(primary_exit_fee_bps),
+            "primary_fee_model": "binance_us",
+            "comparison_fee_model": "none",
             "enable_exchange_fee_comparison": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON),
-            "comparison_entry_fee_bps": float(binance_entry_fee_bps),
-            "comparison_exit_fee_bps": float(binance_exit_fee_bps),
+            "comparison_entry_fee_bps": float(primary_entry_fee_bps),
+            "comparison_exit_fee_bps": float(primary_exit_fee_bps),
             "max_spread_bps": float(MAX_SPREAD_BPS),
             "est_slippage_bps": float(EST_SLIPPAGE_BPS),
             "est_adverse_fill_bps": float(EST_ADVERSE_FILL_BPS),
@@ -16540,7 +16264,7 @@ class TradingBot:
             "enable_strategy_variant_replay": True,
             "strategy_variants": list(REQUIRED_REPLAY_STRATEGY_VARIANTS),
             "high_win_v2_min_target_to_cost_ratio": 1.35, "high_win_v2_min_target_over_cost_bps": 35.0, "high_win_v2_min_probability": 0.54, "high_win_v2_min_score": 54.0, "high_win_v2_max_spread_bps": 22.0, "high_win_v2_require_momentum_either": True, "high_win_v2_min_momentum_either_bps": 0.0, "high_win_v2_block_low_room": True, "high_win_v2_block_low_volume_above_value": True, "high_win_v2_stop_loss_pct": 0.004, "high_win_v2_profit_pullback_pct": 0.0018,
-            "coinbase_survival_min_target_to_cost_ratio": 2.25, "coinbase_survival_min_target_over_cost_bps": 140.0, "coinbase_survival_min_probability": 0.56, "coinbase_survival_min_score": 58.0, "coinbase_survival_max_spread_bps": 22.0, "coinbase_survival_stop_loss_pct": 0.0035, "coinbase_survival_profit_pullback_pct": 0.0015,
+            "high_fee_survival_min_target_to_cost_ratio": 2.25, "high_fee_survival_min_target_over_cost_bps": 140.0, "high_fee_survival_min_probability": 0.56, "high_fee_survival_min_score": 58.0, "high_fee_survival_max_spread_bps": 22.0, "high_fee_survival_stop_loss_pct": 0.0035, "high_fee_survival_profit_pullback_pct": 0.0015,
             "low_fee_scalp_min_target_to_cost_ratio": 1.15, "low_fee_scalp_min_target_over_cost_bps": 15.0, "low_fee_scalp_min_probability": 0.52, "low_fee_scalp_min_score": 50.0, "low_fee_scalp_max_spread_bps": 22.0, "low_fee_scalp_stop_loss_pct": 0.004, "low_fee_scalp_profit_pullback_pct": 0.0015,
             "enable_early_adverse_exit": True, "early_adverse_exit_bps": 18.0, "early_adverse_min_age_bars": 2, "early_adverse_requires_negative_momentum": True, "early_adverse_momentum_lookback": 5,
         }
@@ -16715,7 +16439,7 @@ class TradingBot:
                 return
             if "strategy_variant" not in sub.columns:
                 sub["strategy_variant"] = "baseline"
-            scenario_cols = ["coinbase_maker_maker", "coinbase_maker_taker", "coinbase_taker_taker", "binance_maker_maker", "binance_maker_taker", "binance_taker_taker"]
+            scenario_cols = ["binance_maker_maker", "binance_maker_taker", "binance_taker_taker"]
             rows_to_write = []
             for variant, group in sub.groupby(sub["strategy_variant"].astype(str)):
                 row = {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "timeframe": timeframe, "strategy_variant": variant, "rows": int(len(group)), "reason": "strategy_variant_replay_summary"}
@@ -16786,8 +16510,8 @@ class TradingBot:
                 "product_id": product_id,
                 "timeframe": timeframe,
                 "rows": int(len(sub)),
-                "primary_fee_model": str(sub["primary_fee_model"].dropna().iloc[-1]) if "primary_fee_model" in sub.columns and not sub["primary_fee_model"].dropna().empty else "coinbase",
-                "comparison_fee_model": str(sub["comparison_fee_model"].dropna().iloc[-1]) if "comparison_fee_model" in sub.columns and not sub["comparison_fee_model"].dropna().empty else "binance_us",
+                "primary_fee_model": str(sub["primary_fee_model"].dropna().iloc[-1]) if "primary_fee_model" in sub.columns and not sub["primary_fee_model"].dropna().empty else "binance",
+                "comparison_fee_model": str(sub["comparison_fee_model"].dropna().iloc[-1]) if "comparison_fee_model" in sub.columns and not sub["comparison_fee_model"].dropna().empty else "none",
                 "primary_avg_net_bps": float(primary.mean()),
                 "primary_median_net_bps": float(primary.median()),
                 "primary_win_rate": float((primary > 0).mean()),
@@ -16799,7 +16523,7 @@ class TradingBot:
                 "primary_profitable_rows": int((primary > 0).sum()),
                 "comparison_profitable_rows": int((comparison > 0).sum()),
                 "rows_flipped_to_profit_by_comparison": flipped,
-                "reason": "same_entry_same_exit_fee_comparison;primary=coinbase_current_fee_model;comparison=binance_us_configurable_fee_model",
+                "reason": "same_entry_same_exit_fee_comparison;primary=binance_us;comparison=none",
             }
             with open(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=REPLAY_FEE_COMPARISON_SUMMARY_COLUMNS)
@@ -17085,7 +16809,7 @@ class TradingBot:
             if len(binance_candles) >= max(1, int(min_needed)) and self._candles_recent_enough_for_timeframe(binance_candles, tf):
                 return binance_candles, granularity, HISTORICAL_SOURCE_BINANCE_BULK
             module_debug(MODULE_NAME, "binance_bulk_historical_backfill_insufficient", data={"product_id": product_id, "timeframe": tf, "needed": int(min_needed), "received": len(binance_candles), "meta": binance_meta}, level="WARN", also_overall=False)
-        module_debug(MODULE_NAME, "historical_replay_coinbase_fallback_start", data={"product_id": product_id, "timeframe": tf, "granularity": granularity, "start_ts": start_ts, "end_ts": now_i, "cached_rows": len(cached), "needed": int(min_needed)}, level="INFO", also_overall=False)
+        module_debug(MODULE_NAME, "historical_replay_binance_api_gapfill_start", data={"product_id": product_id, "timeframe": tf, "granularity": granularity, "start_ts": start_ts, "end_ts": now_i, "cached_rows": len(cached), "needed": int(min_needed)}, level="INFO", also_overall=False)
         async with self._historical_replay_fetch_sem:
             candles = await self.fetcher.fetch_chunked(product_id, start_ts, now_i, granularity, max_candles_per_req=300)
         if candles:
@@ -17101,15 +16825,15 @@ class TradingBot:
         final_cached = self._read_candles_from_csv_for_replay(path=fallback_path, product_id=product_id, min_ts=float(start_ts))
         if final_cached:
             if cached and bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL):
-                source_label = "mixed_local_binance_coinbase_gapfill"
+                source_label = "mixed_local_binance_bulk_api_gapfill"
             elif bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL):
-                source_label = "binance_bulk_plus_coinbase_gapfill"
+                source_label = "binance_bulk_plus_api_gapfill"
             elif cached:
-                source_label = "local_cache_plus_coinbase_gapfill"
+                source_label = "local_cache_plus_binance_api_gapfill"
             else:
-                source_label = HISTORICAL_SOURCE_COINBASE_FALLBACK
+                source_label = HISTORICAL_SOURCE_BINANCE_API_GAPFILL
             return final_cached, granularity, source_label
-        return candles or cached, granularity, HISTORICAL_SOURCE_COINBASE_FALLBACK if candles else "csv_cache_partial"
+        return candles or cached, granularity, HISTORICAL_SOURCE_BINANCE_API_GAPFILL if candles else "csv_cache_partial"
 
 
     def _historical_replay_job_queue(self) -> List[Tuple[str, str]]:
@@ -17328,7 +17052,7 @@ class TradingBot:
             exit_fee = primary_exit_fee_usd
             max_favorable_bps = ((peak_price / entry_price) - 1.0) * 10000.0; max_adverse_bps = ((trough_price / entry_price) - 1.0) * 10000.0
             replay_key = f"{product_id}|{timeframe}|{replay_ts}|{int(float(signal.score) * 1000000)}"
-            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "primary_entry_fee_bps": entry_fee_bps, "primary_exit_fee_bps": exit_fee_bps, "primary_entry_fee_usd": primary_entry_fee_usd, "primary_exit_fee_usd": primary_exit_fee_usd, "primary_net_pnl_usd": net_pnl, "primary_net_pnl_bps": net_pnl_bps, "primary_would_have_won": int(net_pnl > 0), "comparison_entry_fee_bps": comparison_entry_fee_bps, "comparison_exit_fee_bps": comparison_exit_fee_bps, "comparison_entry_fee_usd": comparison_entry_fee_usd, "comparison_exit_fee_usd": comparison_exit_fee_usd, "comparison_net_pnl_usd": comparison_net_pnl, "comparison_net_pnl_bps": comparison_net_pnl_bps, "comparison_would_have_won": int(comparison_net_pnl > 0), "comparison_net_improvement_usd": float(comparison_net_pnl - net_pnl), "comparison_net_improvement_bps": float(comparison_net_pnl_bps - net_pnl_bps), "comparison_break_even_reduction_bps": float(entry_fee_bps + exit_fee_bps - comparison_entry_fee_bps - comparison_exit_fee_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "historical_source_exchange": ("binance" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else ("coinbase" if str(replay_source) == HISTORICAL_SOURCE_COINBASE_FALLBACK else "local_cache")), "historical_source_symbol": (coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US)) if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else product_id), "historical_source_note": ("Historical replay used Binance public bulk USDT-pair candles as a proxy for Coinbase USD-pair execution." if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else "Historical replay used local cache or Coinbase fallback candles."), "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
+            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "primary_entry_fee_bps": entry_fee_bps, "primary_exit_fee_bps": exit_fee_bps, "primary_entry_fee_usd": primary_entry_fee_usd, "primary_exit_fee_usd": primary_exit_fee_usd, "primary_net_pnl_usd": net_pnl, "primary_net_pnl_bps": net_pnl_bps, "primary_would_have_won": int(net_pnl > 0), "comparison_entry_fee_bps": comparison_entry_fee_bps, "comparison_exit_fee_bps": comparison_exit_fee_bps, "comparison_entry_fee_usd": comparison_entry_fee_usd, "comparison_exit_fee_usd": comparison_exit_fee_usd, "comparison_net_pnl_usd": comparison_net_pnl, "comparison_net_pnl_bps": comparison_net_pnl_bps, "comparison_would_have_won": int(comparison_net_pnl > 0), "comparison_net_improvement_usd": float(comparison_net_pnl - net_pnl), "comparison_net_improvement_bps": float(comparison_net_pnl_bps - net_pnl_bps), "comparison_break_even_reduction_bps": float(entry_fee_bps + exit_fee_bps - comparison_entry_fee_bps - comparison_exit_fee_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "historical_source_exchange": ("binance" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else ("coinbase" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_API_GAPFILL else "local_cache")), "historical_source_symbol": (coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US)) if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else product_id), "historical_source_note": ("Historical replay used Binance public bulk USDT-pair candles as a proxy for Coinbase USD-pair execution." if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else "Historical replay used local cache or Binance API gapfill candles."), "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
         except Exception as exc:
             module_exception(MODULE_NAME, "simulate_historical_replay_candidate_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "traceback": traceback.format_exc()}, also_overall=False)
             return None
@@ -17750,15 +17474,19 @@ class TradingBot:
             for score_col, component in component_map.items():
                 if score_col not in frame.columns: continue
                 df = frame.copy(); df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
-                df["coinbase_mm"] = pd.to_numeric(df.get("coinbase_maker_maker_net_pnl_bps"), errors="coerce"); df["binance_mm"] = pd.to_numeric(df.get("binance_maker_maker_net_pnl_bps"), errors="coerce")
-                valid = df.dropna(subset=[score_col, "coinbase_mm", "binance_mm"])
+                df["binance_taker"] = pd.to_numeric(df.get("binance_taker_taker_net_pnl_bps"), errors="coerce")
+                df["binance_maker_taker"] = pd.to_numeric(df.get("binance_maker_taker_net_pnl_bps"), errors="coerce")
+                df["binance_mm"] = pd.to_numeric(df.get("binance_maker_maker_net_pnl_bps"), errors="coerce")
+                valid = df.dropna(subset=[score_col, "binance_taker", "binance_maker_taker", "binance_mm"])
                 if valid.empty: continue
                 threshold = float(valid[score_col].quantile(0.70)); high = valid[valid[score_col] >= threshold]; low = valid[valid[score_col] < threshold]
                 if high.empty or low.empty: continue
-                high_cb = float(high["coinbase_mm"].mean()); low_cb = float(low["coinbase_mm"].mean()); high_bn = float(high["binance_mm"].mean()); low_bn = float(low["binance_mm"].mean())
+                high_cb = 0.0; low_cb = 0.0
+                high_bn = float(high["binance_mm"].mean()); low_bn = float(low["binance_mm"].mean())
                 high_stop = float(high["exit_reason"].astype(str).eq("historical_hard_stop").mean()) if "exit_reason" in high.columns else 0.0; low_stop = float(low["exit_reason"].astype(str).eq("historical_hard_stop").mean()) if "exit_reason" in low.columns else 0.0
-                edge_cb = high_cb - low_cb; edge_bn = high_bn - low_bn
-                role = "entry_confirmer" if (edge_cb > 10 or edge_bn > 10) else "risk_filter" if (high_stop < low_stop and (edge_cb > 0 or edge_bn > 0)) else "veto_or_low_value"
+                high_bn_taker = float(high["binance_taker"].mean()); low_bn_taker = float(low["binance_taker"].mean())
+                edge_cb = 0.0; edge_bn = high_bn_taker - low_bn_taker
+                role = "entry_confirmer" if edge_bn > 10 else "risk_filter" if (high_stop < low_stop and edge_bn > 0) else "veto_or_low_value"
                 rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "component": component, "rows": int(len(valid)), "high_score_rows": int(len(high)), "low_score_rows": int(len(low)), "high_score_avg_coinbase_maker_maker_bps": high_cb, "low_score_avg_coinbase_maker_maker_bps": low_cb, "high_score_avg_binance_maker_maker_bps": high_bn, "low_score_avg_binance_maker_maker_bps": low_bn, "high_score_hard_stop_rate": high_stop, "low_score_hard_stop_rate": low_stop, "edge_vs_low_coinbase_bps": edge_cb, "edge_vs_low_binance_bps": edge_bn, "recommended_role": role, "reason": f"component_attribution;score_col={score_col};threshold={threshold:.4f}"})
             if rows:
                 with open(AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH, "a", newline="", encoding="utf-8") as f:
@@ -17800,13 +17528,28 @@ class TradingBot:
     def _latest_strategy_variant_policy(self) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
         try:
             frame = self._read_csv_tail_for_bot(STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH, max_lines=10000)
-            if frame.empty: return {}
-            frame = frame.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1); out = {}
+            if frame.empty:
+                return {}
+            frame = frame.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1)
+            out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
             for _, r in frame.iterrows():
                 key = (str(r.get("product_id") or ""), str(r.get("timeframe") or ""), str(r.get("strategy_variant") or "baseline"))
-                out[key] = {"rows": int(r.get("rows", 0) or 0), "coinbase_mm_avg": float(r.get("coinbase_maker_maker_avg_bps", 0.0) or 0.0), "coinbase_mm_win": float(r.get("coinbase_maker_maker_win_rate", 0.0) or 0.0), "binance_mm_avg": float(r.get("binance_maker_maker_avg_bps", 0.0) or 0.0), "binance_mm_win": float(r.get("binance_maker_maker_win_rate", 0.0) or 0.0), "hard_stop_rate": float(r.get("hard_stop_rate", 1.0) or 1.0), "profit_pullback_rate": float(r.get("profit_pullback_rate", 0.0) or 0.0)}
+                out[key] = {
+                    "rows": int(r.get("rows", 0) or 0),
+                    "binance_maker_maker_avg": float(r.get("binance_maker_maker_avg_bps", 0.0) or 0.0),
+                    "binance_maker_maker_win": float(r.get("binance_maker_maker_win_rate", 0.0) or 0.0),
+                    "binance_maker_taker_avg": float(r.get("binance_maker_taker_avg_bps", 0.0) or 0.0),
+                    "binance_maker_taker_win": float(r.get("binance_maker_taker_win_rate", 0.0) or 0.0),
+                    "binance_taker_taker_avg": float(r.get("binance_taker_taker_avg_bps", 0.0) or 0.0),
+                    "binance_taker_taker_win": float(r.get("binance_taker_taker_win_rate", 0.0) or 0.0),
+                    "hard_stop_rate": float(r.get("hard_stop_rate", 1.0) or 1.0),
+                    "profit_pullback_rate": float(r.get("profit_pullback_rate", 0.0) or 0.0),
+                    "early_adverse_exit_rate": float(r.get("early_adverse_exit_rate", 0.0) or 0.0),
+                }
             return out
-        except Exception: return {}
+        except Exception as exc:
+            module_debug(MODULE_NAME, "latest_strategy_variant_policy_failed", data={"error": str(exc), "traceback": traceback.format_exc()}, level="WARN", also_overall=False)
+            return {}
 
     def _write_backtest_setup_performance_from_replay(self) -> None:
         try:
@@ -17814,7 +17557,15 @@ class TradingBot:
             if frame.empty: return
             for col in ["product_id", "timeframe", "setup_tag", "regime_tag", "strategy_variant"]:
                 if col not in frame.columns: frame[col] = ""
-            scenario = "coinbase_maker_maker_net_pnl_bps" if "coinbase_maker_maker_net_pnl_bps" in frame.columns else "net_pnl_bps"; frame[scenario] = pd.to_numeric(frame[scenario], errors="coerce"); rows=[]
+            if "binance_taker_taker_net_pnl_bps" in frame.columns:
+                scenario = "binance_taker_taker_net_pnl_bps"
+            elif "binance_maker_taker_net_pnl_bps" in frame.columns:
+                scenario = "binance_maker_taker_net_pnl_bps"
+            elif "binance_maker_maker_net_pnl_bps" in frame.columns:
+                scenario = "binance_maker_maker_net_pnl_bps"
+            else:
+                scenario = "net_pnl_bps"
+            frame[scenario] = pd.to_numeric(frame[scenario], errors="coerce"); rows=[]
             for keys, group in frame.groupby(["product_id", "timeframe", "strategy_variant", "setup_tag", "regime_tag"]):
                 if len(group) < 10: continue
                 pnl = group[scenario].dropna()
@@ -17831,8 +17582,10 @@ class TradingBot:
             if frame.empty: return
             rows=[]
             for _, r in frame.iterrows():
-                edge_cb=float(pd.to_numeric(pd.Series([r.get("edge_vs_low_coinbase_bps")]), errors="coerce").fillna(0).iloc[0]); edge_bn=float(pd.to_numeric(pd.Series([r.get("edge_vs_low_binance_bps")]), errors="coerce").fillna(0).iloc[0])
-                rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "agent": str(r.get("component") or ""), "rows": int(r.get("rows", 0) or 0), "with_agent_avg_bps": float(r.get("high_score_avg_coinbase_maker_maker_bps", 0.0) or 0.0), "without_agent_avg_bps": float(r.get("low_score_avg_coinbase_maker_maker_bps", 0.0) or 0.0), "delta_bps": edge_cb, "binance_delta_bps": edge_bn, "recommended_weight_adjustment": "increase" if edge_cb > 5 or edge_bn > 5 else "decrease" if edge_cb < -5 and edge_bn < -5 else "neutral", "reason": "component_replay_ablation_proxy"})
+                edge_bn = float(pd.to_numeric(pd.Series([r.get("edge_vs_low_binance_bps")]), errors="coerce").fillna(0).iloc[0])
+                with_agent_avg = float(r.get("high_score_avg_binance_maker_maker_bps", 0.0) or 0.0)
+                without_agent_avg = float(r.get("low_score_avg_binance_maker_maker_bps", 0.0) or 0.0)
+                rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "agent": str(r.get("component") or ""), "rows": int(r.get("rows", 0) or 0), "with_agent_avg_bps": with_agent_avg, "without_agent_avg_bps": without_agent_avg, "delta_bps": edge_bn, "binance_delta_bps": edge_bn, "recommended_weight_adjustment": "increase" if edge_bn > 5 else "decrease" if edge_bn < -5 else "neutral", "reason": "component_replay_ablation_proxy"})
             if rows:
                 with open(AGENT_ABLATION_CSV_PATH, "a", newline="", encoding="utf-8") as f:
                     writer=csv.DictWriter(f, fieldnames=AGENT_ABLATION_COLUMNS); [writer.writerow({col: row.get(col, "") for col in AGENT_ABLATION_COLUMNS}) for row in rows]
@@ -18858,6 +18611,10 @@ class TradingBot:
             )
 
             if fill is None:
+                continue
+
+            if isinstance(fill, dict) and fill.get("dry_run_test_only"):
+                log(f"[binance-order-test] {held_product} SELL order parameters validated; no live order placed and no local position closed")
                 continue
 
             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
@@ -21402,15 +21159,150 @@ class TradingBot:
             await asyncio.sleep(1.0)
         return last
 
+    def _schedule_background_work(
+        self,
+        label: str,
+        running_attr: str,
+        fn: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Schedule slow maintenance work outside the hot eval loop."""
+        try:
+            if bool(getattr(self, running_attr, False)):
+                return
+            setattr(self, running_attr, True)
+
+            async def _runner() -> None:
+                started = time.perf_counter()
+                try:
+                    await asyncio.to_thread(fn, *args, **kwargs)
+                    module_debug(MODULE_NAME, "background_work_completed", data={"label": str(label), "elapsed_sec": round(time.perf_counter() - started, 4)}, level="DEBUG", also_overall=False)
+                except Exception as exc:
+                    module_exception(MODULE_NAME, "background_work_failed", exc, data={"label": str(label), "running_attr": str(running_attr), "traceback": traceback.format_exc()}, also_overall=False)
+                finally:
+                    setattr(self, running_attr, False)
+
+            asyncio.create_task(_runner())
+        except Exception as exc:
+            module_debug(MODULE_NAME, "schedule_background_work_failed", data={"label": str(label), "running_attr": str(running_attr), "error": str(exc)}, level="WARN", also_overall=False)
+
+    def _top_of_book_age_sec(self, product_id: str) -> Optional[float]:
+        """Return age of Binance top-of-book data for a product."""
+        try:
+            tob = self.tob.get(str(product_id))
+            if tob is None:
+                return None
+            ts = float(getattr(tob, "ts", 0.0) or 0.0)
+            if ts <= 0:
+                return None
+            return max(0.0, now_ts() - ts)
+        except Exception:
+            return None
+
+    async def binance_book_ticker_loop(self) -> None:
+        """Live Binance.US bookTicker stream with REST fallback elsewhere."""
+        from binance_us_websocket import BinanceUSBookTickerStream
+
+        def on_update(data: Dict[str, Any]) -> None:
+            try:
+                product_id = str(data.get("product_id") or "")
+                bid = safe_float(data.get("bid"), 0.0)
+                ask = safe_float(data.get("ask"), 0.0)
+                mid = safe_float(data.get("mid"), 0.0)
+                ts = safe_float(data.get("ts"), now_ts())
+                if product_id not in PRODUCTS or bid <= 0 or ask <= 0:
+                    return
+                if mid <= 0:
+                    mid = (bid + ask) / 2.0
+                self.tob[product_id] = TopOfBook(bid=float(bid), ask=float(ask), ts=float(ts))
+                self.mid_series[product_id].push(int(ts), float(mid))
+                self.live_1m[product_id].push_mid(int(ts), float(mid))
+                self._last_binance_book_ticker_ts = now_ts()
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_book_ticker_update_failed", data={"error": str(exc), "data": data}, level="WARN", also_overall=False)
+
+        while not self._stop_event.is_set():
+            try:
+                stream = BinanceUSBookTickerStream(PRODUCTS, on_update)
+                await stream.run_forever()
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_book_ticker_stream_reconnect", data={"error": str(exc), "delay_sec": float(WS_RECONNECT_DELAY_SEC)}, level="WARN", also_overall=False)
+                await asyncio.sleep(float(WS_RECONNECT_DELAY_SEC))
+
+    async def viewer_snapshot_heartbeat_loop(self) -> None:
+        """Keep viewer_snapshot.json fresh while bot runs."""
+        while not self._stop_event.is_set():
+            try:
+                snapshot = {
+                    "updated_ts": time.time(),
+                    "coins": dict(getattr(self, "_latest_viewer_snapshot_rows", {}) or {}),
+                    "top_products": list((getattr(self, "_latest_viewer_snapshot_rows", {}) or {}).keys())[:8],
+                    "live_positions": [pid for pid in PRODUCTS if self._has_open_position(pid)],
+                    "readiness": self._live_readiness_status(),
+                    "heartbeat_reason": "heartbeat",
+                }
+                self._write_viewer_snapshot(snapshot)
+            except Exception as exc:
+                module_debug(MODULE_NAME, "viewer_snapshot_heartbeat_failed", data={"error": str(exc), "traceback": traceback.format_exc()}, level="WARN", also_overall=False)
+            await asyncio.sleep(float(VIEWER_SNAPSHOT_WRITE_EVERY_SEC))
+
+    async def top_of_book_keeper_loop(self) -> None:
+        """Ensure Binance top-of-book remains fresh; WebSocket primary, REST fallback."""
+        self._top_of_book_keeper_running = True
+        while not self._stop_event.is_set():
+            try:
+                stale_products = []
+                for product_id in PRODUCTS:
+                    age = self._top_of_book_age_sec(product_id)
+                    if age is None or age > float(TOP_OF_BOOK_STALE_WARN_SEC):
+                        stale_products.append(product_id)
+                if stale_products:
+                    await asyncio.to_thread(self._rest_backfill_top_of_book, stale_products)
+                self._last_tob_keeper_cycle_ts = now_ts()
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_top_of_book_keeper_failed", data={"error": str(exc), "traceback": traceback.format_exc()}, level="WARN", also_overall=False)
+            await asyncio.sleep(5.0)
+
+    async def macro_refresh_loop(self) -> None:
+        """Refresh macro day/week context using Binance klines."""
+        while not self._stop_event.is_set():
+            try:
+                for product_id in PRODUCTS:
+                    try:
+                        refresh = getattr(self, "_refresh_macro_context_for_product", None)
+                        if callable(refresh):
+                            await refresh(product_id)
+                    except Exception as product_exc:
+                        module_debug(MODULE_NAME, "macro_refresh_product_failed", data={"product_id": product_id, "error": str(product_exc)}, level="WARN", also_overall=False)
+                self._macro_ready = True
+            except Exception as exc:
+                module_exception(MODULE_NAME, "macro_refresh_loop_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+            await asyncio.sleep(float(MACRO_REFRESH_EVERY_SEC))
+
     async def run(self) -> None:
         self.bot_start_ts = now_ts()
         self._write_startup_viewer_snapshot("bot_started_waiting_for_live_quotes")
+        book_ticker_task = asyncio.create_task(self.binance_book_ticker_loop())
+        try:
+            await asyncio.sleep(2.0)
+            await asyncio.to_thread(self._rest_backfill_top_of_book, PRODUCTS)
+        except Exception as exc:
+            module_debug(MODULE_NAME, "startup_binance_tob_backfill_failed", data={"error": str(exc)}, level="WARN", also_overall=False)
         await self._startup_binance_portfolio_reconcile()
         user_stream_task = asyncio.create_task(self.binance_user_data_stream_loop())
         telemetry_task = asyncio.create_task(self.telemetry_loop())
         eval_task = asyncio.create_task(self.eval_loop())
         history_task = asyncio.create_task(self.historical_shadow_replay_loop())
-        await asyncio.gather(user_stream_task, telemetry_task, eval_task, history_task)
+        optional_tasks = []
+        for method_name in ["viewer_snapshot_heartbeat_loop", "top_of_book_keeper_loop", "macro_refresh_loop", "extended_chart_cache_loop", "startup_calibration_loop"]:
+            method = getattr(self, method_name, None)
+            if callable(method):
+                try:
+                    optional_tasks.append(asyncio.create_task(method()))
+                except Exception as exc:
+                    module_debug(MODULE_NAME, "optional_runtime_task_start_failed", data={"method_name": method_name, "error": str(exc)}, level="WARN", also_overall=False)
+        await asyncio.gather(book_ticker_task, user_stream_task, telemetry_task, eval_task, history_task, *optional_tasks)
 
     async def eval_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -21498,89 +21390,10 @@ class TradingBot:
                 )
             self.last_loop_lag_check_ts = ts_now
 
-            if ENABLE_PENDING_BALANCE_DELTA_RECONCILIATION and self.pending_buy_reconciliations:
-                for product_id_r, pending in list(self.pending_buy_reconciliations.items()):
-                    age = ts_now - float(pending.get("ts", ts_now))
-                    if age < 10.0:
-                        continue
-                    try:
-                        snapshot = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                        base_asset = product_base_asset(product_id_r)
-                        qty_now = self._legacy_coinbase_portfolio.get_total_asset(base_asset, snapshot=snapshot or {})
-                        cash_now = self._legacy_coinbase_portfolio.get_tradable_usd(snapshot=snapshot or {})
-                        before_base = float(pending.get("before_base", 0.0))
-                        before_cash = float(pending.get("before_cash", 0.0))
-                        requested_quote = float(pending.get("requested_quote_usd", 0.0) or 0.0)
-
-                        actual_delta = max(0.0, float(qty_now) - before_base)
-                        cash_delta = max(0.0, float(before_cash) - float(cash_now))
-
-                        if actual_delta > 1e-12:
-                            tob = self.tob.get(product_id_r)
-                            fallback_ask = float(pending.get("ask", 0.0))
-                            mid = float(tob.mid) if tob and tob.mid > 0 else fallback_ask
-
-                            if cash_delta > 0.0 and requested_quote > 0.0:
-                                raw_notional = min(float(cash_delta), float(requested_quote))
-                            elif requested_quote > 0.0:
-                                raw_notional = float(requested_quote)
-                            else:
-                                raw_notional = float(actual_delta) * max(float(fallback_ask), float(mid))
-
-                            raw_fill_price = (
-                                float(raw_notional) / float(actual_delta)
-                                if actual_delta > 0 and raw_notional > 0
-                                else max(float(fallback_ask), float(mid))
-                            )
-
-                            fee_from_cash_delta = max(0.0, float(cash_delta) - float(raw_notional))
-                            try:
-                                estimated_buy_fee = max(
-                                    fee_from_cash_delta,
-                                    fee_usd(float(raw_notional), self._entry_fee_bps_for_mode("MARKET")),
-                                )
-                            except Exception:
-                                estimated_buy_fee = fee_from_cash_delta
-
-                            all_in_entry_price = (
-                                (float(raw_notional) + float(estimated_buy_fee)) / float(actual_delta)
-                                if actual_delta > 0 and raw_notional > 0
-                                else float(raw_fill_price)
-                            )
-
-                            pending["raw_notional_usd"] = float(raw_notional)
-                            pending["raw_fill_price"] = float(raw_fill_price)
-                            pending["estimated_buy_fee_usd"] = float(estimated_buy_fee)
-                            pending["all_in_entry_price"] = float(all_in_entry_price)
-                            pending["after_cash"] = float(cash_now)
-                            pending["cash_delta"] = float(cash_delta)
-
-                            self._adopt_live_position_after_uncertain_buy(
-                                product_id=product_id_r,
-                                qty=actual_delta,
-                                entry_price=all_in_entry_price,
-                                pending=pending,
-                            )
-                            self.reconciliation_log.log_reconciliation(
-                                event_type="delayed_buy_adopted", product_id=product_id_r, side="BUY",
-                                requested_quote_usd=f"{float(pending.get('requested_quote_usd', 0.0)):.6f}",
-                                actual_base_delta=f"{actual_delta:.12f}", before_base=f"{before_base:.12f}",
-                                after_base=f"{float(qty_now):.12f}", status="adopted",
-                                error=pending.get("reason", ""),
-                                action_taken="adopted_coinbase_balance_delta_as_position",
-                            )
-                            self.pending_buy_reconciliations.pop(product_id_r, None)
-                        elif age > 60.0:
-                            self.reconciliation_log.log_reconciliation(
-                                event_type="delayed_buy_rejected", product_id=product_id_r, side="BUY",
-                                requested_quote_usd=f"{float(pending.get('requested_quote_usd', 0.0)):.6f}",
-                                before_base=f"{before_base:.12f}", after_base=f"{float(qty_now):.12f}",
-                                status="rejected", error="no_base_balance_delta_after_60s",
-                                action_taken="dropped_pending_reconciliation",
-                            )
-                            self.pending_buy_reconciliations.pop(product_id_r, None)
-                    except Exception as exc:
-                        log(f"[reconcile] delayed buy reconcile failed for {product_id_r}: {exc}")
+            if self.pending_buy_reconciliations:
+                # Coinbase balance-delta reconciliation has been removed.
+                # Binance orders are reconciled through REST order polling and user-data stream events.
+                self.pending_buy_reconciliations.clear()
 
             if self.post_buy_review_queue and ENABLE_TRADE_OUTCOME_RESEARCH_LOG:
                 remaining_reviews: List[Dict[str, Any]] = []
@@ -21670,7 +21483,7 @@ class TradingBot:
 
             if ts_now - self.last_heartbeat_ts >= 30.0:
                 try:
-                    cash_usd = float(self._legacy_coinbase_portfolio.cash_usd)
+                    cash_usd = float(await self._live_refresh_cash())
                 except Exception:
                     cash_usd = float("nan")
 
@@ -21900,6 +21713,10 @@ class TradingBot:
                             ),
                         )
                         if fill is not None:
+                            if isinstance(fill, dict) and fill.get("dry_run_test_only"):
+                                log(f"[binance-order-test] {product_id} SELL order parameters validated; no live order placed and no local position closed")
+                                continue
+
                             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
                             self.signal_events_log.log_event(
                                 event_type="sell_fill",
@@ -22840,6 +22657,10 @@ class TradingBot:
                         f"error={error_text}"
                     )
                     continue
+
+                if isinstance(fill, dict) and fill.get("dry_run_test_only"):
+                    log(f"[binance-order-test] {product_id} BUY order parameters validated; no live order placed and no local position created")
+                    return True
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
                 requested_quote_for_fill = float(entry_notional)

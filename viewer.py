@@ -2132,10 +2132,27 @@ def render_strategy_variant_replay_panel():
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     latest = df.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1)
-    show_cols = [c for c in ["product_id", "timeframe", "strategy_variant", "rows", "coinbase_maker_maker_avg_bps", "coinbase_maker_maker_win_rate", "coinbase_taker_taker_avg_bps", "coinbase_taker_taker_win_rate", "binance_taker_taker_avg_bps", "binance_taker_taker_win_rate", "hard_stop_rate", "profit_pullback_rate", "avg_mfe_bps", "avg_mae_bps"] if c in latest.columns]
+    show_cols = [c for c in [
+        "product_id", "timeframe", "strategy_variant", "rows",
+        "binance_maker_maker_avg_bps", "binance_maker_maker_win_rate",
+        "binance_maker_taker_avg_bps", "binance_maker_taker_win_rate",
+        "binance_taker_taker_avg_bps", "binance_taker_taker_win_rate",
+        "hard_stop_rate", "profit_pullback_rate", "early_adverse_exit_rate",
+        "avg_mfe_bps", "avg_mae_bps",
+    ] if c in latest.columns]
     st.dataframe(latest[show_cols], width="stretch", hide_index=True)
     if "strategy_variant" in latest.columns:
-        by_variant = latest.groupby("strategy_variant").agg({"rows": "sum", "coinbase_taker_taker_avg_bps": "mean", "coinbase_taker_taker_win_rate": "mean", "binance_taker_taker_avg_bps": "mean", "binance_taker_taker_win_rate": "mean", "hard_stop_rate": "mean"}).reset_index()
+        by_variant = latest.groupby("strategy_variant").agg({
+            "rows": "sum",
+            "binance_maker_maker_avg_bps": "mean",
+            "binance_maker_maker_win_rate": "mean",
+            "binance_maker_taker_avg_bps": "mean",
+            "binance_maker_taker_win_rate": "mean",
+            "binance_taker_taker_avg_bps": "mean",
+            "binance_taker_taker_win_rate": "mean",
+            "hard_stop_rate": "mean",
+            "profit_pullback_rate": "mean",
+        }).reset_index()
         st.markdown("#### Overall by variant")
         st.dataframe(by_variant, width="stretch", hide_index=True)
 

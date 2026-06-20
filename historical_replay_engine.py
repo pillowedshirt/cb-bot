@@ -88,7 +88,7 @@ class ReplayEngineConfig:
     min_required_net_edge_bps: float = 15.0
     vwap_reclaim_buffer_bps: float = 3.0
     primary_fee_model: str = "binance_us"
-    comparison_fee_model: str = "coinbase_legacy"
+    comparison_fee_model: str = "none"
     comparison_entry_fee_bps: float = 0.0
     comparison_exit_fee_bps: float = 2.0
     enable_exchange_fee_comparison: bool = True
@@ -120,13 +120,13 @@ class ReplayEngineConfig:
     high_win_v2_block_low_volume_above_value: bool = True
     high_win_v2_stop_loss_pct: float = 0.004
     high_win_v2_profit_pullback_pct: float = 0.0018
-    coinbase_survival_min_target_to_cost_ratio: float = 2.25
-    coinbase_survival_min_target_over_cost_bps: float = 140.0
-    coinbase_survival_min_probability: float = 0.56
-    coinbase_survival_min_score: float = 58.0
-    coinbase_survival_max_spread_bps: float = 22.0
-    coinbase_survival_stop_loss_pct: float = 0.0035
-    coinbase_survival_profit_pullback_pct: float = 0.0015
+    high_fee_survival_min_target_to_cost_ratio: float = 2.25
+    high_fee_survival_min_target_over_cost_bps: float = 140.0
+    high_fee_survival_min_probability: float = 0.56
+    high_fee_survival_min_score: float = 58.0
+    high_fee_survival_max_spread_bps: float = 22.0
+    high_fee_survival_stop_loss_pct: float = 0.0035
+    high_fee_survival_profit_pullback_pct: float = 0.0015
     low_fee_scalp_min_target_to_cost_ratio: float = 1.15
     low_fee_scalp_min_target_over_cost_bps: float = 15.0
     low_fee_scalp_min_probability: float = 0.52
@@ -428,7 +428,7 @@ def _variant_entry_filter(*, variant: str, signal: ReplaySignal, candles: List[R
         if bool(config.high_win_v2_block_low_room) and "low_room" in str(_setup_tag_from_signal(signal)[1]).lower(): reasons.append("low_room_blocked")
         if bool(config.high_win_v2_block_low_volume_above_value) and "above" in str(signal.value_acceptance_state).lower() and "low" in str(signal.volume_node_state).lower(): reasons.append("above_value_low_volume_blocked")
     elif variant == "high_fee_survival_v1":
-        reasons = fail_reasons(min_ratio=float(config.coinbase_survival_min_target_to_cost_ratio), min_over=float(config.coinbase_survival_min_target_over_cost_bps), min_prob=float(config.coinbase_survival_min_probability), min_score=float(config.coinbase_survival_min_score), max_spread=float(config.coinbase_survival_max_spread_bps), require_momentum_either=True, min_momentum_either=0.0)
+        reasons = fail_reasons(min_ratio=float(config.high_fee_survival_min_target_to_cost_ratio), min_over=float(config.high_fee_survival_min_target_over_cost_bps), min_prob=float(config.high_fee_survival_min_probability), min_score=float(config.high_fee_survival_min_score), max_spread=float(config.high_fee_survival_max_spread_bps), require_momentum_either=True, min_momentum_either=0.0)
     elif variant == "low_fee_scalp_v1":
         reasons = fail_reasons(min_ratio=float(config.low_fee_scalp_min_target_to_cost_ratio), min_over=float(config.low_fee_scalp_min_target_over_cost_bps), min_prob=float(config.low_fee_scalp_min_probability), min_score=float(config.low_fee_scalp_min_score), max_spread=float(config.low_fee_scalp_max_spread_bps), require_momentum_either=True, min_momentum_either=0.0)
     else:
@@ -447,7 +447,7 @@ def _variant_sell_settings(variant: str, config: ReplayEngineConfig) -> Dict[str
     if variant == "high_win_rate_v2":
         return {"stop_loss_pct": float(config.high_win_v2_stop_loss_pct), "pullback_pct": float(config.high_win_v2_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
     if variant == "high_fee_survival_v1":
-        return {"stop_loss_pct": float(config.coinbase_survival_stop_loss_pct), "pullback_pct": float(config.coinbase_survival_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
+        return {"stop_loss_pct": float(config.high_fee_survival_stop_loss_pct), "pullback_pct": float(config.high_fee_survival_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
     if variant == "low_fee_scalp_v1":
         return {"stop_loss_pct": float(config.low_fee_scalp_stop_loss_pct), "pullback_pct": float(config.low_fee_scalp_profit_pullback_pct), "early_adverse_exit_bps": float(config.early_adverse_exit_bps)}
     return {"stop_loss_pct": float(config.max_position_loss_pct), "pullback_pct": float(config.scalp_pullback_pct), "early_adverse_exit_bps": 0.0}

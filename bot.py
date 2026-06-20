@@ -22,6 +22,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass, field
 from collections import deque
 from io import StringIO
+from types import SimpleNamespace
 from typing import Dict, Deque, List, Optional, Set, Tuple, Any, Callable
 
 import numpy as np
@@ -596,6 +597,8 @@ AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv"
 AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH: str = os.path.join(BASE_DIR, "agent_component_replay_attribution.csv")
 AGENT_TRADE_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "agent_trade_policy.csv")
 AGENT_SIDE_RATINGS_CSV_PATH: str = os.path.join(BASE_DIR, "agent_side_ratings.csv")
+FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH: str = os.path.join(BASE_DIR, "four_pass_product_live_gate.csv")
+PRODUCT_COOLDOWNS_CSV_PATH: str = os.path.join(BASE_DIR, "product_cooldowns.csv")
 BACKTEST_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_recommendations.csv")
 BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_sell_recommendations.csv")
 BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
@@ -631,6 +634,8 @@ RUNTIME_CSV_ROW_LIMITS = {
     "historical_replay_15m_90d.csv": 150000,
     "historical_replay_1h_365d.csv": 150000,
     "historical_replay_1d_2y.csv": 20000,
+    "four_pass_product_live_gate.csv": 10000,
+    "product_cooldowns.csv": 10000,
 }
 
 SHADOW_SELL_REPLAY_COLUMNS: List[str] = [
@@ -1169,6 +1174,9 @@ BACKTEST_INTELLIGENCE_MIN_PRODUCT_ROWS: int = 80
 BACKTEST_INTELLIGENCE_MIN_RERUN_SECONDS: int = env_int("BACKTEST_INTELLIGENCE_MIN_RERUN_SECONDS", 180)
 BACKTEST_INTELLIGENCE_MIN_NEW_ROWS: int = env_int("BACKTEST_INTELLIGENCE_MIN_NEW_ROWS", 2500)
 BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE: bool = env_bool("BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE", True)
+FOUR_PASS_CACHE_WARMUP_ENABLED: bool = env_bool("FOUR_PASS_CACHE_WARMUP_ENABLED", True)
+CALCULATION_PARALLEL_PHASES_ENABLED: bool = env_bool("CALCULATION_PARALLEL_PHASES_ENABLED", True)
+STARTUP_STATUS_MIN_UPDATE_SECONDS: float = env_float("STARTUP_STATUS_MIN_UPDATE_SECONDS", 2.0)
 BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS: bool = True
 BACKTEST_USE_PRODUCT_SELL_RECOMMENDATIONS: bool = True
 
@@ -6555,8 +6563,11 @@ class TradingBot:
 
         if bool(ENABLE_BACKTEST_INTELLIGENCE) and bool(BACKTEST_INTELLIGENCE_RUN_ON_STARTUP):
             try:
-                self._run_backtest_intelligence_if_due(force=True)
-                self._load_backtest_recommendations()
+                if bool(CALCULATION_PARALLEL_PHASES_ENABLED):
+                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True)
+                else:
+                    self._run_backtest_intelligence_if_due(force=True)
+                    self._load_backtest_recommendations()
             except Exception as exc:
                 log(f"[backtest] startup backtest intelligence failed: {exc}")
         # positions per product: list of PositionLot
@@ -12576,6 +12587,77 @@ class TradingBot:
             + "|fvg_score=" + self._setup_perf_bucket(safe_float(candidate.get("fvg_buy_score"), 0.0))
         )
 
+
+    def _latest_product_live_gate(self, product_id: str) -> Dict[str, Any]:
+        try:
+            frame = self._read_csv_tail_for_bot(FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH, max_lines=10000)
+            if frame.empty or "product_id" not in frame.columns:
+                return {}
+            rows = frame[frame["product_id"].astype(str).eq(str(product_id))].copy()
+            if rows.empty:
+                return {}
+            if "ts" in rows.columns:
+                rows["ts_num"] = pd.to_numeric(rows["ts"], errors="coerce")
+                rows = rows.sort_values("ts_num")
+            return rows.tail(1).iloc[0].to_dict()
+        except Exception:
+            return {}
+
+    def _product_is_in_cooldown(self, product_id: str) -> Tuple[bool, str]:
+        try:
+            frame = self._read_csv_tail_for_bot(PRODUCT_COOLDOWNS_CSV_PATH, max_lines=10000)
+            if frame.empty or "product_id" not in frame.columns:
+                return False, ""
+            rows = frame[frame["product_id"].astype(str).eq(str(product_id))].copy()
+            if rows.empty:
+                return False, ""
+            rows["cooldown_until_ts_num"] = pd.to_numeric(rows.get("cooldown_until_ts", 0.0), errors="coerce").fillna(0.0)
+            rows = rows.sort_values("cooldown_until_ts_num")
+            latest = rows.tail(1).iloc[0].to_dict()
+            cooldown_until = float(latest.get("cooldown_until_ts", 0.0) or 0.0)
+            if cooldown_until > now_ts():
+                return True, str(latest.get("reason", "product_cooldown"))
+            return False, ""
+        except Exception:
+            return False, ""
+
+    def _four_pass_product_live_buy_allowed(self, product_id: str) -> Tuple[bool, str]:
+        in_cooldown, cooldown_reason = self._product_is_in_cooldown(product_id)
+        if in_cooldown:
+            return False, f"product_cooldown:{cooldown_reason}"
+        gate = self._latest_product_live_gate(product_id)
+        if not gate:
+            return False, "missing_four_pass_product_live_gate"
+        approved = str(gate.get("approved_for_live_buy", "0")).strip()
+        if approved not in {"1", "true", "True", "yes", "YES"}:
+            return False, str(gate.get("gate_reason", "four_pass_product_gate_blocked"))
+        return True, str(gate.get("gate_reason", "four_pass_product_gate_approved"))
+
+    def _infer_live_market_regime_from_signal(self, signal: Any = None, product_id: str = "") -> Dict[str, Any]:
+        try:
+            momentum_15 = float(getattr(signal, "momentum_15_bps", 0.0) or 0.0)
+            momentum_30 = float(getattr(signal, "momentum_30_bps", 0.0) or 0.0)
+            volatility = float(getattr(signal, "volatility_bps", getattr(signal, "range_bps", 0.0)) or 0.0)
+            atr = float(getattr(signal, "atr_bps", 0.0) or 0.0)
+            range_bps = float(getattr(signal, "range_bps", volatility) or 0.0)
+            momentum = momentum_15 if abs(momentum_15) >= abs(momentum_30) else momentum_30
+            vol = max(volatility, atr, range_bps)
+            if momentum >= 20.0 and vol >= 80.0:
+                regime = "trend_high_vol"
+            elif momentum >= 20.0 and vol < 80.0:
+                regime = "trend_low_vol"
+            elif momentum <= -20.0 and vol >= 80.0:
+                regime = "downtrend_high_vol"
+            elif momentum <= -20.0 and vol < 80.0:
+                regime = "downtrend_low_vol"
+            elif abs(momentum) < 20.0 and vol >= 80.0:
+                regime = "range_high_vol"
+            else:
+                regime = "range_low_vol"
+            return {"product_id": str(product_id), "market_regime": regime, "momentum_15_bps": momentum_15, "momentum_30_bps": momentum_30, "volatility_bps": volatility, "atr_bps": atr, "range_bps": range_bps}
+        except Exception:
+            return {"product_id": str(product_id), "market_regime": "unknown", "momentum_15_bps": 0.0, "momentum_30_bps": 0.0, "volatility_bps": 0.0, "atr_bps": 0.0, "range_bps": 0.0}
+
     def _backtest_setup_performance_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         """Return exact setup replay performance or a product-level fallback."""
         if not bool(ENABLE_BACKTEST_SETUP_PERFORMANCE_FEEDBACK):
@@ -13248,6 +13330,9 @@ class TradingBot:
                 tob_age = self._top_of_book_age_sec(product_id)
                 if tob_age is None or tob_age > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
                     return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age}")
+            product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+            if not product_gate_ok:
+                return False, f"live_buy_blocked:{product_gate_reason}"
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
@@ -13286,6 +13371,10 @@ class TradingBot:
                                             and float(latest.get("avg_net_bps", 0.0) or 0.0) >= 20.0
                                             and float(latest.get("median_net_bps", 0.0) or 0.0) >= 8.0
                                         )
+                                    if four_pass_ok:
+                                        product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+                                        if not product_gate_ok:
+                                            four_pass_ok = False
                     except Exception:
                         four_pass_ok = False
                     if not four_pass_ok:
@@ -14078,6 +14167,16 @@ class TradingBot:
             mom1, mom3 = float(context["mom1"]), float(context["mom3"])
             mom5, mom15 = float(context["mom5"]), float(context["mom15"])
             setup_tag, market_regime = str(context["setup_tag"]), str(context["market_regime"])
+            signal_obj = SimpleNamespace(
+                momentum_15_bps=float(context.get("mom15", 0.0) or 0.0),
+                momentum_30_bps=float(context.get("mom30", context.get("mom15", 0.0)) or 0.0),
+                volatility_bps=float(context.get("volatility_bps", context.get("range_bps", 0.0)) or 0.0),
+                atr_bps=float(context.get("atr_bps", 0.0) or 0.0),
+                range_bps=float(context.get("range_bps", context.get("volatility_bps", 0.0)) or 0.0),
+            )
+            regime_payload = self._infer_live_market_regime_from_signal(signal_obj, product_id)
+            if regime_payload.get("market_regime") and regime_payload.get("market_regime") != "unknown":
+                market_regime = str(regime_payload["market_regime"])
             execution_state, learning_score = str(context["execution_state"]), float(context["learning_score"])
             trend_score = clamp_float(0.50 + mom5 / 180.0 + mom15 / 300.0, 0.0, 1.0)
             mean_reversion_score = clamp_float(0.45 + max(0.0, -mom5) / 180.0 + max(0.0, mom1) / 160.0, 0.0, 1.0)
@@ -14089,6 +14188,12 @@ class TradingBot:
             common = {
                 "setup_tag": setup_tag,
                 "market_regime": market_regime,
+                "product_id": regime_payload["product_id"],
+                "momentum_15_bps": regime_payload["momentum_15_bps"],
+                "momentum_30_bps": regime_payload["momentum_30_bps"],
+                "volatility_bps": regime_payload["volatility_bps"],
+                "atr_bps": regime_payload["atr_bps"],
+                "range_bps": regime_payload["range_bps"],
                 "execution_state": execution_state,
                 "learning_score": learning_score,
                 "owns_position": bool(owns_position),
@@ -18697,6 +18802,12 @@ class TradingBot:
             phase_progress["replay_calibration_verdicts"] = 1.0
             status["phase_progress"] = phase_progress
         try:
+            if not bool(force):
+                last_status_write = float(getattr(self, "_last_calculation_status_write_ts", 0.0) or 0.0)
+                now_value = now_ts()
+                if now_value - last_status_write < float(STARTUP_STATUS_MIN_UPDATE_SECONDS):
+                    return status
+                self._last_calculation_status_write_ts = now_value
             tmp = CALCULATION_STATUS_JSON_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(status, f, indent=2, sort_keys=True)

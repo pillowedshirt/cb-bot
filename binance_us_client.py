@@ -31,7 +31,6 @@ class BinanceUSClient:
         if end_ms is not None: p["endTime"]=int(end_ms)
         return self._request("GET","/api/v3/klines", params=p)
     def new_order(self, **params): return self._request("POST","/api/v3/order", params=params, signed=True)
-    def test_order(self, **params): return self._request("POST","/api/v3/order/test", params=params, signed=True)
     def get_order(self, symbol, order_id=None, client_order_id=None):
         p={"symbol":symbol};
         if order_id: p["orderId"]=order_id

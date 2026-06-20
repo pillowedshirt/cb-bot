@@ -9,6 +9,11 @@ LIVE_EXECUTION_EXCHANGE = os.getenv("LIVE_EXECUTION_EXCHANGE", EXCHANGE_BINANCE_
 HISTORICAL_DATA_SOURCE_PRIORITY: List[str] = ["local_cache", "binance_bulk", "legacy_removed_fallback"]
 
 @dataclass(frozen=True)
+# NOTE:
+# coinbase_product_id is legacy field naming only.
+# The runtime bot is Binance.US-only.
+# Internal product IDs like BTC-USD are canonical display IDs.
+# Execution symbols are Binance.US symbols like BTCUSDT.
 class ProductSymbolMap:
     canonical_product_id: str
     coinbase_product_id: str

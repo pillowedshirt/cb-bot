@@ -167,6 +167,35 @@ FOUR_PASS_AGENT_CONTEXT_RATINGS_COLUMNS: List[str] = [
     "profitability_mode", "reason",
 ]
 
+FOUR_PASS_SELL_PATH_REPLAY_COLUMNS = [
+    "ts", "dt_utc",
+    "product_id", "entry_ts", "exit_ts",
+    "entry_price", "exit_price",
+    "held_minutes", "exit_agent", "exit_score",
+    "exit_reason", "realized_net_bps",
+    "max_favorable_bps", "max_adverse_bps",
+    "profitability_mode", "reason",
+]
+
+FOUR_PASS_PURGED_WALK_FORWARD_COLUMNS = [
+    "ts", "dt_utc",
+    "fold_id", "side", "train_start_ts", "train_end_ts",
+    "embargo_start_ts", "embargo_end_ts",
+    "validation_start_ts", "validation_end_ts",
+    "train_rows", "validation_rows",
+    "train_win_rate", "validation_win_rate",
+    "train_avg_net_bps", "validation_avg_net_bps",
+    "train_median_net_bps", "validation_median_net_bps",
+    "validation_reference_return_pct",
+    "verdict", "reason",
+]
+
+FEATURE_STORE_SUMMARY_COLUMNS = [
+    "ts", "dt_utc",
+    "feature_store_path", "row_count", "column_count",
+    "source_files", "cache_mode", "reason",
+]
+
 BUY_AGENT_SCORE_COLUMNS = {
     "price_action": "price_action_buy_score",
     "market_structure_agent": "market_structure_buy_score",
@@ -1044,6 +1073,43 @@ def _save_cached_four_pass_frame(base_dir: str, name: str, key: str, frame: pd.D
         pass
 
 
+
+
+def _feature_store_summary_rows(base_dir: str) -> List[List[Any]]:
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+    cache_dir = os.path.join(base_dir, "_four_pass_cache")
+    rows: List[List[Any]] = []
+    try:
+        if not os.path.isdir(cache_dir):
+            return rows
+        total_rows = 0
+        total_cols = 0
+        files = []
+        for name in os.listdir(cache_dir):
+            if not name.endswith(".pkl"):
+                continue
+            path = os.path.join(cache_dir, name)
+            files.append(name)
+            try:
+                with open(path, "rb") as f:
+                    payload = pickle.load(f)
+                frame = payload.get("frame")
+                if isinstance(frame, pd.DataFrame):
+                    total_rows += int(len(frame))
+                    total_cols = max(total_cols, int(len(frame.columns)))
+            except Exception:
+                pass
+        rows.append([
+            f"{ts_value:.6f}", dt_value, cache_dir, int(total_rows), int(total_cols),
+            ",".join(files), "pickle_feature_frame_cache",
+            "feature_store_summary_for_four_pass_cache",
+        ])
+    except Exception:
+        pass
+    return rows
+
+
 def _four_pass_score_from_ev(*, smoothed_win_rate: float, ev_bps: float, avg_net_bps: float, median_net_bps: float, avg_adverse_bps: float, selected_count: int, sample_floor: int) -> float:
     sample_factor = min(1.0, math.sqrt(float(selected_count) / max(1.0, float(sample_floor))))
     score = (
@@ -1076,6 +1142,39 @@ def _softmax_weights(scored_rows: List[Dict[str, Any]], *, score_key: str, raw_k
         row[weight_key] = float(row[raw_key]) / raw_total * 100.0
     return scored_rows
 
+
+
+
+def _softmax_weights_by_group(
+    rows: List[Dict[str, Any]],
+    *,
+    group_keys: List[str],
+    score_key: str,
+    raw_key: str,
+    weight_key: str,
+) -> List[Dict[str, Any]]:
+    """Normalize weights inside each context group."""
+    if not rows:
+        return []
+    grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = tuple(row.get(k, "") for k in group_keys)
+        grouped.setdefault(key, []).append(row)
+    out: List[Dict[str, Any]] = []
+    for group_rows in grouped.values():
+        raw_total = 0.0
+        for row in group_rows:
+            score = float(row.get(score_key, 0.50) or 0.50)
+            samples = float(row.get("selected_count", row.get("sample_count", 0)) or 0)
+            sample_factor = max(0.05, min(1.0, samples / 80.0))
+            raw = math.exp((score - 0.50) / 0.070) * sample_factor
+            row[raw_key] = raw
+            raw_total += raw
+        raw_total = max(raw_total, 1e-9)
+        for row in group_rows:
+            row[weight_key] = float(row[raw_key]) / raw_total * 100.0
+            out.append(row)
+    return out
 
 def _buy_agent_score_columns(frame: pd.DataFrame) -> Dict[str, str]:
     """Return every buy-capable analyst that has a score column in the replay frame."""
@@ -1209,7 +1308,7 @@ def _four_pass_buy_agent_rows(base_dir: str) -> Tuple[List[List[Any]], Dict[str,
                     context_rows_for_weighting.append(context_best)
 
     rows_for_weighting = _softmax_weights(rows_for_weighting, score_key="score", raw_key="raw_authority", weight_key="buy_weight_pct")
-    context_rows_for_weighting = _softmax_weights(context_rows_for_weighting, score_key="score", raw_key="raw_authority", weight_key="weight_pct")
+    context_rows_for_weighting = _softmax_weights_by_group(context_rows_for_weighting, group_keys=["side", "product_id", "market_regime"], score_key="score", raw_key="raw_authority", weight_key="weight_pct")
     output_rows: List[List[Any]] = []
     weights: Dict[str, float] = {}
     for row in rows_for_weighting:
@@ -1286,10 +1385,27 @@ def _four_pass_council_buy_rows(base_dir: str, buy_weights: Dict[str, float], bu
 def _build_sell_training_frame(base_dir: str, council_buy_entries: pd.DataFrame) -> pd.DataFrame:
     """SELL training frame based on weighted council BUY entries from Pass 2."""
     buy_rows = 0 if council_buy_entries is None or council_buy_entries.empty else len(council_buy_entries)
+    buy_fingerprint = "empty"
+    try:
+        if council_buy_entries is not None and not council_buy_entries.empty:
+            fingerprint_cols = [
+                c for c in [
+                    "product_id", "replay_ts", "ts", "entry_ts",
+                    "buy_net_bps", "four_pass_buy_council_score",
+                    "four_pass_buy_product_threshold"
+                ]
+                if c in council_buy_entries.columns
+            ]
+            fingerprint_frame = council_buy_entries[fingerprint_cols].copy() if fingerprint_cols else council_buy_entries.head(500).copy()
+            buy_fingerprint = hashlib.sha256(
+                pd.util.hash_pandas_object(fingerprint_frame, index=True).values.tobytes()
+            ).hexdigest()
+    except Exception:
+        buy_fingerprint = "fingerprint_failed"
     cache_key = _four_pass_cache_key(
         base_dir,
         ["sell_outcomes.csv", "shadow_sell_replay.csv", "candidate_replay.csv", "historical_shadow_replay.csv"],
-    ) + f":buy_rows={buy_rows}"
+    ) + f":buy_rows={buy_rows}:buy_fingerprint={buy_fingerprint}"
     cached = _load_cached_four_pass_frame(base_dir, "sell_training_frame", cache_key)
     if not cached.empty:
         return cached
@@ -1405,11 +1521,80 @@ def _four_pass_final_agent_rating_rows(buy_agent_rows: List[List[Any]], sell_age
     return rows
 
 
+
+def _four_pass_sell_path_replay_rows(
+    base_dir: str,
+    council_buy_entries: pd.DataFrame,
+    sell_weights: Dict[str, float],
+    sell_frame: pd.DataFrame,
+) -> List[List[Any]]:
+    """True sell-path replay when enough sell-path data exists."""
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+    if sell_frame is None or sell_frame.empty:
+        return []
+    has_pnl = bool({"realized_net_pnl_bps", "net_pnl_bps"}.intersection(set(sell_frame.columns)))
+    if not has_pnl or "product_id" not in sell_frame.columns:
+        return []
+    frame = sell_frame.copy()
+    if "realized_net_pnl_bps" not in frame.columns:
+        frame["realized_net_pnl_bps"] = _numeric(frame, "net_pnl_bps", 0.0)
+    else:
+        frame["realized_net_pnl_bps"] = _numeric(frame, "realized_net_pnl_bps", 0.0)
+    if council_buy_entries is not None and not council_buy_entries.empty and "product_id" in council_buy_entries.columns:
+        allowed_products = set(council_buy_entries["product_id"].astype(str).unique())
+        frame = frame[frame["product_id"].astype(str).isin(allowed_products)].copy()
+    if frame.empty:
+        return []
+    if "profitability_mode" in frame.columns:
+        frame = frame[~frame["profitability_mode"].astype(str).str.contains("proxy", case=False, na=False)].copy()
+    if "exit_ts" not in frame.columns and "decision_ts" not in frame.columns:
+        return []
+    if frame.empty:
+        return []
+    score_cols = _sell_agent_score_columns(frame)
+    rows: List[List[Any]] = []
+    for _, row in frame.iterrows():
+        product_id = str(row.get("product_id") or "")
+        best_agent = ""
+        best_score = 0.0
+        for agent, col in score_cols.items():
+            if col not in row.index:
+                continue
+            try:
+                score_val = float(row.get(col, 0.0) or 0.0)
+                if score_val > best_score:
+                    best_score = score_val
+                    best_agent = agent
+            except Exception:
+                continue
+        if not best_agent and sell_weights:
+            best_agent = max(sell_weights.items(), key=lambda kv: float(kv[1]))[0]
+            best_score = float(sell_weights.get(best_agent, 0.0) or 0.0)
+        entry_ts = float(row.get("entry_ts", row.get("replay_ts", row.get("ts", 0.0))) or 0.0)
+        exit_ts = float(row.get("exit_ts", row.get("decision_ts", row.get("ts", entry_ts))) or entry_ts)
+        held_minutes = max(0.0, (exit_ts - entry_ts) / 60.0) if exit_ts and entry_ts else 0.0
+        entry_price = float(row.get("entry_price", row.get("buy_price", 0.0)) or 0.0)
+        exit_price = float(row.get("exit_price", row.get("sell_price", 0.0)) or 0.0)
+        realized_net = float(row.get("realized_net_pnl_bps", 0.0) or 0.0)
+        max_fav = float(row.get("max_favorable_bps", row.get("max_favorable_after_entry_bps", 0.0)) or 0.0)
+        max_adv = float(row.get("max_adverse_bps", row.get("max_adverse_after_entry_bps", 0.0)) or 0.0)
+        rows.append([
+            f"{ts_value:.6f}", dt_value, product_id, f"{entry_ts:.6f}", f"{exit_ts:.6f}",
+            f"{entry_price:.12f}", f"{exit_price:.12f}", f"{held_minutes:.3f}", best_agent,
+            f"{best_score:.6f}", str(row.get("exit_reason", row.get("reason", "sell_path_replay"))),
+            f"{realized_net:.6f}", f"{max_fav:.6f}", f"{max_adv:.6f}",
+            str(row.get("profitability_mode", "external_sell_outcome_replay")),
+            "true_sell_path_replay_when_external_sell_rows_include_realized_pnl",
+        ])
+    return rows
+
 def _four_pass_profitability_summary_rows(
     buy_agent_rows: List[List[Any]],
     council_buy_rows: List[List[Any]],
     sell_agent_rows: List[List[Any]],
     council_sell_rows: List[List[Any]],
+    sell_path_replay_rows: List[List[Any]] = None,
 ) -> List[List[Any]]:
     ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
     def _sum_return(rows: List[List[Any]], return_index: int) -> float:
@@ -1429,20 +1614,29 @@ def _four_pass_profitability_summary_rows(
         return count
     buy_return = _sum_return(council_buy_rows, 11)
     sell_return = _sum_return(council_sell_rows, 11)
+    true_sell_path_return = 0.0
+    if sell_path_replay_rows:
+        try:
+            true_sell_path_return = sum(float(r[11]) * 5.0 / 10000.0 for r in sell_path_replay_rows)
+        except Exception:
+            true_sell_path_return = 0.0
     buy_modes = sorted(set(str(row[13]) for row in council_buy_rows if len(row) > 13)) if council_buy_rows else []
     sell_modes = sorted(set(str(row[13]) for row in council_sell_rows if len(row) > 13)) if council_sell_rows else []
     buy_positive_products = _count_positive(council_buy_rows, 8, 9)
     sell_positive_products = _count_positive(council_sell_rows, 10, None)
-    final_return = sell_return if council_sell_rows else buy_return
+    final_return = true_sell_path_return if sell_path_replay_rows else (sell_return if council_sell_rows else buy_return)
     buy_mode_text = ",".join(buy_modes) if buy_modes else "none"
     sell_mode_text = ",".join(sell_modes) if sell_modes else "none"
     sell_is_real = (
-        "external_sell_outcome_replay" in sell_mode_text
+        bool(sell_path_replay_rows)
+        or "external_sell_outcome_replay" in sell_mode_text
         or "realized" in sell_mode_text
         or "exit" in sell_mode_text
     )
-    sell_is_proxy = "proxy" in sell_mode_text
-    if council_sell_rows and sell_return > 0 and sell_is_real and not sell_is_proxy:
+    sell_is_proxy = "proxy" in sell_mode_text and not bool(sell_path_replay_rows)
+    if sell_path_replay_rows and true_sell_path_return > 0:
+        verdict = "positive_true_sell_path_replay"
+    elif council_sell_rows and sell_return > 0 and sell_is_real and not sell_is_proxy:
         verdict = "positive_realized_sell_replay"
     elif council_sell_rows and sell_return > 0 and sell_is_proxy:
         verdict = "positive_proxy_sell_model_not_final_live_proof"
@@ -1452,19 +1646,83 @@ def _four_pass_profitability_summary_rows(
         verdict = "not_profitable_yet"
     reason = (
         f"buy_return={buy_return:.4f};sell_return={sell_return:.4f};"
+        f"true_sell_path_return={true_sell_path_return:.4f};"
         f"buy_positive_products={buy_positive_products};sell_positive_products={sell_positive_products};"
-        f"buy_modes={buy_mode_text};sell_modes={sell_mode_text}"
+        f"buy_modes={buy_mode_text};sell_modes={sell_mode_text};"
+        f"true_sell_path_rows={len(sell_path_replay_rows or [])}"
     )
     return [[f"{ts_value:.6f}", dt_value, int(len(buy_agent_rows)), int(len(council_buy_rows)), int(len(sell_agent_rows)), int(len(council_sell_rows)), buy_mode_text, sell_mode_text, f"{buy_return:.6f}", f"{sell_return:.6f}", f"{final_return:.6f}", int(buy_positive_products), int(sell_positive_products), verdict, reason]]
 
+
+def _purged_walk_forward_rows(base_dir: str, frame: pd.DataFrame, *, side: str = "BUY") -> List[List[Any]]:
+    """Purged walk-forward validation with a fixed embargo gap."""
+    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
+    if frame is None or frame.empty:
+        return []
+    work = frame.copy()
+    time_col = next((c for c in ["replay_ts", "entry_ts", "ts"] if c in work.columns), None)
+    if not time_col:
+        return []
+    work["_time"] = pd.to_numeric(work[time_col], errors="coerce")
+    work = work.dropna(subset=["_time"]).sort_values("_time").copy()
+    if work.empty:
+        return []
+    if side.upper() == "BUY":
+        if "buy_net_bps" not in work.columns:
+            return []
+        net_col = "buy_net_bps"
+    else:
+        if "realized_net_pnl_bps" in work.columns:
+            net_col = "realized_net_pnl_bps"
+        elif "net_pnl_bps" in work.columns:
+            net_col = "net_pnl_bps"
+        else:
+            return []
+    work["_net"] = pd.to_numeric(work[net_col], errors="coerce").fillna(0.0)
+    min_t = float(work["_time"].min()); max_t = float(work["_time"].max())
+    if max_t <= min_t:
+        return []
+    fold_count = 4; fold_span = (max_t - min_t) / float(fold_count + 1); embargo_seconds = 6 * 60 * 60
+    rows: List[List[Any]] = []
+    for fold_id in range(1, fold_count + 1):
+        train_start = min_t; train_end = min_t + fold_span * fold_id
+        embargo_start = train_end; embargo_end = embargo_start + embargo_seconds
+        validation_start = embargo_end; validation_end = validation_start + fold_span
+        train = work[(work["_time"] >= train_start) & (work["_time"] < train_end)].copy()
+        validation = work[(work["_time"] >= validation_start) & (work["_time"] < validation_end)].copy()
+        if len(train) < 50 or len(validation) < 20:
+            continue
+        train_stats = _ev_stats(train["_net"]); validation_stats = _ev_stats(validation["_net"])
+        validation_reference_return_pct = float(validation["_net"].sum() * 5.0 / 10000.0)
+        if validation_stats["avg_net_bps"] > 0.0 and validation_stats["median_net_bps"] > 0.0:
+            verdict = "validated_positive"
+        elif validation_stats["avg_net_bps"] > 0.0:
+            verdict = "positive_average_weak_median"
+        else:
+            verdict = "not_validated"
+        rows.append([
+            f"{ts_value:.6f}", dt_value, int(fold_id), side.upper(), f"{train_start:.6f}", f"{train_end:.6f}",
+            f"{embargo_start:.6f}", f"{embargo_end:.6f}", f"{validation_start:.6f}", f"{validation_end:.6f}",
+            int(len(train)), int(len(validation)), f"{float(train_stats['smoothed_win_rate']):.6f}",
+            f"{float(validation_stats['smoothed_win_rate']):.6f}", f"{float(train_stats['avg_net_bps']):.6f}",
+            f"{float(validation_stats['avg_net_bps']):.6f}", f"{float(train_stats['median_net_bps']):.6f}",
+            f"{float(validation_stats['median_net_bps']):.6f}", f"{validation_reference_return_pct:.6f}", verdict,
+            f"purged_walk_forward;side={side.upper()};embargo_hours=6;fold={fold_id};train_avg={float(train_stats['avg_net_bps']):.2f};val_avg={float(validation_stats['avg_net_bps']):.2f}",
+        ])
+    return rows
+
 def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     buy_agent_rows, buy_weights, buy_frame, buy_context_rows = _four_pass_buy_agent_rows(base_dir)
+    walk_forward_buy_rows = _purged_walk_forward_rows(base_dir, buy_frame, side="BUY")
     council_buy_rows, council_buy_entries = _four_pass_council_buy_rows(base_dir, buy_weights, buy_frame)
     sell_agent_rows, sell_weights, sell_frame = _four_pass_sell_agent_rows(base_dir, council_buy_entries)
+    walk_forward_sell_rows = _purged_walk_forward_rows(base_dir, sell_frame, side="SELL")
     council_sell_rows = _four_pass_council_sell_rows(base_dir, sell_weights, sell_frame)
+    sell_path_replay_rows = _four_pass_sell_path_replay_rows(base_dir, council_buy_entries, sell_weights, sell_frame)
     final_rating_rows = _four_pass_final_agent_rating_rows(buy_agent_rows, sell_agent_rows)
-    profitability_summary_rows = _four_pass_profitability_summary_rows(buy_agent_rows, council_buy_rows, sell_agent_rows, council_sell_rows)
-    return {"buy_agent_rows": buy_agent_rows, "buy_weights": buy_weights, "council_buy_rows": council_buy_rows, "council_buy_entries": council_buy_entries, "sell_agent_rows": sell_agent_rows, "sell_weights": sell_weights, "council_sell_rows": council_sell_rows, "final_rating_rows": final_rating_rows, "profitability_summary_rows": profitability_summary_rows, "context_rating_rows": buy_context_rows}
+    profitability_summary_rows = _four_pass_profitability_summary_rows(buy_agent_rows, council_buy_rows, sell_agent_rows, council_sell_rows, sell_path_replay_rows)
+    feature_store_summary_rows = _feature_store_summary_rows(base_dir)
+    return {"buy_agent_rows": buy_agent_rows, "buy_weights": buy_weights, "council_buy_rows": council_buy_rows, "council_buy_entries": council_buy_entries, "sell_agent_rows": sell_agent_rows, "sell_weights": sell_weights, "council_sell_rows": council_sell_rows, "sell_path_replay_rows": sell_path_replay_rows, "purged_walk_forward_rows": walk_forward_buy_rows + walk_forward_sell_rows, "final_rating_rows": final_rating_rows, "profitability_summary_rows": profitability_summary_rows, "context_rating_rows": buy_context_rows, "feature_store_summary_rows": feature_store_summary_rows}
 
 
 def _agent_ablation_rows(base_dir: str) -> List[List[Any]]:
@@ -1576,6 +1834,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     four_pass_final_agent_ratings_path = os.path.join(base_dir, "four_pass_final_agent_ratings.csv")
     four_pass_profitability_summary_path = os.path.join(base_dir, "four_pass_profitability_summary.csv")
     four_pass_agent_context_ratings_path = os.path.join(base_dir, "four_pass_agent_context_ratings.csv")
+    four_pass_sell_path_replay_path = os.path.join(base_dir, "four_pass_sell_path_replay.csv")
+    four_pass_purged_walk_forward_path = os.path.join(base_dir, "four_pass_purged_walk_forward.csv")
+    feature_store_summary_path = os.path.join(base_dir, "feature_store_summary.csv")
     summary_path = os.path.join(base_dir, "backtest_summary.csv")
 
     _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
@@ -1591,6 +1852,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     _write_rows(four_pass_final_agent_ratings_path, FOUR_PASS_FINAL_AGENT_RATINGS_COLUMNS, four_pass["final_rating_rows"])
     _write_rows(four_pass_profitability_summary_path, FOUR_PASS_PROFITABILITY_SUMMARY_COLUMNS, four_pass["profitability_summary_rows"])
     _write_rows(four_pass_agent_context_ratings_path, FOUR_PASS_AGENT_CONTEXT_RATINGS_COLUMNS, four_pass["context_rating_rows"])
+    _write_rows(four_pass_sell_path_replay_path, FOUR_PASS_SELL_PATH_REPLAY_COLUMNS, four_pass["sell_path_replay_rows"])
+    _write_rows(four_pass_purged_walk_forward_path, FOUR_PASS_PURGED_WALK_FORWARD_COLUMNS, four_pass["purged_walk_forward_rows"])
+    _write_rows(feature_store_summary_path, FEATURE_STORE_SUMMARY_COLUMNS, four_pass["feature_store_summary_rows"])
 
     ts_value = _utc_ts()
     summary_rows = [
@@ -1606,6 +1870,8 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_council_sell_rows", len(four_pass["council_sell_rows"]), "pass 4 sell timing by weighted sell council"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_profitability_summary_rows", len(four_pass["profitability_summary_rows"]), "four-pass profitability summary with mode labels"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_agent_context_rating_rows", len(four_pass["context_rating_rows"]), "product and regime specific agent ratings"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_sell_path_replay_rows", len(four_pass["sell_path_replay_rows"]), "true sell-path replay rows when realized sell path data exists"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_purged_walk_forward_rows", len(four_pass["purged_walk_forward_rows"]), "purged walk-forward validation rows"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
     ]
     _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
@@ -1656,6 +1922,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
             "four_pass_final_agent_ratings": four_pass_final_agent_ratings_path,
             "four_pass_profitability_summary": four_pass_profitability_summary_path,
             "four_pass_agent_context_ratings": four_pass_agent_context_ratings_path,
+            "four_pass_sell_path_replay": four_pass_sell_path_replay_path,
+            "four_pass_purged_walk_forward": four_pass_purged_walk_forward_path,
+            "feature_store_summary": feature_store_summary_path,
             "backtest_summary": summary_path,
         },
         "recommendations": buy_recs,

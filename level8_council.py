@@ -59,6 +59,7 @@ AGENT_LEADERBOARD_CSV = os.path.join(BASE_DIR, "agent_leaderboard.csv")
 AGENT_ABLATION_CSV = os.path.join(BASE_DIR, "agent_ablation.csv")
 AGENT_TRADE_POLICY_CSV = os.path.join(BASE_DIR, "agent_trade_policy.csv")
 AGENT_SIDE_RATINGS_CSV = os.path.join(BASE_DIR, "agent_side_ratings.csv")
+FOUR_PASS_AGENT_CONTEXT_RATINGS_CSV = os.path.join(BASE_DIR, "four_pass_agent_context_ratings.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
 BUY_LEAD_ONLY_MODE = False
@@ -74,6 +75,7 @@ LEVEL8_CSV_TAIL_LIMITS = {
     "trades.csv": 5000,
     "agent_ablation.csv": 5000,
     "agent_side_ratings.csv": 5000,
+    "four_pass_agent_context_ratings.csv": 20000,
 }
 
 LEVEL8_CSV_USECOLS = {
@@ -83,6 +85,11 @@ LEVEL8_CSV_USECOLS = {
     "missed_opportunities.csv": ["ts", "product_id", "move_bps", "decision_action", "decision_strategy"],
     "trades.csv": ["ts", "event", "product_id", "side", "entry_price", "exit_price", "price", "move_bps", "net_pnl_usd", "pnl", "agent"],
     "agent_side_ratings.csv": ["ts", "agent", "buy_rows", "buy_accuracy", "buy_score", "buy_weight_pct", "buy_weight_multiplier", "sell_rows", "sell_accuracy", "sell_score", "sell_weight_pct", "sell_weight_multiplier"],
+    "four_pass_agent_context_ratings.csv": [
+        "agent", "side", "product_id", "market_regime",
+        "selected_count", "smoothed_win_rate", "ev_bps",
+        "score", "weight_pct", "profitability_mode",
+    ],
 }
 
 
@@ -426,6 +433,9 @@ class Level8Council:
         self._agent_side_ratings_cache: Dict[str, Dict[str, float]] = {}
         self._agent_side_ratings_cache_ts: float = 0.0
         self._agent_side_ratings_cache_sec: float = 60.0
+        self._agent_context_ratings_cache: Dict[str, Dict[str, Any]] = {}
+        self._agent_context_ratings_cache_ts: float = 0.0
+        self._agent_context_ratings_cache_sec: float = 60.0
         self._agent_ablation_cache: Dict[str, Dict[str, float]] = {}
         self._agent_ablation_cache_ts: float = 0.0
         # Lightweight in-process caches prevent every agent vote from re-reading
@@ -1453,16 +1463,92 @@ class Level8Council:
         except Exception:
             return {}
 
+
+    def _latest_agent_context_ratings(self) -> Dict[str, Dict[str, Any]]:
+        """Load product/regime-specific context ratings keyed by SIDE|PRODUCT_ID|MARKET_REGIME|AGENT."""
+        try:
+            now_value = utc_ts()
+            if self._agent_context_ratings_cache and now_value - float(self._agent_context_ratings_cache_ts) < float(self._agent_context_ratings_cache_sec):
+                return dict(self._agent_context_ratings_cache)
+            self._agent_context_ratings_cache = {}
+            self._agent_context_ratings_cache_ts = now_value
+            frame = _read_csv_tail_direct(
+                FOUR_PASS_AGENT_CONTEXT_RATINGS_CSV,
+                20000,
+                usecols=LEVEL8_CSV_USECOLS.get("four_pass_agent_context_ratings.csv"),
+            )
+            if frame.empty:
+                return {}
+            for _, row in frame.iterrows():
+                side = str(row.get("side") or "").upper()
+                product_id = str(row.get("product_id") or "")
+                market_regime = str(row.get("market_regime") or "unknown")
+                agent = str(row.get("agent") or "")
+                if not side or not product_id or not agent:
+                    continue
+                key = f"{side}|{product_id}|{market_regime}|{agent}"
+                self._agent_context_ratings_cache[key] = {
+                    "selected_count": float(row.get("selected_count", 0.0) or 0.0),
+                    "smoothed_win_rate": float(row.get("smoothed_win_rate", 0.5) or 0.5),
+                    "ev_bps": float(row.get("ev_bps", 0.0) or 0.0),
+                    "score": float(row.get("score", 0.5) or 0.5),
+                    "weight_pct": float(row.get("weight_pct", 0.0) or 0.0),
+                    "profitability_mode": str(row.get("profitability_mode") or "unknown"),
+                }
+            return dict(self._agent_context_ratings_cache)
+        except Exception:
+            return {}
+
+    def _infer_live_market_regime_for_votes(self, adjusted_votes: list[AgentVote]) -> str:
+        """Lightweight live regime inference from vote metadata."""
+        try:
+            momentum_values = []
+            volatility_values = []
+            for vote in adjusted_votes:
+                data = asdict(vote)
+                for key in ["momentum_15_bps", "momentum_30_bps", "trend_bps", "macro_momentum_bps"]:
+                    if key in data:
+                        try:
+                            momentum_values.append(float(data.get(key) or 0.0))
+                        except Exception:
+                            pass
+                for key in ["volatility_bps", "atr_bps", "range_bps", "macro_volatility_bps"]:
+                    if key in data:
+                        try:
+                            volatility_values.append(float(data.get(key) or 0.0))
+                        except Exception:
+                            pass
+            momentum = sum(momentum_values) / max(1, len(momentum_values))
+            volatility = sum(volatility_values) / max(1, len(volatility_values))
+            if momentum >= 20.0 and volatility >= 80.0:
+                return "trend_high_vol"
+            if momentum >= 20.0 and volatility < 80.0:
+                return "trend_low_vol"
+            if momentum <= -20.0 and volatility >= 80.0:
+                return "downtrend_high_vol"
+            if momentum <= -20.0 and volatility < 80.0:
+                return "downtrend_low_vol"
+            if abs(momentum) < 20.0 and volatility >= 80.0:
+                return "range_high_vol"
+            return "range_low_vol"
+        except Exception:
+            return "unknown"
+
     def _weighted_vote_pairs(
         self,
         adjusted_votes: list[AgentVote],
         *,
         decision_side: str,
+        product_id: str = "",
+        market_regime: str = "",
     ) -> list[tuple[AgentVote, float]]:
         """Return vote weights after redundancy-group caps."""
         raw_pairs: list[tuple[AgentVote, float, str]] = []
         agent_policy = self._latest_agent_trade_policy() if hasattr(self, "_latest_agent_trade_policy") else {}
         side_ratings = self._latest_agent_side_ratings() if hasattr(self, "_latest_agent_side_ratings") else {}
+        context_ratings = self._latest_agent_context_ratings() if hasattr(self, "_latest_agent_context_ratings") else {}
+        if not market_regime:
+            market_regime = self._infer_live_market_regime_for_votes(adjusted_votes)
         for vote in adjusted_votes:
             # BUY_LEAD_ONLY_MODE is intentionally disabled.
             # All analysts remain eligible for BUY voting.
@@ -1471,6 +1557,16 @@ class Level8Council:
             raw_weight = max(0.0, float(vote.confidence) * float(vote.reliability))
             side_rating = side_ratings.get(str(vote.agent), {})
             side = str(decision_side).upper()
+            context_key = f"{side}|{str(product_id)}|{str(market_regime)}|{str(vote.agent)}"
+            context_rating = context_ratings.get(context_key, {})
+            if context_rating:
+                context_rows = float(context_rating.get("selected_count", 0.0) or 0.0)
+                context_weight_pct = float(context_rating.get("weight_pct", 0.0) or 0.0)
+                context_ev = float(context_rating.get("ev_bps", 0.0) or 0.0)
+                if context_rows >= 20 and context_weight_pct > 0.0 and context_ev > 0.0:
+                    equal_context_weight = 100.0 / max(1.0, len(adjusted_votes))
+                    context_multiplier = max(0.25, min(5.0, context_weight_pct / max(1e-9, equal_context_weight)))
+                    raw_weight *= context_multiplier
             if side == "BUY":
                 buy_rows = float(side_rating.get("buy_rows", 0.0) or 0.0)
                 if buy_rows >= 10:
@@ -1519,7 +1615,7 @@ class Level8Council:
         decision_id = f"l8buy-{product_id}-{int(utc_ts())}-{uuid.uuid4().hex[:8]}"
         adjusted = [self._adjust_vote(vote, product_id, strategy) for vote in votes]
         adjusted_truth = self._adjust_vote(truth_vote, product_id, strategy)
-        weighted = self._weighted_vote_pairs(adjusted, decision_side="BUY")
+        weighted = self._weighted_vote_pairs(adjusted, decision_side="BUY", product_id=product_id)
         weight_total = sum(weight for _, weight in weighted) or 1.0
         combined = {
             "adj_buy": sum(v.adjusted_buy_score * w for v, w in weighted) / weight_total,
@@ -1986,7 +2082,7 @@ class Level8Council:
 
         adjusted = [self._adjust_vote(vote, product_id, "EXIT_REVIEW") for vote in votes]
         adjusted_truth = self._adjust_vote(truth_vote, product_id, "EXIT_REVIEW")
-        weighted = self._weighted_vote_pairs(adjusted, decision_side="SELL")
+        weighted = self._weighted_vote_pairs(adjusted, decision_side="SELL", product_id=product_id)
         weight_total = sum(weight for _, weight in weighted) or 1.0
         final_sell = clamp(
             sum(v.adjusted_sell_score * w for v, w in weighted) / weight_total

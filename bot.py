@@ -1166,6 +1166,9 @@ ENABLE_BACKTEST_INTELLIGENCE: bool = True
 BACKTEST_INTELLIGENCE_RUN_ON_STARTUP: bool = True
 BACKTEST_INTELLIGENCE_UPDATE_EVERY_SEC: float = 30 * 60
 BACKTEST_INTELLIGENCE_MIN_PRODUCT_ROWS: int = 80
+BACKTEST_INTELLIGENCE_MIN_RERUN_SECONDS: int = env_int("BACKTEST_INTELLIGENCE_MIN_RERUN_SECONDS", 180)
+BACKTEST_INTELLIGENCE_MIN_NEW_ROWS: int = env_int("BACKTEST_INTELLIGENCE_MIN_NEW_ROWS", 2500)
+BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE: bool = env_bool("BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE", True)
 BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS: bool = True
 BACKTEST_USE_PRODUCT_SELL_RECOMMENDATIONS: bool = True
 
@@ -11193,31 +11196,105 @@ class TradingBot:
         except Exception as exc:
             log_exception("backtest intelligence update failed", exc)
 
+    def _current_replay_training_row_count(self) -> int:
+        total = 0
+        for filename in [
+            "candidate_replay.csv",
+            "historical_shadow_replay.csv",
+            "shadow_sell_replay.csv",
+            "sell_outcomes.csv",
+        ]:
+            path = os.path.join(BASE_DIR, filename)
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    frame = self._read_csv_tail_for_bot(path, max_lines=500000)
+                    total += int(len(frame))
+            except Exception:
+                pass
+        return int(total)
+
     def _maybe_run_backtest_intelligence_background(self, *, force_when_replay_complete: bool = False) -> None:
-        """Re-run backtest intelligence after replay data exists."""
+        """
+        Re-run backtest intelligence only when it is useful.
+
+        This prevents startup slowdown from repeatedly recalculating four-pass backtests
+        after every small worker merge.
+        """
         try:
             now_value = now_ts()
             last_run = float(getattr(self, "_last_backtest_intelligence_run_ts", 0.0) or 0.0)
+            last_rows = int(getattr(self, "_last_backtest_intelligence_training_rows", 0) or 0)
+
             candidate_path = os.path.join(BASE_DIR, "candidate_replay.csv")
             historical_path = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
+
             candidate_ready = os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 5000
             historical_ready = os.path.exists(historical_path) and os.path.getsize(historical_path) > 5000
+
             if not candidate_ready and not historical_ready:
                 return
-            if not force_when_replay_complete and now_value - last_run < 600:
+
+            current_rows = self._current_replay_training_row_count()
+            new_rows = current_rows - last_rows
+
+            enough_time = now_value - last_run >= float(BACKTEST_INTELLIGENCE_MIN_RERUN_SECONDS)
+            enough_new_rows = new_rows >= int(BACKTEST_INTELLIGENCE_MIN_NEW_ROWS)
+
+            startup_complete = False
+            try:
+                status = self._calculation_status()
+                startup_complete = bool(status.get("calculation_work_complete"))
+            except Exception:
+                startup_complete = False
+
+            final_startup_force = (
+                bool(force_when_replay_complete)
+                and bool(BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE)
+                and bool(startup_complete)
+                and current_rows > 0
+            )
+
+            if not final_startup_force and not (enough_time and enough_new_rows):
+                module_debug(
+                    MODULE_NAME,
+                    "backtest_intelligence_debounced",
+                    data={
+                        "current_rows": int(current_rows),
+                        "last_rows": int(last_rows),
+                        "new_rows": int(new_rows),
+                        "seconds_since_last_run": float(now_value - last_run),
+                        "min_seconds": int(BACKTEST_INTELLIGENCE_MIN_RERUN_SECONDS),
+                        "min_new_rows": int(BACKTEST_INTELLIGENCE_MIN_NEW_ROWS),
+                        "startup_complete": bool(startup_complete),
+                    },
+                    level="INFO",
+                    also_overall=False,
+                )
                 return
+
             self._last_backtest_intelligence_run_ts = now_value
+            self._last_backtest_intelligence_training_rows = current_rows
+
             self._run_backtest_intelligence_if_due(force=True)
+
             try:
                 self._write_agent_side_ratings()
             except Exception:
                 pass
+
             try:
                 self._maybe_reload_backtest_background()
             except Exception:
                 pass
+
         except Exception as exc:
-            module_exception(MODULE_NAME, "maybe_run_backtest_intelligence_background_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+            module_exception(
+                MODULE_NAME,
+                "maybe_run_backtest_intelligence_background_failed",
+                exc,
+                data={"traceback": traceback.format_exc()},
+                also_overall=False,
+            )
 
     def _load_backtest_recommendations(self) -> None:
         """Load latest backtest recommendations into memory."""
@@ -13184,12 +13261,25 @@ class TradingBot:
                                         if col in product_rows.columns:
                                             product_rows[col] = pd.to_numeric(product_rows[col], errors="coerce")
                                     latest = product_rows.tail(1).iloc[0]
+                                    profitability_mode = str(latest.get("profitability_mode", "") or "").lower()
+                                    realized_mode = "realized" in profitability_mode or "exit" in profitability_mode
+
                                     four_pass_ok = (
                                         float(latest.get("selected_count", 0) or 0) >= 10
                                         and float(latest.get("win_rate", 0.0) or 0.0) >= 0.56
                                         and float(latest.get("avg_net_bps", 0.0) or 0.0) > 0.0
                                         and float(latest.get("median_net_bps", 0.0) or 0.0) > 0.0
                                     )
+
+                                    # Opportunity-proxy approval can help identify buy timing,
+                                    # but live trading should be more careful than realized replay approval.
+                                    if four_pass_ok and not realized_mode:
+                                        four_pass_ok = (
+                                            float(latest.get("selected_count", 0) or 0) >= 25
+                                            and float(latest.get("win_rate", 0.0) or 0.0) >= 0.60
+                                            and float(latest.get("avg_net_bps", 0.0) or 0.0) >= 20.0
+                                            and float(latest.get("median_net_bps", 0.0) or 0.0) >= 8.0
+                                        )
                     except Exception:
                         four_pass_ok = False
                     if not four_pass_ok:
@@ -18160,7 +18250,7 @@ class TradingBot:
                 except Exception:
                     pass
                 try:
-                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True)
+                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=False)
                 except Exception:
                     pass
                 try:
@@ -18567,6 +18657,10 @@ class TradingBot:
             status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(data=status)
+                try:
+                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True)
+                except Exception:
+                    pass
                 latch = self._load_calculation_complete_latch()
                 status["calculation_complete_latched"] = bool(latch.get("calculation_complete_latched"))
                 status["calculation_complete_latch"] = latch

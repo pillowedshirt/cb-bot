@@ -793,11 +793,13 @@ def freshness_class(age_sec: float, warn: float, danger: float) -> str:
 def get_refresh_config() -> dict:
     """
     Viewer refresh is intentionally automatic and hidden.
-    Keep the UI clean by removing the manual live-data settings.
+    The loading/calibration screen and the unlocked live dashboard must both
+    refresh from the same auto-refresh path.
     """
     return {
         "live_enabled": True,
         "interval_label": "2s",
+        "fallback_interval_sec": 2.0,
         "manual_tick": int(st.session_state.get("_manual_refresh_tick", 0)),
         "fragment_supported": callable(getattr(st, "fragment", None)),
     }
@@ -2119,7 +2121,8 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     st.progress(progress)
     status_ts = float(calc_status.get("ts", 0.0) or 0.0)
     age_sec = max(0.0, time.time() - status_ts) if status_ts > 0 else 0.0
-    st.caption(f"Status age: {age_sec:.1f}s · The bot updates this from calculation_status.json.")
+    status_source = str(calc_status.get("viewer_status_source") or "calculation_status.json")
+    st.caption(f"Status age: {age_sec:.1f}s · Source: {status_source} · Auto-refresh should update this every 2 seconds.")
     cols = st.columns(4)
     cols[0].metric("Complete products", f"{complete_products}/{product_count}")
     cols[1].metric("Profit-ready products", profit_ready_products)
@@ -2512,28 +2515,63 @@ def render_live_dashboard(selected, refresh_config):
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
+def render_viewer_tick(refresh_config: dict) -> None:
+    """Render one live viewer tick.
+
+    This function intentionally handles both states:
+    1. locked calculation/loading screen
+    2. unlocked live dashboard
+
+    It must run inside the auto-refresh fragment so the loading screen updates
+    without requiring browser refreshes.
+    """
+    snapshot = load_viewer_snapshot()
+    selected = pick_selected_coin(snapshot)
+
+    if not selected:
+        calc_status = load_calculation_status(snapshot)
+
+        if not bool(calc_status.get("full_viewer_unlocked", False)):
+            render_calibration_loading_screen(calc_status, snapshot)
+            return
+
+        # The calculation status says the viewer can unlock, but the current
+        # snapshot may not have populated coin rows yet. Re-read once, then try
+        # to enter the live dashboard.
+        snapshot = load_viewer_snapshot()
+        selected = pick_selected_coin(snapshot)
+
+        if selected:
+            render_live_dashboard(selected, refresh_config)
+            return
+
+        st.info("Waiting for bot data. The calculation gate is unlocked, but viewer_snapshot.json has not exposed selectable coins yet.")
+        return
+
+    render_live_dashboard(selected, refresh_config)
+
+
 def main() -> None:
     inject_crypto_game_css()
     refresh_config = get_refresh_config()
     render_crypto_header()
-    snapshot_static = load_viewer_snapshot()
-    selected = pick_selected_coin(snapshot_static)
-    if not selected:
-        calc_status = load_calculation_status(snapshot_static)
-        if not bool(calc_status.get("full_viewer_unlocked", False)):
-            render_calibration_loading_screen(calc_status, snapshot_static)
-            return
-        st.info("Waiting for bot data. Start the bot and wait for viewer_snapshot.json to update.")
-        return
+
     run_every = run_every_value(refresh_config)
+
     if callable(getattr(st, "fragment", None)):
         @st.fragment(run_every=run_every)
-        def live_dashboard_fragment():
-            render_live_dashboard(selected, refresh_config)
-        live_dashboard_fragment()
-    else:
-        st.warning("Subtle auto-refresh needs Streamlit 1.37+. Manual refresh still works.")
-        render_live_dashboard(selected, refresh_config)
+        def viewer_auto_refresh_fragment():
+            render_viewer_tick(refresh_config)
+
+        viewer_auto_refresh_fragment()
+        return
+
+    st.warning("Streamlit fragment auto-refresh is unavailable. Using full-page fallback refresh instead.")
+    render_viewer_tick(refresh_config)
+
+    if refresh_config.get("live_enabled"):
+        time.sleep(float(refresh_config.get("fallback_interval_sec", 2.0) or 2.0))
+        st.rerun()
 
 
 if __name__ == "__main__":

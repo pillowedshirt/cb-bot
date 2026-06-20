@@ -217,11 +217,34 @@ def env_float(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
+
+def require_live_binance_configuration() -> None:
+    """Live-only Binance.US startup guard."""
+    errors = []
+    if str(LIVE_EXECUTION_EXCHANGE_ID).lower() != EXCHANGE_BINANCE_US:
+        errors.append(f"LIVE_EXECUTION_EXCHANGE must be binance_us; got {LIVE_EXECUTION_EXCHANGE_ID}")
+    if not bool(ENABLE_BINANCE_LIVE_EXECUTION):
+        errors.append("ENABLE_BINANCE_LIVE_EXECUTION must be true")
+    if not bool(BINANCE_US_ENABLE_SPOT_TRADING):
+        errors.append("BINANCE_US_ENABLE_SPOT_TRADING must be true")
+    if not bool(BINANCE_US_ALLOW_REAL_ORDERS):
+        errors.append("BINANCE_US_ALLOW_REAL_ORDERS must be true")
+    api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
+    api_secret = os.getenv("BINANCE_US_API_SECRET", "").strip()
+    if not api_key:
+        errors.append("BINANCE_US_API_KEY is missing")
+    if not api_secret:
+        errors.append("BINANCE_US_API_SECRET is missing")
+    if errors:
+        raise RuntimeError("Live Binance.US configuration is incomplete. This build is live-only and will not run in simulation or validation-only mode. " + " | ".join(errors))
+
 LIVE_EXECUTION_EXCHANGE_ID = "binance_us"
 ENABLE_BINANCE_LIVE_EXECUTION = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
 BINANCE_US_ENABLE_SPOT_TRADING = env_bool("BINANCE_US_ENABLE_SPOT_TRADING", False)
-BINANCE_US_DRY_RUN = env_bool("BINANCE_US_DRY_RUN", True)
 BINANCE_US_ALLOW_REAL_ORDERS = env_bool("BINANCE_US_ALLOW_REAL_ORDERS", False)
+# Live-only build.
+# Simulation and Binance validation-only order behavior are intentionally removed.
+BINANCE_US_DRY_RUN: bool = False
 BOT_MIN_ORDER_USD = env_float("BOT_MIN_ORDER_USD", 5.0)
 BOT_MIN_ORDER_PORTFOLIO_PCT = env_float("BOT_MIN_ORDER_PORTFOLIO_PCT", 10.0)
 BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT = env_float("BOT_MAX_SINGLE_ORDER_PORTFOLIO_PCT", 80.0)
@@ -522,11 +545,12 @@ REPLAY_POLICY_MIN_ROWS: int = 30
 REPLAY_POLICY_MAX_HARD_STOP_RATE: float = 0.35
 REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_AVG_BPS: float = 15.0
 REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_WIN_RATE: float = 0.52
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 0.0
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.50
-REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 0.0
-REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = REPLAY_POLICY_MAX_HARD_STOP_RATE
-REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.0
+# Since live execution is MARKET/MARKET, approve only if taker/taker replay is positive.
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 10.0
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.55
+REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 10.0
+REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.05
+REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = 0.45
 REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW: bool = True
 COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY: bool = True
 COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE: bool = False
@@ -1280,19 +1304,16 @@ TARGET_UTIL_MAX: float = 0.90
 HIGH_SCORE_UTIL_THRESHOLD: float = 78.0
 MID_SCORE_UTIL_THRESHOLD: float = 60.0
 
-# Execution mode.
-# MAKER_FIRST = try Coinbase Advanced post-only maker execution first.
-# MARKET = immediate taker execution.
-# LIMIT_THEN_MARKET = try maker briefly, then allow taker fallback only when urgent.
-ENTRY_EXECUTION_MODE: str = "MAKER_FIRST"
-EXIT_EXECUTION_MODE: str = "MAKER_FIRST"
-
-# Fee-efficient execution policy.
-ENABLE_MAKER_FIRST_EXECUTION: bool = True
+# Live-only Binance execution.
+# MARKET entries/exits are used because they return immediate fill truth.
+# Profitability policy must therefore be based on binance_taker_taker replay results.
+ENTRY_EXECUTION_MODE: str = "MARKET"
+EXIT_EXECUTION_MODE: str = "MARKET"
+ENABLE_MAKER_FIRST_EXECUTION: bool = False
 MAKER_FIRST_BUY_TIMEOUT_SEC: float = 7.0
 MAKER_FIRST_SELL_TIMEOUT_SEC: float = 8.0
 MAKER_FIRST_REPRICE_SEC: float = 2.0
-ALLOW_MARKET_FALLBACK_FOR_BUYS: bool = False
+ALLOW_MARKET_FALLBACK_FOR_BUYS: bool = True
 MIN_BUY_FILL_RATIO_TO_ACCEPT_AS_POSITION: float = 0.98
 ALLOW_PARTIAL_MAKER_BUY_POSITION: bool = True
 ALLOW_MARKET_FALLBACK_FOR_PROFIT_SELLS: bool = True
@@ -6008,7 +6029,7 @@ class TradingBot:
         self.startup_had_existing_runtime_state: bool = has_existing_runtime_csv_state()
 
         self.live_exchange = EXCHANGE_BINANCE_US
-        self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+        self.exchange_adapter = BinanceUSAdapter(dry_run=False, allow_real_orders=True)
         self.portfolio = None
         self.fetcher = BinanceKlineFetcher(self.exchange_adapter.client)
         self.macro = MacroManager()
@@ -6448,8 +6469,6 @@ class TradingBot:
           - avg_price determinable and > 0 (from avg_price or filled_notional/qty)
         """
         if isinstance(r, ExchangeOrderResult):
-            if str(r.status).upper() == "DRY_RUN_TEST_OK":
-                return {"dry_run_test_only": True, "filled_qty": 0.0, "avg_price": 0.0, "fee_usd": 0.0, "filled_notional_usd": 0.0, "order_id": str(r.order_id or "")}
             if not r.ok:
                 raise RuntimeError(r.error or f"Binance {side} failed")
             if float(r.filled_qty or 0.0) <= 0:
@@ -6610,10 +6629,6 @@ class TradingBot:
         if fill is None:
             return None
 
-        if isinstance(fill, dict) and fill.get("dry_run_test_only"):
-            log(f"[binance-order-test] {product_id} SELL order parameters validated; no live order placed and no local position closed")
-            return None
-
         filled_qty, avg_px, fee_val, _filled_notional, _order_id = fill
         sold_qty = float(min(qty_to_sell, filled_qty))
         return sold_qty, float(avg_px), float(fee_val)
@@ -6636,10 +6651,6 @@ class TradingBot:
             reason=note or "force_sell",
         )
         if fill is None:
-            return
-
-        if isinstance(fill, dict) and fill.get("dry_run_test_only"):
-            log(f"[binance-order-test] {product} SELL order parameters validated; no live order placed and no local position closed")
             return
 
         filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
@@ -6859,7 +6870,7 @@ class TradingBot:
 
     def _active_adapter(self) -> BinanceUSAdapter:
         if getattr(self, "exchange_adapter", None) is None:
-            self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+            self.exchange_adapter = BinanceUSAdapter(dry_run=False, allow_real_orders=True)
         return self.exchange_adapter
 
     def _get_live_fee_bps(self, product_id: str) -> Tuple[float, float]:
@@ -12575,9 +12586,7 @@ class TradingBot:
                     return False, "live_buy_blocked:binance_live_execution_disabled"
                 if not bool(BINANCE_US_ENABLE_SPOT_TRADING):
                     return False, "live_buy_blocked:binance_spot_trading_disabled"
-                if bool(BINANCE_US_DRY_RUN) and not bool(BINANCE_US_ALLOW_ORDER_TEST):
-                    return False, "live_buy_blocked:binance_dry_run_order_test_disabled"
-                if (not bool(BINANCE_US_DRY_RUN)) and not bool(BINANCE_US_ALLOW_REAL_ORDERS):
+                if not bool(BINANCE_US_ALLOW_REAL_ORDERS):
                     return False, "live_buy_blocked:binance_real_orders_disabled"
             product_id = str(candidate.get("product_id", ""))
             if bool(REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY):
@@ -15652,7 +15661,7 @@ class TradingBot:
     # --------------------------------------------------------
     def _active_adapter(self) -> BinanceUSAdapter:
         if getattr(self, "exchange_adapter", None) is None:
-            self.exchange_adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+            self.exchange_adapter = BinanceUSAdapter(dry_run=False, allow_real_orders=True)
         return self.exchange_adapter
 
     def _get_top_of_book_live(self, product_id: str) -> Dict[str, Any]:
@@ -15762,117 +15771,22 @@ class TradingBot:
         reason: str,
         execution_mode: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
-        """Execute a live buy using the fee-efficient maker-first policy."""
-        requested_mode = str(execution_mode or ENTRY_EXECUTION_MODE or "MAKER_FIRST").upper()
-        mode = requested_mode
+        """Execute a real live Binance.US market buy."""
+        mode = "MARKET"
         result = None
-
         try:
-            if bool(ENABLE_MAKER_FIRST_EXECUTION) and requested_mode in {"MAKER", "MAKER_FIRST", "LIMIT_THEN_MARKET"}:
-                mode = "MAKER_FIRST"
-                result = await self._live_buy_maker(product_id=product_id, quote_usd=float(quote_usd), bid=float(bid))
-                self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
-                fill = self._require_live_fill(result, product_id=product_id, side="BUY")
-                if fill is not None:
-                    self._append_maker_fill_outcome(
-                        product_id=product_id,
-                        side="BUY",
-                        mode=mode,
-                        filled=True,
-                        partial_fill=False,
-                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
-                        bid=float(bid),
-                        ask=float(ask),
-                        limit_price=float(bid),
-                        time_on_book_sec=float(MAKER_FIRST_BUY_TIMEOUT_SEC),
-                        requested_size=float(quote_usd),
-                        filled_size=float(fill[0] if fill else 0.0),
-                        reason="maker_buy_filled",
-                    )
-                    if LOG_ORDER_ATTEMPTS:
-                        self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_filled;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
-                    return fill
-
-                for retry_idx in range(int(MAKER_FIRST_RETRY_COUNT)):
-                    await asyncio.sleep(float(MAKER_FIRST_RETRY_SLEEP_SEC))
-                    retry_result = await self._live_buy_maker(
-                        product_id=product_id,
-                        quote_usd=float(quote_usd),
-                        bid=float(bid),
-                    )
-                    self.last_buy_execution_result[product_id] = dict(retry_result) if isinstance(retry_result, dict) else {}
-                    retry_fill = self._require_live_fill(retry_result, product_id=product_id, side="BUY")
-                    if retry_fill is not None:
-                        log(f"[buy] {product_id} maker retry filled retry={retry_idx + 1}")
-                        return retry_fill
-
-                allow_market_fallback = bool(ALLOW_MARKET_FALLBACK_FOR_BUYS) or bool(
-                    requested_mode == "LIMIT_THEN_MARKET" and self._buy_allows_market_fallback(reason)
-                )
-                reason_values: Dict[str, float] = {}
-                for token in str(reason or "").replace(";", " ").split():
-                    if "=" in token:
-                        key, value = token.split("=", 1)
-                        reason_values[key.strip()] = safe_float(value, 0.0)
-                expected_utility = float(reason_values.get("expected_utility", reason_values.get("expected_utility_bps", 0.0)))
-                truth_score = float(reason_values.get("truth", reason_values.get("level8_truth_score", 0.0)))
-                spread_bps = ((float(ask) / float(bid)) - 1.0) * 10000.0 if float(bid) > 0 else 999.0
-                exceptional_taker_fallback = bool(
-                    MAKER_FIRST_ALLOW_TAKER_FALLBACK
-                    and expected_utility >= float(TAKER_FALLBACK_MIN_EXPECTED_UTILITY_BPS)
-                    and truth_score >= float(TAKER_FALLBACK_MIN_TRUTH_SCORE)
-                    and spread_bps <= float(TAKER_FALLBACK_MAX_SPREAD_BPS)
-                )
-                allow_market_fallback = bool(allow_market_fallback or exceptional_taker_fallback)
-                if not allow_market_fallback:
-                    if LOG_ORDER_ATTEMPTS:
-                        self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"fee_efficient_maker_buy_no_fill_skip_market;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
-                    self._append_maker_miss_outcome(
-                        product_id=product_id,
-                        quote_usd=float(quote_usd),
-                        bid=float(bid),
-                        ask=float(ask),
-                        reason=reason,
-                    )
-                    self._append_maker_fill_outcome(
-                        product_id=product_id,
-                        side="BUY",
-                        mode=mode,
-                        filled=False,
-                        partial_fill=False,
-                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
-                        bid=float(bid),
-                        ask=float(ask),
-                        limit_price=float(bid),
-                        time_on_book_sec=float(MAKER_FIRST_BUY_TIMEOUT_SEC),
-                        requested_size=float(quote_usd),
-                        filled_size=0.0,
-                        reason="maker_buy_no_fill_skip_market",
-                    )
-                    log(
-                        f"[buy-skip] {product_id} maker_no_fill; skipping market fallback "
-                        f"expected_utility={expected_utility:.2f};truth={truth_score:.3f};spread={spread_bps:.3f};"
-                        f"taker_fee_bps={self._entry_fee_bps_for_mode('MARKET'):.3f}"
-                    )
-                    return None
-
-                log(
-                    f"[buy-fallback] {product_id} maker_no_fill; using MARKET fallback because "
-                    f"expected_utility={expected_utility:.2f};truth={truth_score:.3f};spread={spread_bps:.3f};"
-                    f"reason={TAKER_FALLBACK_REASON_REQUIRED}"
-                )
-
-            mode = "MARKET"
-            if str(LIVE_EXECUTION_EXCHANGE_ID) == "coinbase" and bool(COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY) and not bool(COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE):
-                log(f"[buy-skip] {product_id} binance_market_buy_blocked:maker_first_required")
-                return None
             result = await self._live_buy_market(product_id=product_id, quote_usd=float(quote_usd))
-            self.last_buy_execution_result[product_id] = dict(result) if isinstance(result, dict) else {}
+            self.last_buy_execution_result[product_id] = dict(result.raw or {}) if isinstance(result, ExchangeOrderResult) else {}
             fill = self._require_live_fill(result, product_id=product_id, side="BUY")
             if LOG_ORDER_ATTEMPTS:
-                self.olog.log_order(event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode, requested_quote_usd=float(quote_usd), result=result, reason=(f"market_buy_after_fee_policy;requested_quote_usd={float(quote_usd):.6f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                symbol = self._active_adapter().product_to_symbol(product_id)
+                self.olog.log_order(
+                    event="BUY_ATTEMPT", product_id=product_id, side="BUY", mode=mode,
+                    requested_quote_usd=float(quote_usd), result=result,
+                    reason=(f"live_binance_market_buy;exchange=binance_us;symbol={symbol};requested_quote_usd={float(quote_usd):.6f};"
+                            f"bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"),
+                )
             return fill
-
         except Exception as e:
             self.last_buy_execution_result[product_id] = {"error": str(e), "status": "EXCEPTION"}
             if LOG_ORDER_ATTEMPTS:
@@ -15890,322 +15804,26 @@ class TradingBot:
         reason: str,
         mode_override: Optional[str] = None,
     ) -> Optional[Tuple[float, float, float, Optional[float], Optional[str]]]:
-        """Execute a live sell using maker-first unless the reason requires market urgency."""
-        requested_mode = str(mode_override or EXIT_EXECUTION_MODE or "MAKER_FIRST").upper()
-        urgent_market = self._sell_reason_requires_market(reason, mode_override=mode_override)
-        spike_profit_market = bool(
-            bool(ENABLE_SPIKE_PROFIT_PROTECTION)
-            and bool(SPIKE_PROTECT_ALLOW_MARKET_FALLBACK)
-            and "spike_profit" in str(reason or "").lower()
-        )
-        if spike_profit_market:
-            urgent_market = True
-        if urgent_market and (bool(HARD_EXIT_USES_MARKET) or spike_profit_market):
-            requested_mode = "MARKET"
-        mode = requested_mode
+        """Execute a real live Binance.US market sell."""
+        mode = "MARKET"
         result = None
-        log(f"[sell-attempt] {product_id} requested_mode={requested_mode} qty={float(base_qty):.12f} bid_snapshot={float(bid):.8f} ask_snapshot={float(ask):.8f} urgent_market={urgent_market} reason={reason}")
-
         try:
-            if bool(ENABLE_MAKER_FIRST_EXECUTION) and requested_mode in {"MAKER", "MAKER_FIRST", "LIMIT_THEN_MARKET"}:
-                mode = "MAKER_FIRST"
-                result = await self._live_sell_maker(product_id=product_id, base_qty=float(base_qty), ask=float(ask))
-                fill = self._require_live_fill(result, product_id=product_id, side="SELL")
-                if fill is not None:
-                    self._append_maker_fill_outcome(
-                        product_id=product_id,
-                        side="SELL",
-                        mode=mode,
-                        filled=True,
-                        partial_fill=False,
-                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
-                        bid=float(bid),
-                        ask=float(ask),
-                        limit_price=float(ask),
-                        time_on_book_sec=float(MAKER_FIRST_SELL_TIMEOUT_SEC),
-                        requested_size=float(base_qty),
-                        filled_size=float(fill[0] if fill else 0.0),
-                        reason="maker_sell_filled",
-                    )
-                    if LOG_ORDER_ATTEMPTS:
-                        self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"fee_efficient_maker_sell_filled;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
-                    return fill
-
-                if not bool(ALLOW_MARKET_FALLBACK_FOR_PROFIT_SELLS):
-                    if LOG_ORDER_ATTEMPTS:
-                        self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"fee_efficient_maker_sell_no_fill_skip_market;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
-                    self._append_maker_fill_outcome(
-                        product_id=product_id,
-                        side="SELL",
-                        mode=mode,
-                        filled=False,
-                        partial_fill=False,
-                        spread_bps=((float(ask) / float(bid)) - 1.0) * 10000.0 if bid > 0 else 0.0,
-                        bid=float(bid),
-                        ask=float(ask),
-                        limit_price=float(ask),
-                        time_on_book_sec=float(MAKER_FIRST_SELL_TIMEOUT_SEC),
-                        requested_size=float(base_qty),
-                        filled_size=0.0,
-                        reason="maker_sell_no_fill_skip_market",
-                    )
-                    log(f"[sell-skip] {product_id} maker_no_fill; skipping market fallback to avoid taker fee")
-                    return None
-                log(f"[sell-fallback] {product_id} maker_no_fill; using market fallback for exit")
-
-            mode = "MARKET"
             result = await self._live_sell_market(product_id=product_id, base_qty=float(base_qty))
             fill = self._require_live_fill(result, product_id=product_id, side="SELL")
             if LOG_ORDER_ATTEMPTS:
-                self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=(f"market_sell_after_fee_policy;requested_base_qty={float(base_qty):.12f};bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"))
+                symbol = self._active_adapter().product_to_symbol(product_id)
+                self.olog.log_order(
+                    event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode,
+                    requested_base_qty=float(base_qty), result=result,
+                    reason=(f"live_binance_market_sell;exchange=binance_us;symbol={symbol};requested_base_qty={float(base_qty):.12f};"
+                            f"bid_snapshot={float(bid):.8f};ask_snapshot={float(ask):.8f};{reason}"),
+                )
             return fill
-
         except Exception as e:
             if LOG_ORDER_ATTEMPTS:
                 self.olog.log_order(event="SELL_ATTEMPT", product_id=product_id, side="SELL", mode=mode, requested_base_qty=float(base_qty), result=result, reason=reason, raw_error=str(e))
             log(f"[sell-error] {product_id} mode={mode} qty={float(base_qty):.12f}: {e}")
             return None
-
-
-    async def _live_refresh_cash(self) -> float:
-        return await asyncio.to_thread(self._get_available_quote_live)
-
-    async def _live_can_afford(self, notional_usd: float, fee_bps: Optional[float] = None) -> bool:
-        if fee_bps is None:
-            _maker, taker = self._get_live_fee_bps(PRODUCTS[0] if PRODUCTS else "BTC-USD")
-            fee_bps = taker
-        notional_usd = float(max(0.0, notional_usd))
-        if notional_usd <= 0:
-            return False
-        available = await asyncio.to_thread(self._get_available_quote_live)
-        required = notional_usd * (1.0 + float(fee_bps) / 10000.0) + float(RESERVE_USD)
-        return float(available) >= float(required)
-
-    async def _live_refresh_snapshot(self, *, force: bool = True, ttl_sec: float = 0.0) -> Optional[Dict[str, Any]]:
-        return await asyncio.to_thread(self._get_account_balances_live)
-
-    def _rest_backfill_top_of_book(self, product_ids: Optional[List[str]] = None) -> None:
-        if not ENABLE_REST_TOP_OF_BOOK_FALLBACK:
-            return
-        requested_products = product_ids or list(PRODUCTS)
-        now_value = now_ts()
-        for product_id in requested_products:
-            tob = self.tob.get(product_id)
-            is_missing = tob is None or tob.bid <= 0 or tob.ask <= 0
-            try:
-                is_stale = tob is not None and (now_value - float(tob.ts)) > float(TOP_OF_BOOK_MAX_STALE_SEC)
-            except Exception:
-                is_stale = True
-            if not is_missing and not is_stale:
-                continue
-            try:
-                quote = self._get_top_of_book_live(product_id)
-                bid = float(quote.get("bid", 0.0) or 0.0); ask = float(quote.get("ask", 0.0) or 0.0)
-                if bid <= 0 or ask <= 0:
-                    continue
-                top = TopOfBook(bid=bid, ask=ask, ts=float(quote.get("ts", now_value)))
-                self.tob[product_id] = top
-                mid = (bid + ask) / 2.0; ts_i = int(top.ts)
-                self.mid_series[product_id].push(ts_i, mid); self.live_1m[product_id].push_mid(ts_i, mid)
-                log(f"[tob-rest-binance] {product_id} bid={bid:.8f} ask={ask:.8f} spread_bps={top.spread_bps:.3f}")
-            except Exception as exc:
-                module_debug(MODULE_NAME, "binance_rest_top_of_book_backfill_failed", data={"product_id": product_id, "error": str(exc)}, level="WARN", also_overall=False)
-
-    async def _wait_for_tob_ready(self, timeout_sec: float = TOP_OF_BOOK_WAIT_SEC) -> None:
-        """Wait until the configured percentage of products have valid quotes."""
-        started_at = now_ts()
-        last_log = 0.0
-        last_rest_tob_backfill = 0.0
-        required_ready = max(
-            1,
-            int(math.ceil(len(PRODUCTS) * float(TOP_OF_BOOK_READY_MIN_PRODUCTS_PCT))),
-        )
-
-        while now_ts() - started_at < float(timeout_sec):
-            if (
-                ENABLE_REST_TOP_OF_BOOK_FALLBACK
-                and now_ts() - last_rest_tob_backfill >= TOP_OF_BOOK_REST_FALLBACK_EVERY_SEC
-            ):
-                missing_or_stale = []
-                current_time = now_ts()
-                for product_id in PRODUCTS:
-                    quote = self.tob.get(product_id)
-                    if (
-                        quote is None
-                        or quote.bid <= 0
-                        or quote.ask <= 0
-                        or current_time - float(quote.ts) > float(TOP_OF_BOOK_MAX_STALE_SEC)
-                    ):
-                        missing_or_stale.append(product_id)
-                self._rest_backfill_top_of_book(missing_or_stale)
-                last_rest_tob_backfill = now_ts()
-
-            ready = [
-                product_id for product_id in PRODUCTS
-                if self.tob.get(product_id) is not None
-                and self.tob[product_id].bid > 0
-                and self.tob[product_id].ask > 0
-            ]
-            if len(ready) >= required_ready:
-                log(f"[startup] top-of-book ready for {len(ready)}/{len(PRODUCTS)} products")
-                return
-
-            if now_ts() - last_log >= 5.0:
-                missing = [product_id for product_id in PRODUCTS if product_id not in ready]
-                log(
-                    f"[startup] waiting for top-of-book | "
-                    f"ready={len(ready)}/{len(PRODUCTS)} required={required_ready} missing={missing}"
-                )
-                last_log = now_ts()
-
-            await asyncio.sleep(0.25)
-
-        missing = [
-            product_id for product_id in PRODUCTS
-            if self.tob.get(product_id) is None
-            or self.tob[product_id].bid <= 0
-            or self.tob[product_id].ask <= 0
-        ]
-        log(
-            f"[startup] top-of-book wait timed out; "
-            f"ready={len(PRODUCTS) - len(missing)}/{len(PRODUCTS)} "
-            f"required={required_ready} missing={missing}; "
-            f"trading will skip products without fresh bid/ask"
-        )
-
-    def _ensure_shadow_sell_replay_header(self) -> None:
-        try:
-            if os.path.exists(SHADOW_SELL_REPLAY_CSV_PATH) and os.path.getsize(SHADOW_SELL_REPLAY_CSV_PATH) > 0:
-                return
-            with open(SHADOW_SELL_REPLAY_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(SHADOW_SELL_REPLAY_COLUMNS)
-        except Exception as exc:
-            module_exception(MODULE_NAME, "ensure_shadow_sell_replay_header_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
-
-
-    def _ensure_historical_shadow_replay_header(self) -> None:
-        try:
-            if os.path.exists(HISTORICAL_SHADOW_REPLAY_CSV_PATH) and os.path.getsize(HISTORICAL_SHADOW_REPLAY_CSV_PATH) > 0:
-                return
-            with open(HISTORICAL_SHADOW_REPLAY_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(HISTORICAL_SHADOW_REPLAY_COLUMNS)
-        except Exception as exc:
-            module_exception(MODULE_NAME, "ensure_historical_shadow_replay_header_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
-
-
-    def _safe_replace_with_retries(self, src: str, dst: str, *, attempts: int = 5, sleep_sec: float = 0.25) -> bool:
-        for i in range(max(1, int(attempts))):
-            try:
-                os.replace(src, dst)
-                return True
-            except PermissionError:
-                time.sleep(float(sleep_sec) * (i + 1))
-            except Exception:
-                raise
-        return False
-
-    def _cleanup_stale_compact_tmp_files(self) -> None:
-        try:
-            for name in os.listdir(BASE_DIR):
-                if not name.endswith(".compact.tmp"):
-                    continue
-                path = os.path.join(BASE_DIR, name)
-                try:
-                    if now_ts() - os.path.getmtime(path) > 3600:
-                        os.remove(path)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _load_calculation_complete_latch(self) -> Dict[str, Any]:
-        try:
-            if not os.path.exists(CALCULATION_COMPLETE_LATCH_PATH) or os.path.getsize(CALCULATION_COMPLETE_LATCH_PATH) <= 0:
-                return {}
-            with open(CALCULATION_COMPLETE_LATCH_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def _write_calculation_complete_latch(self, *, calc_status: Dict[str, Any]) -> None:
-        try:
-            payload = {"calculation_complete_latched": True, "calculation_complete_ts": now_ts(), "calculation_complete_dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "complete_products": int(calc_status.get("complete_products", 0) or 0), "product_count": int(calc_status.get("product_count", len(PRODUCTS)) or len(PRODUCTS)), "profit_ready_products": int(calc_status.get("profit_ready_products", 0) or 0), "blocked_products": int(calc_status.get("blocked_products", 0) or 0), "historical_replay_worker_manifest": calc_status.get("historical_replay_worker_manifest", {})}
-            tmp = CALCULATION_COMPLETE_LATCH_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
-            os.replace(tmp, CALCULATION_COMPLETE_LATCH_PATH)
-            module_debug(MODULE_NAME, "calculation_complete_latched", data=payload, level="INFO", also_overall=True)
-        except Exception as exc:
-            module_exception(MODULE_NAME, "write_calculation_complete_latch_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
-
-    def _worker_timeframes(self) -> List[str]:
-        frames = list(HISTORICAL_REPLAY_WORKER_TIMEFRAMES)
-        if bool(HISTORICAL_REPLAY_WORKER_INCLUDE_DAILY_CONTEXT):
-            frames.append("daily_1d_2y")
-        return frames
-
-    def _ensure_historical_replay_manifest(self) -> Dict[str, Any]:
-        os.makedirs(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, exist_ok=True)
-        return ensure_manifest(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, products=list(PRODUCTS), timeframes=self._worker_timeframes(), output_dir=HISTORICAL_REPLAY_WORKER_OUTPUT_DIR)
-
-    def _load_historical_replay_manifest(self) -> Dict[str, Any]:
-        manifest = load_manifest(HISTORICAL_REPLAY_MANIFEST_JSON_PATH)
-        if not manifest or "jobs" not in manifest:
-            manifest = self._ensure_historical_replay_manifest()
-        return manifest
-
-    def _historical_replay_manifest_progress(self) -> Dict[str, Any]:
-        try:
-            return manifest_progress(self._load_historical_replay_manifest())
-        except Exception:
-            return {}
-
-    def _worker_output_path_for_job(self, product_id: str, timeframe: str) -> str:
-        os.makedirs(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, exist_ok=True)
-        job_id = safe_job_id(product_id, timeframe)
-        return os.path.join(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, f"historical_shadow_replay.{job_id}.csv")
-
-    def _replay_cache_path_for_timeframe(self, timeframe: str) -> str:
-        tf = str(timeframe)
-        if tf == "primary_15m_90d":
-            return HIST_REPLAY_15M_90D_CSV_PATH
-        if tf == "regime_1h_365d":
-            return HIST_REPLAY_1H_365D_CSV_PATH
-        if tf == "daily_1d_2y":
-            return HIST_REPLAY_1D_2Y_CSV_PATH
-        return HIST_REPLAY_15M_90D_CSV_PATH
-
-    def _granularity_for_replay_timeframe(self, timeframe: str) -> str:
-        tf = str(timeframe)
-        if tf == "primary_15m_90d":
-            return HIST_REPLAY_PRIMARY_GRANULARITY
-        if tf == "regime_1h_365d":
-            return HIST_REPLAY_REGIME_GRANULARITY
-        return HIST_REPLAY_DAILY_GRANULARITY
-
-    def _lookback_sec_for_replay_timeframe(self, timeframe: str) -> int:
-        tf = str(timeframe)
-        if tf == "primary_15m_90d":
-            return int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS) * 86400
-        if tf == "regime_1h_365d":
-            return int(HIST_REPLAY_REGIME_LOOKBACK_DAYS) * 86400
-        return int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400
-
-    def _replay_fee_scenario_bps(self, product_id: str) -> Dict[str, Dict[str, float]]:
-        try:
-            adapter = self._active_adapter()
-            symbol = adapter.product_to_symbol(product_id)
-            fees = adapter.fee_bps_for_symbol(symbol)
-            binance_maker = float(fees["maker_bps"])
-            binance_taker = float(fees["taker_bps"])
-        except Exception:
-            binance_maker = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
-            binance_taker = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
-        return {
-            "binance_maker_maker": {"entry_fee_bps": binance_maker, "exit_fee_bps": binance_maker},
-            "binance_maker_taker": {"entry_fee_bps": binance_maker, "exit_fee_bps": binance_taker},
-            "binance_taker_taker": {"entry_fee_bps": binance_taker, "exit_fee_bps": binance_taker},
-        }
 
     def _process_worker_replay_config(self, product_id: str) -> Dict[str, Any]:
         profile = self.calibration_profiles.get(product_id, ProductCalibrationProfile(product_id=product_id))
@@ -16218,14 +15836,12 @@ class TradingBot:
         except Exception:
             maker_bps = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
             taker_bps = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
-        entry_mode = str(ENTRY_EXECUTION_MODE).upper()
-        exit_mode = str(EXIT_EXECUTION_MODE).upper()
-        primary_entry_fee_bps = maker_bps if entry_mode in {"MAKER", "MAKER_FIRST", "LIMIT_MAKER", "POST_ONLY"} else taker_bps
-        primary_exit_fee_bps = maker_bps if exit_mode in {"MAKER", "MAKER_FIRST", "LIMIT_MAKER", "POST_ONLY"} else taker_bps
+        primary_entry_fee_bps = float(taker_bps)
+        primary_exit_fee_bps = float(taker_bps)
         return {
             "entry_fee_bps": float(primary_entry_fee_bps),
             "exit_fee_bps": float(primary_exit_fee_bps),
-            "primary_fee_model": "binance_us",
+            "primary_fee_model": "binance_us_taker_taker_live",
             "comparison_fee_model": "none",
             "enable_exchange_fee_comparison": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON),
             "comparison_entry_fee_bps": float(primary_entry_fee_bps),
@@ -17052,7 +16668,7 @@ class TradingBot:
             exit_fee = primary_exit_fee_usd
             max_favorable_bps = ((peak_price / entry_price) - 1.0) * 10000.0; max_adverse_bps = ((trough_price / entry_price) - 1.0) * 10000.0
             replay_key = f"{product_id}|{timeframe}|{replay_ts}|{int(float(signal.score) * 1000000)}"
-            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "primary_entry_fee_bps": entry_fee_bps, "primary_exit_fee_bps": exit_fee_bps, "primary_entry_fee_usd": primary_entry_fee_usd, "primary_exit_fee_usd": primary_exit_fee_usd, "primary_net_pnl_usd": net_pnl, "primary_net_pnl_bps": net_pnl_bps, "primary_would_have_won": int(net_pnl > 0), "comparison_entry_fee_bps": comparison_entry_fee_bps, "comparison_exit_fee_bps": comparison_exit_fee_bps, "comparison_entry_fee_usd": comparison_entry_fee_usd, "comparison_exit_fee_usd": comparison_exit_fee_usd, "comparison_net_pnl_usd": comparison_net_pnl, "comparison_net_pnl_bps": comparison_net_pnl_bps, "comparison_would_have_won": int(comparison_net_pnl > 0), "comparison_net_improvement_usd": float(comparison_net_pnl - net_pnl), "comparison_net_improvement_bps": float(comparison_net_pnl_bps - net_pnl_bps), "comparison_break_even_reduction_bps": float(entry_fee_bps + exit_fee_bps - comparison_entry_fee_bps - comparison_exit_fee_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "historical_source_exchange": ("binance" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else ("coinbase" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_API_GAPFILL else "local_cache")), "historical_source_symbol": (coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US)) if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else product_id), "historical_source_note": ("Historical replay used Binance public bulk USDT-pair candles as a proxy for Coinbase USD-pair execution." if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else "Historical replay used local cache or Binance API gapfill candles."), "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
+            return {"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "replay_key": replay_key, "product_id": product_id, "timeframe": timeframe, "granularity": granularity, "replay_ts": replay_ts, "entry_price": entry_price, "entry_fee_bps": entry_fee_bps, "exit_fee_bps": exit_fee_bps, "synthetic_notional_usd": synthetic_notional, "synthetic_qty": synthetic_qty, "all_in_entry_price": all_in_entry_price, "min_profitable_exit_price": min_profitable_exit_price, "hard_stop_price": hard_stop_price, "exit_ts": float(exit_ts), "exit_price": float(exit_price), "exit_reason": exit_reason, "held_seconds": max(0.0, float(exit_ts) - float(replay_ts)), "max_favorable_bps": max_favorable_bps, "max_adverse_bps": max_adverse_bps, "peak_price": peak_price, "trough_price": trough_price, "gross_pnl_usd": gross_pnl, "exit_fee_usd": exit_fee, "net_pnl_usd": net_pnl, "net_pnl_bps": net_pnl_bps, "primary_fee_model": str(REPLAY_PRIMARY_FEE_MODEL), "comparison_fee_model": str(REPLAY_COMPARISON_FEE_MODEL), "primary_entry_fee_bps": entry_fee_bps, "primary_exit_fee_bps": exit_fee_bps, "primary_entry_fee_usd": primary_entry_fee_usd, "primary_exit_fee_usd": primary_exit_fee_usd, "primary_net_pnl_usd": net_pnl, "primary_net_pnl_bps": net_pnl_bps, "primary_would_have_won": int(net_pnl > 0), "comparison_entry_fee_bps": comparison_entry_fee_bps, "comparison_exit_fee_bps": comparison_exit_fee_bps, "comparison_entry_fee_usd": comparison_entry_fee_usd, "comparison_exit_fee_usd": comparison_exit_fee_usd, "comparison_net_pnl_usd": comparison_net_pnl, "comparison_net_pnl_bps": comparison_net_pnl_bps, "comparison_would_have_won": int(comparison_net_pnl > 0), "comparison_net_improvement_usd": float(comparison_net_pnl - net_pnl), "comparison_net_improvement_bps": float(comparison_net_pnl_bps - net_pnl_bps), "comparison_break_even_reduction_bps": float(entry_fee_bps + exit_fee_bps - comparison_entry_fee_bps - comparison_exit_fee_bps), "would_have_won": int(net_pnl > 0), "would_have_hit_stop": int(exit_reason == "historical_hard_stop"), "would_have_hit_min_profit": int(peak_price >= min_profitable_exit_price), "score": float(signal.score), "probability": float(signal.estimated_prob_up), "expected_net_edge_bps": float(signal.expected_net_edge_bps), "target_bps": float(signal.target_bps), "cost_bps": float(signal.cost_bps), "spread_bps": float(spread_bps), "session_liquidity_setup": str(getattr(signal, "session_liquidity_setup", "")), "value_acceptance_state": str(getattr(signal, "value_acceptance_state", "")), "volume_node_state": str(getattr(signal, "volume_node_state", "")), "poc_distance_bps": float(getattr(signal, "poc_distance_bps", 0.0) or 0.0), "volume_profile_leader_buy_score": float(getattr(signal, "volume_profile_leader_buy_score", 0.0) or 0.0), "volume_profile_leader_wait_score": float(getattr(signal, "volume_profile_leader_wait_score", 0.0) or 0.0), "price_action_buy_score": float(getattr(signal, "price_action_buy_score", 0.0) or 0.0), "market_structure_buy_score": float(getattr(signal, "market_structure_buy_score", 0.0) or 0.0), "quant_buy_score": float(getattr(signal, "quant_buy_score", 0.0) or 0.0), "setup_tag": setup_tag, "regime_tag": regime_tag, "replay_candidate_qualified": int(bool(qualified)), "replay_candidate_quality": float(replay_quality), "replay_filter_reason": qualification_reason, "accepted_for_calibration": int(bool(qualified) and self._historical_replay_row_is_calibration_eligible({"timeframe": timeframe, "granularity": granularity})), "replay_source": replay_source, "historical_source_exchange": ("binance" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else ("binance_us" if str(replay_source) == HISTORICAL_SOURCE_BINANCE_API_GAPFILL else "local_cache")), "historical_source_symbol": (coinbase_to_binance_symbol(product_id, prefer_us=bool(BINANCE_BULK_PREFER_BINANCE_US)) if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else product_id), "historical_source_note": ("Historical replay used Binance public bulk USDT-pair candles as a proxy for Coinbase USD-pair execution." if str(replay_source) == HISTORICAL_SOURCE_BINANCE_BULK else "Historical replay used local cache or Binance API gapfill candles."), "reason": f"historical_shadow_replay;exit={exit_reason};net_bps={net_pnl_bps:.2f};mfe={max_favorable_bps:.2f};mae={max_adverse_bps:.2f};qualified={qualified};qualification={qualification_reason};score={float(signal.score):.4f};prob={float(signal.estimated_prob_up):.4f};setup={setup_tag};regime={regime_tag}"}
         except Exception as exc:
             module_exception(MODULE_NAME, "simulate_historical_replay_candidate_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "traceback": traceback.format_exc()}, also_overall=False)
             return None
@@ -18014,7 +17630,7 @@ class TradingBot:
             else: phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_dry_run": bool(BINANCE_US_DRY_RUN), "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(calc_status=status)
                 latch = self._load_calculation_complete_latch()
@@ -18611,10 +18227,6 @@ class TradingBot:
             )
 
             if fill is None:
-                continue
-
-            if isinstance(fill, dict) and fill.get("dry_run_test_only"):
-                log(f"[binance-order-test] {held_product} SELL order parameters validated; no live order placed and no local position closed")
                 continue
 
             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
@@ -20861,7 +20473,7 @@ class TradingBot:
         try:
             snapshot["live_execution_exchange"] = "binance_us"
             snapshot["source_of_truth"] = "binance_us"
-            snapshot["binance_dry_run"] = bool(BINANCE_US_DRY_RUN)
+            snapshot["binance_live_real_order_mode"] = True
             snapshot["binance_allow_real_orders"] = bool(BINANCE_US_ALLOW_REAL_ORDERS)
             snapshot["binance_spot_trading_enabled"] = bool(BINANCE_US_ENABLE_SPOT_TRADING)
             tmp_path = VIEWER_SNAPSHOT_PATH + ".tmp"
@@ -21264,6 +20876,68 @@ class TradingBot:
                 module_debug(MODULE_NAME, "binance_top_of_book_keeper_failed", data={"error": str(exc), "traceback": traceback.format_exc()}, level="WARN", also_overall=False)
             await asyncio.sleep(5.0)
 
+
+    def _is_product_calibration_ready(self, product_id: str) -> bool:
+        try:
+            if bool(getattr(self, "_product_calibration_ready", {}).get(product_id, False)):
+                return True
+            profile = self.calibration_profiles.get(product_id)
+            if profile is not None and bool(getattr(profile, "is_calibrated", False)):
+                self._product_calibration_ready[product_id] = True
+                return True
+            return False
+        except Exception:
+            return False
+
+    async def startup_calibration_loop(self) -> None:
+        """Run startup calibration once, then exit."""
+        if bool(getattr(self, "_startup_calibration_ready", False)):
+            return
+        await self.calibrate_products_on_startup_background()
+
+    async def _refresh_macro_context_for_product(self, product_id: str) -> None:
+        """Refresh macro day/week candle CSVs from Binance.US klines."""
+        end_ts = int(now_ts_i())
+        day_start = end_ts - 24 * 60 * 60
+        week_start = end_ts - 7 * 24 * 60 * 60
+        day_candles = await self.fetcher.fetch_chunked(product_id, day_start, end_ts, "1m")
+        week_candles = await self.fetcher.fetch_chunked(product_id, week_start, end_ts, "15m")
+        if day_candles:
+            day_rows = [{"ts": int(c.ts), "product_id": product_id, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(c.volume)} for c in day_candles]
+            existing = []
+            try:
+                existing_df = pd.read_csv(MACRO_DAY_CSV)
+                if not existing_df.empty:
+                    existing = existing_df.to_dict("records")
+            except Exception:
+                existing = []
+            await self.day_writer.write([r for r in existing if str(r.get("product_id")) != product_id] + day_rows)
+            self._last_macro_day_fetch_ts = now_ts()
+        if week_candles:
+            week_rows = [{"ts": int(c.ts), "product_id": product_id, "open": float(c.open), "high": float(c.high), "low": float(c.low), "close": float(c.close), "volume": float(c.volume)} for c in week_candles]
+            existing = []
+            try:
+                existing_df = pd.read_csv(MACRO_WEEK_CSV)
+                if not existing_df.empty:
+                    existing = existing_df.to_dict("records")
+            except Exception:
+                existing = []
+            await self.week_writer.write([r for r in existing if str(r.get("product_id")) != product_id] + week_rows)
+            self._last_macro_week_fetch_ts = now_ts()
+
+    async def extended_chart_cache_loop(self) -> None:
+        """Keep extended chart cache flags alive."""
+        while not self._stop_event.is_set():
+            try:
+                self._extended_chart_cache_running = True
+                self._last_extended_chart_refresh_ts = now_ts()
+                module_debug(MODULE_NAME, "extended_chart_cache_heartbeat", data={"source": "binance_us", "last_extended_chart_refresh_ts": self._last_extended_chart_refresh_ts}, level="DEBUG", also_overall=False)
+            except Exception as exc:
+                module_debug(MODULE_NAME, "extended_chart_cache_loop_failed", data={"error": str(exc), "traceback": traceback.format_exc()}, level="WARN", also_overall=False)
+            finally:
+                self._extended_chart_cache_running = False
+            await asyncio.sleep(float(EXTENDED_CHART_REFRESH_EVERY_SEC))
+
     async def macro_refresh_loop(self) -> None:
         """Refresh macro day/week context using Binance klines."""
         while not self._stop_event.is_set():
@@ -21287,6 +20961,10 @@ class TradingBot:
         try:
             await asyncio.sleep(2.0)
             await asyncio.to_thread(self._rest_backfill_top_of_book, PRODUCTS)
+            try:
+                await self.preload_micro_history()
+            except Exception as exc:
+                module_debug(MODULE_NAME, "startup_preload_micro_history_failed", data={"error": str(exc), "traceback": traceback.format_exc()}, level="WARN", also_overall=False)
         except Exception as exc:
             module_debug(MODULE_NAME, "startup_binance_tob_backfill_failed", data={"error": str(exc)}, level="WARN", also_overall=False)
         await self._startup_binance_portfolio_reconcile()
@@ -21713,9 +21391,6 @@ class TradingBot:
                             ),
                         )
                         if fill is not None:
-                            if isinstance(fill, dict) and fill.get("dry_run_test_only"):
-                                log(f"[binance-order-test] {product_id} SELL order parameters validated; no live order placed and no local position closed")
-                                continue
 
                             filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
                             self.signal_events_log.log_event(
@@ -22657,10 +22332,6 @@ class TradingBot:
                         f"error={error_text}"
                     )
                     continue
-
-                if isinstance(fill, dict) and fill.get("dry_run_test_only"):
-                    log(f"[binance-order-test] {product_id} BUY order parameters validated; no live order placed and no local position created")
-                    return True
 
                 filled_qty, avg_px, fee_val, filled_notional, _order_id = fill
                 requested_quote_for_fill = float(entry_notional)
@@ -23605,11 +23276,12 @@ async def main() -> None:
         log(f"[startup] file={os.path.abspath(__file__)}")
         log("[startup] loading Binance.US exchange client")
         load_dotenv(os.path.join(BASE_DIR, ".env"))
-        adapter = BinanceUSAdapter(dry_run=BINANCE_US_DRY_RUN, allow_real_orders=BINANCE_US_ALLOW_REAL_ORDERS)
+        require_live_binance_configuration()
+        adapter = BinanceUSAdapter(dry_run=False, allow_real_orders=True)
         rest = adapter.client
         api_key = os.getenv("BINANCE_US_API_KEY", "").strip()
         pem = ""
-        log("[startup] Binance.US mode " f"dry_run={BINANCE_US_DRY_RUN} " f"allow_real_orders={BINANCE_US_ALLOW_REAL_ORDERS} " f"live_execution_enabled={ENABLE_BINANCE_LIVE_EXECUTION} " f"spot_trading_enabled={BINANCE_US_ENABLE_SPOT_TRADING}")
+        log("[startup] LIVE BINANCE.US MODE " f"live_execution_enabled={ENABLE_BINANCE_LIVE_EXECUTION} " f"spot_trading_enabled={BINANCE_US_ENABLE_SPOT_TRADING} " f"allow_real_orders={BINANCE_US_ALLOW_REAL_ORDERS}")
 
         log("[startup] selecting products")
         if AUTO_SELECT_PRODUCTS:
@@ -23657,7 +23329,7 @@ async def main() -> None:
             )
         log("[startup] creating TradingBot instance")
         bot = TradingBot(rest=rest, api_key=api_key, pem_secret=pem)
-        log(f"[startup] LIVE-ONLY MODE: live_exchange={LIVE_EXECUTION_EXCHANGE_ID} dry_run={BINANCE_US_DRY_RUN} allow_real_orders={BINANCE_US_ALLOW_REAL_ORDERS}")
+        log(f"[startup] LIVE-ONLY MODE: live_exchange={LIVE_EXECUTION_EXCHANGE_ID} allow_real_orders={BINANCE_US_ALLOW_REAL_ORDERS}")
         bot.exchange_adapter = adapter
 
         if not hasattr(bot, "run"):

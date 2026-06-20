@@ -19,7 +19,7 @@ from exchange_catalog import product_to_execution_symbol, execution_symbol_to_pr
 class BinanceUSAdapter(BaseExchangeAdapter):
     exchange_id=EXCHANGE_BINANCE_US
     def __init__(self, *, dry_run: Optional[bool]=None, allow_real_orders: Optional[bool]=None):
-        self.client=BinanceUSClient(); self.client.sync_time(); self.dry_run=(str(os.getenv("BINANCE_US_DRY_RUN","true")).strip().lower() in {"1","true","yes","on"} if dry_run is None else bool(dry_run)); self.allow_real_orders=(str(os.getenv("BINANCE_US_ALLOW_REAL_ORDERS","false")).strip().lower() in {"1","true","yes","on"} if allow_real_orders is None else bool(allow_real_orders)); self.symbol_rules_cache={}; self.fee_cache={}
+        self.client=BinanceUSClient(); self.client.sync_time(); self.allow_real_orders=True; self.symbol_rules_cache={}; self.fee_cache={}
     def product_to_symbol(self, product_id):
         symbol=product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
         if not symbol: raise RuntimeError(f"No Binance.US symbol mapping for {product_id}")
@@ -77,23 +77,19 @@ class BinanceUSAdapter(BaseExchangeAdapter):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); tob=self.get_top_of_book(product_id)
         if float(quote_usd) < float(rules.min_notional): raise RuntimeError(f"Order below Binance.US minNotional for {symbol}: quote={quote_usd} min={rules.min_notional}")
         params={"symbol":symbol,"side":"BUY","type":"MARKET","quoteOrderQty":str(round(float(quote_usd),2)),"newOrderRespType":"FULL","newClientOrderId":f"bot-buy-{uuid.uuid4().hex[:20]}"}
-        if self.dry_run or not self.allow_real_orders: return ExchangeOrderResult(True,self.exchange_id,product_id,"BUY",float(quote_usd),status="DRY_RUN_TEST_OK",raw={"test_order":self.client.test_order(**params),"params":params,"top_of_book":tob})
         return self._result_from_order(product_id=product_id, side="BUY", requested_quote_usd=float(quote_usd), raw=self.client.new_order(**params))
     def place_market_sell(self, product_id, base_qty):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); qty=format_quantity(base_qty, rules, market=True); tob=self.get_top_of_book(product_id); price=float(tob.get("bid",0.0) or 0.0)
         if not order_meets_minimums(quote_usd=float(qty)*price, qty=qty, price=price, rules=rules): raise RuntimeError(f"Market sell does not meet Binance.US filters symbol={symbol} qty={qty} price={price}")
         params={"symbol":symbol,"side":"SELL","type":"MARKET","quantity":qty,"newOrderRespType":"FULL","newClientOrderId":f"bot-sell-{uuid.uuid4().hex[:20]}"}
-        if self.dry_run or not self.allow_real_orders: return ExchangeOrderResult(True,self.exchange_id,product_id,"SELL",status="DRY_RUN_TEST_OK",raw={"test_order":self.client.test_order(**params),"params":params,"top_of_book":tob})
         return self._result_from_order(product_id=product_id, side="SELL", raw=self.client.new_order(**params))
     def place_limit_buy(self, product_id, quote_usd, limit_price):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); price=format_price(limit_price, rules); qty=quantity_from_quote(float(quote_usd), float(limit_price), rules)
         if not order_meets_minimums(quote_usd=float(quote_usd), qty=qty, price=float(limit_price), rules=rules): raise RuntimeError(f"Limit buy does not meet Binance.US filters symbol={symbol} qty={qty} price={price}")
         params={"symbol":symbol,"side":"BUY","type":"LIMIT_MAKER","quantity":qty,"price":price,"newOrderRespType":"FULL","newClientOrderId":f"bot-lbuy-{uuid.uuid4().hex[:20]}"}
-        if self.dry_run or not self.allow_real_orders: return ExchangeOrderResult(True,self.exchange_id,product_id,"BUY",float(quote_usd),status="DRY_RUN_TEST_OK",raw={"test_order":self.client.test_order(**params),"params":params})
         return self._result_from_order(product_id=product_id, side="BUY", requested_quote_usd=float(quote_usd), raw=self.client.new_order(**params))
     def place_limit_sell(self, product_id, base_qty, limit_price):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); params={"symbol":symbol,"side":"SELL","type":"LIMIT_MAKER","quantity":format_quantity(base_qty, rules),"price":format_price(limit_price, rules),"newOrderRespType":"FULL","newClientOrderId":f"bot-lsell-{uuid.uuid4().hex[:20]}"}
-        if self.dry_run or not self.allow_real_orders: return ExchangeOrderResult(True,self.exchange_id,product_id,"SELL",status="DRY_RUN_TEST_OK",raw={"test_order":self.client.test_order(**params),"params":params})
         return self._result_from_order(product_id=product_id, side="SELL", raw=self.client.new_order(**params))
     def cancel_order(self, order_id, product_id=None, symbol=None):
         if not symbol:

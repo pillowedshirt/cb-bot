@@ -1,8 +1,41 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 @dataclass
 class ExchangeOrderResult:
-    ok: bool; exchange: str; product_id: str; side: str; requested_quote_usd: float=0.0; filled_qty: float=0.0; avg_price: float=0.0; fee_usd: float=0.0; order_id: str=""; status: str=""; raw: Optional[Dict[str, Any]]=None; error: str=""
+    ok: bool
+    exchange: str
+    product_id: str
+    side: str
+    requested_quote_usd: float = 0.0
+    requested_base_qty: float = 0.0
+    filled_qty: float = 0.0
+    avg_price: float = 0.0
+    fee_usd: float = 0.0
+    filled_notional_usd: float = 0.0
+    order_id: str = ""
+    client_order_id: str = ""
+    status: str = ""
+    raw: Optional[Dict[str, Any]] = None
+    error: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": bool(self.ok),
+            "exchange": str(self.exchange),
+            "product_id": str(self.product_id),
+            "side": str(self.side),
+            "requested_quote_usd": float(self.requested_quote_usd or 0.0),
+            "requested_base_qty": float(self.requested_base_qty or 0.0),
+            "filled_qty": float(self.filled_qty or 0.0),
+            "avg_price": float(self.avg_price or 0.0),
+            "fee_usd": float(self.fee_usd or 0.0),
+            "filled_notional_usd": float(self.filled_notional_usd or 0.0),
+            "order_id": str(self.order_id or ""),
+            "client_order_id": str(self.client_order_id or ""),
+            "status": str(self.status or ""),
+            "raw": self.raw or {},
+            "error": str(self.error or ""),
+        }
 class BaseExchangeAdapter:
     exchange_id="base"
     def get_account_snapshot(self)->Dict[str,Any]: raise NotImplementedError
@@ -16,6 +49,11 @@ import os, time, uuid
 from binance_us_client import BinanceUSClient
 from binance_symbol_filters import parse_symbol_rules, quantity_from_quote, format_price, format_quantity, order_meets_minimums
 from exchange_catalog import product_to_execution_symbol, execution_symbol_to_product, EXCHANGE_BINANCE_US
+try:
+    from debug_tools import module_debug, module_exception
+except Exception:
+    module_debug = None
+    module_exception = None
 class BinanceUSAdapter(BaseExchangeAdapter):
     exchange_id=EXCHANGE_BINANCE_US
     def __init__(self, *, dry_run: Optional[bool]=None, allow_real_orders: Optional[bool]=None):
@@ -65,24 +103,72 @@ class BinanceUSAdapter(BaseExchangeAdapter):
                 maker=float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS","0.0")); taker=float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS","2.0"))
                 self.fee_cache[symbol]={"maker_bps":maker,"taker_bps":taker,"source":"fallback","error":str(exc)}
         return self.fee_cache[symbol]
-    def _result_from_order(self, *, product_id, side, requested_quote_usd=0.0, raw):
-        fills=raw.get("fills") or []; qty=float(raw.get("executedQty") or 0.0); quote=float(raw.get("cummulativeQuoteQty") or raw.get("cumQuote") or 0.0); fee=0.0; fee_assets=[]
+    def _result_from_order(
+        self,
+        *,
+        product_id: str,
+        side: str,
+        requested_quote_usd: float = 0.0,
+        requested_base_qty: float = 0.0,
+        raw: Dict[str, Any],
+    ) -> ExchangeOrderResult:
+        fills = raw.get("fills") or []
+        filled_qty = float(raw.get("executedQty") or 0.0)
+        filled_quote = float(raw.get("cummulativeQuoteQty") or raw.get("cumQuote") or 0.0)
+        fee_usd = 0.0
+        fee_assets = []
         for f in fills:
-            commission=float(f.get("commission") or 0.0); asset=str(f.get("commissionAsset") or "")
-            fee_assets.append({"asset":asset,"amount":commission})
-            if asset in {"USDT","USD","USDC"}: fee += commission
+            try:
+                commission = float(f.get("commission") or 0.0)
+                asset = str(f.get("commissionAsset") or "")
+                fee_assets.append({"asset": asset, "amount": commission})
+                if asset in {"USDT", "USD", "USDC"}:
+                    fee_usd += commission
+            except Exception:
+                continue
+        avg_price = filled_quote / filled_qty if filled_qty > 0 else 0.0
+        status = str(raw.get("status") or "").upper()
+        order_id = str(raw.get("orderId") or "")
+        client_order_id = str(raw.get("clientOrderId") or raw.get("client_order_id") or "")
         raw["fee_assets"] = fee_assets
-        return ExchangeOrderResult(str(raw.get("status","")).upper() in {"FILLED","PARTIALLY_FILLED","NEW"}, self.exchange_id, product_id, side, float(requested_quote_usd), qty, quote/qty if qty>0 else 0.0, fee, str(raw.get("orderId") or ""), str(raw.get("status") or ""), raw, "")
+        ok = status in {"FILLED", "PARTIALLY_FILLED"} and filled_qty > 0 and avg_price > 0
+        return ExchangeOrderResult(
+            ok=bool(ok),
+            exchange=self.exchange_id,
+            product_id=str(product_id),
+            side=str(side).upper(),
+            requested_quote_usd=float(requested_quote_usd or 0.0),
+            requested_base_qty=float(requested_base_qty or 0.0),
+            filled_qty=float(filled_qty),
+            avg_price=float(avg_price),
+            fee_usd=float(fee_usd),
+            filled_notional_usd=float(filled_quote),
+            order_id=order_id,
+            client_order_id=client_order_id,
+            status=status,
+            raw=raw,
+            error="" if ok else f"order_not_filled_or_missing_fill_data status={status}",
+        )
     def place_market_buy(self, product_id, quote_usd):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); tob=self.get_top_of_book(product_id)
         if float(quote_usd) < float(rules.min_notional): raise RuntimeError(f"Order below Binance.US minNotional for {symbol}: quote={quote_usd} min={rules.min_notional}")
         params={"symbol":symbol,"side":"BUY","type":"MARKET","quoteOrderQty":str(round(float(quote_usd),2)),"newOrderRespType":"FULL","newClientOrderId":f"bot-buy-{uuid.uuid4().hex[:20]}"}
-        return self._result_from_order(product_id=product_id, side="BUY", requested_quote_usd=float(quote_usd), raw=self.client.new_order(**params))
+        if module_debug:
+            module_debug("exchange_adapters", "binance_live_order_submit", data={"product_id": product_id, "symbol": symbol, "side": params.get("side"), "type": params.get("type"), "quoteOrderQty": params.get("quoteOrderQty", ""), "quantity": params.get("quantity", ""), "newClientOrderId": params.get("newClientOrderId", "")}, level="INFO", also_overall=True)
+        raw = self.client.new_order(**params)
+        if module_debug:
+            module_debug("exchange_adapters", "binance_live_order_result", data={"product_id": product_id, "symbol": symbol, "side": params.get("side"), "type": params.get("type"), "status": raw.get("status"), "orderId": raw.get("orderId"), "clientOrderId": raw.get("clientOrderId"), "executedQty": raw.get("executedQty"), "cummulativeQuoteQty": raw.get("cummulativeQuoteQty")}, level="INFO", also_overall=True)
+        return self._result_from_order(product_id=product_id, side="BUY", requested_quote_usd=float(quote_usd), raw=raw)
     def place_market_sell(self, product_id, base_qty):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); qty=format_quantity(base_qty, rules, market=True); tob=self.get_top_of_book(product_id); price=float(tob.get("bid",0.0) or 0.0)
         if not order_meets_minimums(quote_usd=float(qty)*price, qty=qty, price=price, rules=rules): raise RuntimeError(f"Market sell does not meet Binance.US filters symbol={symbol} qty={qty} price={price}")
         params={"symbol":symbol,"side":"SELL","type":"MARKET","quantity":qty,"newOrderRespType":"FULL","newClientOrderId":f"bot-sell-{uuid.uuid4().hex[:20]}"}
-        return self._result_from_order(product_id=product_id, side="SELL", raw=self.client.new_order(**params))
+        if module_debug:
+            module_debug("exchange_adapters", "binance_live_order_submit", data={"product_id": product_id, "symbol": symbol, "side": params.get("side"), "type": params.get("type"), "quoteOrderQty": params.get("quoteOrderQty", ""), "quantity": params.get("quantity", ""), "newClientOrderId": params.get("newClientOrderId", "")}, level="INFO", also_overall=True)
+        raw = self.client.new_order(**params)
+        if module_debug:
+            module_debug("exchange_adapters", "binance_live_order_result", data={"product_id": product_id, "symbol": symbol, "side": params.get("side"), "type": params.get("type"), "status": raw.get("status"), "orderId": raw.get("orderId"), "clientOrderId": raw.get("clientOrderId"), "executedQty": raw.get("executedQty"), "cummulativeQuoteQty": raw.get("cummulativeQuoteQty")}, level="INFO", also_overall=True)
+        return self._result_from_order(product_id=product_id, side="SELL", requested_base_qty=float(base_qty), raw=raw)
     def place_limit_buy(self, product_id, quote_usd, limit_price):
         symbol=self.product_to_symbol(product_id); rules=self.symbol_rules(symbol); price=format_price(limit_price, rules); qty=quantity_from_quote(float(quote_usd), float(limit_price), rules)
         if not order_meets_minimums(quote_usd=float(quote_usd), qty=qty, price=float(limit_price), rules=rules): raise RuntimeError(f"Limit buy does not meet Binance.US filters symbol={symbol} qty={qty} price={price}")

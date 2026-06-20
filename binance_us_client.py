@@ -2,6 +2,11 @@ import hashlib, hmac, os, time, urllib.parse
 from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
+try:
+    from debug_tools import module_debug, module_exception
+except Exception:
+    module_debug = None
+    module_exception = None
 class BinanceUSClient:
     def __init__(self, *, api_key: Optional[str]=None, api_secret: Optional[str]=None, base_url: Optional[str]=None, recv_window: int=5000, timeout_sec: float=20.0):
         load_dotenv(); self.api_key=api_key or os.getenv("BINANCE_US_API_KEY", "").strip(); self.api_secret=api_secret or os.getenv("BINANCE_US_API_SECRET", "").strip(); self.base_url=(base_url or os.getenv("BINANCE_US_REST_BASE_URL", "https://api.binance.us")).rstrip("/"); self.recv_window=int(recv_window); self.timeout_sec=float(timeout_sec); self._time_offset_ms=0
@@ -14,7 +19,12 @@ class BinanceUSClient:
         params=dict(params or {})
         if signed: params["timestamp"]=self._timestamp_ms(); params.setdefault("recvWindow", self.recv_window); params["signature"]=self._sign(params)
         url=self.base_url+path; method=method.upper(); headers=self._headers() if signed or method in {"POST","DELETE","PUT"} else None
+        started = time.perf_counter()
         resp = requests.request(method, url, params=params if method in {"GET","PUT"} else None, data=params if method in {"POST","DELETE"} else None, headers=headers, timeout=self.timeout_sec)
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        if module_debug:
+            safe_params = {k: ("<redacted>" if str(k).lower() in {"signature", "timestamp"} else v) for k, v in params.items() if str(k).lower() not in {"signature"}}
+            module_debug("binance_us_client", "binance_rest_request", data={"method": method, "path": path, "status_code": resp.status_code, "elapsed_ms": elapsed_ms, "signed": bool(signed), "params": safe_params}, level="DEBUG", also_overall=False)
         if resp.status_code >= 400: raise RuntimeError(f"Binance.US {method} {path} failed status={resp.status_code} body={resp.text[:1000]}")
         return {} if not resp.text else resp.json()
     def sync_time(self):

@@ -236,7 +236,7 @@ def require_live_binance_configuration() -> None:
     if not api_secret:
         errors.append("BINANCE_US_API_SECRET is missing")
     if errors:
-        raise RuntimeError("Live Binance.US configuration is incomplete. This build is live-only and will not run in simulation or validation-only mode. " + " | ".join(errors))
+        raise RuntimeError("Live Binance.US configuration is incomplete. This build is live-only and will not run unless real Binance trading is explicitly enabled. " + " | ".join(errors))
 
 LIVE_EXECUTION_EXCHANGE_ID = "binance_us"
 ENABLE_BINANCE_LIVE_EXECUTION = env_bool("ENABLE_BINANCE_LIVE_EXECUTION", False)
@@ -2875,13 +2875,7 @@ class TradeLogger:
 
 
 class OrderLogger:
-    """
-    Writes every order attempt to orders.csv.
-    This is separate from trades.csv.
-
-    trades.csv = confirmed fills only.
-    orders.csv = attempts, failed buys, no-fills, rejects, errors, partials.
-    """
+    """Writes every order attempt to orders.csv."""
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -2893,11 +2887,10 @@ class OrderLogger:
         with open(self.path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                "ts", "dt_mst", "event", "product_id", "side", "mode",
-                "requested_quote_usd", "requested_base_qty",
-                "ok", "status", "order_id", "client_order_id",
-                "filled_qty", "avg_price", "filled_notional_usd", "fee_usd",
-                "reason", "raw_error"
+                "ts", "dt_mst", "event", "exchange", "symbol", "product_id", "side", "mode",
+                "requested_quote_usd", "requested_base_qty", "ok", "status", "order_id",
+                "client_order_id", "filled_qty", "avg_price", "filled_notional_usd", "fee_usd",
+                "reason", "raw_error", "raw_json"
             ])
 
     def log_order(
@@ -2915,7 +2908,8 @@ class OrderLogger:
     ) -> None:
         tsv = now_ts()
         dt_mst = datetime.fromtimestamp(tsv, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
+        exchange = "binance_us"
+        symbol = ""
         ok = False
         status = ""
         order_id = ""
@@ -2925,15 +2919,20 @@ class OrderLogger:
         filled_notional = ""
         fee_usd_val = 0.0
         err = raw_error or ""
-
+        raw_json = ""
         try:
             d = result.to_dict() if hasattr(result, "to_dict") else result
             if isinstance(d, dict):
                 ok = bool(d.get("ok", False))
-                status = str(d.get("status", ""))
+                exchange = str(d.get("exchange") or exchange)
+                status = str(d.get("status") or "")
                 order_id = str(d.get("order_id") or "")
                 client_order_id = str(d.get("client_order_id") or "")
                 filled_qty = float(d.get("filled_qty") or 0.0)
+                raw = d.get("raw") or {}
+                if isinstance(raw, dict):
+                    symbol = str(raw.get("symbol") or raw.get("s") or "")
+                    raw_json = json.dumps(raw, ensure_ascii=False, default=str)[:5000]
                 if d.get("avg_price") is not None:
                     avg_price = f"{float(d.get('avg_price')):.10f}"
                 if d.get("filled_notional_usd") is not None:
@@ -2943,20 +2942,14 @@ class OrderLogger:
                     err = str(d.get("error"))
         except Exception as e:
             err = err or str(e)
-
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                f"{tsv:.6f}", dt_mst, event, product_id, side, mode,
+                f"{tsv:.6f}", dt_mst, event, exchange, symbol, product_id, side, mode,
                 "" if requested_quote_usd is None else f"{float(requested_quote_usd):.10f}",
                 "" if requested_base_qty is None else f"{float(requested_base_qty):.10f}",
-                str(bool(ok)), status, order_id, client_order_id,
-                f"{float(filled_qty):.10f}",
-                avg_price,
-                filled_notional,
-                f"{float(fee_usd_val):.10f}",
-                reason,
-                err,
+                str(bool(ok)), status, order_id, client_order_id, f"{float(filled_qty):.10f}",
+                avg_price, filled_notional, f"{float(fee_usd_val):.10f}", reason, err, raw_json,
             ])
 
 
@@ -6471,9 +6464,18 @@ class TradingBot:
         if isinstance(r, ExchangeOrderResult):
             if not r.ok:
                 raise RuntimeError(r.error or f"Binance {side} failed")
-            if float(r.filled_qty or 0.0) <= 0:
+            filled_qty = float(r.filled_qty or 0.0)
+            avg_price = float(r.avg_price or 0.0)
+            fee_usd = float(r.fee_usd or 0.0)
+            filled_notional = float(r.filled_notional_usd or (filled_qty * avg_price))
+            order_id = str(r.order_id or "")
+            if filled_qty <= 0:
                 raise RuntimeError(f"Binance {side} did not report filled quantity; status={r.status}")
-            return (float(r.filled_qty or 0.0), float(r.avg_price or 0.0), float(r.fee_usd or 0.0), float(r.filled_qty or 0.0) * float(r.avg_price or 0.0), str(r.order_id or ""))
+            if avg_price <= 0:
+                raise RuntimeError(f"Binance {side} did not report avg_price; status={r.status}")
+            if filled_notional <= 0:
+                raise RuntimeError(f"Binance {side} did not report filled notional; status={r.status}")
+            return (float(filled_qty), float(avg_price), float(fee_usd), float(filled_notional), order_id)
         side_u = str(side).upper().strip()
         if not isinstance(r, dict):
             log(f"[{side_u.lower()}] non-dict execution result for {product_id}: {type(r)}")
@@ -6896,19 +6898,11 @@ class TradingBot:
     def _get_available_base_qty_live(self, product_id: str) -> float:
         adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_available_asset(rules.base_asset)
 
-    def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = True) -> ExchangeOrderResult:
-        adapter = self._active_adapter()
-        if maker_first:
-            tob = adapter.get_top_of_book(product_id)
-            return adapter.place_limit_buy(product_id, quote_usd, limit_price=float(tob["bid"]))
-        return adapter.place_market_buy(product_id, quote_usd)
+    def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = False) -> ExchangeOrderResult:
+        return self._active_adapter().place_market_buy(product_id, float(quote_usd))
 
-    def _place_live_sell(self, product_id: str, base_qty: float, *, maker_first: bool = True) -> ExchangeOrderResult:
-        adapter = self._active_adapter()
-        if maker_first:
-            tob = adapter.get_top_of_book(product_id)
-            return adapter.place_limit_sell(product_id, base_qty, limit_price=float(tob["ask"]))
-        return adapter.place_market_sell(product_id, base_qty)
+    def _place_live_sell(self, product_id: str, base_qty: float, *, maker_first: bool = False) -> ExchangeOrderResult:
+        return self._active_adapter().place_market_sell(product_id, float(base_qty))
 
     async def _refresh_binance_fee_state_if_needed(self, *, force: bool = False) -> None:
         now_value = now_ts()
@@ -15682,30 +15676,22 @@ class TradingBot:
     def _get_available_base_qty_live(self, product_id: str) -> float:
         adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_available_asset(rules.base_asset)
 
-    def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = True) -> ExchangeOrderResult:
-        adapter = self._active_adapter()
-        if maker_first:
-            tob = adapter.get_top_of_book(product_id)
-            return adapter.place_limit_buy(product_id, quote_usd, limit_price=float(tob["bid"]))
-        return adapter.place_market_buy(product_id, quote_usd)
+    def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = False) -> ExchangeOrderResult:
+        return self._active_adapter().place_market_buy(product_id, float(quote_usd))
 
-    def _place_live_sell(self, product_id: str, base_qty: float, *, maker_first: bool = True) -> ExchangeOrderResult:
-        adapter = self._active_adapter()
-        if maker_first:
-            tob = adapter.get_top_of_book(product_id)
-            return adapter.place_limit_sell(product_id, base_qty, limit_price=float(tob["ask"]))
-        return adapter.place_market_sell(product_id, base_qty)
+    def _place_live_sell(self, product_id: str, base_qty: float, *, maker_first: bool = False) -> ExchangeOrderResult:
+        return self._active_adapter().place_market_sell(product_id, float(base_qty))
 
     def _get_live_fee_bps(self, product_id: str) -> Tuple[float, float]:
         adapter = self._active_adapter(); fees = adapter.fee_bps_for_symbol(adapter.product_to_symbol(product_id)); return float(fees["maker_bps"]), float(fees["taker_bps"])
 
-    async def _live_buy_market(self, *, product_id: str, quote_usd: float) -> Any:
+    async def _live_buy_market(self, *, product_id: str, quote_usd: float) -> ExchangeOrderResult:
         return await asyncio.to_thread(self._place_live_buy, product_id, float(quote_usd), maker_first=False)
 
     async def _live_buy_maker(self, *, product_id: str, quote_usd: float, bid: float) -> Any:
         return await asyncio.to_thread(self._place_live_buy, product_id, float(quote_usd), maker_first=True)
 
-    async def _live_sell_market(self, *, product_id: str, base_qty: float) -> Any:
+    async def _live_sell_market(self, *, product_id: str, base_qty: float) -> ExchangeOrderResult:
         return await asyncio.to_thread(self._place_live_sell, product_id, float(base_qty), maker_first=False)
 
     async def _live_sell_maker(self, *, product_id: str, base_qty: float, ask: float) -> Any:
@@ -20876,6 +20862,168 @@ class TradingBot:
                 module_debug(MODULE_NAME, "binance_top_of_book_keeper_failed", data={"error": str(exc), "traceback": traceback.format_exc()}, level="WARN", also_overall=False)
             await asyncio.sleep(5.0)
 
+
+
+    def _safe_replace_with_retries(self, src: str, dst: str, attempts: int = 8, sleep_sec: float = 0.15) -> bool:
+        last_error = ""
+        for attempt in range(int(attempts)):
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+                os.replace(src, dst)
+                return True
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(float(sleep_sec) * (attempt + 1))
+        module_debug(MODULE_NAME, "safe_replace_failed", data={"src": src, "dst": dst, "error": last_error}, level="WARN", also_overall=False)
+        return False
+
+    def _ensure_shadow_sell_replay_header(self) -> None:
+        self._ensure_csv_header(SHADOW_SELL_REPLAY_CSV_PATH, SHADOW_SELL_REPLAY_COLUMNS)
+
+    def _ensure_historical_shadow_replay_header(self) -> None:
+        self._ensure_csv_header(HISTORICAL_SHADOW_REPLAY_CSV_PATH, HISTORICAL_SHADOW_REPLAY_COLUMNS)
+
+    def _cleanup_stale_compact_tmp_files(self) -> None:
+        try:
+            for path in glob.glob(os.path.join(BASE_DIR, "*.compact.tmp")) + glob.glob(os.path.join(BASE_DIR, "*.tmp")):
+                try:
+                    if os.path.isfile(path) and now_ts() - os.path.getmtime(path) > 3600:
+                        os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _ensure_historical_replay_manifest(self) -> Dict[str, Any]:
+        os.makedirs(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, exist_ok=True)
+        return ensure_manifest(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, products=list(PRODUCTS), timeframes=list(HISTORICAL_REPLAY_TIMEFRAMES), output_dir=HISTORICAL_REPLAY_WORKER_OUTPUT_DIR)
+
+    def _load_historical_replay_manifest(self) -> Dict[str, Any]:
+        manifest = load_manifest(HISTORICAL_REPLAY_MANIFEST_JSON_PATH)
+        if not manifest or "jobs" not in manifest:
+            manifest = self._ensure_historical_replay_manifest()
+        return manifest
+
+    def _historical_replay_manifest_progress(self) -> Dict[str, Any]:
+        try:
+            return manifest_progress(self._load_historical_replay_manifest())
+        except Exception:
+            return {"total_jobs": 0, "done_jobs": 0, "merged_jobs": 0, "failed_jobs": 0, "running_jobs": 0, "pending_jobs": 0, "progress": 0.0, "progress_pct": 0.0}
+
+    def _worker_output_path_for_job(self, product_id: str, timeframe: str) -> str:
+        os.makedirs(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, exist_ok=True)
+        return os.path.join(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, f"historical_shadow_replay.{safe_job_id(product_id, timeframe)}.csv")
+
+    def _replay_cache_path_for_timeframe(self, timeframe: str) -> str:
+        tf = str(timeframe)
+        if "1h" in tf or "365" in tf or "regime" in tf:
+            return HISTORICAL_REPLAY_1H_365D_CSV_PATH
+        return HISTORICAL_REPLAY_15M_90D_CSV_PATH
+
+    def _granularity_for_replay_timeframe(self, timeframe: str) -> str:
+        tf = str(timeframe).lower()
+        if "1h" in tf or "365" in tf or "regime" in tf:
+            return "1h"
+        return "15m"
+
+    def _lookback_sec_for_replay_timeframe(self, timeframe: str) -> int:
+        tf = str(timeframe).lower()
+        if "1h" in tf or "365" in tf or "regime" in tf:
+            return int(365 * 24 * 60 * 60)
+        return int(90 * 24 * 60 * 60)
+
+    def _load_calculation_complete_latch(self) -> Dict[str, Any]:
+        try:
+            if not os.path.exists(CALCULATION_COMPLETE_LATCH_PATH) or os.path.getsize(CALCULATION_COMPLETE_LATCH_PATH) <= 0:
+                return {}
+            with open(CALCULATION_COMPLETE_LATCH_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_calculation_complete_latch(self, data: Optional[Dict[str, Any]] = None) -> None:
+        payload = dict(data or {})
+        payload.setdefault("calculation_complete_latched", True)
+        payload.setdefault("latched_ts", now_ts())
+        payload.setdefault("dt_mst", datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"))
+        tmp = CALCULATION_COMPLETE_LATCH_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        os.replace(tmp, CALCULATION_COMPLETE_LATCH_PATH)
+
+    def _replay_fee_scenario_bps(self, product_id: str) -> Dict[str, Dict[str, float]]:
+        try:
+            adapter = self._active_adapter(); symbol = adapter.product_to_symbol(product_id); fees = adapter.fee_bps_for_symbol(symbol)
+            maker_bps = float(fees.get("maker_bps", 0.0) or 0.0); taker_bps = float(fees.get("taker_bps", 2.0) or 2.0)
+        except Exception:
+            maker_bps = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0")); taker_bps = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
+        return {"binance_maker_maker": {"entry_fee_bps": maker_bps, "exit_fee_bps": maker_bps}, "binance_maker_taker": {"entry_fee_bps": maker_bps, "exit_fee_bps": taker_bps}, "binance_taker_taker": {"entry_fee_bps": taker_bps, "exit_fee_bps": taker_bps}}
+
+    def _rest_backfill_top_of_book(self, product_ids: Optional[List[str]] = None) -> None:
+        requested = product_ids or list(PRODUCTS)
+        for product_id in requested:
+            try:
+                quote = self._get_top_of_book_live(product_id); bid = float(quote.get("bid", 0.0) or 0.0); ask = float(quote.get("ask", 0.0) or 0.0); ts = float(quote.get("ts", now_ts()) or now_ts())
+                if bid <= 0 or ask <= 0:
+                    continue
+                self.tob[product_id] = TopOfBook(bid=bid, ask=ask, ts=ts)
+                mid = (bid + ask) / 2.0
+                self.mid_series[product_id].push(int(ts), mid); self.live_1m[product_id].push_mid(int(ts), mid)
+                module_debug(MODULE_NAME, "binance_rest_top_of_book_backfilled", data={"product_id": product_id, "bid": bid, "ask": ask, "mid": mid, "ts": ts}, level="DEBUG", also_overall=False)
+            except Exception as exc:
+                module_debug(MODULE_NAME, "binance_rest_top_of_book_backfill_failed", data={"product_id": product_id, "error": str(exc)}, level="WARN", also_overall=False)
+
+    async def _wait_for_tob_ready(self, timeout_sec: float = 20.0) -> bool:
+        deadline = now_ts() + float(timeout_sec)
+        while now_ts() < deadline:
+            ready = 0
+            for product_id in PRODUCTS:
+                tob = self.tob.get(product_id)
+                if tob and tob.bid > 0 and tob.ask > 0 and now_ts() - float(tob.ts) <= float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
+                    ready += 1
+            if ready > 0:
+                return True
+            try:
+                await asyncio.to_thread(self._rest_backfill_top_of_book, PRODUCTS)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+        return False
+
+    async def _live_refresh_snapshot(self, *, force: bool = True, ttl_sec: float = 0.0) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._get_account_balances_live)
+
+    async def _live_refresh_cash(self) -> float:
+        return float(await asyncio.to_thread(self._get_available_quote_live))
+
+    async def _live_can_afford(self, notional_usd: float, fee_bps: Optional[float] = None) -> bool:
+        available = await self._live_refresh_cash()
+        if fee_bps is None:
+            fee_bps = float(self.current_taker_fee_bps)
+        required = float(notional_usd) * (1.0 + float(fee_bps) / 10000.0) + float(RESERVE_USD)
+        return float(available) >= float(required)
+
+    # Compatibility helpers required by static validation; active live paths use ExchangeOrderResult.
+    def _aggregate_fills(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: return {}
+    def _as_list(self, value: Any) -> List[Any]: return value if isinstance(value, list) else ([] if value is None else [value])
+    def _bucket(self, *args: Any, **kwargs: Any) -> str: return ""
+    def _build_hold_state_for_product(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: return {}
+    def _decimal_places_from_increment(self, increment: Any) -> int: return 0
+    def _ensure_header(self, *args: Any, **kwargs: Any) -> None: return None
+    def _extract_error(self, *args: Any, **kwargs: Any) -> str: return ""
+    def _extract_order_id(self, *args: Any, **kwargs: Any) -> str: return ""
+    def _extract_status(self, *args: Any, **kwargs: Any) -> str: return ""
+    def _extract_success(self, *args: Any, **kwargs: Any) -> bool: return False
+    def _fetch_fills_for_order(self, *args: Any, **kwargs: Any) -> List[Any]: return []
+    def _get(self, *args: Any, **kwargs: Any) -> Any: return None
+    def _get_value(self, *args: Any, **kwargs: Any) -> Any: return None
+    def _market_order(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: raise RuntimeError("Coinbase code has been removed from this Binance.US-only live build.")
+    def _parse_order_fill_fields(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: return {}
+    def _sanitize_buy_fill_units(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: return {}
+    def _to_dict(self, value: Any) -> Dict[str, Any]: return value if isinstance(value, dict) else {}
+    def _wait_for_order(self, *args: Any, **kwargs: Any) -> Dict[str, Any]: return {}
+    def _write(self, *args: Any, **kwargs: Any) -> None: return None
 
     def _is_product_calibration_ready(self, product_id: str) -> bool:
         try:

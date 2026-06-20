@@ -553,7 +553,7 @@ HISTORICAL_REPLAY_WORKER_INCLUDE_DAILY_CONTEXT: bool = False
 ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE: bool = True
 HISTORICAL_REPLAY_WORKER_MAX_ATTEMPTS: int = 3
 ENABLE_HISTORICAL_REPLAY_PROCESS_POOL: bool = True
-HISTORICAL_REPLAY_PROCESS_WORKERS: int = 4
+HISTORICAL_REPLAY_PROCESS_WORKERS: int = min(8, max(4, (os.cpu_count() or 4)))
 ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS: bool = True
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_summary.csv")
 REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
@@ -698,11 +698,33 @@ REPLAY_POLICY_MAX_HARD_STOP_RATE: float = 0.35
 REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_AVG_BPS: float = 15.0
 REPLAY_POLICY_MIN_COINBASE_MAKER_MAKER_WIN_RATE: float = 0.52
 # Since live execution is MARKET/MARKET, approve only if taker/taker replay is positive.
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 10.0
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.55
-REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 10.0
-REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.05
-REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = 0.45
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 2.0
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.30
+REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 2.0
+REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.25
+REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = 0.58
+REPLAY_POLICY_USE_PRODUCT_ALLOWLIST: bool = True
+REPLAY_POLICY_ALLOWED_PRODUCTS = {
+    "DOGE-USD",
+    "XLM-USD",
+    "SUI-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "AVAX-USD",
+    "ADA-USD",
+}
+REPLAY_POLICY_BLOCKED_UNLESS_EXCEPTION_PRODUCTS = {
+    "DOT-USD",
+    "SOL-USD",
+    "SHIB-USD",
+    "XRP-USD",
+    "BTC-USD",
+    "BCH-USD",
+    "ETH-USD",
+    "BNB-USD",
+}
+REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS: float = 7.5
+REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP: float = 0.45
 REPLAY_POLICY_ALLOW_BINANCE_ONLY_SHADOW: bool = True
 COINBASE_REQUIRE_MAKER_FIRST_FOR_LIVE_BUY: bool = True
 COINBASE_ALLOW_TAKER_ONLY_IF_TAKER_REPLAY_PROFITABLE: bool = False
@@ -1182,7 +1204,11 @@ LEVEL8_MIN_HOLD_SEC: float = 10 * 60
 LEVEL8_TARGET_HOLD_SEC: float = 30 * 60
 LEVEL8_MAX_HOLD_SEC: float = 90 * 60
 LEVEL8_HARD_STOP_UNREALIZED_BPS: float = -420.0
-LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL: float = 45.0
+LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL: float = 12.0
+PROFIT_LOCK_ARM_NET_AFTER_EXIT_BPS: float = 8.0
+PROFIT_LOCK_MIN_PEAK_UNREALIZED_BPS: float = 14.0
+PROFIT_LOCK_PULLBACK_FROM_PEAK_BPS: float = 6.0
+PROFIT_LOCK_SELL_FRACTION: float = 1.0
 LEVEL8_ALLOW_EARLY_PROFIT_CAPTURE: bool = True
 LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS: bool = True
 
@@ -1286,9 +1312,9 @@ SHADOW_SELL_REPLAY_SYNTHETIC_NOTIONAL_USD: float = 5.0
 
 ENABLE_HISTORICAL_SHADOW_REPLAY: bool = True
 ENABLE_PROFIT_REPLAY_BASED_CALIBRATION: bool = True
-HIST_REPLAY_PRIMARY_LOOKBACK_DAYS: int = 90
-HIST_REPLAY_REGIME_LOOKBACK_DAYS: int = 365
-HIST_REPLAY_DAILY_CONTEXT_DAYS: int = 730
+HIST_REPLAY_PRIMARY_LOOKBACK_DAYS: int = 30
+HIST_REPLAY_REGIME_LOOKBACK_DAYS: int = 120
+HIST_REPLAY_DAILY_CONTEXT_DAYS: int = 365
 HIST_REPLAY_PRIMARY_GRANULARITY: str = "FIFTEEN_MINUTE"
 HIST_REPLAY_REGIME_GRANULARITY: str = "ONE_HOUR"
 HIST_REPLAY_DAILY_GRANULARITY: str = "ONE_DAY"
@@ -1296,8 +1322,16 @@ HIST_REPLAY_DAILY_GRANULARITY: str = "ONE_DAY"
 HISTORICAL_REPLAY_TIMEFRAMES: List[str] = [
     "primary_15m_90d",
     "regime_1h_365d",
+]
+
+HISTORICAL_REPLAY_OPTIONAL_TIMEFRAMES: List[str] = [
     "daily_1d_2y",
 ]
+
+HISTORICAL_REPLAY_STARTUP_REQUIRED_TIMEFRAMES = {
+    "primary_15m_90d",
+    "regime_1h_365d",
+}
 
 HIST_REPLAY_FAST_BOOTSTRAP_MODE: bool = True
 HIST_REPLAY_BOOTSTRAP_ROWS_PER_PRODUCT_TARGET: int = 300
@@ -1309,22 +1343,22 @@ HIST_REPLAY_STARTUP_ACCELERATION_ENABLED: bool = True
 HIST_REPLAY_PARALLEL_STARTUP_ENABLED: bool = True
 # Number of product/timeframe replay jobs to execute concurrently while the viewer is locked.
 # Start with 4. Raising this too high can cause disk/API/network contention.
-HIST_REPLAY_STARTUP_PARALLEL_JOBS: int = 5
+HIST_REPLAY_STARTUP_PARALLEL_JOBS: int = HISTORICAL_REPLAY_PROCESS_WORKERS
 # Maximum simultaneous historical candle downloads/backfills.
 # This controls Binance bulk and Coinbase fallback pressure.
-HIST_REPLAY_MAX_PARALLEL_FETCHES: int = 4
+HIST_REPLAY_MAX_PARALLEL_FETCHES: int = min(6, HISTORICAL_REPLAY_PROCESS_WORKERS)
 # Keep output writes serialized.
 # Multiple workers can calculate at the same time, but only one should append to shared CSVs at a time.
 HIST_REPLAY_SERIALIZE_OUTPUT_WRITES: bool = True
 # After each parallel batch during startup, sleep briefly.
-HIST_REPLAY_STARTUP_BATCH_SLEEP_SEC: float = 1.0
+HIST_REPLAY_STARTUP_BATCH_SLEEP_SEC: float = 0.25
 # Keep normal background replay slower after the viewer unlocks.
 HIST_REPLAY_NORMAL_SLEEP_SEC: float = 90.0
 # Keep old sequential setting as fallback only.
 HIST_REPLAY_STARTUP_JOBS_PER_CYCLE: int = 6
-HIST_REPLAY_STARTUP_SLEEP_SEC: float = 1.0
-HIST_REPLAY_MAX_CANDIDATES_PER_PASS: int = 300
-HIST_REPLAY_MAX_RUNTIME_SEC: float = 45.0
+HIST_REPLAY_STARTUP_SLEEP_SEC: float = 0.25
+HIST_REPLAY_MAX_CANDIDATES_PER_PASS: int = 180
+HIST_REPLAY_MAX_RUNTIME_SEC: float = 25.0
 HIST_REPLAY_EVERY_SEC: float = 120.0
 HIST_REPLAY_CACHE_COMPACT_EVERY_SEC: float = 30 * 60.0
 HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC: float = 1.0
@@ -1357,7 +1391,7 @@ REPLAY_SUPPORT_MIN_AVG_NET_BPS: float = 10.0
 REPLAY_SUPPORT_MIN_WIN_RATE: float = 0.35
 VIEWER_REQUIRE_FULL_STARTUP_CALCULATION: bool = True
 REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY: bool = True
-REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY: bool = True
+REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY: bool = False
 ALLOW_STRONG_UTILITY_OVERRIDE_WITHOUT_REPLAY: bool = False
 LIVE_USE_HIGH_WIN_RATE_VARIANT_ONLY_AFTER_REPLAY_PROVEN: bool = False
 STARTUP_CALC_USE_FULL_HISTORICAL_CACHE_TARGETS: bool = True
@@ -7664,6 +7698,30 @@ class TradingBot:
             * float(PRICE_ACTION_SCORE_BONUS_WEIGHT)
         )
 
+        replay_component_score_bonus = 0.0
+
+        # Replay attribution showed market_structure and price_action helped.
+        replay_component_score_bonus += max(0.0, market_structure_buy_score - 0.57) * 9.0
+        replay_component_score_bonus += max(0.0, price_action_buy_score - 0.45) * 5.0
+
+        # Replay attribution showed volume_profile_leader was harmful as a direct buy booster.
+        replay_component_score_bonus -= max(0.0, volume_profile_leader_buy_score - 0.33) * 4.0
+
+        value_acceptance_state_l = str(value_acceptance_state or "").lower()
+        volume_node_state_l = str(volume_node_state or "").lower()
+
+        if value_acceptance_state_l in {"reclaimed_value_low", "inside_value_near_poc"}:
+            replay_component_score_bonus += 4.0
+
+        if value_acceptance_state_l in {"accepted_above_value", "inside_fair_value"}:
+            replay_component_score_bonus -= 3.0
+
+        if volume_node_state_l == "high_volume_node":
+            replay_component_score_bonus += 3.0
+
+        if volume_node_state_l == "low_volume_node":
+            replay_component_score_bonus -= 6.0
+
         raw_score = (
             support_score * 0.14
             + room_score * 0.14
@@ -7678,6 +7736,7 @@ class TradingBot:
             + edge_score * 0.12
             + session_score_bonus
             + price_action_score_bonus
+            + replay_component_score_bonus
             - spread_penalty
             - cost_penalty
         )
@@ -9554,6 +9613,30 @@ class TradingBot:
         )
 
         price_action_score_bonus = combined_price_action_buy * price_action_confidence * float(PRICE_ACTION_SCORE_BONUS_WEIGHT)
+        replay_component_score_bonus = 0.0
+
+        # Replay attribution showed market_structure and price_action helped.
+        replay_component_score_bonus += max(0.0, market_structure_buy_score - 0.57) * 9.0
+        replay_component_score_bonus += max(0.0, price_action_buy_score - 0.45) * 5.0
+
+        # Replay attribution showed volume_profile_leader was harmful as a direct buy booster.
+        replay_component_score_bonus -= max(0.0, volume_profile_leader_buy_score - 0.33) * 4.0
+
+        value_acceptance_state_l = str(value_acceptance_state or "").lower()
+        volume_node_state_l = str(volume_node_state or "").lower()
+
+        if value_acceptance_state_l in {"reclaimed_value_low", "inside_value_near_poc"}:
+            replay_component_score_bonus += 4.0
+
+        if value_acceptance_state_l in {"accepted_above_value", "inside_fair_value"}:
+            replay_component_score_bonus -= 3.0
+
+        if volume_node_state_l == "high_volume_node":
+            replay_component_score_bonus += 3.0
+
+        if volume_node_state_l == "low_volume_node":
+            replay_component_score_bonus -= 6.0
+
         price_action_prob_bonus = combined_price_action_buy * price_action_confidence * float(PRICE_ACTION_PROB_BONUS_WEIGHT)
 
         pa_upside_target_bps = float(price_action_context.get("nearest_upside_liquidity", 0.0) or 0.0)
@@ -9583,6 +9666,7 @@ class TradingBot:
             + edge_score * 0.12
             + session_score_bonus
             + price_action_score_bonus
+            + replay_component_score_bonus
             - spread_penalty
             - cost_penalty
         )
@@ -12751,8 +12835,18 @@ class TradingBot:
                     return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age}")
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 policy = self._latest_strategy_variant_policy()
-                candidate_variants = ["high_win_rate_v2", "low_fee_scalp_v1", "baseline"]
+                candidate_variants = [
+                    "high_win_rate_v2",
+                    "high_fee_survival_v1",
+                    "low_fee_scalp_v1",
+                    "baseline",
+                ]
                 approved = []
+                checked = []
+                product_allowed = (
+                    not bool(REPLAY_POLICY_USE_PRODUCT_ALLOWLIST)
+                    or product_id in set(REPLAY_POLICY_ALLOWED_PRODUCTS)
+                )
                 for timeframe in ["primary_15m_90d", "regime_1h_365d"]:
                     for variant in candidate_variants:
                         row = policy.get((product_id, timeframe, variant))
@@ -12764,10 +12858,42 @@ class TradingBot:
                         bn_maker_taker_avg = float(row.get("binance_maker_taker_avg", row.get("binance_maker_taker_avg_bps", 0.0)) or 0.0)
                         hard_stop = float(row.get("hard_stop_rate", 1.0) or 1.0)
                         profit_pullback = float(row.get("profit_pullback_rate", 0.0) or 0.0)
-                        if (rows >= int(REPLAY_POLICY_MIN_ROWS) and bn_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS) and bn_taker_win >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE) and bn_maker_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS) and hard_stop <= float(REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE) and profit_pullback >= float(REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE)):
+                        exceptional_variant = bool(
+                            bn_taker_avg >= float(REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS)
+                            and bn_maker_taker_avg >= float(REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS)
+                            and hard_stop <= float(REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP)
+                        )
+                        approved_policy = bool(
+                            rows >= int(REPLAY_POLICY_MIN_ROWS)
+                            and bn_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS)
+                            and bn_taker_win >= float(REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE)
+                            and bn_maker_taker_avg >= float(REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS)
+                            and hard_stop <= float(REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE)
+                            and profit_pullback >= float(REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE)
+                            and (product_allowed or exceptional_variant)
+                        )
+                        checked.append(
+                            f"{timeframe}/{variant}:"
+                            f"rows={rows},"
+                            f"avg={bn_taker_avg:.2f},"
+                            f"win={bn_taker_win:.3f},"
+                            f"hard={hard_stop:.3f},"
+                            f"pullback={profit_pullback:.3f},"
+                            f"product_allowed={product_allowed},"
+                            f"exceptional={exceptional_variant},"
+                            f"approved={approved_policy}"
+                        )
+                        if approved_policy:
                             approved.append((timeframe, variant, row))
+                candidate["replay_policy_approvals"] = str(approved)
+                candidate["replay_policy_checked"] = " | ".join(checked[-12:])
                 if not approved:
-                    return False, ("live_buy_blocked:no_binance_replay_policy_approval " f"product_id={product_id};checked_variants={candidate_variants}")
+                    return False, (
+                        f"live_buy_blocked:no_binance_replay_policy_approval "
+                        f"product_id={product_id};"
+                        f"product_allowed={product_allowed};"
+                        f"checked={' | '.join(checked[-8:])}"
+                    )
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
                 calc_status = self._calculation_status()
                 if not bool(calc_status.get("full_viewer_unlocked")):
@@ -15123,6 +15249,28 @@ class TradingBot:
             or float(unrealized_bps) <= float(LEVEL8_HARD_STOP_UNREALIZED_BPS)
         )
 
+        peak_unrealized_for_profit_lock = float(
+            hold_state.get("peak_unrealized_bps", 0.0) or 0.0
+        )
+        pullback_for_profit_lock = float(
+            hold_state.get("pullback_from_peak_bps", 0.0) or 0.0
+        )
+
+        profit_lock_hit = bool(
+            net_after_exit_for_hard_check >= float(PROFIT_LOCK_ARM_NET_AFTER_EXIT_BPS)
+            and peak_unrealized_for_profit_lock >= float(PROFIT_LOCK_MIN_PEAK_UNREALIZED_BPS)
+            and pullback_for_profit_lock >= float(PROFIT_LOCK_PULLBACK_FROM_PEAK_BPS)
+        )
+
+        if profit_lock_hit:
+            return True, (
+                f"level8_profit_lock_exit;"
+                f"net_after_exit_bps={net_after_exit_for_hard_check:.2f};"
+                f"peak_unrealized_bps={peak_unrealized_for_profit_lock:.2f};"
+                f"pullback_from_peak_bps={pullback_for_profit_lock:.2f};"
+                f"{default_exit_reason}"
+            ), float(PROFIT_LOCK_SELL_FRACTION)
+
         if hard_exit:
             if hard_stop_for_hard_check:
                 return True, f"level8_hard_stop_exit;{default_exit_reason}", 1.0
@@ -16155,14 +16303,40 @@ class TradingBot:
     def _next_manifest_jobs(self, count: int) -> List[Dict[str, Any]]:
         manifest = self._load_historical_replay_manifest()
         jobs = list((manifest.get("jobs", {}) or {}).values())
+
+        try:
+            latch = self._load_calculation_complete_latch()
+        except Exception:
+            latch = {}
+
+        startup_unlocked = bool(
+            latch.get("calculation_complete_latched")
+            or latch.get("full_viewer_unlocked")
+        )
+        startup_required = set(HISTORICAL_REPLAY_STARTUP_REQUIRED_TIMEFRAMES)
+
         candidates = []
         for job in jobs:
+            timeframe = str(job.get("timeframe") or "")
+            if not startup_unlocked and timeframe not in startup_required:
+                continue
+
             status = str(job.get("status") or JOB_PENDING)
             attempts = int(job.get("attempts", 0) or 0)
-            if status == JOB_PENDING or (status == JOB_FAILED and attempts < int(HISTORICAL_REPLAY_WORKER_MAX_ATTEMPTS)):
+            if status == JOB_PENDING or (
+                status == JOB_FAILED
+                and attempts < int(HISTORICAL_REPLAY_WORKER_MAX_ATTEMPTS)
+            ):
                 candidates.append(job)
-        timeframe_rank = {"primary_15m_90d": 0, "regime_1h_365d": 1, "daily_1d_2y": 2}
-        candidates.sort(key=lambda j: (timeframe_rank.get(str(j.get("timeframe") or ""), 99), int(j.get("rows_written", 0) or 0), str(j.get("product_id") or "")))
+
+        timeframe_rank = {"primary_15m_90d": 0, "regime_1h_365d": 1, "daily_1d_2y": 99}
+        candidates.sort(
+            key=lambda j: (
+                timeframe_rank.get(str(j.get("timeframe") or ""), 99),
+                int(j.get("rows_written", 0) or 0),
+                str(j.get("product_id") or ""),
+            )
+        )
         filtered = []
         for job in candidates:
             product_id = str(job.get("product_id") or "")
@@ -16175,7 +16349,7 @@ class TradingBot:
                     pass
                 continue
             filtered.append(job)
-        return filtered[:max(1, int(count))]
+        return filtered[: max(1, int(count))]
 
     async def _historical_replay_worker_pool_health_check(self) -> None:
         try:
@@ -17783,7 +17957,7 @@ class TradingBot:
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
             status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
-                self._write_calculation_complete_latch(calc_status=status)
+                self._write_calculation_complete_latch(data=status)
                 latch = self._load_calculation_complete_latch()
                 status["calculation_complete_latched"] = bool(latch.get("calculation_complete_latched"))
                 status["calculation_complete_latch"] = latch

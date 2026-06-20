@@ -60,6 +60,16 @@ SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
 SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
 HISTORICAL_SHADOW_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_summary.csv")
+HISTORICAL_REPLAY_MANIFEST_JSON_PATH = os.path.join(BASE_DIR, "historical_replay_manifest.json")
+HIST_REPLAY_15M_90D_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_15m_90d.csv")
+HIST_REPLAY_1H_365D_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_1h_365d.csv")
+
+STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT = 120
+STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT = int(90 * 24 * 4 * 0.92)
+STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT = int(365 * 24 * 0.92)
+STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT = 300
+STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT = 100
+
 STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "strategy_variant_replay_summary.csv")
 REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
 EXCHANGE_PRODUCT_MAP_CSV_PATH = os.path.join(BASE_DIR, "exchange_product_map.csv")
@@ -466,12 +476,287 @@ def _load_calculation_status_cached(path: str, exists: bool, size_bytes: int, mt
         return {}
 
 
-def load_calculation_status() -> dict:
+def _viewer_count_rows_by_product(path: str) -> Dict[str, int]:
+    try:
+        df = load_csv_tail(path, max_lines=300000)
+        if df is None or df.empty or "product_id" not in df.columns:
+            return {}
+        return df["product_id"].astype(str).value_counts().to_dict()
+    except Exception:
+        return {}
+
+
+def _viewer_product_ids(snapshot: dict, manifest: dict, micro_counts: Dict[str, int]) -> list:
+    ids = []
+
+    try:
+        ids.extend([str(x) for x in ((snapshot or {}).get("coins") or {}).keys() if str(x)])
+    except Exception:
+        pass
+
+    try:
+        jobs = ((manifest or {}).get("jobs") or {}).values()
+        ids.extend([str(j.get("product_id") or "") for j in jobs if str(j.get("product_id") or "")])
+    except Exception:
+        pass
+
+    try:
+        ids.extend([str(x) for x in micro_counts.keys() if str(x)])
+    except Exception:
+        pass
+
+    try:
+        exchange_map = load_csv(EXCHANGE_PRODUCT_MAP_CSV_PATH)
+        if exchange_map is not None and not exchange_map.empty:
+            if "canonical_product_id" in exchange_map.columns:
+                ids.extend([str(x) for x in exchange_map["canonical_product_id"].dropna().astype(str).tolist() if str(x)])
+            elif "coinbase_product_id" in exchange_map.columns:
+                ids.extend([str(x) for x in exchange_map["coinbase_product_id"].dropna().astype(str).tolist() if str(x)])
+    except Exception:
+        pass
+
+    out = []
+    seen = set()
+    for product_id in ids:
+        product_id = str(product_id).strip()
+        if not product_id or product_id in seen:
+            continue
+        seen.add(product_id)
+        out.append(product_id)
+
+    return out
+
+
+def _viewer_manifest_progress(manifest: dict) -> dict:
+    jobs = list(((manifest or {}).get("jobs") or {}).values())
+    total = len(jobs)
+
+    counts = {}
+    for job in jobs:
+        status = str(job.get("status") or "pending")
+        counts[status] = counts.get(status, 0) + 1
+
+    complete = counts.get("done", 0) + counts.get("merged", 0)
+
+    return {
+        "total_jobs": int(total),
+        "done_jobs": int(counts.get("done", 0)),
+        "merged_jobs": int(counts.get("merged", 0)),
+        "failed_jobs": int(counts.get("failed", 0)),
+        "running_jobs": int(counts.get("running", 0)),
+        "pending_jobs": int(counts.get("pending", 0)),
+        "progress": float(complete / max(1, total)),
+        "progress_pct": float(complete / max(1, total) * 100.0),
+        "running_jobs_detail": [
+            {
+                "job_id": str(j.get("job_id") or ""),
+                "product_id": str(j.get("product_id") or ""),
+                "timeframe": str(j.get("timeframe") or ""),
+                "started_ts": float(j.get("started_ts", 0.0) or 0.0),
+            }
+            for j in jobs
+            if str(j.get("status") or "") == "running"
+        ][:10],
+        "failed_job_errors": [
+            {
+                "job_id": str(j.get("job_id") or ""),
+                "product_id": str(j.get("product_id") or ""),
+                "timeframe": str(j.get("timeframe") or ""),
+                "attempts": int(j.get("attempts", 0) or 0),
+                "error": str(j.get("error") or ""),
+            }
+            for j in jobs
+            if str(j.get("status") or "") == "failed"
+        ][-10:],
+        "next_pending_jobs": [
+            {
+                "job_id": str(j.get("job_id") or ""),
+                "product_id": str(j.get("product_id") or ""),
+                "timeframe": str(j.get("timeframe") or ""),
+            }
+            for j in jobs
+            if str(j.get("status") or "pending") == "pending"
+        ][:10],
+    }
+
+
+def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
+    """Viewer-side fallback when bot has not written calculation_status.json yet.
+
+    This prevents the loading screen from lying with 0.0% and 0 seconds while
+    startup files already prove calculation/backlog work is underway.
+    """
+    now_value = time.time()
+
+    manifest = {}
+    if os.path.exists(HISTORICAL_REPLAY_MANIFEST_JSON_PATH):
+        try:
+            with open(HISTORICAL_REPLAY_MANIFEST_JSON_PATH, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception:
+            manifest = {}
+
+    micro_counts = _viewer_count_rows_by_product(MICRO_HISTORY_CSV_PATH)
+    candle_15m_counts = _viewer_count_rows_by_product(HIST_REPLAY_15M_90D_CSV_PATH)
+    candle_1h_counts = _viewer_count_rows_by_product(HIST_REPLAY_1H_365D_CSV_PATH)
+
+    replay_counts_15m = {}
+    replay_counts_1h = {}
+
+    replay_df = load_csv_tail(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=300000)
+    if replay_df is not None and not replay_df.empty and "product_id" in replay_df.columns:
+        replay_df = replay_df.copy()
+        replay_df["product_id"] = replay_df["product_id"].astype(str)
+        timeframe_series = replay_df["timeframe"].astype(str) if "timeframe" in replay_df.columns else pd.Series([""] * len(replay_df))
+
+        replay_counts_15m = replay_df[
+            timeframe_series.str.contains("15m|primary", case=False, regex=True, na=False)
+        ]["product_id"].value_counts().to_dict()
+
+        replay_counts_1h = replay_df[
+            timeframe_series.str.contains("1h|regime", case=False, regex=True, na=False)
+        ]["product_id"].value_counts().to_dict()
+
+    product_ids = _viewer_product_ids(snapshot, manifest, micro_counts)
+    product_status = {}
+
+    for product_id in product_ids:
+        micro_rows = int(micro_counts.get(product_id, 0) or 0)
+        candle_15m_rows = int(candle_15m_counts.get(product_id, 0) or 0)
+        candle_1h_rows = int(candle_1h_counts.get(product_id, 0) or 0)
+        replay_15m_rows = int(replay_counts_15m.get(product_id, 0) or 0)
+        replay_1h_rows = int(replay_counts_1h.get(product_id, 0) or 0)
+
+        micro_progress = min(1.0, micro_rows / max(1.0, float(STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT)))
+        candle_15m_progress = min(1.0, candle_15m_rows / max(1.0, float(STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT)))
+        candle_1h_progress = min(1.0, candle_1h_rows / max(1.0, float(STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT)))
+        replay_15m_progress = min(1.0, replay_15m_rows / max(1.0, float(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)))
+        replay_1h_progress = min(1.0, replay_1h_rows / max(1.0, float(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)))
+
+        historical_candle_progress = (candle_15m_progress + candle_1h_progress) / 2.0
+        historical_replay_progress = (replay_15m_progress + replay_1h_progress) / 2.0
+
+        complete = bool(
+            micro_progress >= 1.0
+            and historical_candle_progress >= 1.0
+            and historical_replay_progress >= 1.0
+        )
+
+        product_status[product_id] = {
+            "product_id": product_id,
+            "micro_rows": micro_rows,
+            "historical_15m_candle_rows": candle_15m_rows,
+            "required_15m_candle_rows": STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT,
+            "historical_1h_candle_rows": candle_1h_rows,
+            "required_1h_candle_rows": STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT,
+            "primary_15m_90d_rows": replay_15m_rows,
+            "regime_1h_365d_rows": replay_1h_rows,
+            "qualified_rows": replay_15m_rows + replay_1h_rows,
+            "avg_net_pnl_bps": 0.0,
+            "verdict": "viewer_synthesized_status",
+            "complete": complete,
+            "profit_ready": False,
+            "live_trade_allowed": False,
+            "reason": "viewer_synthesized_from_csvs_because_calculation_status_json_missing_or_stale",
+            "micro_progress": float(micro_progress),
+            "historical_candle_progress": float(historical_candle_progress),
+            "historical_replay_progress": float(historical_replay_progress),
+            "calibration_verdict_progress": 0.0,
+            "overall_product_progress": float(
+                (micro_progress * 0.15)
+                + (historical_candle_progress * 0.20)
+                + (historical_replay_progress * 0.35)
+            ),
+        }
+
+    product_count = max(1, len(product_ids))
+
+    phase_progress = {
+        "live_data": 1.0 if ((snapshot or {}).get("updated_ts") or os.path.exists(MARKET_CSV_PATH)) else 0.0,
+        "micro_backlog": sum(v["micro_progress"] for v in product_status.values()) / product_count,
+        "historical_candle_backlog": sum(v["historical_candle_progress"] for v in product_status.values()) / product_count,
+        "historical_replay": sum(v["historical_replay_progress"] for v in product_status.values()) / product_count,
+        "replay_calibration_verdicts": 0.0,
+    }
+
+    overall_progress = (
+        phase_progress["live_data"] * 0.10
+        + phase_progress["micro_backlog"] * 0.15
+        + phase_progress["historical_candle_backlog"] * 0.20
+        + phase_progress["historical_replay"] * 0.35
+        + phase_progress["replay_calibration_verdicts"] * 0.20
+    )
+
+    start_ts_candidates = [
+        float((manifest or {}).get("created_ts") or 0.0),
+        float((snapshot or {}).get("calculation_started_ts") or 0.0),
+        float((snapshot or {}).get("updated_ts") or 0.0),
+    ]
+    start_ts_candidates = [x for x in start_ts_candidates if x > 0.0]
+
+    calculation_started_ts = min(start_ts_candidates) if start_ts_candidates else now_value
+    elapsed_sec = max(0.0, now_value - calculation_started_ts)
+
+    if phase_progress["historical_candle_backlog"] < 1.0:
+        phase_label = "Building historical candle backlogs"
+    elif phase_progress["historical_replay"] < 1.0:
+        phase_label = "Running historical replay across all products"
+    elif phase_progress["replay_calibration_verdicts"] < 1.0:
+        phase_label = "Calculating replay-based product verdicts"
+    else:
+        phase_label = "Final readiness checks"
+
+    worker_manifest = _viewer_manifest_progress(manifest)
+
+    return {
+        "ts": now_value,
+        "calculation_started_ts": float(calculation_started_ts),
+        "calculation_elapsed_sec": float(elapsed_sec),
+        "full_viewer_unlocked": False,
+        "calculation_work_complete": False,
+        "calculation_complete_latched": False,
+        "overall_progress": float(max(0.0, min(1.0, overall_progress))),
+        "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))),
+        "phase_label": phase_label,
+        "phase_progress": phase_progress,
+        "product_count": int(len(product_ids)),
+        "complete_products": int(sum(1 for v in product_status.values() if v.get("complete"))),
+        "profit_ready_products": 0,
+        "blocked_products": 0,
+        "incomplete_products": int(len(product_ids) - sum(1 for v in product_status.values() if v.get("complete"))),
+        "product_status": product_status,
+        "historical_replay_worker_manifest": worker_manifest,
+        "readiness": (snapshot or {}).get("readiness", {}),
+        "policy": (snapshot or {}).get("readiness", {}),
+        "viewer_status_source": "synthesized_from_csvs_and_manifest",
+        "viewer_status_reason": "calculation_status.json was missing or stale, so viewer calculated progress from existing runtime files",
+    }
+
+
+def load_calculation_status(snapshot: dict | None = None) -> dict:
     sig = file_signature(CALCULATION_STATUS_JSON_PATH)
     status = _load_calculation_status_cached(sig[0], sig[1], sig[2], sig[3])
-    if not status:
-        return {"full_viewer_unlocked": False, "overall_progress": 0.0, "overall_progress_pct": 0.0, "phase_label": "Waiting for bot calculation status", "phase_progress": {}, "product_status": {}}
-    return status
+
+    if status:
+        try:
+            status_ts = float(status.get("ts", 0.0) or 0.0)
+            if status_ts > 0 and time.time() - status_ts <= 15.0:
+                return status
+        except Exception:
+            return status
+
+    synthesized = _synthesize_calculation_status_for_viewer(snapshot or load_viewer_snapshot())
+
+    if status:
+        synthesized["bot_calculation_status_stale"] = True
+        synthesized["bot_calculation_status_age_sec"] = max(
+            0.0,
+            time.time() - float(status.get("ts", 0.0) or 0.0),
+        )
+    else:
+        synthesized["bot_calculation_status_missing"] = True
+
+    return synthesized
 
 
 def dataframe_latest_age_sec(frame: pd.DataFrame) -> float:
@@ -1817,7 +2102,11 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         f"""<div class=\"calibration-gate\"><div class=\"calibration-title\">Calculating and calibrating</div><div class=\"calibration-subtitle\">The full viewer is locked until every tracked coin has completed backlogs, historical replay, and replay-based calibration verdicts.</div><div class=\"calibration-phase-card\"><b>Current phase:</b> {_html(phase_label)}<br><b>Overall completion:</b> {progress_pct:.1f}%</div></div>""",
         unsafe_allow_html=True,
     )
-    elapsed_sec = float(calc_status.get("calculation_elapsed_sec", 0.0) or 0.0)
+    calculation_started_ts = float(calc_status.get("calculation_started_ts", 0.0) or 0.0)
+    if calculation_started_ts > 0.0:
+        elapsed_sec = max(0.0, time.time() - calculation_started_ts)
+    else:
+        elapsed_sec = float(calc_status.get("calculation_elapsed_sec", 0.0) or 0.0)
     elapsed_label = format_elapsed_duration(elapsed_sec)
     st.markdown(
         f'''
@@ -2197,7 +2486,7 @@ def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
     snapshot = load_viewer_snapshot()
-    calc_status = load_calculation_status()
+    calc_status = load_calculation_status(snapshot)
     if not bool(calc_status.get("full_viewer_unlocked", False)):
         render_calibration_loading_screen(calc_status, snapshot)
         return
@@ -2230,7 +2519,7 @@ def main() -> None:
     snapshot_static = load_viewer_snapshot()
     selected = pick_selected_coin(snapshot_static)
     if not selected:
-        calc_status = load_calculation_status()
+        calc_status = load_calculation_status(snapshot_static)
         if not bool(calc_status.get("full_viewer_unlocked", False)):
             render_calibration_loading_screen(calc_status, snapshot_static)
             return

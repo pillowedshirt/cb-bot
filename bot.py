@@ -17444,6 +17444,7 @@ class TradingBot:
             merge_result = await self._merge_completed_worker_outputs()
             return {"used_manifest_workers": True, "jobs_started": 0, "merge_result": merge_result}
         module_debug(MODULE_NAME, "historical_replay_manifest_worker_batch_started", data={"jobs_started": len(jobs), "jobs": [{"job_id": j.get("job_id"), "product_id": j.get("product_id"), "timeframe": j.get("timeframe"), "attempts": j.get("attempts")} for j in jobs]}, level="INFO", also_overall=False)
+        self._write_calculation_status(force=True)
         if (bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS) and self._historical_worker_pool is not None and run_full_replay_worker_job is not None):
             tasks = [asyncio.create_task(self._run_manifest_job_in_process_worker(job)) for job in jobs]
         else:
@@ -17530,6 +17531,7 @@ class TradingBot:
         while not self._stop_event.is_set():
             try:
                 calc_status = self._calculation_status(force=False)
+                self._write_calculation_status(force=True)
                 unlocked = bool(calc_status.get("full_viewer_unlocked"))
                 if bool(HIST_REPLAY_STARTUP_ACCELERATION_ENABLED) and not unlocked:
                     module_debug(MODULE_NAME, "historical_replay_startup_acceleration_cycle", data={"parallel_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "fetch_concurrency": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "progress_pct": round(float(calc_status.get("overall_progress_pct", 0.0)), 2), "phase": calc_status.get("phase_label")}, level="INFO", also_overall=False)

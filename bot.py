@@ -580,6 +580,7 @@ RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
 AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
 AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH: str = os.path.join(BASE_DIR, "agent_component_replay_attribution.csv")
 AGENT_TRADE_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "agent_trade_policy.csv")
+AGENT_SIDE_RATINGS_CSV_PATH: str = os.path.join(BASE_DIR, "agent_side_ratings.csv")
 BACKTEST_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_recommendations.csv")
 BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_sell_recommendations.csv")
 BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
@@ -604,6 +605,7 @@ RUNTIME_CSV_ROW_LIMITS = {
     "council_votes.csv": 60000,
     "shadow_trades.csv": 20000,
     "agent_performance.csv": 75000,
+    "agent_side_ratings.csv": 10000,
     "candidate_replay.csv": 75000,
     "decision_audit.csv": 50000,
     "order_book_snapshots.csv": 15000,
@@ -795,6 +797,14 @@ POST_ONLY_ENTRY_TIMEOUT_SEC: float = 20.0
 POST_ONLY_EXIT_TIMEOUT_SEC: float = 30.0
 AGENT_COMPONENT_REPLAY_ATTRIBUTION_COLUMNS: List[str] = ["ts", "dt_mst", "component", "rows", "high_score_rows", "low_score_rows", "high_score_avg_coinbase_maker_maker_bps", "low_score_avg_coinbase_maker_maker_bps", "high_score_avg_binance_maker_maker_bps", "low_score_avg_binance_maker_maker_bps", "high_score_hard_stop_rate", "low_score_hard_stop_rate", "edge_vs_low_coinbase_bps", "edge_vs_low_binance_bps", "recommended_role", "reason"]
 AGENT_TRADE_POLICY_COLUMNS: List[str] = ["ts", "dt_mst", "agent", "rows", "buy_rows", "buy_avg_move_bps", "buy_success_rate", "wait_hold_rows", "wait_hold_avg_move_bps", "wait_hold_success_rate", "avg_weighted_credit", "recommended_role", "entry_weight_multiplier", "veto_weight_multiplier", "reason"]
+AGENT_SIDE_RATINGS_COLUMNS: List[str] = [
+    "ts", "dt_mst", "agent",
+    "buy_rows", "buy_accuracy", "buy_avg_move_bps", "buy_avg_credit",
+    "buy_score", "buy_weight_pct", "buy_weight_multiplier",
+    "sell_rows", "sell_accuracy", "sell_avg_move_bps", "sell_avg_credit",
+    "sell_score", "sell_weight_pct", "sell_weight_multiplier",
+    "total_rows", "formula", "reason",
+]
 BACKTEST_SETUP_PERFORMANCE_COLUMNS: List[str] = ["ts", "dt_mst", "product_id", "timeframe", "strategy", "setup_tag", "market_regime", "rows", "win_rate", "avg_move_bps", "median_move_bps", "confidence", "recommended_action", "reason"]
 AGENT_ABLATION_COLUMNS: List[str] = ["ts", "dt_mst", "agent", "rows", "with_agent_avg_bps", "without_agent_avg_bps", "delta_bps", "binance_delta_bps", "recommended_weight_adjustment", "reason"]
 
@@ -17708,6 +17718,9 @@ class TradingBot:
     def _ensure_agent_trade_policy_header(self) -> None:
         self._ensure_csv_header(AGENT_TRADE_POLICY_CSV_PATH, AGENT_TRADE_POLICY_COLUMNS)
 
+    def _ensure_agent_side_ratings_header(self) -> None:
+        self._ensure_csv_header(AGENT_SIDE_RATINGS_CSV_PATH, AGENT_SIDE_RATINGS_COLUMNS)
+
     def _write_agent_component_replay_attribution(self) -> None:
         try:
             self._ensure_agent_component_replay_attribution_header()
@@ -17757,6 +17770,90 @@ class TradingBot:
                     writer = csv.DictWriter(f, fieldnames=AGENT_TRADE_POLICY_COLUMNS); [writer.writerow({col: row.get(col, "") for col in AGENT_TRADE_POLICY_COLUMNS}) for row in rows]
         except Exception as exc:
             module_exception(MODULE_NAME, "write_agent_trade_policy_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+
+    def _write_agent_side_ratings(self) -> None:
+        """Build separate BUY and SELL analyst authority from performance rows."""
+        try:
+            self._ensure_agent_side_ratings_header()
+            frame = self._read_csv_tail_for_bot(AGENT_PERFORMANCE_CSV_PATH, max_lines=250000)
+            if frame.empty or "agent" not in frame.columns or "agent_direction" not in frame.columns:
+                return
+            frame = frame.copy()
+            frame["agent"] = frame["agent"].astype(str)
+            frame["agent_direction"] = frame["agent_direction"].astype(str).str.upper()
+            frame["strategy"] = frame.get("strategy", pd.Series("", index=frame.index)).astype(str).str.upper()
+            frame["outcome_source"] = frame.get("outcome_source", pd.Series("", index=frame.index)).astype(str).str.lower()
+            frame["_success"] = pd.to_numeric(frame.get("outcome_success", 0), errors="coerce").fillna(0.0)
+            frame["_credit"] = pd.to_numeric(frame.get("weighted_agent_credit_score", frame.get("agent_credit_score", 0.5)), errors="coerce").fillna(0.5)
+            frame["_move"] = pd.to_numeric(frame.get("outcome_move_bps", 0.0), errors="coerce").fillna(0.0)
+            if "outcome_weight" in frame.columns:
+                frame["_source_weight"] = pd.to_numeric(frame["outcome_weight"], errors="coerce").fillna(0.35)
+            else:
+                frame["_source_weight"] = frame["outcome_source"].map({"trade_outcome": 1.00, "real_trade": 1.00, "sell_outcome": 1.00, "agent_performance": 0.80, "observation_outcome": 0.40, "level8_observation": 0.40}).fillna(0.35).astype(float)
+            frame = frame[frame["agent"].ne("")].copy()
+            if frame.empty:
+                return
+
+            def weighted_mean(values, weights, default=0.0) -> float:
+                try:
+                    v = pd.to_numeric(values, errors="coerce").fillna(float(default))
+                    w = pd.to_numeric(weights, errors="coerce").fillna(0.0)
+                    total_w = float(w.sum())
+                    if total_w <= 0:
+                        return float(v.mean()) if len(v) else float(default)
+                    return float((v * w).sum() / total_w)
+                except Exception:
+                    return float(default)
+
+            def side_stats(group: pd.DataFrame, side: str) -> Dict[str, float]:
+                side_u = str(side).upper()
+                if side_u == "BUY":
+                    rows = group[group["agent_direction"].eq("BUY")].copy()
+                else:
+                    rows = pd.concat([group[group["agent_direction"].eq("SELL")].copy(), group[group["strategy"].eq("EXIT_REVIEW")].copy()], ignore_index=True, sort=False)
+                    if not rows.empty:
+                        rows = rows.drop_duplicates()
+                n = int(len(rows))
+                if n <= 0:
+                    return {"rows": 0, "accuracy": 0.5, "avg_move_bps": 0.0, "avg_credit": 0.5, "score": 0.5, "authority_raw": 0.10}
+                weights = rows["_source_weight"]
+                accuracy = weighted_mean(rows["_success"], weights, 0.5)
+                avg_credit = weighted_mean(rows["_credit"], weights, 0.5)
+                avg_move = weighted_mean(rows["_move"], weights, 0.0)
+                edge_for_side = avg_move if side_u == "BUY" else -avg_move
+                sample_factor = clamp_float(n / 50.0, 0.0, 1.0)
+                edge_component = clamp_float(edge_for_side / 160.0, -0.16, 0.16)
+                score = clamp_float(0.50 + (accuracy - 0.50) * 0.75 * sample_factor + (avg_credit - 0.50) * 0.35 + edge_component * sample_factor, 0.05, 0.98)
+                if n < 5:
+                    score = 0.50 + (score - 0.50) * 0.25
+                authority_raw = math.exp((score - 0.50) / 0.075) * max(0.10, sample_factor)
+                return {"rows": n, "accuracy": float(accuracy), "avg_move_bps": float(avg_move), "avg_credit": float(avg_credit), "score": float(score), "authority_raw": float(authority_raw)}
+
+            rows = []
+            ts_val = now_ts()
+            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            for agent, group in frame.groupby(frame["agent"].astype(str)):
+                buy = side_stats(group, "BUY"); sell = side_stats(group, "SELL")
+                rows.append({"ts": ts_val, "dt_mst": dt_mst, "agent": agent, "buy_rows": int(buy["rows"]), "buy_accuracy": float(buy["accuracy"]), "buy_avg_move_bps": float(buy["avg_move_bps"]), "buy_avg_credit": float(buy["avg_credit"]), "buy_score": float(buy["score"]), "buy_authority_raw": float(buy["authority_raw"]), "sell_rows": int(sell["rows"]), "sell_accuracy": float(sell["accuracy"]), "sell_avg_move_bps": float(sell["avg_move_bps"]), "sell_avg_credit": float(sell["avg_credit"]), "sell_score": float(sell["score"]), "sell_authority_raw": float(sell["authority_raw"]), "total_rows": int(len(group))})
+            if not rows:
+                return
+            buy_total = sum(float(r["buy_authority_raw"]) for r in rows) or 1.0
+            sell_total = sum(float(r["sell_authority_raw"]) for r in rows) or 1.0
+            equal_weight_pct = 100.0 / max(1, len(rows))
+            for row in rows:
+                row["buy_weight_pct"] = float(row["buy_authority_raw"]) / buy_total * 100.0
+                row["sell_weight_pct"] = float(row["sell_authority_raw"]) / sell_total * 100.0
+                row["buy_weight_multiplier"] = clamp_float(row["buy_weight_pct"] / max(equal_weight_pct, 1e-9), 0.25, 6.0)
+                row["sell_weight_multiplier"] = clamp_float(row["sell_weight_pct"] / max(equal_weight_pct, 1e-9), 0.25, 6.0)
+                row["formula"] = "score=shrunk_accuracy+weighted_credit+directional_edge; authority=exp((score-.50)/.075); weights normalized to 100pct separately for buy and sell"
+                row["reason"] = f"buy_score={row['buy_score']:.3f};buy_weight={row['buy_weight_pct']:.2f}%;sell_score={row['sell_score']:.3f};sell_weight={row['sell_weight_pct']:.2f}%;equal_weight={equal_weight_pct:.2f}%"
+            with open(AGENT_SIDE_RATINGS_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=AGENT_SIDE_RATINGS_COLUMNS)
+                for row in rows:
+                    writer.writerow({col: row.get(col, "") for col in AGENT_SIDE_RATINGS_COLUMNS})
+        except Exception as exc:
+            module_exception(MODULE_NAME, "write_agent_side_ratings_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
 
     def _latest_agent_trade_policy(self) -> Dict[str, Dict[str, Any]]:
         try:
@@ -17889,6 +17986,10 @@ class TradingBot:
                     pass
                 try:
                     self._write_agent_trade_policy()
+                except Exception:
+                    pass
+                try:
+                    self._write_agent_side_ratings()
                 except Exception:
                     pass
                 try:
@@ -20973,6 +21074,10 @@ class TradingBot:
                             f"source={outcome_source};weight={outcome_weight:.2f}"
                         ),
                     ])
+            try:
+                self._write_agent_side_ratings()
+            except Exception:
+                pass
         except Exception as exc:
             log(f"[level8] agent performance update failed: {exc}")
 

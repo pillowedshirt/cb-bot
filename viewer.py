@@ -84,6 +84,7 @@ AGENT_ADJUSTMENTS_PATH = os.path.join(BASE_DIR, "agent_adjustments.csv")
 AGENT_PERFORMANCE_PATH = os.path.join(BASE_DIR, "agent_performance.csv")
 AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH = os.path.join(BASE_DIR, "agent_component_replay_attribution.csv")
 AGENT_TRADE_POLICY_CSV_PATH = os.path.join(BASE_DIR, "agent_trade_policy.csv")
+AGENT_SIDE_RATINGS_PATH = os.path.join(BASE_DIR, "agent_side_ratings.csv")
 DECISION_AUDIT_PATH = os.path.join(BASE_DIR, "decision_audit.csv")
 
 SNAPSHOT_STALE_WARN_SEC = 20.0
@@ -119,6 +120,74 @@ AGENT_TITLES = {
     "risk": "🛡 Risk Officer", "exploration": "🧪 Exploration Coach", "truth": "⚖️ Truth Arbiter",
     "fallback": "🛰 Strategy Agent",
 }
+
+AGENT_MONITOR_DESCRIPTIONS = {
+    "volume_profile_leader": "Monitors value area, POC, VAH/VAL, volume nodes, and whether price is accepting or rejecting important volume zones.",
+    "volume_profile_agent": "Watches whether price is inside value, above value, below value, or moving through low/high-volume areas.",
+    "trend": "Measures short-term and medium-term momentum to decide whether price is trending or stalling.",
+    "mean_reversion": "Looks for stretched moves that may snap back toward fair value or the recent mean.",
+    "breakout": "Looks for acceptance above resistance, continuation through clean levels, and room for price to expand.",
+    "ai_outcome": "Uses learned outcome patterns to estimate whether similar setups recently led to favorable movement.",
+    "execution": "Checks whether the trade can be executed cleanly without stale quotes, excessive spread, or fill risk.",
+    "order_book_liquidity_agent": "Reads order-book pressure, bid/ask liquidity, spread quality, and whether enough depth supports the move.",
+    "previous_session_volume_profile_agent": "Compares current price to prior-session POC, VAH, VAL, and previous value reactions.",
+    "quant_boundary_agent": "Checks statistical boundaries, expected movement, and whether price is near a probable edge or danger zone.",
+    "candle_context_agent": "Reads the latest candles for rejection, continuation, wick behavior, and candle quality.",
+    "candle_sequence_agent": "Looks at candle order and rhythm to judge whether the move is building or fading.",
+    "candle_exhaustion_agent": "Looks for signs that a move is exhausted and may need to pause, reverse, or harvest profit.",
+    "market_structure_agent": "Tracks swing highs, swing lows, higher highs, lower lows, breaks of structure, and trend structure.",
+    "validated_liquidity_agent": "Watches liquidity sweeps, reclaims, stop zones, and whether liquidity was taken cleanly.",
+    "fresh_zone_retest_agent": "Looks for clean retests of newly created support or resistance zones.",
+    "fair_value_gap_agent": "Tracks fair value gaps, gap fills, reclaim behavior, and rejection from imbalance zones.",
+    "smt_divergence_agent": "Looks for divergence between related markets that may warn of weak continuation or hidden strength.",
+    "setup_performance_agent": "Compares the current setup type against backlog results and historical replay performance.",
+    "utility_leader": "Judges whether expected reward is large enough after fees, spread, slippage, and wait value.",
+    "risk": "Controls downside, exposure, stop risk, portfolio concentration, and whether the trade is worth live funds.",
+    "exploration": "Allows controlled learning when the bot needs more outcome data but should not over-risk live money.",
+    "truth": "Combines the strongest economic and technical evidence into a final reality check.",
+    "exit_truth": "Combines sell-side evidence to decide whether an open position should be harvested or held.",
+    "sell_utility_leader": "Checks whether selling now captures enough profit compared with holding longer.",
+    "drawdown_exit": "Watches drawdown and invalidation to prevent a winning or neutral position from turning into a poor hold.",
+    "fee_recovery": "Checks whether the position has cleared fees, spread, and minimum profitable exit requirements.",
+    "fallback": "General strategy analyst monitoring the current market state.",
+}
+
+
+def agent_monitor_description(agent: Any) -> str:
+    return AGENT_MONITOR_DESCRIPTIONS.get(str(agent), AGENT_MONITOR_DESCRIPTIONS["fallback"])
+
+
+def latest_agent_side_ratings_map(agent_side_ratings_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    try:
+        if agent_side_ratings_df is None or agent_side_ratings_df.empty or "agent" not in agent_side_ratings_df.columns:
+            return {}
+        frame = agent_side_ratings_df.copy()
+        if "ts" in frame.columns:
+            frame["ts_num"] = pd.to_numeric(frame["ts"], errors="coerce")
+            frame = frame.sort_values("ts_num")
+        latest = frame.groupby(frame["agent"].astype(str), as_index=False).tail(1)
+        out = {}
+        for _, row in latest.iterrows():
+            agent = str(row.get("agent") or "")
+            if agent:
+                out[agent] = row.to_dict()
+        return out
+    except Exception:
+        return {}
+
+
+def _pct_text(value: Any, default: str = "—") -> str:
+    try:
+        return f"{float(value) * 100.0:.1f}%"
+    except Exception:
+        return default
+
+
+def _weight_pct_text(value: Any, default: str = "—") -> str:
+    try:
+        return f"{float(value):.1f}%"
+    except Exception:
+        return default
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1584,12 +1653,10 @@ def render_leadership_verdicts(rows: list[dict], decisions_df: pd.DataFrame, cou
     top_row = rows[0]
     product_id = str(top_row.get("product_id") or "")
     decision = latest_decision_for_product(decisions_df, product_id)
-    oracle_vote = latest_volume_oracle_vote(council_votes_df, decisions_df, product_id)
     action = str(decision.get("action") or top_row.get("action") or "WAIT").upper()
     expected_utility = _safe_float(decision.get("expected_utility_bps") or top_row.get("expected_utility_bps"))
-    oracle_leaning = vote_leaning(oracle_vote) if oracle_vote else "WAIT"
     st.markdown(
-        f'''<div class="leadership-grid"><div class="leadership-card"><div class="leadership-title">{_html(LEAD_DECISION_MAKER_TITLE)}</div><div class="leadership-subtitle">{_html(LEAD_DECISION_MAKER_SUBTITLE)} · {_html(product_id)}</div><div class="leadership-verdict">Current verdict: {_html(action)} · Utility {expected_utility:.2f} bps</div><div class="leadership-paragraph">{_html(signal_core_paragraph(decision, top_row))}</div><div class="leadership-learning"><b>Current learning:</b> {_html(signal_core_learning_paragraph(decision, top_row))}</div></div><div class="leadership-card oracle"><div class="leadership-title">{_html(VOLUME_LEADER_TITLE)}</div><div class="leadership-subtitle">{_html(VOLUME_LEADER_SUBTITLE)} · {_html(product_id)}</div><div class="leadership-verdict">Current verdict: {_html(oracle_leaning)}</div><div class="leadership-paragraph">{_html(volume_oracle_paragraph(oracle_vote, product_id))}</div><div class="leadership-learning"><b>Current learning:</b> {_html(volume_oracle_learning_paragraph(oracle_vote, product_id))}</div></div></div>''',
+        f'''<div class="leadership-grid"><div class="leadership-card"><div class="leadership-title">{_html(LEAD_DECISION_MAKER_TITLE)}</div><div class="leadership-subtitle">{_html(LEAD_DECISION_MAKER_SUBTITLE)} · {_html(product_id)}</div><div class="leadership-verdict">Current verdict: {_html(action)} · Utility {expected_utility:.2f} bps</div><div class="leadership-paragraph">{_html(signal_core_paragraph(decision, top_row))}</div><div class="leadership-learning"><b>Current learning:</b> {_html(signal_core_learning_paragraph(decision, top_row))}</div></div></div>''',
         unsafe_allow_html=True,
     )
 
@@ -1881,7 +1948,7 @@ def render_agent_dialogue_panel(agent_name: str, votes: pd.DataFrame):
         f'''
         <div class="screen-card">
             <h2>{_html(agent_title_icon(agent_name))}</h2>
-            <div class="muted">Full analyst dialogue for the selected decision.</div>
+            <div class="muted">{_html(agent_monitor_description(agent_name))}</div>
             <p>{_html(agent_full_plain_summary(row))}</p>
             <div class="context-grid">
                 <div class="context-card"><h3>Current leaning</h3><p><b>{_html(vote_leaning(row))}</b></p></div>
@@ -1897,7 +1964,7 @@ def render_agent_dialogue_panel(agent_name: str, votes: pd.DataFrame):
     with st.expander("Raw coded analyst reason", expanded=False):
         st.text(reason)
 
-def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
+def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame, agent_side_ratings_df: pd.DataFrame = None):
     st.markdown("### Analyst Roster")
 
     if votes.empty:
@@ -1914,6 +1981,7 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
         display_votes = votes.copy()
 
     rows = display_votes.to_dict("records")
+    side_rating_map = latest_agent_side_ratings_map(agent_side_ratings_df)
 
     if not st.session_state.get("selected_agent_dialogue"):
         if "agent" in votes.columns and "volume_profile_leader" in votes["agent"].astype(str).tolist():
@@ -1928,16 +1996,28 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame):
             agent = str(row.get("agent", "fallback"))
             leaning = vote_leaning(row).lower()
             selected_class = "active" if agent == st.session_state.get("selected_agent_dialogue") else ""
+            side_rating = side_rating_map.get(agent, {})
+            buy_weight_pct = _weight_pct_text(side_rating.get("buy_weight_pct"))
+            sell_weight_pct = _weight_pct_text(side_rating.get("sell_weight_pct"))
+            buy_accuracy = _pct_text(side_rating.get("buy_accuracy"))
+            sell_accuracy = _pct_text(side_rating.get("sell_accuracy"))
+            buy_rows = int(float(side_rating.get("buy_rows", 0) or 0))
+            sell_rows = int(float(side_rating.get("sell_rows", 0) or 0))
 
             with col:
                 st.markdown(
                     f'''
                     <div class="agent-card agent-card-{leaning} {selected_class}">
                         <div class="agent-title">{_html(agent_title_icon(agent))}</div>
+                        <div class="agent-description">
+                            {_html(agent_monitor_description(agent))}
+                        </div>
                         <div class="agent-metrics">
                             Leaning: <b>{leaning.upper()}</b><br>
                             Confidence: <b>{_safe_float(row.get("confidence")):.3f}</b><br>
-                            Strongest score: <b>{strongest_vote_score(row):.3f}</b>
+                            Strongest score: <b>{strongest_vote_score(row):.3f}</b><br>
+                            Buy weight: <b>{buy_weight_pct}</b> · Buy accuracy: <b>{buy_accuracy}</b> · n=<b>{buy_rows}</b><br>
+                            Sell weight: <b>{sell_weight_pct}</b> · Sell accuracy: <b>{sell_accuracy}</b> · n=<b>{sell_rows}</b>
                         </div>
                         <div class="agent-summary">
                             {_html(agent_plain_summary(row))}
@@ -1984,7 +2064,7 @@ def render_learning_console(selected_coin, votes, decisions_df, market_df, snaps
     render_topic_explanation(topic, selected_coin, votes, decisions_df, market_df, snapshot)
 
 
-def render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df):
+def render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df=None):
     available = get_available_products(snapshot)
     if not available:
         st.info("No products are available yet. Waiting for bot files to populate.")
@@ -2028,7 +2108,8 @@ def render_strategy_screen(selected, snapshot, market_df, decisions_df, council_
         config={"displayModeBar": True, "scrollZoom": True, "responsive": True},
     )
     latest_decision_id, drow, votes = latest_council_votes_for_coin(council_votes_df, decisions_df, selected)
-    render_agent_debate_stream(selected, latest_decision_id, drow, votes); render_agent_roster_no_buttons(selected, votes)
+    render_agent_debate_stream(selected, latest_decision_id, drow, votes)
+    render_agent_roster_no_buttons(selected, votes, agent_side_ratings_df)
 
 
 def explain_current_trade_state(blocker: str, decision: dict, market: dict) -> str:
@@ -2174,6 +2255,56 @@ def replay_calibration_eligible_frame(frame: pd.DataFrame) -> pd.DataFrame:
         out = out[qualified.astype(int).eq(1)].copy()
     return out
 
+
+def render_historical_replay_profitability_box(historical_replay_df: pd.DataFrame, historical_replay_summary_df: pd.DataFrame = None) -> None:
+    eligible = replay_calibration_eligible_frame(historical_replay_df)
+    if eligible is None or eligible.empty:
+        st.markdown('<div class="screen-card"><h2>Replay Profitability Estimate</h2><p>No qualified replay rows are available yet. Once historical replay finishes, this box will show projected profitability from accepted replay candidates.</p></div>', unsafe_allow_html=True)
+        return
+    frame = eligible.copy()
+    if "net_pnl_bps" not in frame.columns:
+        st.info("Qualified replay rows exist, but net_pnl_bps is missing.")
+        return
+    net_bps = pd.to_numeric(frame["net_pnl_bps"], errors="coerce").dropna()
+    if net_bps.empty:
+        st.info("Qualified replay rows exist, but net P/L values are not numeric yet.")
+        return
+    if "net_pnl_usd" in frame.columns:
+        net_usd = pd.to_numeric(frame["net_pnl_usd"], errors="coerce").fillna(0.0)
+    else:
+        notional = pd.to_numeric(frame.get("synthetic_notional_usd", 5.0), errors="coerce").fillna(5.0)
+        net_usd = notional * (pd.to_numeric(frame["net_pnl_bps"], errors="coerce").fillna(0.0) / 10000.0)
+    wins = int((net_bps > 0).sum())
+    losses = int((net_bps <= 0).sum())
+    win_rate = wins / max(1, wins + losses)
+    total_net_usd = float(net_usd.sum())
+    reference_portfolio_usd = 100.0
+    total_portfolio_return_pct = total_net_usd / reference_portfolio_usd * 100.0
+    daily_avg_pct = 0.0
+    thirty_day_simple_pct = 0.0
+    if "replay_ts" in frame.columns:
+        dated = frame.copy()
+        dated["replay_dt"] = pd.to_datetime(pd.to_numeric(dated["replay_ts"], errors="coerce"), unit="s", utc=True, errors="coerce")
+        dated["_net_usd"] = net_usd
+        dated = dated.dropna(subset=["replay_dt"])
+        if not dated.empty:
+            dated["replay_day"] = dated["replay_dt"].dt.date
+            daily = dated.groupby("replay_day")["_net_usd"].sum()
+            if not daily.empty:
+                daily_avg_pct = float((daily / reference_portfolio_usd * 100.0).mean())
+                thirty_day_simple_pct = daily_avg_pct * 30.0
+    verdict_class = "good" if total_portfolio_return_pct > 0 and win_rate >= 0.50 else "warn"
+    st.markdown(f'''<div class="screen-card"><h2>Replay Profitability Estimate</h2><p>Based only on qualified historical replay rows, the accepted replay set is currently <b>{total_portfolio_return_pct:.2f}%</b> on a $100 reference portfolio. Average active-day replay projection is <b>{daily_avg_pct:.2f}%</b>, which equals about <b>{thirty_day_simple_pct:.2f}%</b> over 30 active replay days if conditions repeated.</p></div>''', unsafe_allow_html=True)
+    cols = st.columns(5)
+    cols[0].metric("Replay Portfolio Return", f"{total_portfolio_return_pct:.2f}%")
+    cols[1].metric("30-Day Replay Projection", f"{thirty_day_simple_pct:.2f}%")
+    cols[2].metric("Qualified Win Rate", f"{win_rate * 100.0:.1f}%")
+    cols[3].metric("Avg Net / Trade", f"{float(net_bps.mean()):.2f} bps")
+    cols[4].metric("Median Net / Trade", f"{float(net_bps.median()):.2f} bps")
+    if verdict_class == "good":
+        st.success("Qualified replay is showing positive portfolio return and at least 50% win rate.")
+    else:
+        st.warning("Replay profitability is not strong enough yet to assume live profitability. Treat this as a calibration signal, not proof.")
 
 def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None:
     progress = float(calc_status.get("overall_progress", 0.0) or 0.0)
@@ -2333,6 +2464,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
 
 
     st.markdown("### Historical Shadow Replay Calibration")
+    render_historical_replay_profitability_box(historical_replay_df, historical_replay_summary_df)
     hist_enabled = readiness.get("historical_replay_enabled")
     hist_running = readiness.get("historical_replay_running")
     hist_ready = readiness.get("historical_replay_ready_count", 0)
@@ -2581,6 +2713,7 @@ def render_live_dashboard(selected, refresh_config):
     market_df = load_csv_tail(MARKET_CSV_PATH, max_lines=6000)
     decisions_df = load_csv_tail(COUNCIL_DECISIONS_PATH, max_lines=6000)
     council_votes_df = load_csv_tail(COUNCIL_VOTES_CSV_PATH, max_lines=40000)
+    agent_side_ratings_df = load_csv_tail(AGENT_SIDE_RATINGS_PATH, max_lines=5000)
     targets_df = load_csv(POSITION_TARGETS_PATH)
     trades_df = load_csv(TRADES_CSV_PATH)
     orders_df = load_csv(ORDERS_CSV_PATH)
@@ -2591,7 +2724,7 @@ def render_live_dashboard(selected, refresh_config):
     historical_replay_df = load_csv_tail(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=50000)
     historical_replay_summary_df = load_csv_tail(HISTORICAL_REPLAY_SUMMARY_CSV_PATH, max_lines=5000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
-    with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()

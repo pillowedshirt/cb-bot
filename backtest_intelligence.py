@@ -1,4 +1,5 @@
 import csv
+import json
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
@@ -448,6 +449,27 @@ def _safe_bool(value: Any) -> bool:
     return text in {"true", "1", "yes", "y", "win", "won"}
 
 
+GENERATED_FILE_VERSION = "fast_startup_calc_v1_2026_06_21"
+
+
+def _sidecar_meta_path(path: str) -> str:
+    return f"{path}.meta.json"
+
+
+def _write_generated_file_meta(path: str, *, reason: str = "") -> None:
+    try:
+        meta = {
+            "generation_version": GENERATED_FILE_VERSION,
+            "generated_at_ts": time.time(),
+            "generated_at_iso": datetime.now(timezone.utc).isoformat(),
+            "reason": str(reason or ""),
+        }
+        with open(_sidecar_meta_path(path), "w", encoding="utf-8") as file:
+            json.dump(meta, file, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
 def _read_csv(path: str) -> pd.DataFrame:
     try:
         if not path or not os.path.exists(path) or os.path.getsize(path) <= 0:
@@ -464,6 +486,7 @@ def _write_rows(path: str, columns: List[str], rows: List[List[Any]]) -> None:
         writer.writerow(columns)
         writer.writerows(rows)
     os.replace(tmp, path)
+    _write_generated_file_meta(path, reason="backtest_intelligence_regenerated")
 
 
 def _numeric(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:

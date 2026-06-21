@@ -1,4 +1,5 @@
 import csv
+import json
 import math
 import os
 import time
@@ -90,6 +91,27 @@ def _utc_dt(ts_value: Optional[float] = None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+GENERATED_FILE_VERSION = "fast_startup_calc_v1_2026_06_21"
+
+
+def _sidecar_meta_path(path: str) -> str:
+    return f"{path}.meta.json"
+
+
+def _write_generated_file_meta(path: str, *, reason: str = "") -> None:
+    try:
+        meta = {
+            "generation_version": GENERATED_FILE_VERSION,
+            "generated_at_ts": time.time(),
+            "generated_at_iso": datetime.now(timezone.utc).isoformat(),
+            "reason": str(reason or ""),
+        }
+        with open(_sidecar_meta_path(path), "w", encoding="utf-8") as file:
+            json.dump(meta, file, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
 def _read_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path) or os.path.getsize(path) <= 0:
         return pd.DataFrame()
@@ -106,6 +128,7 @@ def _write_rows(path: str, columns: List[str], rows: List[List[Any]]) -> None:
         writer.writerow(columns)
         writer.writerows(rows)
     os.replace(tmp_path, path)
+    _write_generated_file_meta(path, reason="quant_state_engine_regenerated")
 
 
 def _num(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:

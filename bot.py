@@ -20699,9 +20699,25 @@ class TradingBot:
 
     def _historical_profit_verdict_for_product(self, product_id: str) -> Dict[str, Any]:
         counts = self._historical_replay_counts_for_product(product_id)
-        has_required_15m = counts["primary_15m_90d_rows"] >= int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)
-        has_required_1h = counts["regime_1h_365d_rows"] >= int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)
+
+        worker_15m_done, worker_15m_reason = self._historical_replay_worker_timeframe_done(product_id, "primary_15m_90d")
+        worker_1h_done, worker_1h_reason = self._historical_replay_worker_timeframe_done(product_id, "regime_1h_365d")
+
+        has_required_15m_rows = counts["primary_15m_90d_rows"] >= int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)
+        has_required_1h_rows = counts["regime_1h_365d_rows"] >= int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)
+
+        has_required_15m = bool(has_required_15m_rows or worker_15m_done)
+        has_required_1h = bool(has_required_1h_rows or worker_1h_done)
+
         replay_complete = bool(has_required_15m and has_required_1h)
+        replay_completed_by_worker_manifest = bool(
+            replay_complete and (worker_15m_done or worker_1h_done)
+        )
+
+        low_signal_count_but_worker_done = bool(
+            replay_completed_by_worker_manifest
+            and (not has_required_15m_rows or not has_required_1h_rows)
+        )
         qualified_rows = int(counts["qualified_rows"]); accepted_rows = int(counts["accepted_rows"]); wins = int(counts["wins"])
         avg_net = float(counts["avg_net_pnl_bps"]); median_net = float(counts["median_net_pnl_bps"]); win_rate = float(counts["win_rate"])
         profit_ready = bool(
@@ -20747,10 +20763,15 @@ class TradingBot:
             verdict = "replay_incomplete"
             complete = False
             reason = (
-                f"replay incomplete; 15m_rows={counts['primary_15m_90d_rows']}/"
+                f"replay incomplete; "
+                f"15m_rows={counts['primary_15m_90d_rows']}/"
                 f"{int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)};"
                 f"1h_rows={counts['regime_1h_365d_rows']}/"
                 f"{int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)};"
+                f"worker_15m_done={worker_15m_done};"
+                f"worker_1h_done={worker_1h_done};"
+                f"worker_15m_reason={worker_15m_reason};"
+                f"worker_1h_reason={worker_1h_reason};"
                 f"product_gate={product_gate_reason}"
             )
 
@@ -20765,6 +20786,12 @@ class TradingBot:
             "reason": reason,
             "product_live_gate_ok": bool(product_gate_ok),
             "product_live_gate_reason": str(product_gate_reason),
+            "worker_15m_done": bool(worker_15m_done),
+            "worker_1h_done": bool(worker_1h_done),
+            "worker_15m_reason": str(worker_15m_reason),
+            "worker_1h_reason": str(worker_1h_reason),
+            "replay_completed_by_worker_manifest": bool(replay_completed_by_worker_manifest),
+            "low_signal_count_but_worker_done": bool(low_signal_count_but_worker_done),
             **counts,
         }
 
@@ -20882,8 +20909,25 @@ class TradingBot:
                 required_1h_candles = int(self._required_candle_rows_for_timeframe("regime_1h_365d"))
                 candle_15m_progress = min(1.0, candle_15m_rows / max(1.0, float(required_15m_candles)))
                 candle_1h_progress = min(1.0, candle_1h_rows / max(1.0, float(required_1h_candles)))
-                replay_15m_progress = min(1.0, float(replay_verdict.get("primary_15m_90d_rows", 0)) / max(1.0, float(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)))
-                replay_1h_progress = min(1.0, float(replay_verdict.get("regime_1h_365d_rows", 0)) / max(1.0, float(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)))
+                replay_15m_row_progress = min(
+                    1.0,
+                    float(replay_verdict.get("primary_15m_90d_rows", 0))
+                    / max(1.0, float(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)),
+                )
+                replay_1h_row_progress = min(
+                    1.0,
+                    float(replay_verdict.get("regime_1h_365d_rows", 0))
+                    / max(1.0, float(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)),
+                )
+
+                replay_15m_progress = max(
+                    replay_15m_row_progress,
+                    1.0 if bool(replay_verdict.get("worker_15m_done")) else 0.0,
+                )
+                replay_1h_progress = max(
+                    replay_1h_row_progress,
+                    1.0 if bool(replay_verdict.get("worker_1h_done")) else 0.0,
+                )
                 product_backlog_progress = (micro_progress + candle_15m_progress + candle_1h_progress) / 3.0
                 product_replay_progress = (replay_15m_progress + replay_1h_progress) / 2.0
                 product_verdict_progress = 1.0 if bool(replay_verdict.get("complete")) else 0.0
@@ -24340,6 +24384,51 @@ class TradingBot:
         if not manifest or "jobs" not in manifest:
             manifest = self._ensure_historical_replay_manifest()
         return manifest
+
+
+    def _historical_replay_worker_timeframe_done(self, product_id: str, timeframe: str) -> Tuple[bool, str]:
+        try:
+            manifest = self._load_historical_replay_manifest()
+            jobs = manifest.get("jobs", {}) or {}
+            product_id_norm = str(product_id)
+            timeframe_norm = str(timeframe)
+
+            matching_jobs = []
+            for job_id, job in jobs.items():
+                if str(job.get("product_id", "")) == product_id_norm and str(job.get("timeframe", "")) == timeframe_norm:
+                    matching_jobs.append(dict(job))
+
+            if not matching_jobs:
+                return False, f"worker_manifest_missing_job product_id={product_id_norm};timeframe={timeframe_norm}"
+
+            completed_statuses = {"merged", "done", "completed", "success"}
+            for job in matching_jobs:
+                status = str(job.get("status", "")).strip().lower()
+                if status in completed_statuses:
+                    return True, (
+                        f"worker_manifest_timeframe_done;"
+                        f"job_id={job.get('job_id', '')};"
+                        f"status={status};"
+                        f"rows_written={job.get('rows_written', 0)};"
+                        f"rows_appended={job.get('rows_appended_to_master', 0)}"
+                    )
+
+            latest_status = ",".join(str(j.get("status", "")) for j in matching_jobs)
+            return False, (
+                f"worker_manifest_timeframe_not_done;"
+                f"product_id={product_id_norm};timeframe={timeframe_norm};"
+                f"statuses={latest_status}"
+            )
+
+        except Exception as exc:
+            return False, f"worker_manifest_timeframe_check_failed:{exc}"
+
+    def _historical_replay_worker_product_done(self, product_id: str) -> Tuple[bool, str]:
+        primary_done, primary_reason = self._historical_replay_worker_timeframe_done(product_id, "primary_15m_90d")
+        regime_done, regime_reason = self._historical_replay_worker_timeframe_done(product_id, "regime_1h_365d")
+
+        done = bool(primary_done and regime_done)
+        return done, f"primary={primary_reason};regime={regime_reason}"
 
     def _historical_replay_manifest_progress(self) -> Dict[str, Any]:
         try:

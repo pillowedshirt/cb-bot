@@ -432,15 +432,16 @@ class Level8Council:
         self.min_truth_to_core_trade = 0.62
 
         # Portfolio allocation model.
-        # The only hard spending ceiling is 80% deployed / 20% reserve.
-        self.reserve_bucket_pct = 0.20
-        self.max_single_asset_pct = 0.20
-        self.max_total_exposure_pct = 0.45
+        self.reserve_bucket_pct = 0.00
+        self.max_single_asset_pct = 1.00
+        self.max_total_exposure_pct = 1.00
 
-        # Council-controlled sizing.
-        self.test_bucket_trade_pct = 0.05
-        self.min_core_trade_pct = 0.08
-        self.max_core_trade_pct = 0.20
+        # Council-controlled high-conviction sizing.
+        # Weak setups should be SHADOW, not tiny live tests.
+        # Approved setups start at 50%.
+        self.test_bucket_trade_pct = 0.50
+        self.min_core_trade_pct = 0.65
+        self.max_core_trade_pct = 1.00
 
         # These are descriptive only now; they do not hard-block spending.
         self.test_bucket_pct = 0.10
@@ -1976,11 +1977,33 @@ class Level8Council:
         sell_quality_penalty = float(sell_quality_context.get("sell_quality_penalty", 0.0) or 0.0)
         sell_quality_reason = str(sell_quality_context.get("reason", ""))
 
+        adaptive_exit = dict(context.get("adaptive_exit_profile", {}) or {})
+        adaptive_enabled = bool(adaptive_exit.get("enabled", False))
+        adaptive_expected_favorable_bps = float(adaptive_exit.get("expected_favorable_bps", 0.0) or 0.0)
+        adaptive_progress_to_expected = float(adaptive_exit.get("progress_to_expected", 0.0) or 0.0)
+        adaptive_protection_armed = bool(adaptive_exit.get("protection_armed", False))
+        adaptive_floor_exit_confirmed = bool(adaptive_exit.get("floor_exit_confirmed", False))
+        adaptive_partial_harvest = bool(adaptive_exit.get("adaptive_partial_harvest", False))
+        adaptive_full_exit = bool(adaptive_exit.get("adaptive_full_exit", False))
+        adaptive_harvest_fraction = float(adaptive_exit.get("adaptive_harvest_fraction", 0.0) or 0.0)
+        adaptive_strong_continuation = bool(adaptive_exit.get("strong_continuation", False))
+        adaptive_dynamic_pullback_bps = float(adaptive_exit.get("dynamic_pullback_bps", 0.0) or 0.0)
+        adaptive_dynamic_strong_pullback_bps = float(adaptive_exit.get("dynamic_strong_pullback_bps", 0.0) or 0.0)
+        adaptive_dynamic_full_exit_pullback_bps = float(adaptive_exit.get("dynamic_full_exit_pullback_bps", 0.0) or 0.0)
+        adaptive_reason = str(adaptive_exit.get("reason", "no_adaptive_exit_context"))
+
         min_partial_fraction = float(context.get("min_partial_sell_fraction", 0.25) or 0.25)
         max_partial_fraction = float(context.get("max_partial_sell_fraction", 1.0) or 1.0)
         peak_capture_trigger_bps = float(context.get("peak_capture_trigger_bps", 45.0) or 45.0)
         strong_pullback_bps = float(context.get("peak_capture_strong_pullback_bps", 120.0) or 120.0)
         full_exit_pullback_bps = float(context.get("peak_capture_full_exit_pullback_bps", 240.0) or 240.0)
+        if adaptive_enabled:
+            if adaptive_dynamic_pullback_bps > 0:
+                peak_capture_trigger_bps = adaptive_dynamic_pullback_bps
+            if adaptive_dynamic_strong_pullback_bps > 0:
+                strong_pullback_bps = adaptive_dynamic_strong_pullback_bps
+            if adaptive_dynamic_full_exit_pullback_bps > 0:
+                full_exit_pullback_bps = adaptive_dynamic_full_exit_pullback_bps
         strong_continuation_mom3_bps = float(context.get("strong_continuation_mom3_bps", 10.0) or 10.0)
         strong_continuation_pullback_max_bps = float(context.get("strong_continuation_pullback_max_bps", 35.0) or 35.0)
 
@@ -2018,6 +2041,17 @@ class Level8Council:
             + momentum_fade_sell * 0.18
             + loss_exit * 0.18
             + price_action_harvest_pressure * 0.15,
+            0.0,
+            1.0,
+        )
+
+        adaptive_wave_pressure = clamp(
+            (0.22 if adaptive_protection_armed else 0.0)
+            + adaptive_progress_to_expected * 0.28
+            + (0.30 if adaptive_partial_harvest else 0.0)
+            + (0.55 if adaptive_full_exit else 0.0)
+            + (0.80 if adaptive_floor_exit_confirmed else 0.0)
+            - (0.25 if adaptive_strong_continuation else 0.0),
             0.0,
             1.0,
         )
@@ -2154,6 +2188,15 @@ class Level8Council:
                 ),
                 "reason": f"spike_profit_protection_vote;{spike_reason}",
             },
+            {
+                "agent": "adaptive_wave_capture",
+                "buy": 0.0,
+                "sell": adaptive_wave_pressure,
+                "hold": clamp(0.62 + (0.20 if adaptive_strong_continuation else 0.0) - adaptive_wave_pressure * 0.45, 0.0, 1.0),
+                "wait": 0.20,
+                "confidence": 0.82 if adaptive_enabled else 0.15,
+                "reason": f"adaptive_wave_capture;{adaptive_reason}",
+            },
         ]
 
         truth_vote = {
@@ -2167,7 +2210,8 @@ class Level8Council:
                 + execution_sell_quality * 0.09
                 + fee_recovery * 0.10
                 + harvest_pressure * 0.09
-                + price_action_harvest_pressure * 0.10,
+                + price_action_harvest_pressure * 0.08
+                + adaptive_wave_pressure * 0.12,
                 0.0,
                 1.0,
             ),
@@ -2222,13 +2266,19 @@ class Level8Council:
         )
 
         strong_continuation = bool(
-            raw_strong_continuation
+            (raw_strong_continuation or adaptive_strong_continuation)
             and not continuation_override_by_harvest
+            and not adaptive_partial_harvest
+            and not adaptive_full_exit
+            and not adaptive_floor_exit_confirmed
         )
 
         if hard_stop_hit:
             recommended_sell_fraction = 1.0
             sell_fraction_reason = "hard_stop_full_exit"
+        elif adaptive_floor_exit_confirmed or adaptive_full_exit:
+            recommended_sell_fraction = 1.0
+            sell_fraction_reason = f"adaptive_full_exit;{adaptive_reason}"
         elif net_after_exit_bps < min_net_after_exit_bps:
             recommended_sell_fraction = 0.0
             sell_fraction_reason = f"not_net_profitable_enough;net_after_exit_bps={net_after_exit_bps:.2f};min={min_net_after_exit_bps:.2f}"
@@ -2258,6 +2308,10 @@ class Level8Council:
                 fraction = max(fraction, sell_utility_fraction)
             if spike_allow_partial and spike_suggested_fraction > 0.0:
                 fraction = max(fraction, spike_suggested_fraction)
+            if adaptive_partial_harvest and adaptive_harvest_fraction > 0.0:
+                fraction = max(fraction, adaptive_harvest_fraction)
+            if adaptive_strong_continuation and not adaptive_partial_harvest and not adaptive_full_exit:
+                fraction = max(0.0, fraction - 0.20)
             if max_hold_elapsed:
                 fraction = max(fraction, 0.50)
             if pullback_from_peak_bps >= strong_pullback_bps and peak_unrealized_bps > min_net_after_exit_bps:
@@ -2304,7 +2358,7 @@ class Level8Council:
             and recommended_sell_fraction > 0.0
         )
 
-        if hard_stop_hit:
+        if hard_stop_hit or adaptive_floor_exit_confirmed or adaptive_full_exit:
             action = "ALLOW_SELL"
 
         elif (
@@ -2419,6 +2473,17 @@ class Level8Council:
                 f"spike_profit_immediate={spike_immediate_partial};"
                 f"spike_profit_fraction={spike_suggested_fraction:.3f};"
                 f"spike_profit_reason={spike_reason};"
+                f"adaptive_enabled={adaptive_enabled};"
+                f"adaptive_expected_favorable_bps={adaptive_expected_favorable_bps:.2f};"
+                f"adaptive_progress_to_expected={adaptive_progress_to_expected:.3f};"
+                f"adaptive_protection_armed={adaptive_protection_armed};"
+                f"adaptive_floor_exit_confirmed={adaptive_floor_exit_confirmed};"
+                f"adaptive_partial_harvest={adaptive_partial_harvest};"
+                f"adaptive_full_exit={adaptive_full_exit};"
+                f"adaptive_harvest_fraction={adaptive_harvest_fraction:.3f};"
+                f"adaptive_strong_continuation={adaptive_strong_continuation};"
+                f"adaptive_wave_pressure={adaptive_wave_pressure:.3f};"
+                f"adaptive_reason={adaptive_reason};"
                 f"hard_stop_hit={hard_stop_hit}"
             ),
         }
@@ -2431,54 +2496,35 @@ class Level8Council:
         truth_score: float,
         risk_mode: str,
     ) -> Tuple[str, float, str]:
-        """
-        Aggressive Level 8 sizing model.
-
-        The council may scale up to 80% of portfolio value on very strong decisions.
-        The only hard portfolio spending ceiling remains 20% reserve / 80% max deployment.
-        """
+        """High-conviction adaptive sizing model."""
         margin = float(final_buy_score) - float(threshold)
-
-        if margin < -0.08:
-            return "SHADOW", 0.0, "far_below_threshold_shadow_only"
-
-        # Allow tiny below-threshold learning trades if truth is not completely absent.
-        if margin < 0 and truth_score >= self.min_truth_to_trade:
-            pct = self.test_bucket_trade_pct
-            return "TEST", pct, (
-                f"slightly_below_threshold_learning_test margin={margin:.3f};"
-                f"truth={truth_score:.3f}"
-            )
-
+        if margin < 0:
+            return "SHADOW", 0.0, f"below_threshold_shadow_only;margin={margin:.3f};truth={truth_score:.3f}"
         if truth_score < self.min_truth_to_trade:
-            return "SHADOW", 0.0, "truth_below_live_trade_min"
-
-        # Base position from score strength.
-        # Small pass = small live test.
-        # Large pass + strong truth = large core position.
-        if margin < 0.05 or truth_score < self.min_truth_to_core_trade:
-            pct = self.test_bucket_trade_pct + max(0.0, margin) * 0.50
-            bucket = "TEST"
-        else:
-            pct = (
-                self.min_core_trade_pct
-                + margin * 1.25
-                + max(0.0, truth_score - self.min_truth_to_core_trade) * 0.75
+            return "SHADOW", 0.0, (
+                f"truth_below_live_trade_min;margin={margin:.3f};truth={truth_score:.3f};"
+                f"min_truth={self.min_truth_to_trade:.3f}"
             )
+        base_pct = 0.50
+        bucket = "APPROVED"
+        conviction = clamp(
+            margin * 1.75 + max(0.0, truth_score - self.min_truth_to_trade) * 1.15,
+            0.0,
+            1.0,
+        )
+        if truth_score >= self.min_truth_to_core_trade or margin >= 0.06:
             bucket = "CORE"
-
+            base_pct = max(base_pct, self.min_core_trade_pct)
+        pct = base_pct + conviction * (self.max_single_asset_pct - base_pct)
         risk_mode_u = str(risk_mode).upper()
-
         if risk_mode_u == "DEFENSIVE":
             pct *= 0.70
         elif risk_mode_u == "CAUTIOUS":
             pct *= 0.85
         elif risk_mode_u == "AGGRESSIVE":
-            pct *= 1.25
-
-        pct = clamp(pct, 0.0, self.max_single_asset_pct)
-
+            pct *= 1.10
+        pct = clamp(pct, 0.50, self.max_single_asset_pct)
         return bucket, pct, (
-            f"{bucket.lower()}_bucket margin={margin:.3f};"
-            f"truth={truth_score:.3f};risk={risk_mode_u};pct={pct:.3f}"
+            f"high_conviction_{bucket.lower()}_bucket;margin={margin:.3f};truth={truth_score:.3f};"
+            f"risk={risk_mode_u};conviction={conviction:.3f};pct={pct:.3f}"
         )

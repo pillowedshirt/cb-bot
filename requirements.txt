@@ -10,3 +10,6 @@ streamlit>=1.37.0
 websockets
 websocket-client
 streamlit
+pybind11
+setuptools
+wheel

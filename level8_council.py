@@ -60,6 +60,8 @@ AGENT_ABLATION_CSV = os.path.join(BASE_DIR, "agent_ablation.csv")
 AGENT_TRADE_POLICY_CSV = os.path.join(BASE_DIR, "agent_trade_policy.csv")
 AGENT_SIDE_RATINGS_CSV = os.path.join(BASE_DIR, "agent_side_ratings.csv")
 FOUR_PASS_AGENT_CONTEXT_RATINGS_CSV = os.path.join(BASE_DIR, "four_pass_agent_context_ratings.csv")
+AGENT_DECISION_INFLUENCE_CSV = os.path.join(BASE_DIR, "agent_decision_influence.csv")
+PRODUCT_AGENT_INFLUENCE_CSV = os.path.join(BASE_DIR, "product_agent_influence.csv")
 LEVEL8_EVENTS_DB = os.path.join(BASE_DIR, "level8_events.sqlite3")
 
 BUY_LEAD_ONLY_MODE = False
@@ -76,6 +78,8 @@ LEVEL8_CSV_TAIL_LIMITS = {
     "agent_ablation.csv": 5000,
     "agent_side_ratings.csv": 5000,
     "four_pass_agent_context_ratings.csv": 20000,
+    "agent_decision_influence.csv": 5000,
+    "product_agent_influence.csv": 10000,
 }
 
 LEVEL8_CSV_USECOLS = {
@@ -89,6 +93,15 @@ LEVEL8_CSV_USECOLS = {
         "agent", "side", "product_id", "market_regime",
         "selected_count", "smoothed_win_rate", "ev_bps",
         "score", "weight_pct", "profitability_mode",
+    ],
+    "agent_decision_influence.csv": [
+        "agent", "side", "selected_count", "frequency_per_day",
+        "smoothed_win_rate", "ev_bps", "decision_weight_pct", "role",
+    ],
+    "product_agent_influence.csv": [
+        "product_id", "market_regime", "agent", "side",
+        "selected_count", "frequency_per_day",
+        "smoothed_win_rate", "ev_bps", "decision_weight_pct", "role",
     ],
 }
 
@@ -443,6 +456,12 @@ class Level8Council:
         self._agent_context_ratings_cache: Dict[str, Dict[str, Any]] = {}
         self._agent_context_ratings_cache_ts: float = 0.0
         self._agent_context_ratings_cache_sec: float = 60.0
+        self._agent_decision_influence_cache: Dict[str, Dict[str, Any]] = {}
+        self._agent_decision_influence_cache_ts: float = 0.0
+        self._agent_decision_influence_cache_sec: float = 60.0
+        self._product_agent_influence_cache: Dict[str, Dict[str, Any]] = {}
+        self._product_agent_influence_cache_ts: float = 0.0
+        self._product_agent_influence_cache_sec: float = 60.0
         self._agent_ablation_cache: Dict[str, Dict[str, float]] = {}
         self._agent_ablation_cache_ts: float = 0.0
         # Lightweight in-process caches prevent every agent vote from re-reading
@@ -1513,6 +1532,55 @@ class Level8Council:
         except Exception:
             return {}
 
+
+    def _latest_agent_decision_influence(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            now_value = utc_ts()
+            if self._agent_decision_influence_cache and now_value - self._agent_decision_influence_cache_ts < self._agent_decision_influence_cache_sec:
+                return dict(self._agent_decision_influence_cache)
+            self._agent_decision_influence_cache = {}
+            self._agent_decision_influence_cache_ts = now_value
+            frame = _read_csv_tail_direct(AGENT_DECISION_INFLUENCE_CSV, 5000, usecols=LEVEL8_CSV_USECOLS.get("agent_decision_influence.csv"))
+            if frame.empty:
+                return {}
+            for _, row in frame.iterrows():
+                key = f"{str(row.get('side') or '').upper()}|{str(row.get('agent') or '')}"
+                self._agent_decision_influence_cache[key] = {
+                    "selected_count": float(row.get("selected_count", 0.0) or 0.0),
+                    "frequency_per_day": float(row.get("frequency_per_day", 0.0) or 0.0),
+                    "smoothed_win_rate": float(row.get("smoothed_win_rate", 0.5) or 0.5),
+                    "ev_bps": float(row.get("ev_bps", 0.0) or 0.0),
+                    "decision_weight_pct": float(row.get("decision_weight_pct", 0.0) or 0.0),
+                    "role": str(row.get("role") or ""),
+                }
+            return dict(self._agent_decision_influence_cache)
+        except Exception:
+            return {}
+
+    def _latest_product_agent_influence(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            now_value = utc_ts()
+            if self._product_agent_influence_cache and now_value - self._product_agent_influence_cache_ts < self._product_agent_influence_cache_sec:
+                return dict(self._product_agent_influence_cache)
+            self._product_agent_influence_cache = {}
+            self._product_agent_influence_cache_ts = now_value
+            frame = _read_csv_tail_direct(PRODUCT_AGENT_INFLUENCE_CSV, 10000, usecols=LEVEL8_CSV_USECOLS.get("product_agent_influence.csv"))
+            if frame.empty:
+                return {}
+            for _, row in frame.iterrows():
+                key = f"{str(row.get('side') or '').upper()}|{str(row.get('product_id') or '')}|{str(row.get('market_regime') or 'unknown')}|{str(row.get('agent') or '')}"
+                self._product_agent_influence_cache[key] = {
+                    "selected_count": float(row.get("selected_count", 0.0) or 0.0),
+                    "frequency_per_day": float(row.get("frequency_per_day", 0.0) or 0.0),
+                    "smoothed_win_rate": float(row.get("smoothed_win_rate", 0.5) or 0.5),
+                    "ev_bps": float(row.get("ev_bps", 0.0) or 0.0),
+                    "decision_weight_pct": float(row.get("decision_weight_pct", 0.0) or 0.0),
+                    "role": str(row.get("role") or ""),
+                }
+            return dict(self._product_agent_influence_cache)
+        except Exception:
+            return {}
+
     def _infer_live_market_regime_for_votes(self, adjusted_votes: list[AgentVote]) -> str:
         """Lightweight live regime inference from vote metadata."""
         try:
@@ -1572,6 +1640,8 @@ class Level8Council:
         agent_policy = self._latest_agent_trade_policy() if hasattr(self, "_latest_agent_trade_policy") else {}
         side_ratings = self._latest_agent_side_ratings() if hasattr(self, "_latest_agent_side_ratings") else {}
         context_ratings = self._latest_agent_context_ratings() if hasattr(self, "_latest_agent_context_ratings") else {}
+        decision_influence = self._latest_agent_decision_influence() if hasattr(self, "_latest_agent_decision_influence") else {}
+        product_influence = self._latest_product_agent_influence() if hasattr(self, "_latest_product_agent_influence") else {}
         if not market_regime:
             market_regime = self._infer_live_market_regime_for_votes(adjusted_votes)
         for vote in adjusted_votes:
@@ -1592,6 +1662,17 @@ class Level8Council:
                     equal_context_weight = 100.0 / max(1.0, len(adjusted_votes))
                     context_multiplier = max(0.25, min(5.0, context_weight_pct / max(1e-9, equal_context_weight)))
                     raw_weight *= context_multiplier
+            product_influence_key = f"{side}|{str(product_id)}|{str(market_regime)}|{str(vote.agent)}"
+            global_influence_key = f"{side}|{str(vote.agent)}"
+            influence = product_influence.get(product_influence_key) or decision_influence.get(global_influence_key) or {}
+            if influence:
+                samples = float(influence.get("selected_count", 0.0) or 0.0)
+                ev = float(influence.get("ev_bps", 0.0) or 0.0)
+                pct = float(influence.get("decision_weight_pct", 0.0) or 0.0)
+                if samples >= 20 and pct > 0.0 and ev > 0.0:
+                    equal_pct = 100.0 / max(1.0, len(adjusted_votes))
+                    influence_multiplier = max(0.20, min(6.0, pct / max(1e-9, equal_pct)))
+                    raw_weight *= influence_multiplier
             if side == "BUY":
                 buy_rows = float(side_rating.get("buy_rows", 0.0) or 0.0)
                 if buy_rows >= 10:

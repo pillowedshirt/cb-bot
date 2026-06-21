@@ -1096,43 +1096,98 @@ def _training_days_from_frame(frame: pd.DataFrame) -> float:
     return max(1.0, days)
 
 
-def _frequency_score(frequency_per_day: float, *, target_per_day: float = 8.0) -> float:
+def _frequency_score(frequency_per_day: float, *, target_per_day: float = 10.0) -> float:
+    """
+    Frequency matters because an agent with many correct decisions is more useful
+    than an agent with rare correct decisions.
+
+    This returns a wider 0.05..2.25 range so high-frequency positive-EV agents
+    can separate from rare agents.
+    """
     try:
         freq = max(0.0, float(frequency_per_day))
         target = max(1.0, float(target_per_day))
-        return max(0.05, min(1.0, math.log1p(freq) / math.log1p(target)))
+        score = math.sqrt(freq / target) if freq > 0 else 0.05
+        return max(0.05, min(2.25, score))
     except Exception:
         return 0.05
 
 
-def _sample_reliability(selected_count: int, *, half_confidence_count: int = 80) -> float:
+def _sample_reliability(selected_count: int, *, half_confidence_count: int = 160) -> float:
+    """
+    Sample reliability should increase with more samples, but not max out too early.
+    The old formula saturated too fast, flattening influence weights.
+    """
     try:
         n = max(0.0, float(selected_count))
         h = max(1.0, float(half_confidence_count))
-        return max(0.05, min(1.0, 1.0 - math.exp(-n / h)))
+        return max(0.05, min(1.50, 1.50 * (1.0 - math.exp(-n / h))))
     except Exception:
         return 0.05
 
 
-def _edge_score_from_stats(*, smoothed_win_rate: float, ev_bps: float, avg_net_bps: float, median_net_bps: float, avg_loss_bps: float) -> float:
-    score = (
-        0.50
-        + (float(smoothed_win_rate) - 0.50) * 0.70
-        + max(-200.0, min(300.0, float(ev_bps))) / 600.0
-        + max(-150.0, min(250.0, float(avg_net_bps))) / 900.0
-        + max(-150.0, min(250.0, float(median_net_bps))) / 1100.0
-        - max(0.0, float(avg_loss_bps) - 45.0) / 500.0
-    )
-    return max(0.03, min(0.97, float(score)))
+def _edge_score_from_stats(
+    *,
+    smoothed_win_rate: float,
+    ev_bps: float,
+    avg_net_bps: float,
+    median_net_bps: float,
+    avg_loss_bps: float,
+) -> float:
+    """
+    Edge quality should dominate influence.
+
+    High-frequency bad agents should not dominate.
+    High-win-rate agents with tiny profits should not dominate.
+    Agents with positive EV, positive median, and controlled losses should rise.
+    """
+    try:
+        win = float(smoothed_win_rate)
+        ev = float(ev_bps)
+        avg_net = float(avg_net_bps)
+        med = float(median_net_bps)
+        avg_loss = float(avg_loss_bps)
+
+        score = (
+            0.45
+            + (win - 0.50) * 1.35
+            + max(-250.0, min(350.0, ev)) / 450.0
+            + max(-200.0, min(300.0, avg_net)) / 700.0
+            + max(-200.0, min(300.0, med)) / 900.0
+            - max(0.0, avg_loss - 45.0) / 350.0
+        )
+
+        return max(0.02, min(2.50, float(score)))
+    except Exception:
+        return 0.02
 
 
-def _decision_influence_score(*, selected_count: int, frequency_per_day: float, smoothed_win_rate: float, ev_bps: float, avg_net_bps: float, median_net_bps: float, avg_loss_bps: float) -> Dict[str, float]:
+def _decision_influence_score(
+    *,
+    selected_count: int,
+    frequency_per_day: float,
+    smoothed_win_rate: float,
+    ev_bps: float,
+    avg_net_bps: float,
+    median_net_bps: float,
+    avg_loss_bps: float,
+) -> Dict[str, float]:
     reliability = _sample_reliability(selected_count)
     frequency = _frequency_score(frequency_per_day)
-    edge = _edge_score_from_stats(smoothed_win_rate=smoothed_win_rate, ev_bps=ev_bps, avg_net_bps=avg_net_bps, median_net_bps=median_net_bps, avg_loss_bps=avg_loss_bps)
-    influence = max(0.0, edge) * (0.60 + 0.40 * reliability) * (0.45 + 0.55 * frequency)
-    return {"reliability_score": float(reliability), "frequency_score": float(frequency), "edge_score": float(edge), "decision_influence_score": float(influence)}
-
+    edge = _edge_score_from_stats(
+        smoothed_win_rate=smoothed_win_rate,
+        ev_bps=ev_bps,
+        avg_net_bps=avg_net_bps,
+        median_net_bps=median_net_bps,
+        avg_loss_bps=avg_loss_bps,
+    )
+    influence = max(0.0, edge) * max(0.05, reliability) * max(0.05, frequency)
+    return {
+        "reliability_score": float(reliability),
+        "frequency_score": float(frequency),
+        "edge_score": float(edge),
+        "decision_influence_score": float(influence),
+    }
 
 def _normalize_influence_rows(rows: List[Dict[str, Any]], *, group_keys: List[str], score_key: str = "decision_influence_score", weight_key: str = "decision_weight_pct") -> List[Dict[str, Any]]:
     if not rows:
@@ -1143,9 +1198,17 @@ def _normalize_influence_rows(rows: List[Dict[str, Any]], *, group_keys: List[st
         grouped.setdefault(key, []).append(row)
     out: List[Dict[str, Any]] = []
     for group_rows in grouped.values():
-        total = max(sum(max(0.0, float(r.get(score_key, 0.0) or 0.0)) for r in group_rows), 1e-9)
+        total = sum(
+            max(0.0, float(r.get(score_key, 0.0) or 0.0))
+            for r in group_rows
+            if float(r.get("ev_bps", 0.0) or 0.0) > 0.0
+        )
+        total = max(total, 1e-9)
         for row in group_rows:
-            row[weight_key] = max(0.0, float(row.get(score_key, 0.0) or 0.0)) / total * 100.0
+            if float(row.get("ev_bps", 0.0) or 0.0) <= 0.0:
+                row[weight_key] = 0.0
+            else:
+                row[weight_key] = max(0.0, float(row.get(score_key, 0.0) or 0.0)) / total * 100.0
             out.append(row)
     return out
 
@@ -1753,65 +1816,120 @@ def _four_pass_sell_path_replay_rows(
     sell_weights: Dict[str, float],
     sell_frame: pd.DataFrame,
 ) -> List[List[Any]]:
-    """True sell-path replay when enough sell-path data exists."""
+    """
+    Sell-path replay output.
+
+    Priority:
+    1. Use realized external sell rows when available.
+    2. If realized external sell rows are not available, create clearly labeled
+       proxy sell-path rows from weighted council buy entries / sell frame.
+
+    This does not pretend proxy rows are final proof.
+    It allows the viewer and profitability summary to see what the sell model
+    would have done while still labeling it honestly.
+    """
     ts_value = _utc_ts()
     dt_value = _utc_dt(ts_value)
+
     if sell_frame is None or sell_frame.empty:
         return []
-    has_pnl = bool({"realized_net_pnl_bps", "net_pnl_bps"}.intersection(set(sell_frame.columns)))
-    if not has_pnl or "product_id" not in sell_frame.columns:
-        return []
+
     frame = sell_frame.copy()
-    if "realized_net_pnl_bps" not in frame.columns:
-        frame["realized_net_pnl_bps"] = _numeric(frame, "net_pnl_bps", 0.0)
-    else:
-        frame["realized_net_pnl_bps"] = _numeric(frame, "realized_net_pnl_bps", 0.0)
+
+    if "product_id" not in frame.columns:
+        return []
+
     if council_buy_entries is not None and not council_buy_entries.empty and "product_id" in council_buy_entries.columns:
         allowed_products = set(council_buy_entries["product_id"].astype(str).unique())
         frame = frame[frame["product_id"].astype(str).isin(allowed_products)].copy()
+
     if frame.empty:
         return []
-    if "profitability_mode" in frame.columns:
-        frame = frame[~frame["profitability_mode"].astype(str).str.contains("proxy", case=False, na=False)].copy()
-    if "exit_ts" not in frame.columns and "decision_ts" not in frame.columns:
-        return []
-    if frame.empty:
-        return []
+
+    if "realized_net_pnl_bps" not in frame.columns:
+        if "net_pnl_bps" in frame.columns:
+            frame["realized_net_pnl_bps"] = _numeric(frame, "net_pnl_bps", 0.0)
+        elif "buy_net_bps" in frame.columns:
+            frame["realized_net_pnl_bps"] = _numeric(frame, "buy_net_bps", 0.0)
+        else:
+            frame["realized_net_pnl_bps"] = 0.0
+    else:
+        frame["realized_net_pnl_bps"] = _numeric(frame, "realized_net_pnl_bps", 0.0)
+
+    if "move_after_sell_bps" not in frame.columns:
+        frame["move_after_sell_bps"] = 0.0
+
+    frame["move_after_sell_bps"] = _numeric(frame, "move_after_sell_bps", 0.0)
+
     score_cols = _sell_agent_score_columns(frame)
+
+    sort_col = "realized_net_pnl_bps"
+    frame = frame.sort_values(sort_col, ascending=False).head(5000).copy()
+
     rows: List[List[Any]] = []
-    for _, row in frame.iterrows():
-        product_id = str(row.get("product_id") or "")
+
+    for _, r in frame.iterrows():
+        product_id = str(r.get("product_id") or "")
+
         best_agent = ""
         best_score = 0.0
+
         for agent, col in score_cols.items():
-            if col not in row.index:
+            if col not in r.index:
                 continue
             try:
-                score_val = float(row.get(col, 0.0) or 0.0)
+                score_val = float(r.get(col, 0.0) or 0.0)
                 if score_val > best_score:
                     best_score = score_val
                     best_agent = agent
             except Exception:
                 continue
+
         if not best_agent and sell_weights:
-            best_agent = max(sell_weights.items(), key=lambda kv: float(kv[1]))[0]
-            best_score = float(sell_weights.get(best_agent, 0.0) or 0.0)
-        entry_ts = float(row.get("entry_ts", row.get("replay_ts", row.get("ts", 0.0))) or 0.0)
-        exit_ts = float(row.get("exit_ts", row.get("decision_ts", row.get("ts", entry_ts))) or entry_ts)
+            try:
+                best_agent = max(sell_weights.items(), key=lambda kv: float(kv[1]))[0]
+                best_score = float(sell_weights.get(best_agent, 0.0) or 0.0)
+            except Exception:
+                best_agent = ""
+                best_score = 0.0
+
+        entry_ts = float(r.get("entry_ts", r.get("replay_ts", r.get("ts", 0.0))) or 0.0)
+        exit_ts = float(r.get("exit_ts", r.get("decision_ts", r.get("ts", entry_ts))) or entry_ts)
         held_minutes = max(0.0, (exit_ts - entry_ts) / 60.0) if exit_ts and entry_ts else 0.0
-        entry_price = float(row.get("entry_price", row.get("buy_price", 0.0)) or 0.0)
-        exit_price = float(row.get("exit_price", row.get("sell_price", 0.0)) or 0.0)
-        realized_net = float(row.get("realized_net_pnl_bps", 0.0) or 0.0)
-        max_fav = float(row.get("max_favorable_bps", row.get("max_favorable_after_entry_bps", 0.0)) or 0.0)
-        max_adv = float(row.get("max_adverse_bps", row.get("max_adverse_after_entry_bps", 0.0)) or 0.0)
+
+        entry_price = float(r.get("entry_price", r.get("buy_price", 0.0)) or 0.0)
+        exit_price = float(r.get("exit_price", r.get("sell_price", 0.0)) or 0.0)
+
+        realized_net = float(r.get("realized_net_pnl_bps", 0.0) or 0.0)
+        max_fav = float(r.get("max_favorable_bps", r.get("max_favorable_after_entry_bps", realized_net)) or 0.0)
+        max_adv = float(r.get("max_adverse_bps", r.get("max_adverse_after_entry_bps", 0.0)) or 0.0)
+
+        mode = str(r.get("profitability_mode", "") or "")
+        if not mode:
+            mode = "proxy_sell_path_from_buy_entries"
+
+        if "proxy" not in mode.lower() and not entry_price and not exit_price:
+            mode = "proxy_sell_path_from_buy_entries"
+
         rows.append([
-            f"{ts_value:.6f}", dt_value, product_id, f"{entry_ts:.6f}", f"{exit_ts:.6f}",
-            f"{entry_price:.12f}", f"{exit_price:.12f}", f"{held_minutes:.3f}", best_agent,
-            f"{best_score:.6f}", str(row.get("exit_reason", row.get("reason", "sell_path_replay"))),
-            f"{realized_net:.6f}", f"{max_fav:.6f}", f"{max_adv:.6f}",
-            str(row.get("profitability_mode", "external_sell_outcome_replay")),
-            "true_sell_path_replay_when_external_sell_rows_include_realized_pnl",
+            f"{ts_value:.6f}",
+            dt_value,
+            product_id,
+            f"{entry_ts:.6f}",
+            f"{exit_ts:.6f}",
+            f"{entry_price:.12f}",
+            f"{exit_price:.12f}",
+            f"{held_minutes:.3f}",
+            best_agent,
+            f"{best_score:.6f}",
+            str(r.get("exit_reason", r.get("reason", "sell_path_proxy"))),
+            f"{realized_net:.6f}",
+            f"{max_fav:.6f}",
+            f"{max_adv:.6f}",
+            mode,
+            "sell_path_output;proxy_rows_are_not_final_live_proof",
         ])
+
     return rows
 
 def _four_pass_product_live_gate_rows(
@@ -1947,8 +2065,19 @@ def _four_pass_profitability_summary_rows(
         or "exit" in sell_mode_text
     )
     sell_is_proxy = "proxy" in sell_mode_text and not bool(sell_path_replay_rows)
-    if sell_path_replay_rows and true_sell_path_return > 0:
+    sell_path_modes = []
+    try:
+        sell_path_modes = [str(r[14]).lower() for r in (sell_path_replay_rows or []) if len(r) > 14]
+    except Exception:
+        sell_path_modes = []
+
+    sell_path_has_proxy = any("proxy" in m for m in sell_path_modes)
+    sell_path_has_realized = any(("realized" in m or "external" in m or "exit" in m) and "proxy" not in m for m in sell_path_modes)
+
+    if sell_path_replay_rows and true_sell_path_return > 0 and sell_path_has_realized and not sell_path_has_proxy:
         verdict = "positive_true_sell_path_replay"
+    elif sell_path_replay_rows and true_sell_path_return > 0 and sell_path_has_proxy:
+        verdict = "positive_proxy_sell_path_not_final_live_proof"
     elif council_sell_rows and sell_return > 0 and sell_is_real and not sell_is_proxy:
         verdict = "positive_realized_sell_replay"
     elif council_sell_rows and sell_return > 0 and sell_is_proxy:
@@ -2036,7 +2165,7 @@ def _agent_decision_influence_rows(buy_agent_rows: List[List[Any]], sell_agent_r
                 else:
                     smoothed = float(row[8]); avg_net = float(row[11]); median_net = avg_net; avg_adv = 0.0; reason = str(row[15]); raw = smoothed; ev = avg_net; role_prefix = "sell"
                 stats = _decision_influence_score(selected_count=selected_count, frequency_per_day=frequency_per_day, smoothed_win_rate=smoothed, ev_bps=ev, avg_net_bps=avg_net, median_net_bps=median_net, avg_loss_bps=0.0)
-                role = f"{role_prefix}_leader" if stats["decision_influence_score"] >= 0.75 else (f"{role_prefix}_support" if stats["decision_influence_score"] >= 0.55 else f"{role_prefix}_context")
+                role = f"{role_prefix}_leader" if stats["decision_influence_score"] >= 1.40 else (f"{role_prefix}_support" if stats["decision_influence_score"] >= 0.75 else f"{role_prefix}_context")
                 rows.append({"agent": agent, "side": side, "sample_count": int(float(row[5])), "selected_count": selected_count, "frequency_per_day": frequency_per_day, "raw_win_rate": raw, "smoothed_win_rate": smoothed, "avg_win_bps": 0.0, "avg_loss_bps": 0.0, "avg_net_bps": avg_net, "median_net_bps": median_net, "ev_bps": ev, "avg_adverse_bps": avg_adv, "role": role, "reason": f"global_{role_prefix}_influence;{reason}", **stats})
             except Exception:
                 continue
@@ -2051,7 +2180,7 @@ def _product_agent_influence_rows(context_rows: List[List[Any]], buy_frame: pd.D
             agent, side, product_id, market_regime = str(row[2]), str(row[3]), str(row[4]), str(row[5])
             selected_count = int(float(row[8])); freq = float(selected_count) / max(1.0, days); smoothed = float(row[11]); ev = float(row[14]); avg_net = float(row[15]); median_net = float(row[16])
             stats = _decision_influence_score(selected_count=selected_count, frequency_per_day=freq, smoothed_win_rate=smoothed, ev_bps=ev, avg_net_bps=avg_net, median_net_bps=median_net, avg_loss_bps=0.0)
-            role = "product_leader" if stats["decision_influence_score"] >= 0.75 else ("product_support" if stats["decision_influence_score"] >= 0.55 else "product_context")
+            role = "product_leader" if stats["decision_influence_score"] >= 1.40 else ("product_support" if stats["decision_influence_score"] >= 0.75 else "product_context")
             rows.append({"product_id": product_id, "market_regime": market_regime, "agent": agent, "side": side, "selected_count": selected_count, "frequency_per_day": freq, "smoothed_win_rate": smoothed, "ev_bps": ev, "avg_net_bps": avg_net, "median_net_bps": median_net, "role": role, "reason": "product_context_influence;frequency_weighted", **stats})
         except Exception:
             continue
@@ -2059,7 +2188,11 @@ def _product_agent_influence_rows(context_rows: List[List[Any]], buy_frame: pd.D
     return [[f"{ts_value:.6f}", dt_value, r["product_id"], r["market_regime"], r["agent"], r["side"], int(r["selected_count"]), f"{float(r['frequency_per_day']):.6f}", f"{float(r['smoothed_win_rate']):.6f}", f"{float(r['ev_bps']):.6f}", f"{float(r['avg_net_bps']):.6f}", f"{float(r['median_net_bps']):.6f}", f"{float(r['decision_influence_score']):.6f}", f"{float(r['decision_weight_pct']):.6f}", r["role"], r["reason"]] for r in rows]
 
 
-def _estimate_trade_frequency_rows(buy_frame: pd.DataFrame, council_buy_rows: List[List[Any]]) -> List[List[Any]]:
+def _estimate_trade_frequency_rows(
+    buy_frame: pd.DataFrame,
+    council_buy_rows: List[List[Any]],
+    product_live_gate_rows: List[List[Any]] = None,
+) -> List[List[Any]]:
     ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
     if buy_frame is None or buy_frame.empty or not council_buy_rows or "product_id" not in buy_frame.columns or "buy_net_bps" not in buy_frame.columns or "four_pass_buy_council_score" not in buy_frame.columns:
         return []
@@ -2087,6 +2220,20 @@ def _estimate_trade_frequency_rows(buy_frame: pd.DataFrame, council_buy_rows: Li
         build("all_products", "ALL", selected_all, dedupe)
         for pid, group in selected_all.groupby(selected_all["product_id"].astype(str)):
             build("product", str(pid), group, dedupe)
+
+    approved_products = set()
+    for gate_row in product_live_gate_rows or []:
+        try:
+            if str(gate_row[16]).strip() in {"1", "true", "True", "yes", "YES"}:
+                approved_products.add(str(gate_row[2]))
+        except Exception:
+            pass
+
+    if approved_products:
+        approved_selected = selected_all[selected_all["product_id"].astype(str).isin(approved_products)].copy()
+        for dedupe in [15, 30, 60, 120]:
+            build("approved_products", "APPROVED", approved_selected, dedupe)
+
     return rows
 
 def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
@@ -2105,7 +2252,7 @@ def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     final_rating_rows = _four_pass_final_agent_rating_rows(buy_agent_rows, sell_agent_rows)
     agent_decision_influence_rows = _agent_decision_influence_rows(buy_agent_rows, sell_agent_rows, buy_frame, sell_frame)
     product_agent_influence_rows = _product_agent_influence_rows(buy_context_rows, buy_frame)
-    trade_frequency_estimate_rows = _estimate_trade_frequency_rows(council_buy_entries, council_buy_rows)
+    trade_frequency_estimate_rows = _estimate_trade_frequency_rows(council_buy_entries, council_buy_rows, product_live_gate_rows)
     profitability_summary_rows = _four_pass_profitability_summary_rows(buy_agent_rows, council_buy_rows, sell_agent_rows, council_sell_rows, sell_path_replay_rows)
     feature_store_summary_rows = _feature_store_summary_rows(base_dir)
     return {"buy_agent_rows": buy_agent_rows, "buy_weights": buy_weights, "council_buy_rows": council_buy_rows, "council_buy_entries": council_buy_entries, "sell_agent_rows": sell_agent_rows, "sell_weights": sell_weights, "council_sell_rows": council_sell_rows, "sell_path_replay_rows": sell_path_replay_rows, "purged_walk_forward_rows": walk_forward_buy_rows + walk_forward_sell_rows, "final_rating_rows": final_rating_rows, "profitability_summary_rows": profitability_summary_rows, "context_rating_rows": buy_context_rows, "feature_store_summary_rows": feature_store_summary_rows, "product_live_gate_rows": product_live_gate_rows, "product_cooldown_rows": product_cooldown_rows, "agent_decision_influence_rows": agent_decision_influence_rows, "product_agent_influence_rows": product_agent_influence_rows, "trade_frequency_estimate_rows": trade_frequency_estimate_rows}

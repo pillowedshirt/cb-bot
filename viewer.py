@@ -2635,13 +2635,52 @@ def render_four_pass_backtest_box(
             hide_index=True,
         )
 
+    if agent_decision_influence_df is not None and not agent_decision_influence_df.empty:
+        st.markdown("#### Agent Decision Influence")
+        st.caption("Global BUY/SELL influence weighted by win rate, EV, sample reliability, and decision frequency.")
+
+        show_cols = [c for c in ["agent", "side", "selected_count", "frequency_per_day", "smoothed_win_rate", "ev_bps", "avg_net_bps", "median_net_bps", "decision_influence_score", "decision_weight_pct", "role"] if c in agent_decision_influence_df.columns]
+        display_df = agent_decision_influence_df.copy()
+        for col in ["decision_weight_pct", "decision_influence_score", "frequency_per_day", "smoothed_win_rate", "ev_bps", "avg_net_bps"]:
+            if col in display_df.columns:
+                display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+        st.dataframe(display_df.sort_values(["side", "decision_weight_pct"], ascending=[True, False])[show_cols], use_container_width=True, hide_index=True)
+
+    if product_agent_influence_df is not None and not product_agent_influence_df.empty:
+        st.markdown("#### Product-Specific Agent Influence")
+        st.caption("Per-product/per-regime influence. This shows which agents work best on each coin.")
+
+        show_cols = [c for c in ["product_id", "market_regime", "agent", "side", "selected_count", "frequency_per_day", "smoothed_win_rate", "ev_bps", "avg_net_bps", "median_net_bps", "decision_weight_pct", "role"] if c in product_agent_influence_df.columns]
+        display_df = product_agent_influence_df.copy()
+        for col in ["decision_weight_pct", "frequency_per_day", "smoothed_win_rate", "ev_bps", "avg_net_bps"]:
+            if col in display_df.columns:
+                display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+        st.dataframe(display_df.sort_values(["product_id", "side", "decision_weight_pct"], ascending=[True, True, False])[show_cols], use_container_width=True, hide_index=True)
+
+    if trade_frequency_estimate_df is not None and not trade_frequency_estimate_df.empty:
+        st.markdown("#### Estimated Trades Per Day / Avg Win-Loss")
+        st.caption("Replay-based opportunity estimate. This is not guaranteed live trade count.")
+
+        show_cols = [c for c in ["scope", "product_id", "dedupe_minutes", "estimated_trades_per_day", "win_rate", "avg_net_bps", "median_net_bps", "avg_win_bps", "avg_loss_bps", "expected_daily_net_bps_if_all_traded"] if c in trade_frequency_estimate_df.columns]
+        display_df = trade_frequency_estimate_df.copy()
+        for col in ["estimated_trades_per_day", "win_rate", "avg_net_bps", "avg_win_bps", "avg_loss_bps", "expected_daily_net_bps_if_all_traded"]:
+            if col in display_df.columns:
+                display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+        st.dataframe(display_df.sort_values(["dedupe_minutes", "estimated_trades_per_day"], ascending=[True, False])[show_cols], use_container_width=True, hide_index=True)
+
+    if approved_but_shadowed_df is not None and not approved_but_shadowed_df.empty:
+        st.markdown("#### Approved But Shadowed")
+        st.caption("Products that passed the product gate but were still blocked by final live execution logic.")
+
+        show_cols = [c for c in ["dt_mst", "product_id", "symbol", "quote_asset", "council_action", "expected_utility_bps", "candidate_notional_usd", "top_of_book_age_sec", "block_reasons", "next_best_action"] if c in approved_but_shadowed_df.columns]
+        st.dataframe(approved_but_shadowed_df.tail(100)[show_cols], use_container_width=True, hide_index=True)
+
     if product_cooldowns_df is not None and not product_cooldowns_df.empty:
         st.markdown("#### Product Cooldowns")
-        display_cols = [
-            c for c in ["product_id", "cooldown_until_ts", "cooldown_minutes", "reason"]
-            if c in product_cooldowns_df.columns
-        ]
-        st.dataframe(product_cooldowns_df[display_cols], use_container_width=True, hide_index=True)
+        st.caption("Cooldowns are soft unless marked otherwise. Coins remain monitored and can re-qualify.")
+
+        show_cols = [c for c in ["product_id", "cooldown_until_ts", "cooldown_minutes", "cooldown_type", "can_escape_early", "reason"] if c in product_cooldowns_df.columns]
+        st.dataframe(product_cooldowns_df.tail(100)[show_cols], use_container_width=True, hide_index=True)
 
     if four_pass_final_agent_ratings_df is not None and not four_pass_final_agent_ratings_df.empty:
         with st.expander("Final four-pass side-specific analyst ratings", expanded=False):
@@ -2681,11 +2720,11 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         four_pass_sell_path_replay_df,
         four_pass_purged_walk_forward_df,
         four_pass_product_live_gate_df,
-        product_cooldowns_df,
         agent_decision_influence_df,
         product_agent_influence_df,
         trade_frequency_estimate_df,
         approved_but_shadowed_df,
+        product_cooldowns_df,
     )
     hist_enabled = readiness.get("historical_replay_enabled")
     hist_running = readiness.get("historical_replay_running")

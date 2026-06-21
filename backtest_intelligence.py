@@ -26,6 +26,25 @@ except Exception:
     RISK_CONTEXT_PERFORMANCE_COLUMNS = []
     RISK_LIVE_GATE_COLUMNS = []
 
+try:
+    from quant_state_engine import (
+        run_quant_state_engine,
+        FEATURE_OUTCOME_CORRELATION_COLUMNS,
+        FEATURE_CORRELATION_MATRIX_COLUMNS,
+        MARKOV_TRANSITION_COLUMNS,
+        MARKOV_POLICY_COLUMNS,
+        KALMAN_POLICY_COLUMNS,
+        QUANT_STATE_SUMMARY_COLUMNS,
+    )
+except Exception:
+    run_quant_state_engine = None
+    FEATURE_OUTCOME_CORRELATION_COLUMNS = []
+    FEATURE_CORRELATION_MATRIX_COLUMNS = []
+    MARKOV_TRANSITION_COLUMNS = []
+    MARKOV_POLICY_COLUMNS = []
+    KALMAN_POLICY_COLUMNS = []
+    QUANT_STATE_SUMMARY_COLUMNS = []
+
 
 try:
     from debug_tools import (
@@ -2653,25 +2672,6 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     ablation_rows = _agent_ablation_rows(base_dir)
     four_pass = _four_pass_backtest_outputs(base_dir)
 
-    risk_intelligence_result: Dict[str, Any] = {}
-    if run_risk_intelligence is not None:
-        try:
-            risk_intelligence_result = run_risk_intelligence(
-                base_dir=base_dir,
-                log_fn=log,
-                bootstrap_trials=2000,
-                monte_carlo_trials=5000,
-                position_size_pct=0.10,
-            )
-        except Exception as exc:
-            risk_intelligence_result = {"error": str(exc)}
-            module_exception(
-                MODULE_NAME,
-                "risk_intelligence_failed",
-                exc,
-                data={"base_dir": base_dir},
-                also_overall=True,
-            )
 
     recommendations_path = os.path.join(base_dir, "backtest_recommendations.csv")
     sell_recommendations_path = os.path.join(base_dir, "backtest_sell_recommendations.csv")
@@ -2702,6 +2702,12 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     risk_monte_carlo_summary_path = os.path.join(base_dir, "risk_monte_carlo_summary.csv")
     risk_context_performance_path = os.path.join(base_dir, "risk_context_performance.csv")
     risk_live_gate_path = os.path.join(base_dir, "risk_live_gate.csv")
+    feature_outcome_correlation_path = os.path.join(base_dir, "feature_outcome_correlation.csv")
+    feature_correlation_matrix_path = os.path.join(base_dir, "feature_correlation_matrix.csv")
+    markov_regime_transitions_path = os.path.join(base_dir, "markov_regime_transitions.csv")
+    markov_regime_policy_path = os.path.join(base_dir, "markov_regime_policy.csv")
+    kalman_filter_policy_path = os.path.join(base_dir, "kalman_filter_policy.csv")
+    quant_state_summary_path = os.path.join(base_dir, "quant_state_summary.csv")
     summary_path = os.path.join(base_dir, "backtest_summary.csv")
 
     _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
@@ -2730,6 +2736,40 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     _write_rows(fifth_pass_summary_path, FIFTH_PASS_LIVE_STYLE_SUMMARY_COLUMNS, four_pass["fifth_pass_summary_rows"])
     _write_rows(fifth_pass_product_contribution_path, FIFTH_PASS_PRODUCT_CONTRIBUTION_COLUMNS, four_pass["fifth_pass_product_contribution_rows"])
     _write_rows(fifth_pass_blockers_path, FIFTH_PASS_BLOCKER_COLUMNS, four_pass["fifth_pass_blocker_rows"])
+
+    risk_intelligence_result: Dict[str, Any] = {}
+    if run_risk_intelligence is not None:
+        try:
+            risk_intelligence_result = run_risk_intelligence(
+                base_dir=base_dir,
+                log_fn=log,
+                bootstrap_trials=2000,
+                monte_carlo_trials=5000,
+                position_size_pct=0.10,
+            )
+        except Exception as exc:
+            risk_intelligence_result = {"error": str(exc)}
+            module_exception(
+                MODULE_NAME,
+                "risk_intelligence_failed",
+                exc,
+                data={"base_dir": base_dir},
+                also_overall=True,
+            )
+
+    quant_state_result: Dict[str, Any] = {}
+    if run_quant_state_engine is not None:
+        try:
+            quant_state_result = run_quant_state_engine(base_dir=base_dir, log_fn=log)
+        except Exception as exc:
+            quant_state_result = {"error": str(exc)}
+            module_exception(
+                MODULE_NAME,
+                "quant_state_engine_failed",
+                exc,
+                data={"base_dir": base_dir},
+                also_overall=True,
+            )
 
     ts_value = _utc_ts()
     summary_rows = [
@@ -2760,6 +2800,11 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "risk_monte_carlo_rows", risk_intelligence_result.get("monte_carlo_rows", 0), "Monte Carlo path-risk distribution"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "risk_context_performance_rows", risk_intelligence_result.get("context_rows", 0), "context/regime EV confidence rows"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "risk_live_gate_rows", risk_intelligence_result.get("live_gate_rows", 0), "live risk gate rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "feature_outcome_correlation_rows", quant_state_result.get("feature_rows", 0), "active covariance/correlation feature edge rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "feature_correlation_matrix_rows", quant_state_result.get("matrix_rows", 0), "feature correlation matrix rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "markov_transition_rows", quant_state_result.get("markov_transition_rows", 0), "Markov regime transition rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "markov_policy_rows", quant_state_result.get("markov_policy_rows", 0), "active Markov regime policy rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "kalman_policy_rows", quant_state_result.get("kalman_policy_rows", 0), "active Kalman filter policy rows"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
     ]
     _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
@@ -2772,6 +2817,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         f"risk_mc={risk_intelligence_result.get('monte_carlo_rows', 0)} "
         f"risk_context={risk_intelligence_result.get('context_rows', 0)} "
         f"risk_live_gate={risk_intelligence_result.get('live_gate_rows', 0)} "
+        f"quant_feature={quant_state_result.get('feature_rows', 0)} "
+        f"quant_markov={quant_state_result.get('markov_policy_rows', 0)} "
+        f"quant_kalman={quant_state_result.get('kalman_policy_rows', 0)} "
         f"seconds={time.time() - started:.2f}"
     )
     module_debug(
@@ -2833,6 +2881,12 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
             "risk_monte_carlo_summary": risk_monte_carlo_summary_path,
             "risk_context_performance": risk_context_performance_path,
             "risk_live_gate": risk_live_gate_path,
+            "feature_outcome_correlation": feature_outcome_correlation_path,
+            "feature_correlation_matrix": feature_correlation_matrix_path,
+            "markov_regime_transitions": markov_regime_transitions_path,
+            "markov_regime_policy": markov_regime_policy_path,
+            "kalman_filter_policy": kalman_filter_policy_path,
+            "quant_state_summary": quant_state_summary_path,
             "backtest_summary": summary_path,
         },
         "recommendations": buy_recs,

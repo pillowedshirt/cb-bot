@@ -144,6 +144,17 @@ except Exception:
     run_backtest_intelligence = None
 
 try:
+    from risk_intelligence import (
+        load_risk_live_gate_map,
+        load_risk_context_map,
+        context_key_from_mapping,
+    )
+except Exception:
+    load_risk_live_gate_map = None
+    load_risk_context_map = None
+    context_key_from_mapping = None
+
+try:
     from session_liquidity import (
         build_session_liquidity_signal,
         signal_to_dict as session_liquidity_signal_to_dict,
@@ -665,6 +676,10 @@ SELL_QUALITY_REVIEWS_CSV_PATH: str = os.path.join(BASE_DIR, "sell_quality_review
 MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.csv")
 MAKER_MISS_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_miss_outcomes.csv")
 ORDER_BOOK_SNAPSHOTS_CSV_PATH: str = os.path.join(BASE_DIR, "order_book_snapshots.csv")
+RISK_EV_CONFIDENCE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_ev_confidence.csv")
+RISK_MONTE_CARLO_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "risk_monte_carlo_summary.csv")
+RISK_CONTEXT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_context_performance.csv")
+RISK_LIVE_GATE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_live_gate.csv")
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
 ACCOUNT_BALANCE_DIAGNOSTICS_CSV_PATH: str = os.path.join(BASE_DIR, "account_balance_diagnostics.csv")
 LIVE_TRADE_BLOCKERS_CSV_PATH: str = os.path.join(BASE_DIR, "live_trade_blockers.csv")
@@ -2357,6 +2372,17 @@ ORDER_BOOK_IMBALANCE_STRONG_SELL: float = -0.18
 ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE: float = 0.72
 SPREAD_INSTABILITY_WINDOW: int = 12
 SPREAD_INSTABILITY_BLOCK_BPS: float = 18.0
+ENABLE_TRUE_LEVEL3_ORDER_FLOW: bool = False
+LEVEL3_ORDER_FLOW_PROVIDER: str = "disabled"
+LEVEL3_ORDER_FLOW_NOTE: str = "Binance.US public bookTicker/depth is Level 2/order-flow-lite, not true add/cancel/modify Level 3."
+ENABLE_RISK_INTELLIGENCE_LIVE_GATE: bool = True
+ENABLE_RISK_INTELLIGENCE_CONTEXT_GATE: bool = True
+RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK: int = 60
+RISK_CONTEXT_MIN_ROWS_TO_BLOCK: int = 30
+RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER: float = 0.60
+RISK_CONTEXT_WEAK_SIZE_MULTIPLIER: float = 0.60
+RISK_INTELLIGENCE_MIN_SIZE_MULTIPLIER: float = 0.25
+RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER: float = 1.10
 ENABLE_STALE_DATA_LIVE_BUY_GATE: bool = True
 MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC: float = 15.0
 MAX_VIEWER_SNAPSHOT_AGE_WARN_SEC: float = 12.0
@@ -6891,6 +6917,10 @@ class TradingBot:
         self._last_order_book_context_ts: Dict[str, float] = {}
         self._order_book_context_cache: Dict[str, Dict[str, Any]] = {}
         self._spread_history_by_product: Dict[str, Deque[float]] = {}
+        self._risk_live_gate_cache: Dict[str, Dict[str, Any]] = {}
+        self._risk_live_gate_cache_ts: float = 0.0
+        self._risk_context_gate_cache: Dict[str, Dict[str, Any]] = {}
+        self._risk_context_gate_cache_ts: float = 0.0
         self.last_ai_train_ts: float = 0.0
         self._ai_training_running: bool = False
         self._backtest_reload_running: bool = False
@@ -14426,6 +14456,57 @@ class TradingBot:
         except Exception as exc:
             return False, f"market_not_favorable:error={exc}"
 
+    def _risk_live_gate_for_product(self, product_id: str) -> Dict[str, Any]:
+        if not bool(ENABLE_RISK_INTELLIGENCE_LIVE_GATE):
+            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "risk_intelligence_gate_disabled"}
+        if load_risk_live_gate_map is None:
+            return {"available": False, "allowed": True, "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": "risk_intelligence_module_unavailable"}
+        try:
+            now_value = now_ts()
+            if not self._risk_live_gate_cache or now_value - float(self._risk_live_gate_cache_ts or 0.0) > 15.0:
+                self._risk_live_gate_cache = load_risk_live_gate_map(BASE_DIR)
+                self._risk_live_gate_cache_ts = now_value
+            row = dict(self._risk_live_gate_cache.get(str(product_id), {}) or {})
+            if not row:
+                return {"available": False, "allowed": True, "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": f"risk_live_gate_waiting_for_rows product_id={product_id}"}
+            sample_count = int(float(row.get("sample_count", 0) or 0))
+            live_allowed = str(row.get("live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}
+            size_multiplier = clamp_float(float(row.get("size_multiplier", 1.0) or 1.0), float(RISK_INTELLIGENCE_MIN_SIZE_MULTIPLIER), float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER))
+            if sample_count < int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK):
+                return {"available": True, "allowed": True, "size_multiplier": min(size_multiplier, float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER)), "sample_count": sample_count, "reason": f"risk_live_gate_sample_immature sample_count={sample_count};min_to_block={int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK)};row_reason={row.get('reason', '')}"}
+            if not live_allowed:
+                return {"available": True, "allowed": False, "size_multiplier": 0.0, "sample_count": sample_count, "reason": f"risk_live_gate_blocked {row.get('reason', '')}"}
+            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "sample_count": sample_count, "risk_grade": str(row.get("risk_grade", "")), "ev_ci_low_bps": float(row.get("ev_ci_low_bps", 0.0) or 0.0), "prob_ev_positive": float(row.get("prob_ev_positive", 0.0) or 0.0), "p95_max_drawdown_pct_30d": float(row.get("p95_max_drawdown_pct_30d", 0.0) or 0.0), "reason": f"risk_live_gate_allowed {row.get('reason', '')}"}
+        except Exception as exc:
+            return {"available": False, "allowed": True, "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": f"risk_live_gate_error:{exc}"}
+
+    def _risk_context_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(ENABLE_RISK_INTELLIGENCE_CONTEXT_GATE):
+            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "risk_context_gate_disabled"}
+        if load_risk_context_map is None or context_key_from_mapping is None:
+            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "risk_context_module_unavailable"}
+        try:
+            product_id = str(candidate.get("product_id", ""))
+            context_key = context_key_from_mapping(candidate)
+            map_key = f"{product_id}||{context_key}"
+            now_value = now_ts()
+            if not self._risk_context_gate_cache or now_value - float(self._risk_context_gate_cache_ts or 0.0) > 15.0:
+                self._risk_context_gate_cache = load_risk_context_map(BASE_DIR)
+                self._risk_context_gate_cache_ts = now_value
+            row = dict(self._risk_context_gate_cache.get(map_key, {}) or {})
+            if not row:
+                return {"available": False, "allowed": True, "size_multiplier": 1.0, "context_key": context_key, "reason": f"risk_context_waiting_for_rows context_key={context_key}"}
+            sample_count = int(float(row.get("sample_count", 0) or 0))
+            context_allowed = str(row.get("context_live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}
+            size_multiplier = clamp_float(float(row.get("context_size_multiplier", 1.0) or 1.0), 0.0, float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER))
+            if sample_count < int(RISK_CONTEXT_MIN_ROWS_TO_BLOCK):
+                return {"available": True, "allowed": True, "size_multiplier": min(1.0, max(size_multiplier, float(RISK_CONTEXT_WEAK_SIZE_MULTIPLIER))), "context_key": context_key, "sample_count": sample_count, "reason": f"risk_context_sample_immature sample_count={sample_count};context_key={context_key};row_reason={row.get('reason', '')}"}
+            if not context_allowed:
+                return {"available": True, "allowed": False, "size_multiplier": 0.0, "context_key": context_key, "sample_count": sample_count, "reason": f"risk_context_blocked {row.get('reason', '')}"}
+            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "context_key": context_key, "sample_count": sample_count, "reason": f"risk_context_allowed {row.get('reason', '')}"}
+        except Exception as exc:
+            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": f"risk_context_gate_error:{exc}"}
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -14475,6 +14556,29 @@ class TradingBot:
                 return False, (
                     "live_buy_blocked:product_not_approved_by_four_pass_gate "
                     f"product_id={product_id};reason={product_gate_reason}"
+                )
+
+            risk_gate = self._risk_live_gate_for_product(product_id)
+            candidate["risk_live_gate_available"] = bool(risk_gate.get("available", False))
+            candidate["risk_live_gate_allowed"] = bool(risk_gate.get("allowed", True))
+            candidate["risk_size_multiplier"] = float(risk_gate.get("size_multiplier", 1.0) or 1.0)
+            candidate["risk_live_gate_reason"] = str(risk_gate.get("reason", ""))
+            if not bool(risk_gate.get("allowed", True)):
+                return False, (
+                    "live_buy_blocked:risk_intelligence_live_gate "
+                    f"product_id={product_id};reason={risk_gate.get('reason', '')}"
+                )
+
+            context_gate = self._risk_context_gate_for_candidate(candidate)
+            candidate["risk_context_gate_available"] = bool(context_gate.get("available", False))
+            candidate["risk_context_gate_allowed"] = bool(context_gate.get("allowed", True))
+            candidate["risk_context_size_multiplier"] = float(context_gate.get("size_multiplier", 1.0) or 1.0)
+            candidate["risk_context_key"] = str(context_gate.get("context_key", ""))
+            candidate["risk_context_gate_reason"] = str(context_gate.get("reason", ""))
+            if not bool(context_gate.get("allowed", True)):
+                return False, (
+                    "live_buy_blocked:risk_context_gate "
+                    f"product_id={product_id};reason={context_gate.get('reason', '')}"
                 )
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
@@ -14593,6 +14697,31 @@ class TradingBot:
                     return False, f"live_buy_shadowed:{wf_reason}"
             maker_adjusted_ev_bps = float(candidate.get("maker_adjusted_expected_value_bps", 0.0) or 0.0)
             maker_fill_probability = float(candidate.get("maker_fill_probability", 0.0) or 0.0)
+            liquidity_risk_score = float(candidate.get("liquidity_risk_score", 0.0) or 0.0)
+            spread_instability_bps = float(candidate.get("spread_instability_bps", 0.0) or 0.0)
+            order_book_top_depth_usd = float(candidate.get("order_book_top_depth_usd", 0.0) or 0.0)
+            if bool(ENABLE_ORDER_BOOK_CONTEXT):
+                if liquidity_risk_score >= float(ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE):
+                    return False, (
+                        f"live_buy_blocked:order_book_liquidity_risk_high "
+                        f"risk={liquidity_risk_score:.3f};"
+                        f"max={float(ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE):.3f};"
+                        f"reason={candidate.get('order_book_reason', '')}"
+                    )
+                if spread_instability_bps >= float(SPREAD_INSTABILITY_BLOCK_BPS):
+                    return False, (
+                        f"live_buy_blocked:spread_instability_high "
+                        f"spread_instability={spread_instability_bps:.2f};"
+                        f"max={float(SPREAD_INSTABILITY_BLOCK_BPS):.2f};"
+                        f"reason={candidate.get('order_book_reason', '')}"
+                    )
+                if order_book_top_depth_usd > 0.0 and order_book_top_depth_usd < float(ORDER_BOOK_MIN_TOP_DEPTH_USD):
+                    return False, (
+                        f"live_buy_blocked:order_book_top_depth_too_thin "
+                        f"top_depth={order_book_top_depth_usd:.2f};"
+                        f"min={float(ORDER_BOOK_MIN_TOP_DEPTH_USD):.2f};"
+                        f"reason={candidate.get('order_book_reason', '')}"
+                    )
             wait_utility_bps = float(candidate.get("wait_utility_bps", 0.0) or 0.0)
             buy_vs_wait_edge_bps = float(candidate.get("buy_vs_wait_edge_bps", 0.0) or 0.0)
             value_acceptance_state = str(candidate.get("value_acceptance_state", "") or "").lower()
@@ -15029,6 +15158,8 @@ class TradingBot:
                 f"value_acceptance_state={value_acceptance_state};"
                 f"volume_node_state={volume_node_state};"
                 f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
+                f"risk_gate={candidate.get('risk_live_gate_reason', '')};"
+                f"context_gate={candidate.get('risk_context_gate_reason', '')};"
                 f"{backtest_reason}"
             )
 
@@ -22171,22 +22302,64 @@ class TradingBot:
 
     def _order_book_context_for_product(self, product_id: str) -> Dict[str, Any]:
         try:
-            snapshot = self._active_adapter().get_order_book_snapshot(product_id, limit=25)
+            current_ts = now_ts()
+            last_ts = float(self._last_order_book_context_ts.get(product_id, 0.0) or 0.0)
+            cached = self._order_book_context_cache.get(product_id)
+            if cached and current_ts - last_ts < float(ORDER_BOOK_REFRESH_EVERY_SEC):
+                return dict(cached)
+            snapshot = self._active_adapter().get_order_book_snapshot(product_id, limit=int(ORDER_BOOK_LEVELS))
             bid_notional = float(snapshot.get("bid_notional", 0.0) or 0.0)
             ask_notional = float(snapshot.get("ask_notional", 0.0) or 0.0)
             imbalance = float(snapshot.get("imbalance", 0.0) or 0.0)
-            return {
-                "available": True, "order_book_available": True, "exchange": "binance_us",
-                "product_id": product_id, "symbol": snapshot.get("symbol", ""),
-                "bid_notional": bid_notional, "ask_notional": ask_notional, "imbalance": imbalance,
-                "order_book_bid_depth_usd": bid_notional, "order_book_ask_depth_usd": ask_notional,
-                "order_book_imbalance": imbalance,
-                "liquidity_bias": ("bid_support" if imbalance > 0.15 else "ask_pressure" if imbalance < -0.15 else "balanced"),
-                "ts": float(snapshot.get("ts", now_ts()) or now_ts()),
+            tob = self.tob.get(product_id)
+            bid = float(getattr(tob, "bid", 0.0) or 0.0) if tob else 0.0
+            ask = float(getattr(tob, "ask", 0.0) or 0.0) if tob else 0.0
+            tob_ts = float(getattr(tob, "ts", 0.0) or 0.0) if tob else 0.0
+            top_of_book_age_sec = current_ts - tob_ts if tob_ts > 0 else 999999.0
+            mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+            live_spread_bps = ((ask - bid) / mid * 10000.0) if mid > 0 else 9999.0
+            spread_history = self._spread_history_by_product.setdefault(product_id, deque(maxlen=int(SPREAD_INSTABILITY_WINDOW)))
+            if live_spread_bps < 9999.0:
+                spread_history.append(float(live_spread_bps))
+            if spread_history:
+                spread_instability_bps = max(spread_history) - min(spread_history)
+                avg_spread_bps = sum(spread_history) / max(1, len(spread_history))
+            else:
+                spread_instability_bps = 0.0
+                avg_spread_bps = live_spread_bps
+            order_book_top_depth_usd = min(bid_notional, ask_notional) if bid_notional > 0 and ask_notional > 0 else 0.0
+            total_depth_usd = bid_notional + ask_notional
+            depth_risk = 1.0 - min(1.0, order_book_top_depth_usd / max(float(ORDER_BOOK_MIN_TOP_DEPTH_USD), 1.0))
+            spread_instability_risk = min(1.0, spread_instability_bps / max(float(SPREAD_INSTABILITY_BLOCK_BPS), 1.0))
+            ask_pressure_risk = max(0.0, -imbalance) if imbalance < 0.0 else 0.0
+            stale_risk = 1.0 if top_of_book_age_sec > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC) else 0.0
+            liquidity_risk_score = clamp_float(depth_risk * 0.40 + spread_instability_risk * 0.25 + ask_pressure_risk * 0.25 + stale_risk * 0.10, 0.0, 1.0)
+            liquidity_bias = "bid_support" if imbalance >= float(ORDER_BOOK_IMBALANCE_STRONG_BUY) else "ask_pressure" if imbalance <= float(ORDER_BOOK_IMBALANCE_STRONG_SELL) else "balanced"
+            order_book_reason = (
+                f"order_book_l2_context;order_flow_mode=level2_order_flow_lite;"
+                f"true_l3_enabled={bool(ENABLE_TRUE_LEVEL3_ORDER_FLOW)};"
+                f"bid_depth={bid_notional:.2f};ask_depth={ask_notional:.2f};top_depth={order_book_top_depth_usd:.2f};"
+                f"total_depth={total_depth_usd:.2f};imbalance={imbalance:.4f};bias={liquidity_bias};"
+                f"spread={live_spread_bps:.2f};avg_spread={avg_spread_bps:.2f};spread_instability={spread_instability_bps:.2f};"
+                f"liquidity_risk={liquidity_risk_score:.3f};tob_age={top_of_book_age_sec:.2f}"
+            )
+            ctx = {
+                "available": True, "order_book_available": True, "exchange": "binance_us", "product_id": product_id,
+                "symbol": snapshot.get("symbol", ""), "bid_notional": bid_notional, "ask_notional": ask_notional,
+                "imbalance": imbalance, "order_book_bid_depth_usd": bid_notional, "order_book_ask_depth_usd": ask_notional,
+                "order_book_total_depth_usd": total_depth_usd, "order_book_top_depth_usd": order_book_top_depth_usd,
+                "order_book_imbalance": imbalance, "spread_instability_bps": spread_instability_bps,
+                "avg_spread_bps": avg_spread_bps, "liquidity_risk_score": liquidity_risk_score,
+                "liquidity_bias": liquidity_bias, "top_of_book_age_sec": top_of_book_age_sec,
+                "order_flow_mode": "level2_order_flow_lite", "true_level3_enabled": bool(ENABLE_TRUE_LEVEL3_ORDER_FLOW),
+                "true_level3_provider": str(LEVEL3_ORDER_FLOW_PROVIDER), "true_level3_note": str(LEVEL3_ORDER_FLOW_NOTE),
+                "order_book_reason": order_book_reason, "ts": float(snapshot.get("ts", current_ts) or current_ts),
             }
+            self._order_book_context_cache[product_id] = dict(ctx)
+            self._last_order_book_context_ts[product_id] = current_ts
+            return ctx
         except Exception as exc:
-            return {"available": False, "order_book_available": False, "exchange": "binance_us", "product_id": product_id, "reason": f"binance_depth_unavailable:{exc}", "ts": now_ts()}
-
+            return {"available": False, "order_book_available": False, "exchange": "binance_us", "product_id": product_id, "reason": f"binance_depth_unavailable:{exc}", "order_book_reason": f"order_book_l2_context_unavailable:{exc}", "ts": now_ts()}
 
     def _apply_order_book_context_to_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         product_id = str(candidate.get("product_id", ""))
@@ -22194,14 +22367,23 @@ class TradingBot:
             return candidate
         ctx = self._order_book_context_for_product(product_id)
         candidate["order_book_available"] = bool(ctx.get("order_book_available", False))
-        for key in ("order_book_imbalance", "order_book_bid_depth_usd", "order_book_ask_depth_usd", "order_book_top_depth_usd", "spread_instability_bps", "liquidity_risk_score"):
+        for key in ("order_book_imbalance", "order_book_bid_depth_usd", "order_book_ask_depth_usd", "order_book_total_depth_usd", "order_book_top_depth_usd", "spread_instability_bps", "avg_spread_bps", "liquidity_risk_score", "top_of_book_age_sec"):
             candidate[key] = _json_safe_float(ctx.get(key, 0.0))
+        candidate["liquidity_bias"] = str(ctx.get("liquidity_bias", ""))
         candidate["order_book_reason"] = str(ctx.get("order_book_reason", ""))
+        candidate["order_flow_mode"] = str(ctx.get("order_flow_mode", "level2_order_flow_lite"))
+        candidate["true_level3_enabled"] = bool(ctx.get("true_level3_enabled", False))
+        candidate["true_level3_provider"] = str(ctx.get("true_level3_provider", ""))
+        candidate["true_level3_note"] = str(ctx.get("true_level3_note", ""))
         imb = float(candidate["order_book_imbalance"])
         risk = float(candidate["liquidity_risk_score"])
-        candidate["order_book_buy_score"] = clamp_float(0.50 + imb * 0.80 - risk * 0.35, 0.0, 1.0)
+        top_depth = float(candidate.get("order_book_top_depth_usd", 0.0) or 0.0)
+        depth_bonus = min(0.18, top_depth / max(float(ORDER_BOOK_MIN_TOP_DEPTH_USD) * 4.0, 1.0))
+        candidate["order_book_buy_score"] = clamp_float(0.50 + imb * 0.80 - risk * 0.35 + depth_bonus, 0.0, 1.0)
         candidate["order_book_sell_score"] = clamp_float(0.50 - imb * 0.80 + risk * 0.25, 0.0, 1.0)
         candidate["order_book_wait_score"] = clamp_float(0.20 + risk * 0.70, 0.0, 1.0)
+        if risk >= float(ORDER_BOOK_LIQUIDITY_RISK_BLOCK_ABOVE):
+            candidate["order_book_live_warning"] = f"order_book_liquidity_risk_high risk={risk:.3f};reason={candidate.get('order_book_reason', '')}"
         return candidate
 
     def _ai_context_from_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -24717,6 +24899,8 @@ class TradingBot:
 
                     c = dict(watch_candidate)
                     c["manager_strategy"] = "LEVEL8_DIRECT"
+                    if bool(ENABLE_ORDER_BOOK_CONTEXT):
+                        c = self._apply_order_book_context_to_candidate(c)
                     c["entry_reason"] = (
                         f"level8_direct_market_candidate;"
                         f"score={float(c.get('score', 0.0)):.2f};"
@@ -25156,10 +25340,41 @@ class TradingBot:
                         requested_pct=raw_l8_pct,
                     )
 
-                    candidate["level8_raw_recommended_position_pct"] = float(raw_l8_pct)
-                    candidate["level8_recommended_position_pct"] = float(l8_pct)
-                    candidate["level8_graduated_sizing_reason"] = graduated_sizing_reason
+                    risk_size_multiplier = clamp_float(
+                        float(candidate.get("risk_size_multiplier", 1.0) or 1.0),
+                        0.0,
+                        float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
+                    )
+                    context_size_multiplier = clamp_float(
+                        float(candidate.get("risk_context_size_multiplier", 1.0) or 1.0),
+                        0.0,
+                        float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
+                    )
+                    combined_risk_multiplier = clamp_float(
+                        risk_size_multiplier * context_size_multiplier,
+                        0.0,
+                        float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
+                    )
+                    adjusted_l8_pct = clamp_float(
+                        float(l8_pct) * float(combined_risk_multiplier),
+                        0.0,
+                        float(LEVEL8_MAX_SINGLE_TRADE_PCT),
+                    )
 
+                    candidate["level8_raw_recommended_position_pct"] = float(raw_l8_pct)
+                    candidate["level8_pre_risk_recommended_position_pct"] = float(l8_pct)
+                    candidate["level8_recommended_position_pct"] = float(adjusted_l8_pct)
+                    candidate["risk_combined_size_multiplier"] = float(combined_risk_multiplier)
+                    candidate["level8_graduated_sizing_reason"] = (
+                        f"{graduated_sizing_reason};"
+                        f"risk_size_multiplier={risk_size_multiplier:.3f};"
+                        f"context_size_multiplier={context_size_multiplier:.3f};"
+                        f"combined_risk_multiplier={combined_risk_multiplier:.3f};"
+                        f"risk_reason={candidate.get('risk_live_gate_reason', '')};"
+                        f"context_reason={candidate.get('risk_context_gate_reason', '')}"
+                    )
+
+                    l8_pct = adjusted_l8_pct
                     entry_notional = float(equity_usd) * l8_pct
 
                     if l8_pct <= 0.0:

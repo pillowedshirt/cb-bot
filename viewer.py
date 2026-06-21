@@ -61,6 +61,10 @@ WALK_FORWARD_VALIDATION_PATH = os.path.join(BASE_DIR, "walk_forward_validation.c
 AGENT_ABLATION_PATH = os.path.join(BASE_DIR, "agent_ablation.csv")
 AI_FEATURE_IMPORTANCE_PATH = os.path.join(BASE_DIR, "ai_feature_importance.csv")
 ORDER_BOOK_SNAPSHOTS_PATH = os.path.join(BASE_DIR, "order_book_snapshots.csv")
+RISK_EV_CONFIDENCE_PATH = os.path.join(BASE_DIR, "risk_ev_confidence.csv")
+RISK_MONTE_CARLO_SUMMARY_PATH = os.path.join(BASE_DIR, "risk_monte_carlo_summary.csv")
+RISK_CONTEXT_PERFORMANCE_PATH = os.path.join(BASE_DIR, "risk_context_performance.csv")
+RISK_LIVE_GATE_PATH = os.path.join(BASE_DIR, "risk_live_gate.csv")
 MICRO_HISTORY_CSV_PATH = os.path.join(BASE_DIR, "micro_history.csv")
 MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
 MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
@@ -3098,6 +3102,32 @@ def render_profitability_diagnostics_panel():
         st.dataframe(latest, width="stretch", hide_index=True)
 
 
+def render_risk_intelligence_panel(
+    risk_live_gate_df,
+    risk_ev_confidence_df,
+    risk_monte_carlo_df,
+    risk_context_df,
+):
+    st.markdown("### Risk Intelligence")
+    if risk_live_gate_df is None or risk_live_gate_df.empty:
+        st.info("Risk intelligence has not produced live-gate rows yet.")
+        return
+    live_cols = [c for c in ["dt_utc", "product_id", "sample_count", "ev_mean_bps", "ev_ci_low_bps", "prob_ev_positive", "p95_max_drawdown_pct_30d", "prob_loss_7d", "prob_drawdown_gt_3pct_30d", "risk_grade", "live_allowed", "size_multiplier", "reason"] if c in risk_live_gate_df.columns]
+    st.markdown("#### Product Live Risk Gate")
+    st.dataframe(risk_live_gate_df.tail(50)[live_cols], width="stretch", hide_index=True)
+    if risk_ev_confidence_df is not None and not risk_ev_confidence_df.empty:
+        ev_cols = [c for c in ["dt_utc", "scope", "product_id", "market_regime", "sample_count", "ev_mean_bps", "ev_ci_low_bps", "ev_ci_high_bps", "prob_ev_positive", "confidence_grade", "recommended_action", "size_multiplier"] if c in risk_ev_confidence_df.columns]
+        st.markdown("#### Bootstrapped EV Confidence")
+        st.dataframe(risk_ev_confidence_df.tail(80)[ev_cols], width="stretch", hide_index=True)
+    if risk_monte_carlo_df is not None and not risk_monte_carlo_df.empty:
+        mc_cols = [c for c in ["dt_utc", "scope", "product_id", "horizon_days", "trials", "median_return_pct", "p05_return_pct", "p95_return_pct", "prob_loss", "p95_max_drawdown_pct", "prob_drawdown_gt_3pct", "prob_drawdown_gt_5pct", "risk_grade"] if c in risk_monte_carlo_df.columns]
+        st.markdown("#### Monte Carlo Path Risk")
+        st.dataframe(risk_monte_carlo_df.tail(100)[mc_cols], width="stretch", hide_index=True)
+    if risk_context_df is not None and not risk_context_df.empty:
+        ctx_cols = [c for c in ["dt_utc", "product_id", "market_regime", "context_key", "sample_count", "raw_win_rate", "ev_mean_bps", "ev_ci_low_bps", "prob_ev_positive", "context_grade", "context_live_allowed", "context_size_multiplier", "reason"] if c in risk_context_df.columns]
+        st.markdown("#### Context/Regime Risk")
+        st.dataframe(risk_context_df.tail(100)[ctx_cols], width="stretch", hide_index=True)
+
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
@@ -3139,6 +3169,10 @@ def render_live_dashboard(selected, refresh_config):
     approved_but_shadowed_df = load_csv_tail(APPROVED_BUT_SHADOWED_PATH, max_lines=5000)
     account_balance_diagnostics_df = load_csv_tail(ACCOUNT_BALANCE_DIAGNOSTICS_PATH, max_lines=1000)
     live_trade_blockers_df = load_csv_tail(LIVE_TRADE_BLOCKERS_PATH, max_lines=5000)
+    risk_ev_confidence_df = load_csv_tail(RISK_EV_CONFIDENCE_PATH, max_lines=5000)
+    risk_monte_carlo_df = load_csv_tail(RISK_MONTE_CARLO_SUMMARY_PATH, max_lines=5000)
+    risk_context_df = load_csv_tail(RISK_CONTEXT_PERFORMANCE_PATH, max_lines=10000)
+    risk_live_gate_df = load_csv_tail(RISK_LIVE_GATE_PATH, max_lines=5000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
@@ -3146,6 +3180,13 @@ def render_live_dashboard(selected, refresh_config):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):
         render_strategy_variant_replay_panel()
+    with st.expander("Risk intelligence", expanded=True):
+        render_risk_intelligence_panel(
+            risk_live_gate_df,
+            risk_ev_confidence_df,
+            risk_monte_carlo_df,
+            risk_context_df,
+        )
     if account_balance_diagnostics_df is not None and not account_balance_diagnostics_df.empty:
         st.markdown("### Binance Quote Balance Diagnostics")
         latest_balance = account_balance_diagnostics_df.tail(3)

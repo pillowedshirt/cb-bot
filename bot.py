@@ -32,6 +32,15 @@ import requests
 import websockets
 from dotenv import load_dotenv
 
+try:
+    import fast_calibration_core
+    FAST_CALIBRATION_CORE_AVAILABLE = True
+    FAST_CALIBRATION_CORE_IMPORT_ERROR = ""
+except Exception as _fast_calibration_core_exc:
+    fast_calibration_core = None
+    FAST_CALIBRATION_CORE_AVAILABLE = False
+    FAST_CALIBRATION_CORE_IMPORT_ERROR = str(_fast_calibration_core_exc)
+
 RESTClient = None
 jwt_generator = None
 
@@ -8580,6 +8589,37 @@ class TradingBot:
         if entry_price <= 0 or not future_candles:
             return 0.0, 0.0, False, False, 0.0, 0.0, 0.0, None, None, 0.0, 0.0, 0.0, 0.0, False
 
+        if FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None:
+            try:
+                highs = np.asarray([float(c.high) for c in future_candles], dtype=np.float64)
+                lows = np.asarray([float(c.low) for c in future_candles], dtype=np.float64)
+
+                result = fast_calibration_core.evaluate_outcome_arrays(
+                    float(entry_price), highs, lows, float(target_bps), float(cost_bps),
+                    float(min_net_gain_bps), float(bar_minutes), float(MAX_ADVERSE_BEFORE_PROFIT_BPS),
+                )
+                bars_raw = int(result.get("time_to_min_profit_bars", -1))
+                bars = bars_raw if bars_raw > 0 else None
+                mins = float(result.get("time_to_min_profit_minutes", 0.0)) if bars is not None else None
+                return (
+                    float(result.get("max_favorable_bps", 0.0)),
+                    float(result.get("max_adverse_bps", 0.0)),
+                    bool(result.get("reached_min_profit", False)),
+                    bool(result.get("reached_target", False)),
+                    float(result.get("win_bps", 0.0)),
+                    float(result.get("loss_bps", 0.0)),
+                    0.0,
+                    bars,
+                    mins,
+                    float(result.get("forward_window_minutes", 0.0)),
+                    float(result.get("post_profit_max_favorable_bps", 0.0)),
+                    float(result.get("post_profit_extra_gain_bps", 0.0)),
+                    float(result.get("adverse_before_profit_bps", 0.0)),
+                    bool(result.get("survived_to_profit", False)),
+                )
+            except Exception:
+                pass
+
         required_profit_bps = float(cost_bps) + float(min_net_gain_bps)
         max_high = 0.0
         min_low = float("inf")
@@ -9422,6 +9462,139 @@ class TradingBot:
             max_candidates=CALIB_MAX_EXACT_PROB_CANDIDATES,
         )
 
+        if FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None and score_candidates and prob_candidates:
+            try:
+                fast_best = fast_calibration_core.find_best_threshold_profile(
+                    np.asarray([float(o.score) for o in all_obs], dtype=np.float64),
+                    np.asarray([float(o.probability) for o in all_obs], dtype=np.float64),
+                    np.asarray([float(o.expected_value_bps) for o in all_obs], dtype=np.float64),
+                    np.asarray([float(o.cost_bps) for o in all_obs], dtype=np.float64),
+                    np.asarray([float(o.spread_bps) for o in all_obs], dtype=np.float64),
+                    np.asarray([1 if bool(o.reached_min_profit) else 0 for o in all_obs], dtype=np.int32),
+                    np.asarray([1 if bool(o.survived_to_profit) else 0 for o in all_obs], dtype=np.int32),
+                    np.asarray([float(o.max_favorable_bps) for o in all_obs], dtype=np.float64),
+                    np.asarray([
+                        float(o.time_to_min_profit_minutes)
+                        if o.time_to_min_profit_minutes is not None
+                        else 0.0
+                        for o in all_obs
+                    ], dtype=np.float64),
+                    np.asarray([
+                        float(o.forward_window_minutes)
+                        if o.forward_window_minutes is not None
+                        else 0.0
+                        for o in all_obs
+                    ], dtype=np.float64),
+                    np.asarray([float(o.selected_forward_window_minutes) for o in all_obs], dtype=np.float64),
+                    np.asarray([float(o.post_profit_extra_gain_bps) for o in all_obs], dtype=np.float64),
+                    np.asarray([float(o.adverse_before_profit_bps) for o in all_obs], dtype=np.float64),
+                    np.asarray(score_candidates, dtype=np.float64),
+                    np.asarray(prob_candidates, dtype=np.float64),
+                    int(CALIB_EXACT_MIN_SAMPLES),
+                    float(SIMILAR_SCORE_BAND),
+                    float(SIMILAR_PROB_BAND),
+                    float(SIMILAR_COST_BAND_BPS),
+                    float(SIMILAR_SPREAD_BAND_BPS),
+                    float(CALIB_MIN_WIN_RATE),
+                    float(CALIB_MIN_EXPECTED_VALUE_BPS),
+                    float(PREFERRED_TIME_TO_MIN_PROFIT_MINUTES),
+                )
+
+                if bool(fast_best.get("found", False)):
+                    selected_indices = [
+                        int(idx)
+                        for idx in list(fast_best.get("selected_indices", []))
+                        if 0 <= int(idx) < len(all_obs)
+                    ]
+                    selected_for_stats = [all_obs[idx] for idx in selected_indices]
+
+                    for observation in selected_for_stats:
+                        observation.accepted_by_calibration = True
+
+                    selected_probabilities = [
+                        float(observation.probability)
+                        for observation in selected_for_stats
+                        if observation.probability is not None
+                        and np.isfinite(float(observation.probability))
+                    ]
+                    selected_raw_prob_median = (
+                        float(np.median(selected_probabilities))
+                        if selected_probabilities
+                        else 0.0
+                    )
+                    selected_empirical_win_rate = (
+                        sum(
+                            1
+                            for observation in selected_for_stats
+                            if observation.reached_min_profit
+                            and observation.survived_to_profit
+                        )
+                        / max(1, len(selected_for_stats))
+                    )
+                    calibrated_prob_threshold = max(
+                        float(fast_best["prob_threshold"]),
+                        float(MIN_LEARNED_PROB_TARGET),
+                    )
+
+                    return ProductCalibrationProfile(
+                        product_id=product_id,
+                        is_calibrated=True,
+                        calibration_status="exact_threshold_cpp_fast",
+                        min_score=max(float(fast_best["score_threshold"]), float(MIN_LEARNED_TARGET_EPSILON)),
+                        min_probability=float(calibrated_prob_threshold),
+                        min_expected_value_bps=max(float(CALIB_MIN_EXPECTED_VALUE_BPS), float(fast_best["ev"]) * float(EXACT_THRESHOLD_EV_TARGET_FRACTION)),
+                        day_sample_count=len(day_obs),
+                        week_sample_count=len(week_obs),
+                        day_win_rate=self._win_rate(day_obs),
+                        week_win_rate=self._win_rate(week_obs),
+                        blended_win_rate=float(fast_best["win_rate"]),
+                        avg_win_bps=float(fast_best["avg_win"]),
+                        avg_loss_bps=float(fast_best["avg_loss"]),
+                        expected_value_bps=float(fast_best["ev"]),
+                        calibrated_projected_gross_bps=float(fast_best["projected_gross_bps"]),
+                        calibrated_projected_net_bps=float(fast_best["ev"]),
+                        calibrated_time_to_min_profit_minutes=float(fast_best["median_time_to_min_profit"]),
+                        calibrated_forward_window_minutes=float(fast_best["median_forward_window"]),
+                        calibrated_selected_window_minutes=float(fast_best["median_selected_window"]),
+                        calibrated_post_profit_breathing_minutes=float(CALIB_POST_PROFIT_BREATHING_MINUTES),
+                        calibrated_post_profit_extra_gain_bps=float(fast_best["median_post_profit_extra_gain"]),
+                        calibrated_max_adverse_before_profit_bps=float(fast_best["median_adverse_before_profit"]),
+                        calibrated_expected_bps_per_minute=(float(fast_best["ev"]) / max(1.0, float(fast_best["median_time_to_min_profit"] or 1.0))),
+                        calibrated_raw_probability_median=float(selected_raw_prob_median),
+                        calibrated_empirical_win_rate=float(selected_empirical_win_rate),
+                        calibrated_probability_model_note=(
+                            "source=exact_threshold_cpp_fast; "
+                            f"raw_prob_median={selected_raw_prob_median:.6f}; "
+                            "selected_empirical_win_rate="
+                            f"{selected_empirical_win_rate:.6f}"
+                        ),
+                        reason=(
+                            f"exact_threshold_cpp_fast product={product_id} "
+                            f"score>={float(fast_best['score_threshold']):.6f} "
+                            f"prob>={float(fast_best['prob_threshold']):.6f} "
+                            f"samples={int(fast_best['n'])} "
+                            f"win_rate={float(fast_best['win_rate']):.6f} "
+                            f"ev={float(fast_best['ev']):.6f} "
+                            f"avg_win={float(fast_best['avg_win']):.6f} "
+                            f"avg_loss={float(fast_best['avg_loss']):.6f} "
+                            f"window={float(fast_best['median_selected_window']):.1f}m "
+                            f"post_profit_extra={float(fast_best['median_post_profit_extra_gain']):.2f} "
+                            f"adverse_before_profit={float(fast_best['median_adverse_before_profit']):.2f} "
+                            f"quality={float(fast_best['quality_score']):.6f}"
+                        ),
+                    )
+            except Exception as exc:
+                try:
+                    module_debug(
+                        MODULE_NAME,
+                        "fast_calibration_core_threshold_fallback",
+                        data={"product_id": product_id, "error": str(exc)},
+                        level="WARN",
+                        also_overall=False,
+                    )
+                except Exception:
+                    pass
+
         best: Optional[Dict[str, Any]] = None
 
         for score_threshold in score_candidates:
@@ -9645,6 +9818,21 @@ class TradingBot:
         """Simulate a target-arm and pullback exit over historical candles."""
         if entry_price <= 0 or not future_candles:
             return None
+
+        if FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None:
+            try:
+                highs = np.asarray([float(c.high) for c in future_candles], dtype=np.float64)
+                lows = np.asarray([float(c.low) for c in future_candles], dtype=np.float64)
+                closes = np.asarray([float(c.close) for c in future_candles], dtype=np.float64)
+                result = fast_calibration_core.simulate_armed_exit_net_bps(
+                    float(entry_price), highs, lows, closes, float(target_bps), float(cost_bps), float(pullback_pct),
+                )
+                if result is None:
+                    return None
+                return float(result)
+            except Exception:
+                pass
+
         target_price = entry_price * bps_to_mult(float(target_bps))
         armed = False
         peak = 0.0
@@ -20029,7 +20217,7 @@ class TradingBot:
                     phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            status = {"ts": now_ts(), "fast_calibration_core_available": bool(FAST_CALIBRATION_CORE_AVAILABLE), "fast_calibration_core_import_error": str(FAST_CALIBRATION_CORE_IMPORT_ERROR), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(data=status)
                 try:

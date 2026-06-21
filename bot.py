@@ -10,6 +10,7 @@ import json
 import time
 import sys
 import traceback
+import shutil
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import csv
@@ -918,6 +919,115 @@ def _csv_has_meaningful_data_rows(path: str, *, min_rows: int = 1) -> bool:
         return False
 
 
+PREVIOUS_RUNTIME_IMPORT_DIR: str = os.getenv("PREVIOUS_RUNTIME_IMPORT_DIR", "").strip()
+
+RUNTIME_STATE_IMPORT_FILENAMES: List[str] = sorted(set(
+    [os.path.basename(path) for path in STARTUP_STATE_CSV_PATHS]
+    + [
+        "calculation_complete_latch.json",
+        "calculation_status.json",
+        "historical_replay_manifest.json",
+        "viewer_snapshot.json",
+        "level8_events.sqlite3",
+        "ai_brain.joblib",
+    ]
+))
+
+
+def _runtime_file_has_meaningful_state(path: str) -> bool:
+    try:
+        if not path or not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return False
+
+        if str(path).lower().endswith(".csv"):
+            return _csv_has_meaningful_data_rows(path)
+
+        return os.path.getsize(path) > 2
+
+    except Exception:
+        return False
+
+
+def import_previous_runtime_state_if_available() -> Dict[str, Any]:
+    """
+    Import previous runtime files before logger/header constructors run.
+
+    This lets a fresh code folder resume from a previous run when the previous
+    run files are placed in PREVIOUS_RUNTIME_IMPORT_DIR, previous_runtime_state,
+    or previous_run. The import is non-destructive and skips data-bearing files.
+    """
+    copied: List[str] = []
+    skipped: List[str] = []
+    source_dirs: List[str] = []
+
+    if PREVIOUS_RUNTIME_IMPORT_DIR:
+        source_dirs.append(PREVIOUS_RUNTIME_IMPORT_DIR)
+
+    source_dirs.extend([
+        os.path.join(BASE_DIR, "previous_runtime_state"),
+        os.path.join(BASE_DIR, "previous_run"),
+    ])
+
+    for source_dir in source_dirs:
+        try:
+            if not source_dir or not os.path.isdir(source_dir):
+                continue
+
+            for filename in RUNTIME_STATE_IMPORT_FILENAMES:
+                src = os.path.join(source_dir, filename)
+                dst = os.path.join(BASE_DIR, filename)
+
+                if not os.path.exists(src) or os.path.getsize(src) <= 0:
+                    continue
+
+                if _runtime_file_has_meaningful_state(dst):
+                    skipped.append(filename)
+                    continue
+
+                shutil.copy2(src, dst)
+                copied.append(filename)
+
+            cache_src = os.path.join(source_dir, "_four_pass_cache")
+            cache_dst = os.path.join(BASE_DIR, "_four_pass_cache")
+            if os.path.isdir(cache_src) and not os.path.isdir(cache_dst):
+                shutil.copytree(cache_src, cache_dst)
+                copied.append("_four_pass_cache/")
+
+            worker_src = os.path.join(source_dir, "historical_replay_worker_outputs")
+            worker_dst = os.path.join(BASE_DIR, "historical_replay_worker_outputs")
+            if os.path.isdir(worker_src) and not os.path.isdir(worker_dst):
+                shutil.copytree(worker_src, worker_dst)
+                copied.append("historical_replay_worker_outputs/")
+
+            if copied:
+                break
+
+        except Exception as exc:
+            try:
+                module_debug(
+                    MODULE_NAME,
+                    "previous_runtime_state_import_failed",
+                    data={"source_dir": source_dir, "error": str(exc), "traceback": traceback.format_exc()},
+                    level="WARN",
+                    also_overall=True,
+                )
+            except Exception:
+                pass
+
+    try:
+        module_debug(
+            MODULE_NAME,
+            "previous_runtime_state_import_checked",
+            data={"copied": copied, "skipped_existing": skipped, "source_dirs": source_dirs},
+            level="INFO",
+            also_overall=True,
+        )
+    except Exception:
+        pass
+
+    return {"copied": copied, "skipped_existing": skipped, "source_dirs": source_dirs}
+
+
 def has_existing_runtime_csv_state() -> bool:
     """
     Detect whether this launch has meaningful old bot runtime state.
@@ -926,6 +1036,7 @@ def has_existing_runtime_csv_state() -> bool:
     This should be called before logger constructors append/create current-run rows.
     """
     return any(_csv_has_meaningful_data_rows(path) for path in STARTUP_STATE_CSV_PATHS)
+
 
 # Sell outcome classification.
 LEVEL8_SELL_REVIEW_MINUTES: List[int] = [5, 15, 30]
@@ -1288,7 +1399,7 @@ LEVEL8_MIN_ROUND_TRIP_BUFFER_BPS: float = 25.0
 LEVEL8_MIN_EXPECTED_NET_EDGE_BPS_FOR_LIVE: float = 80.0
 
 # Raw signal floors prevent Level 8 exploration from live-buying extremely weak setups.
-LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY: float = 0.40
+LEVEL8_MIN_RAW_PROB_FOR_LIVE_BUY: float = 0.52
 LEVEL8_MIN_RAW_SCORE_FOR_LIVE_BUY: float = 28.0
 
 # Replay showed that high score/probability can still just be volatility.
@@ -1435,8 +1546,8 @@ SHADOW_SELL_REPLAY_SYNTHETIC_NOTIONAL_USD: float = 5.0
 
 ENABLE_HISTORICAL_SHADOW_REPLAY: bool = True
 ENABLE_PROFIT_REPLAY_BASED_CALIBRATION: bool = True
-HIST_REPLAY_PRIMARY_LOOKBACK_DAYS: int = 30
-HIST_REPLAY_REGIME_LOOKBACK_DAYS: int = 120
+HIST_REPLAY_PRIMARY_LOOKBACK_DAYS: int = 90
+HIST_REPLAY_REGIME_LOOKBACK_DAYS: int = 365
 HIST_REPLAY_DAILY_CONTEXT_DAYS: int = 365
 HIST_REPLAY_PRIMARY_GRANULARITY: str = "FIFTEEN_MINUTE"
 HIST_REPLAY_REGIME_GRANULARITY: str = "ONE_HOUR"
@@ -1504,11 +1615,11 @@ HIST_REPLAY_MIN_PREFIX_15M: int = 96
 HIST_REPLAY_MIN_PREFIX_1H: int = 120
 HIST_REPLAY_FORWARD_BARS_15M: List[int] = [4, 8, 12, 16, 24, 32]
 HIST_REPLAY_FORWARD_BARS_1H: List[int] = [2, 4, 8, 12, 24]
-HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION: int = 250
-HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION: int = 25
-HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION: int = 30
+HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION: int = 350
+HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION: int = 40
+HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION: int = 60
 HIST_REPLAY_REQUIRE_POSITIVE_AVG_FOR_CALIBRATION: bool = True
-HIST_REPLAY_REQUIRE_POSITIVE_MEDIAN_FOR_CALIBRATION: bool = False
+HIST_REPLAY_REQUIRE_POSITIVE_MEDIAN_FOR_CALIBRATION: bool = True
 HIST_REPLAY_MIN_AVG_NET_PNL_BPS_FOR_CALIBRATION: float = 15.0
 HIST_REPLAY_MIN_MEDIAN_NET_PNL_BPS_FOR_STRONG_CALIBRATION: float = 0.0
 ENABLE_QUALIFIED_HISTORICAL_REPLAY_FILTER: bool = True
@@ -1860,7 +1971,7 @@ USE_EV_PRIMARY_BUY_GATE: bool = False
 
 # Legacy EV-primary floors are retained for diagnostic logging only.
 EV_PRIMARY_MIN_SCORE_FLOOR: float = 25.0
-EV_PRIMARY_MIN_PROB_FLOOR: float = 0.35
+EV_PRIMARY_MIN_PROB_FLOOR: float = 0.52
 EV_PRIMARY_MIN_PROJECTED_NET_BPS: float = 35.0
 
 # Require projected forward gain to cover modeled cost plus minimum gain.
@@ -2080,7 +2191,8 @@ STALE_POSITION_MIN_PROB_TO_KEEP: float = 0.45
 STALE_POSITION_MIN_EV_TO_KEEP_BPS: float = 0.0
 
 # Minimum product history required before calibration.
-CALIB_MIN_PRODUCT_SAMPLES: int = 25
+# Keep this high enough that tiny 12-row / 14-row perfect pockets do not approve live money.
+CALIB_MIN_PRODUCT_SAMPLES: int = 75
 
 # Exact calibration search.
 # Do not round score/probability targets into buckets.
@@ -2088,15 +2200,15 @@ CALIB_MIN_PRODUCT_SAMPLES: int = 25
 CALIB_USE_EXACT_THRESHOLDS: bool = True
 
 # To avoid overfitting, each candidate threshold must have enough historical samples.
-CALIB_EXACT_MIN_SAMPLES: int = 12
+CALIB_EXACT_MIN_SAMPLES: int = 40
 
 # Candidate pool limits keep startup fast without rounding the final chosen value.
 CALIB_MAX_EXACT_SCORE_CANDIDATES: int = 80
 CALIB_MAX_EXACT_PROB_CANDIDATES: int = 80
 
 # Minimum acceptable historical performance for a buy threshold.
-CALIB_MIN_WIN_RATE: float = 0.54
-CALIB_MIN_EXPECTED_VALUE_BPS: float = 2.0
+CALIB_MIN_WIN_RATE: float = 0.56
+CALIB_MIN_EXPECTED_VALUE_BPS: float = 8.0
 
 # Calibration bank behavior.
 # Startup builds the base bank. Hourly updates append new observations.
@@ -2139,7 +2251,11 @@ BEST_AVAILABLE_EV_TARGET_FRACTION: float = 0.65
 EXACT_THRESHOLD_EV_TARGET_FRACTION: float = 0.65
 
 # Avoid probability targets sitting at the old artificial 20% floor.
-MIN_LEARNED_PROB_TARGET: float = 0.05
+MIN_LEARNED_PROB_TARGET: float = 0.52
+
+# Final live-money probability floor.
+# Calibration may choose higher product-specific thresholds, but never lower.
+LIVE_BUY_MIN_PROBABILITY_FLOOR: float = 0.52
 
 # Event loop lag diagnostics.
 EVENT_LOOP_LAG_WARN_SEC: float = 3.0
@@ -6351,8 +6467,9 @@ class TradingBot:
         self._bot_boot_ts = now_ts()
         self._calculation_started_ts = self._bot_boot_ts
 
-        # Capture pre-existing runtime state before logger constructors create
-        # header-only CSV files or current-run rows.
+        # Import and capture pre-existing runtime state before logger constructors
+        # create header-only CSV files or current-run rows.
+        self.previous_runtime_import_result = import_previous_runtime_state_if_available()
         self.startup_had_existing_runtime_state: bool = has_existing_runtime_csv_state()
 
         self.live_exchange = EXCHANGE_BINANCE_US
@@ -6470,7 +6587,8 @@ class TradingBot:
 
         log(
             f"[startup-state] existing_runtime_csv_state="
-            f"{self.startup_had_existing_runtime_state}"
+            f"{self.startup_had_existing_runtime_state} "
+            f"previous_runtime_import={getattr(self, 'previous_runtime_import_result', {})}"
         )
         self._last_viewer_snapshot_write_ts: float = 0.0
         self._last_calculation_status_write_ts = 0.0
@@ -7327,25 +7445,101 @@ class TradingBot:
     async def _refresh_binance_fee_state_if_needed(self, *, force: bool = False) -> None:
         now_value = now_ts()
         last_ts = float(getattr(self, "last_fee_tier_refresh_ts", 0.0) or 0.0)
+
         if not force and now_value - last_ts < float(FEE_TIER_REFRESH_EVERY_SEC):
             return
-        maker_values = []; taker_values = []; per_product = {}
+
+        maker_values = []
+        taker_values = []
+        per_product = {}
+        api_count = 0
+        fallback_count = 0
+        failed_count = 0
+
+        adapter = self._active_adapter()
+
         for product_id in PRODUCTS:
             try:
-                maker, taker = await asyncio.to_thread(self._get_live_fee_bps, product_id)
-                maker_values.append(float(maker)); taker_values.append(float(taker))
-                per_product[product_id] = {"maker_bps": float(maker), "taker_bps": float(taker)}
+                symbol = adapter.product_to_symbol(product_id)
+                fees = await asyncio.to_thread(adapter.fee_bps_for_symbol, symbol)
+
+                maker = float(fees.get("maker_bps", 0.0) or 0.0)
+                taker = float(fees.get("taker_bps", 0.0) or 0.0)
+                source = str(fees.get("source", "") or "")
+                error = str(fees.get("error", "") or "")
+
+                maker_values.append(maker)
+                taker_values.append(taker)
+
+                if "fallback" in source.lower():
+                    fallback_count += 1
+                else:
+                    api_count += 1
+
+                per_product[product_id] = {
+                    "symbol": symbol,
+                    "maker_bps": maker,
+                    "taker_bps": taker,
+                    "source": source,
+                    "error": error,
+                }
+
             except Exception as exc:
-                module_debug(MODULE_NAME, "binance_fee_refresh_product_failed", data={"product_id": product_id, "error": str(exc)}, level="WARN", also_overall=False)
+                failed_count += 1
+                module_debug(
+                    MODULE_NAME,
+                    "binance_fee_refresh_product_failed",
+                    data={"product_id": product_id, "error": str(exc)},
+                    level="WARN",
+                    also_overall=False,
+                )
+
         if not maker_values or not taker_values:
-            maker = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0")); taker = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0")); reason = "binance_fee_api_failed_using_fallback"
+            maker = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
+            taker = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
+            reason = (
+                "binance_fee_api_failed_using_global_fallback "
+                f"api_products={api_count};fallback_products={fallback_count};failed_products={failed_count}"
+            )
         else:
-            maker = max(maker_values); taker = max(taker_values); reason = "binance_fee_api_loaded"
-        self.current_maker_fee_bps = float(maker); self.current_taker_fee_bps = float(taker)
-        self.current_fee_tier_source = "binance_us"; self.current_fee_tier_reason = reason; self.current_fee_tier_loaded = True
+            maker = max(maker_values)
+            taker = max(taker_values)
+
+            if fallback_count > 0:
+                reason = (
+                    "binance_fee_partially_loaded_with_fallbacks "
+                    f"api_products={api_count};fallback_products={fallback_count};failed_products={failed_count}"
+                )
+            else:
+                reason = (
+                    "binance_fee_api_loaded "
+                    f"api_products={api_count};fallback_products={fallback_count};failed_products={failed_count}"
+                )
+
+        self.current_maker_fee_bps = float(maker)
+        self.current_taker_fee_bps = float(taker)
+        self.current_fee_tier_source = "binance_us"
+        self.current_fee_tier_reason = reason
+        self.current_fee_tier_loaded = bool(maker_values and taker_values)
         self.last_fee_tier_reason = reason
-        self.last_fee_tier_refresh_ts = now_value; self.binance_fee_bps_by_product = per_product
-        module_debug(MODULE_NAME, "binance_fee_state_refreshed", data={"maker_bps": self.current_maker_fee_bps, "taker_bps": self.current_taker_fee_bps, "per_product": per_product, "reason": reason}, level="INFO", also_overall=True)
+        self.last_fee_tier_refresh_ts = now_value
+        self.binance_fee_bps_by_product = per_product
+
+        module_debug(
+            MODULE_NAME,
+            "binance_fee_state_refreshed",
+            data={
+                "maker_bps": self.current_maker_fee_bps,
+                "taker_bps": self.current_taker_fee_bps,
+                "api_products": api_count,
+                "fallback_products": fallback_count,
+                "failed_products": failed_count,
+                "per_product": per_product,
+                "reason": reason,
+            },
+            level="INFO",
+            also_overall=True,
+        )
 
     def _entry_fee_bps_for_mode(self, execution_mode: Optional[str] = None) -> float:
         mode = str(execution_mode or ENTRY_EXECUTION_MODE).upper()
@@ -8693,26 +8887,42 @@ class TradingBot:
             and bool(observation.survived_to_profit)
         ]
 
-        if winners:
-            source = winners
-            source_label = "survived_winners"
-        else:
-            sorted_by_motion = sorted(
-                observations,
-                key=lambda observation: float(
-                    observation.max_favorable_bps or 0.0
+        if not winners:
+            blended_wr, blended_avg_win, blended_avg_loss, blended_ev, _ = self._observation_ev_stats(observations)
+            return self._uncalibrated_profile(
+                product_id=product_id,
+                status=(
+                    "watch_only_no_winning_profile;"
+                    f"{status};"
+                    f"total_observations={len(observations)};"
+                    f"blended_ev={blended_ev:.6f}"
                 ),
-                reverse=True,
+                day_obs=day_obs,
+                week_obs=week_obs,
+                blended_ev=blended_ev,
+                avg_win_bps=blended_avg_win,
+                avg_loss_bps=blended_avg_loss,
             )
-            take_n = max(
-                1,
-                int(
-                    len(sorted_by_motion)
-                    * float(BEST_AVAILABLE_TOP_MOTION_FRACTION)
+
+        if len(winners) < int(CALIB_EXACT_MIN_SAMPLES):
+            blended_wr, blended_avg_win, blended_avg_loss, blended_ev, _ = self._observation_ev_stats(observations)
+            return self._uncalibrated_profile(
+                product_id=product_id,
+                status=(
+                    "watch_only_too_few_winning_observations;"
+                    f"winner_count={len(winners)};"
+                    f"required={int(CALIB_EXACT_MIN_SAMPLES)};"
+                    f"{status}"
                 ),
+                day_obs=day_obs,
+                week_obs=week_obs,
+                blended_ev=blended_ev,
+                avg_win_bps=blended_avg_win,
+                avg_loss_bps=blended_avg_loss,
             )
-            source = sorted_by_motion[:take_n]
-            source_label = "top_motion_no_winners"
+
+        source = winners
+        source_label = "survived_winners"
 
         source_probabilities = [
             float(observation.probability)
@@ -8764,6 +8974,7 @@ class TradingBot:
                 BEST_AVAILABLE_PROB_QUANTILE,
             ),
             float(MIN_LEARNED_PROB_TARGET),
+            float(LIVE_BUY_MIN_PROBABILITY_FLOOR),
         )
         learned_ev = q(
             [
@@ -8781,9 +8992,25 @@ class TradingBot:
             float(learned_ev) * float(BEST_AVAILABLE_EV_TARGET_FRACTION),
         )
 
-        win_rate, avg_win, avg_loss, ev, _ = self._observation_ev_stats(
-            observations
-        )
+        win_rate, avg_win, avg_loss, ev, _ = self._observation_ev_stats(source)
+
+        if win_rate < float(CALIB_MIN_WIN_RATE) or ev < float(CALIB_MIN_EXPECTED_VALUE_BPS):
+            return self._uncalibrated_profile(
+                product_id=product_id,
+                status=(
+                    "watch_only_best_available_winners_not_profitable_enough;"
+                    f"winner_count={len(winners)};"
+                    f"win_rate={win_rate:.6f};"
+                    f"ev={ev:.6f};"
+                    f"min_wr={float(CALIB_MIN_WIN_RATE):.6f};"
+                    f"min_ev={float(CALIB_MIN_EXPECTED_VALUE_BPS):.6f}"
+                ),
+                day_obs=day_obs,
+                week_obs=week_obs,
+                blended_ev=ev,
+                avg_win_bps=avg_win,
+                avg_loss_bps=avg_loss,
+            )
         (
             projected_gross_bps,
             median_time_to_min_profit,
@@ -8835,7 +9062,7 @@ class TradingBot:
                 source_empirical_win_rate
             ),
             calibrated_probability_model_note=(
-                f"source={source_label}; "
+                "source=best_available_survived_winners; "
                 f"raw_prob_median={source_raw_prob_median:.6f}; "
                 f"source_empirical_win_rate={source_empirical_win_rate:.6f}"
             ),
@@ -9977,6 +10204,12 @@ class TradingBot:
             calib_min_probability = math.nan
             calib_min_ev = math.nan
 
+        effective_live_min_probability = (
+            max(float(calib_min_probability), float(LIVE_BUY_MIN_PROBABILITY_FLOOR))
+            if buy_gate_calibration_ready and np.isfinite(calib_min_probability)
+            else math.nan
+        )
+
         # Individual buy-gate checks.
         buy_gate_fee_ok = bool(fee_available and round_trip_cost_bps is not None)
         buy_gate_score_target_ok = bool(
@@ -9986,14 +10219,14 @@ class TradingBot:
         )
         buy_gate_prob_target_ok = bool(
             buy_gate_calibration_ready
-            and np.isfinite(calib_min_probability)
-            and estimated_prob_up >= calib_min_probability
+            and np.isfinite(effective_live_min_probability)
+            and estimated_prob_up >= effective_live_min_probability
         )
 
         # Floors are diagnostic only. They do not authorize buys.
         buy_gate_score_floor_ok = bool(score >= float(EV_PRIMARY_MIN_SCORE_FLOOR))
         buy_gate_prob_floor_ok = bool(
-            estimated_prob_up >= float(EV_PRIMARY_MIN_PROB_FLOOR)
+            estimated_prob_up >= float(LIVE_BUY_MIN_PROBABILITY_FLOOR)
         )
 
         required_min_ev = (
@@ -10110,7 +10343,12 @@ class TradingBot:
                 blockers.append("score_below_calibrated_target")
 
             if not buy_gate_prob_target_ok:
-                blockers.append("probability_below_calibrated_target")
+                blockers.append(
+                    f"probability_below_live_target prob={estimated_prob_up:.6f};"
+                    f"min={effective_live_min_probability:.6f};"
+                    f"calibrated_min={calib_min_probability:.6f};"
+                    f"live_floor={float(LIVE_BUY_MIN_PROBABILITY_FLOOR):.6f}"
+                )
 
             if not buy_gate_ev_ok:
                 blockers.append("ev_below_calibrated_target")
@@ -10175,7 +10413,7 @@ class TradingBot:
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
                 f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
-                f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
+                f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} effective_min_prob={effective_live_min_probability:.6f} "
                 f"raw_prob_median={profile.calibrated_raw_probability_median:.6f} "
                 f"empirical_wr={profile.calibrated_empirical_win_rate:.6f} "
                 f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_floor_ok={buy_gate_prob_floor_ok} "
@@ -10201,7 +10439,7 @@ class TradingBot:
                 f"score={score:.3f} min_score={calib_min_score:.3f} "
                 f"score_floor={EV_PRIMARY_MIN_SCORE_FLOOR:.3f} score_floor_ok={buy_gate_score_floor_ok} "
                 f"score_ok={buy_gate_score_ok} score_target_ok={buy_gate_score_target_ok} "
-                f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} "
+                f"prob={estimated_prob_up:.6f} min_prob={calib_min_probability:.6f} effective_min_prob={effective_live_min_probability:.6f} "
                 f"raw_prob_median={profile.calibrated_raw_probability_median:.6f} "
                 f"empirical_wr={profile.calibrated_empirical_win_rate:.6f} "
                 f"prob_floor={EV_PRIMARY_MIN_PROB_FLOOR:.6f} prob_floor_ok={buy_gate_prob_floor_ok} "
@@ -12721,12 +12959,12 @@ class TradingBot:
 
     def _four_pass_product_live_buy_allowed(self, product_id: str) -> Tuple[bool, str]:
         """
-        Product gate now means:
-        - Is this product structurally approved by the latest four-pass replay?
-        - It does NOT mean "is this product off a timer cooldown?"
+        Final product-level replay gate.
 
-        A product that is not structurally approved can still become eligible
-        later through the current live market setup override.
+        A product must be structurally approved by the latest four-pass replay
+        before it can use live money. Current market conditions can decide whether
+        an approved product should trade now, but they cannot override a product
+        that failed the product-level replay gate.
         """
         gate = self._latest_product_live_gate(product_id)
         if not gate:
@@ -13557,74 +13795,24 @@ class TradingBot:
                 if tob_age > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
                     return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age:.2f}")
             product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+            candidate["product_live_gate_ok"] = bool(product_gate_ok)
+            candidate["product_live_gate_reason"] = str(product_gate_reason)
+
             if not product_gate_ok:
-                live_setup_ok, live_setup_reason = self._blocked_product_live_setup_is_favorable(
-                    candidate=candidate,
-                    level8_info=level8_info,
+                return False, (
+                    "live_buy_blocked:product_not_approved_by_four_pass_gate "
+                    f"product_id={product_id};reason={product_gate_reason}"
                 )
-
-                candidate["market_eligibility_reason"] = live_setup_reason
-
-                if live_setup_ok:
-                    candidate["market_eligibility_override"] = True
-                    candidate["near_miss_exploratory_size"] = True
-                else:
-                    return False, f"live_buy_blocked:product_not_currently_favorable {product_gate_reason};{live_setup_reason}"
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
                     candidate=candidate,
                 )
                 if not bool(replay_gate.get("approved", False)):
-                    four_pass_ok = False
-                    try:
-                        four_pass_path = os.path.join(BASE_DIR, "four_pass_council_buy_timing.csv")
-                        if os.path.exists(four_pass_path) and os.path.getsize(four_pass_path) > 0:
-                            fp = pd.read_csv(four_pass_path)
-                            if not fp.empty and "product_id" in fp.columns:
-                                product_rows = fp[fp["product_id"].astype(str).eq(str(product_id))].copy()
-                                if not product_rows.empty:
-                                    for col in ["win_rate", "avg_net_bps", "median_net_bps", "selected_count"]:
-                                        if col in product_rows.columns:
-                                            product_rows[col] = pd.to_numeric(product_rows[col], errors="coerce")
-                                    latest = product_rows.tail(1).iloc[0]
-                                    profitability_mode = str(latest.get("profitability_mode", "") or "").lower()
-                                    realized_mode = "realized" in profitability_mode or "exit" in profitability_mode
-                                    proxy_mode = "proxy" in profitability_mode
-
-                                    four_pass_ok = (
-                                        float(latest.get("selected_count", 0) or 0) >= 10
-                                        and float(latest.get("win_rate", 0.0) or 0.0) >= 0.56
-                                        and float(latest.get("avg_net_bps", 0.0) or 0.0) > 0.0
-                                        and float(latest.get("median_net_bps", 0.0) or 0.0) > 0.0
-                                    )
-
-                                    # Opportunity-proxy approval can help identify buy timing,
-                                    # but live trading should be more careful than realized replay approval.
-                                    if four_pass_ok and proxy_mode and not realized_mode:
-                                        four_pass_ok = (
-                                            float(latest.get("selected_count", 0) or 0) >= 25
-                                            and float(latest.get("win_rate", 0.0) or 0.0) >= 0.60
-                                            and float(latest.get("avg_net_bps", 0.0) or 0.0) >= 20.0
-                                            and float(latest.get("median_net_bps", 0.0) or 0.0) >= 8.0
-                                        )
-                                    if four_pass_ok:
-                                        product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
-                                        if not product_gate_ok:
-                                            live_setup_ok, live_setup_reason = self._blocked_product_live_setup_is_favorable(
-                                                candidate=candidate,
-                                                level8_info=level8_info,
-                                            )
-                                            candidate["market_eligibility_reason"] = live_setup_reason
-                                            candidate["market_eligibility_override"] = bool(live_setup_ok)
-                                            four_pass_ok = bool(live_setup_ok)
-                    except Exception:
-                        four_pass_ok = False
-                    if not four_pass_ok:
-                        return False, (
-                            f"live_buy_blocked:product_not_currently_favorable "
-                            f"{candidate.get('market_eligibility_reason', replay_gate.get('reason', ''))}"
-                        )
+                    return False, (
+                        "live_buy_blocked:profitability_replay_gate_rejected "
+                        f"product_id={product_id};reason={replay_gate.get('reason', '')}"
+                    )
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
                 calc_status = self._calculation_status()
                 if not bool(calc_status.get("full_viewer_unlocked")):
@@ -17614,16 +17802,53 @@ class TradingBot:
             module_exception(MODULE_NAME, "binance_bulk_historical_backfill_failed", exc, data={**meta, "traceback": traceback.format_exc()}, also_overall=True)
             return [], meta
 
-    def _candles_recent_enough_for_timeframe(self, candles: List[Candle], timeframe: str) -> bool:
+    def _granularity_seconds_for_replay(self, granularity: str) -> int:
+        value = str(granularity or "").upper()
+        mapping = {
+            "ONE_MINUTE": 60,
+            "FIVE_MINUTE": 300,
+            "FIFTEEN_MINUTE": 900,
+            "ONE_HOUR": 3600,
+            "ONE_DAY": 86400,
+            "1M": 60,
+            "5M": 300,
+            "15M": 900,
+            "1H": 3600,
+            "1D": 86400,
+        }
+        return int(mapping.get(value, 60))
+
+    def _most_recent_closed_candle_ts(self, *, granularity: str) -> int:
+        step = max(1, int(self._granularity_seconds_for_replay(granularity)))
+        now_i = int(now_ts())
+        return int((now_i // step) * step)
+
+    def _candles_recent_enough_for_timeframe(self, candles: List[Candle], timeframe: str, granularity: str = "") -> bool:
         if not candles:
             return False
+
+        step = self._granularity_seconds_for_replay(
+            granularity
+            or (
+                HIST_REPLAY_PRIMARY_GRANULARITY
+                if str(timeframe) == "primary_15m_90d"
+                else HIST_REPLAY_REGIME_GRANULARITY
+                if str(timeframe) == "regime_1h_365d"
+                else HIST_REPLAY_DAILY_GRANULARITY
+            )
+        )
+
         newest = max(float(c.ts) for c in candles)
-        age_sec = max(0.0, now_ts() - newest)
+        target_closed = float(self._most_recent_closed_candle_ts(granularity=granularity or "ONE_MINUTE"))
+        age_from_closed = max(0.0, target_closed - newest)
+
         if str(timeframe) == "primary_15m_90d":
-            return age_sec <= 24 * 3600
+            return age_from_closed <= max(step * 2, 1800)
+
         if str(timeframe) == "regime_1h_365d":
-            return age_sec <= 48 * 3600
-        return age_sec <= 7 * 86400
+            return age_from_closed <= max(step * 2, 7200)
+
+        return age_from_closed <= max(step * 2, 2 * 86400)
 
     async def _get_historical_replay_candles(self, *, product_id: str, timeframe: str) -> Tuple[List[Candle], str, str]:
         now_i = int(now_ts())
@@ -17643,9 +17868,11 @@ class TradingBot:
             lookback_sec = int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400
             fallback_path = HIST_REPLAY_1D_2Y_CSV_PATH
             min_needed = int(self._required_candle_rows_for_timeframe("daily_1d_2y"))
+        granularity_sec = self._granularity_seconds_for_replay(granularity)
+        now_i = self._most_recent_closed_candle_ts(granularity=granularity)
         start_ts = now_i - int(lookback_sec)
         cached = self._read_candles_from_csv_for_replay(path=fallback_path, product_id=product_id, min_ts=float(start_ts))
-        if len(cached) >= max(1, int(min_needed)) and self._candles_recent_enough_for_timeframe(cached, tf):
+        if len(cached) >= max(1, int(min_needed)) and self._candles_recent_enough_for_timeframe(cached, tf, granularity):
             return cached, granularity, HISTORICAL_SOURCE_LOCAL_CACHE
         # Incremental gap-fill:
         # If we already have most of the historical cache, do not refetch the entire window.
@@ -17653,7 +17880,7 @@ class TradingBot:
         if cached:
             try:
                 newest_cached_ts = max(int(c.ts) for c in cached)
-                gap_start_ts = newest_cached_ts + int(granularity)
+                gap_start_ts = newest_cached_ts + int(granularity_sec)
                 gap_end_ts = int(now_i)
 
                 if gap_end_ts > gap_start_ts:
@@ -17684,7 +17911,7 @@ class TradingBot:
 
                         if (
                             len(refreshed_cached) >= max(1, int(min_needed))
-                            and self._candles_recent_enough_for_timeframe(refreshed_cached, tf)
+                            and self._candles_recent_enough_for_timeframe(refreshed_cached, tf, granularity)
                         ):
                             module_debug(
                                 MODULE_NAME,
@@ -17712,7 +17939,7 @@ class TradingBot:
                 )
         if bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL) and "binance_bulk" in HISTORICAL_CANDLE_SOURCE_PRIORITY:
             binance_candles, binance_meta = await self._try_binance_bulk_historical_backfill(product_id=product_id, timeframe=tf, cache_path=fallback_path, start_ts=int(start_ts), end_ts=int(now_i))
-            if len(binance_candles) >= max(1, int(min_needed)) and self._candles_recent_enough_for_timeframe(binance_candles, tf):
+            if len(binance_candles) >= max(1, int(min_needed)) and self._candles_recent_enough_for_timeframe(binance_candles, tf, granularity):
                 return binance_candles, granularity, HISTORICAL_SOURCE_BINANCE_BULK
             module_debug(MODULE_NAME, "binance_bulk_historical_backfill_insufficient", data={"product_id": product_id, "timeframe": tf, "needed": int(min_needed), "received": len(binance_candles), "meta": binance_meta}, level="WARN", also_overall=False)
         module_debug(MODULE_NAME, "historical_replay_binance_api_gapfill_start", data={"product_id": product_id, "timeframe": tf, "granularity": granularity, "start_ts": start_ts, "end_ts": now_i, "cached_rows": len(cached), "needed": int(min_needed)}, level="INFO", also_overall=False)
@@ -18008,6 +18235,72 @@ class TradingBot:
                         return frame
                 except Exception as exc:
                     module_exception(MODULE_NAME, "runtime_shadow_replay_candle_source_failed", exc, data={"product_id": product_id, "path": path, "start_ts": start_ts, "end_ts": end_ts, "traceback": traceback.format_exc()}, also_overall=False)
+            try:
+                adapter = self._active_adapter()
+                symbol = adapter.product_to_symbol(product_id)
+                start_ms = int(float(start_ts) * 1000)
+                end_ms = int(float(end_ts) * 1000)
+                raw = adapter.client.klines(
+                    symbol=symbol,
+                    interval="1m",
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    limit=1000,
+                )
+
+                rows = []
+                for item in raw or []:
+                    try:
+                        ts_val = int(item[0]) / 1000.0
+                        rows.append({
+                            "ts": ts_val,
+                            "open": float(item[1]),
+                            "high": float(item[2]),
+                            "low": float(item[3]),
+                            "close": float(item[4]),
+                            "volume": float(item[5] or 0.0),
+                        })
+                    except Exception:
+                        continue
+
+                if rows:
+                    frame = pd.DataFrame(rows).sort_values("ts")
+                    module_debug(
+                        MODULE_NAME,
+                        "runtime_shadow_replay_candles_binance_gapfill_loaded",
+                        data={
+                            "product_id": product_id,
+                            "symbol": symbol,
+                            "rows": len(frame),
+                            "start_ts": start_ts,
+                            "end_ts": end_ts,
+                        },
+                        level="INFO",
+                        also_overall=False,
+                    )
+                    return frame
+
+            except Exception as exc:
+                module_exception(
+                    MODULE_NAME,
+                    "runtime_shadow_replay_binance_gapfill_failed",
+                    exc,
+                    data={
+                        "product_id": product_id,
+                        "start_ts": start_ts,
+                        "end_ts": end_ts,
+                        "traceback": traceback.format_exc(),
+                    },
+                    also_overall=False,
+                )
+
+            module_debug(
+                MODULE_NAME,
+                "runtime_shadow_replay_no_candles_available",
+                data={"product_id": product_id, "start_ts": start_ts, "end_ts": end_ts},
+                level="WARN",
+                also_overall=False,
+            )
             return pd.DataFrame()
         except Exception as exc:
             module_exception(MODULE_NAME, "micro_candles_for_replay_window_failed", exc, data={"product_id": product_id, "start_ts": start_ts, "end_ts": end_ts, "traceback": traceback.format_exc()}, also_overall=False)
@@ -18904,17 +19197,69 @@ class TradingBot:
         replay_complete = bool(has_required_15m and has_required_1h)
         qualified_rows = int(counts["qualified_rows"]); accepted_rows = int(counts["accepted_rows"]); wins = int(counts["wins"])
         avg_net = float(counts["avg_net_pnl_bps"]); median_net = float(counts["median_net_pnl_bps"]); win_rate = float(counts["win_rate"])
-        profit_ready = bool(replay_complete and accepted_rows >= int(HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION) and wins >= int(HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION) and avg_net >= float(HIST_REPLAY_MIN_AVG_NET_PNL_BPS_FOR_CALIBRATION))
-        if profit_ready:
-            verdict = "profit_replay_ready"; complete = True; live_trade_allowed = True
-            reason = f"profit replay ready; accepted_rows={accepted_rows};wins={wins};avg_net={avg_net:.2f};median_net={median_net:.2f};win_rate={win_rate:.3f}"
+        profit_ready = bool(
+            replay_complete
+            and accepted_rows >= int(HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION)
+            and wins >= int(HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION)
+            and avg_net >= float(HIST_REPLAY_MIN_AVG_NET_PNL_BPS_FOR_CALIBRATION)
+            and (
+                median_net >= float(HIST_REPLAY_MIN_MEDIAN_NET_PNL_BPS_FOR_STRONG_CALIBRATION)
+                if bool(HIST_REPLAY_REQUIRE_POSITIVE_MEDIAN_FOR_CALIBRATION)
+                else True
+            )
+        )
+
+        product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+        live_trade_allowed = bool(replay_complete and product_gate_ok)
+
+        if live_trade_allowed:
+            verdict = "product_live_gate_ready"
+            complete = True
+            reason = (
+                f"product live gate ready; product_gate={product_gate_reason};"
+                f"accepted_rows={accepted_rows};wins={wins};"
+                f"avg_net={avg_net:.2f};median_net={median_net:.2f};win_rate={win_rate:.3f}"
+            )
+        elif profit_ready:
+            verdict = "historical_profit_ready_but_product_gate_blocked"
+            complete = True
+            reason = (
+                f"historical profit replay ready but product live gate blocked; "
+                f"product_gate={product_gate_reason};accepted_rows={accepted_rows};"
+                f"wins={wins};avg_net={avg_net:.2f};median_net={median_net:.2f};win_rate={win_rate:.3f}"
+            )
         elif replay_complete and bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE):
-            verdict = "replay_complete_unprofitable_or_unqualified"; complete = True; live_trade_allowed = False
-            reason = f"replay complete but not profitable enough; qualified_rows={qualified_rows};accepted_rows={accepted_rows};wins={wins};avg_net={avg_net:.2f};median_net={median_net:.2f};win_rate={win_rate:.3f}"
+            verdict = "replay_complete_unprofitable_or_unqualified"
+            complete = True
+            reason = (
+                f"replay complete but not live-approved; product_gate={product_gate_reason};"
+                f"qualified_rows={qualified_rows};accepted_rows={accepted_rows};"
+                f"wins={wins};avg_net={avg_net:.2f};median_net={median_net:.2f};win_rate={win_rate:.3f}"
+            )
         else:
-            verdict = "replay_incomplete"; complete = False; live_trade_allowed = False
-            reason = f"replay incomplete; 15m_rows={counts['primary_15m_90d_rows']}/{int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)};1h_rows={counts['regime_1h_365d_rows']}/{int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)}"
-        return {"product_id": product_id, "complete": bool(complete), "replay_complete": bool(replay_complete), "profit_ready": bool(profit_ready), "live_trade_allowed": bool(live_trade_allowed), "verdict": verdict, "reason": reason, **counts}
+            verdict = "replay_incomplete"
+            complete = False
+            reason = (
+                f"replay incomplete; 15m_rows={counts['primary_15m_90d_rows']}/"
+                f"{int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)};"
+                f"1h_rows={counts['regime_1h_365d_rows']}/"
+                f"{int(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)};"
+                f"product_gate={product_gate_reason}"
+            )
+
+        return {
+            "product_id": product_id,
+            "complete": bool(complete),
+            "replay_complete": bool(replay_complete),
+            "profit_ready": bool(live_trade_allowed),
+            "historical_profit_ready": bool(profit_ready),
+            "live_trade_allowed": bool(live_trade_allowed),
+            "verdict": verdict,
+            "reason": reason,
+            "product_live_gate_ok": bool(product_gate_ok),
+            "product_live_gate_reason": str(product_gate_reason),
+            **counts,
+        }
 
     def _historical_replay_is_ready_for_product(self, product_id: str) -> bool:
         frame = self._historical_replay_rows_for_product(product_id)

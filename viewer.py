@@ -101,6 +101,10 @@ PRODUCT_COOLDOWNS_PATH = os.path.join(BASE_DIR, "product_cooldowns.csv")
 AGENT_DECISION_INFLUENCE_PATH = os.path.join(BASE_DIR, "agent_decision_influence.csv")
 PRODUCT_AGENT_INFLUENCE_PATH = os.path.join(BASE_DIR, "product_agent_influence.csv")
 TRADE_FREQUENCY_ESTIMATE_PATH = os.path.join(BASE_DIR, "trade_frequency_estimate.csv")
+FIFTH_PASS_LIVE_STYLE_REPLAY_PATH = os.path.join(BASE_DIR, "fifth_pass_live_style_replay.csv")
+FIFTH_PASS_LIVE_STYLE_SUMMARY_PATH = os.path.join(BASE_DIR, "fifth_pass_live_style_summary.csv")
+FIFTH_PASS_PRODUCT_CONTRIBUTION_PATH = os.path.join(BASE_DIR, "fifth_pass_product_contribution.csv")
+FIFTH_PASS_BLOCKERS_PATH = os.path.join(BASE_DIR, "fifth_pass_blockers.csv")
 APPROVED_BUT_SHADOWED_PATH = os.path.join(BASE_DIR, "approved_but_shadowed.csv")
 DECISION_AUDIT_PATH = os.path.join(BASE_DIR, "decision_audit.csv")
 
@@ -484,7 +488,7 @@ def file_signature(path: str) -> tuple:
 def _load_csv_cached(path: str, exists: bool, size_bytes: int, mtime_ns: int, usecols_key: tuple | None = None) -> pd.DataFrame:
     if not exists: return pd.DataFrame()
     usecols = list(usecols_key) if usecols_key else None
-    return pd.read_csv(path, usecols=usecols)
+    return pd.read_csv(path, usecols=usecols, low_memory=False)
 
 
 def load_csv(path: str, usecols: list[str] | None = None) -> pd.DataFrame:
@@ -521,11 +525,11 @@ def _load_csv_tail_cached(
             return pd.DataFrame()
 
         text = header + "".join(tail_lines)
-        return pd.read_csv(StringIO(text), usecols=usecols)
+        return pd.read_csv(StringIO(text), usecols=usecols, low_memory=False)
 
     except Exception:
         if size_bytes <= 5_000_000:
-            return pd.read_csv(path, usecols=usecols)
+            return pd.read_csv(path, usecols=usecols, low_memory=False)
         return pd.DataFrame()
 
 
@@ -2496,6 +2500,9 @@ def render_four_pass_backtest_box(
     trade_frequency_estimate_df: pd.DataFrame = None,
     approved_but_shadowed_df: pd.DataFrame = None,
     product_cooldowns_df: pd.DataFrame = None,
+    fifth_pass_summary_df: pd.DataFrame = None,
+    fifth_pass_product_contribution_df: pd.DataFrame = None,
+    fifth_pass_blockers_df: pd.DataFrame = None,
 ) -> None:
     st.markdown("### Four-Pass Council Backtest")
 
@@ -2657,6 +2664,40 @@ def render_four_pass_backtest_box(
                 display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
         st.dataframe(display_df.sort_values(["product_id", "side", "decision_weight_pct"], ascending=[True, True, False])[show_cols], width="stretch", hide_index=True)
 
+    if fifth_pass_summary_df is not None and not fifth_pass_summary_df.empty:
+        st.markdown("#### Final Fifth-Pass Live-Style Simulation")
+        st.caption("This is the closest replay to how the calibrated live bot should trade: council buy, council sell/proxy net, market eligibility, trade spacing, and no timer-based product cooldowns.")
+
+        display_df = fifth_pass_summary_df.copy()
+        for col in ["replay_days", "raw_candidate_count", "deduped_trade_count", "estimated_trades_per_day", "win_rate", "avg_net_bps", "median_net_bps", "avg_win_bps", "avg_loss_bps", "reference_return_pct_5pct_size"]:
+            if col in display_df.columns:
+                display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+
+        show_cols = [c for c in ["scope", "product_id", "replay_days", "deduped_trade_count", "estimated_trades_per_day", "win_rate", "avg_net_bps", "median_net_bps", "avg_win_bps", "avg_loss_bps", "reference_return_pct_5pct_size", "verdict"] if c in display_df.columns]
+        st.dataframe(display_df.tail(100)[show_cols], width="stretch", hide_index=True)
+
+    if fifth_pass_product_contribution_df is not None and not fifth_pass_product_contribution_df.empty:
+        st.markdown("#### Fifth-Pass Product Contribution")
+        st.caption("Per-product contribution from the final live-style replay. This separates truly useful products from broad all-product replay noise.")
+
+        display_df = fifth_pass_product_contribution_df.copy()
+        for col in ["trade_count", "estimated_trades_per_day", "win_rate", "avg_net_bps", "median_net_bps", "reference_return_pct_5pct_size", "contribution_rank"]:
+            if col in display_df.columns:
+                display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+
+        show_cols = [c for c in ["contribution_rank", "product_id", "trade_count", "estimated_trades_per_day", "win_rate", "avg_net_bps", "median_net_bps", "reference_return_pct_5pct_size"] if c in display_df.columns]
+        st.dataframe(display_df.sort_values("contribution_rank", ascending=True)[show_cols], width="stretch", hide_index=True)
+
+    if fifth_pass_blockers_df is not None and not fifth_pass_blockers_df.empty:
+        st.markdown("#### Fifth-Pass Market Eligibility Blockers")
+        st.caption("Shows why final live-style replay candidates were not considered tradeable.")
+
+        display_df = fifth_pass_blockers_df.copy()
+        if "count" in display_df.columns:
+            display_df["count"] = pd.to_numeric(display_df["count"], errors="coerce")
+        show_cols = [c for c in ["product_id", "blocker", "count"] if c in display_df.columns]
+        st.dataframe(display_df.sort_values("count", ascending=False).head(100)[show_cols], width="stretch", hide_index=True)
+
     if trade_frequency_estimate_df is not None and not trade_frequency_estimate_df.empty:
         st.markdown("#### Estimated Trades Per Day / Avg Win-Loss")
         st.caption("Replay-based opportunity estimate. This is not guaranteed live trade count.")
@@ -2676,8 +2717,8 @@ def render_four_pass_backtest_box(
         st.dataframe(approved_but_shadowed_df.tail(100)[show_cols], width="stretch", hide_index=True)
 
     if product_cooldowns_df is not None and not product_cooldowns_df.empty:
-        st.markdown("#### Product Cooldowns")
-        st.caption("Cooldowns are soft unless marked otherwise. Coins remain monitored and can re-qualify.")
+        st.markdown("#### Retired Product Cooldown Diagnostics")
+        st.caption("Timer-based product cooldowns are retired. This file is diagnostic only and should not block live trades.")
 
         show_cols = [c for c in ["product_id", "cooldown_until_ts", "cooldown_minutes", "cooldown_type", "can_escape_early", "reason"] if c in product_cooldowns_df.columns]
         st.dataframe(product_cooldowns_df.tail(100)[show_cols], width="stretch", hide_index=True)
@@ -2687,7 +2728,7 @@ def render_four_pass_backtest_box(
             st.dataframe(four_pass_final_agent_ratings_df.tail(200), width="stretch", hide_index=True)
 
 
-def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None, four_pass_agent_buy_df=None, four_pass_council_buy_df=None, four_pass_agent_sell_df=None, four_pass_council_sell_df=None, four_pass_final_agent_ratings_df=None, four_pass_profitability_summary_df=None, four_pass_agent_context_ratings_df=None, four_pass_sell_path_replay_df=None, four_pass_purged_walk_forward_df=None, four_pass_product_live_gate_df=None, product_cooldowns_df=None, agent_decision_influence_df=None, product_agent_influence_df=None, trade_frequency_estimate_df=None, approved_but_shadowed_df=None):
+def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None, four_pass_agent_buy_df=None, four_pass_council_buy_df=None, four_pass_agent_sell_df=None, four_pass_council_sell_df=None, four_pass_final_agent_ratings_df=None, four_pass_profitability_summary_df=None, four_pass_agent_context_ratings_df=None, four_pass_sell_path_replay_df=None, four_pass_purged_walk_forward_df=None, four_pass_product_live_gate_df=None, product_cooldowns_df=None, agent_decision_influence_df=None, product_agent_influence_df=None, trade_frequency_estimate_df=None, approved_but_shadowed_df=None, fifth_pass_summary_df=None, fifth_pass_product_contribution_df=None, fifth_pass_blockers_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
     st.metric("Trading Mode", readiness.get("live_trading_mode_label", readiness.get("trading_aggression_mode", "unknown")))
@@ -2725,6 +2766,9 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         trade_frequency_estimate_df,
         approved_but_shadowed_df,
         product_cooldowns_df,
+        fifth_pass_summary_df,
+        fifth_pass_product_contribution_df,
+        fifth_pass_blockers_df,
     )
     hist_enabled = readiness.get("historical_replay_enabled")
     hist_running = readiness.get("historical_replay_running")
@@ -2998,6 +3042,9 @@ def render_live_dashboard(selected, refresh_config):
     agent_decision_influence_df = load_csv_tail(AGENT_DECISION_INFLUENCE_PATH, max_lines=5000)
     product_agent_influence_df = load_csv_tail(PRODUCT_AGENT_INFLUENCE_PATH, max_lines=10000)
     trade_frequency_estimate_df = load_csv_tail(TRADE_FREQUENCY_ESTIMATE_PATH, max_lines=5000)
+    fifth_pass_summary_df = load_csv_tail(FIFTH_PASS_LIVE_STYLE_SUMMARY_PATH, max_lines=5000)
+    fifth_pass_product_contribution_df = load_csv_tail(FIFTH_PASS_PRODUCT_CONTRIBUTION_PATH, max_lines=5000)
+    fifth_pass_blockers_df = load_csv_tail(FIFTH_PASS_BLOCKERS_PATH, max_lines=5000)
     approved_but_shadowed_df = load_csv_tail(APPROVED_BUT_SHADOWED_PATH, max_lines=5000)
     account_balance_diagnostics_df = load_csv_tail(ACCOUNT_BALANCE_DIAGNOSTICS_PATH, max_lines=1000)
     live_trade_blockers_df = load_csv_tail(LIVE_TRADE_BLOCKERS_PATH, max_lines=5000)
@@ -3018,7 +3065,7 @@ def render_live_dashboard(selected, refresh_config):
         latest_blockers = live_trade_blockers_df.tail(50)
         st.dataframe(latest_blockers[[c for c in ["dt_mst", "product_id", "symbol", "quote_asset", "quote_available", "quote_total", "action", "product_gate_ok", "top_of_book_age_sec", "candidate_notional_usd", "block_reasons"] if c in latest_blockers.columns]], width="stretch", hide_index=True)
 
-    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df, four_pass_agent_buy_df, four_pass_council_buy_df, four_pass_agent_sell_df, four_pass_council_sell_df, four_pass_final_agent_ratings_df, four_pass_profitability_summary_df, four_pass_agent_context_ratings_df, four_pass_sell_path_replay_df, four_pass_purged_walk_forward_df, four_pass_product_live_gate_df, product_cooldowns_df, agent_decision_influence_df, product_agent_influence_df, trade_frequency_estimate_df, approved_but_shadowed_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df, four_pass_agent_buy_df, four_pass_council_buy_df, four_pass_agent_sell_df, four_pass_council_sell_df, four_pass_final_agent_ratings_df, four_pass_profitability_summary_df, four_pass_agent_context_ratings_df, four_pass_sell_path_replay_df, four_pass_purged_walk_forward_df, four_pass_product_live_gate_df, product_cooldowns_df, agent_decision_influence_df, product_agent_influence_df, trade_frequency_estimate_df, approved_but_shadowed_df, fifth_pass_summary_df, fifth_pass_product_contribution_df, fifth_pass_blockers_df); st.markdown('</section>', unsafe_allow_html=True)
 
 
 def render_viewer_tick(refresh_config: dict) -> None:

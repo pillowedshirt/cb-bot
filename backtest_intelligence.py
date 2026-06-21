@@ -259,6 +259,61 @@ TRADE_FREQUENCY_ESTIMATE_COLUMNS = [
     "reason",
 ]
 
+FIFTH_PASS_LIVE_STYLE_REPLAY_COLUMNS = [
+    "ts", "dt_utc",
+    "product_id",
+    "entry_ts",
+    "exit_ts",
+    "held_minutes",
+    "entry_score",
+    "entry_threshold",
+    "market_eligible",
+    "market_eligibility_reason",
+    "realized_or_proxy_net_bps",
+    "win",
+    "source_mode",
+    "reason",
+]
+
+FIFTH_PASS_LIVE_STYLE_SUMMARY_COLUMNS = [
+    "ts", "dt_utc",
+    "scope",
+    "product_id",
+    "replay_days",
+    "raw_candidate_count",
+    "deduped_trade_count",
+    "estimated_trades_per_day",
+    "win_rate",
+    "avg_net_bps",
+    "median_net_bps",
+    "avg_win_bps",
+    "avg_loss_bps",
+    "reference_return_pct_5pct_size",
+    "verdict",
+    "reason",
+]
+
+FIFTH_PASS_PRODUCT_CONTRIBUTION_COLUMNS = [
+    "ts", "dt_utc",
+    "product_id",
+    "trade_count",
+    "estimated_trades_per_day",
+    "win_rate",
+    "avg_net_bps",
+    "median_net_bps",
+    "reference_return_pct_5pct_size",
+    "contribution_rank",
+    "reason",
+]
+
+FIFTH_PASS_BLOCKER_COLUMNS = [
+    "ts", "dt_utc",
+    "product_id",
+    "blocker",
+    "count",
+    "reason",
+]
+
 APPROVED_BUT_SHADOWED_COLUMNS = [
     "ts", "dt_mst",
     "product_id", "symbol", "quote_asset",
@@ -1999,21 +2054,26 @@ def _four_pass_product_live_gate_rows(
                 sell_path_ok = sell_path_avg > 0.0
                 sell_path_note = "sell_path_positive" if sell_path_ok else "sell_path_negative"
             approved = bool(buy_ok and walk_forward_ok and sell_path_ok)
+            cooldown_minutes = 0
+
             if approved:
-                cooldown_minutes = 0
                 reason = f"approved;selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
             else:
                 if avg_net < 0 or median_net < 0:
-                    cooldown_minutes = 1440
+                    market_state = "negative_ev_watch_only"
                 elif not walk_forward_ok:
-                    cooldown_minutes = 720
+                    market_state = "validation_wait"
                 else:
-                    cooldown_minutes = 360
-                reason = f"blocked;buy_ok={buy_ok};walk_forward_ok={walk_forward_ok};sell_path_ok={sell_path_ok};selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
-                cooldown_until = float(ts_value) + float(cooldown_minutes * 60)
-                cooldown_type = "negative_ev_watch_only" if (avg_net < 0 or median_net < 0) else ("validation_wait" if not walk_forward_ok else "near_miss")
-                can_escape_early = 1
-                cooldown_rows.append([f"{ts_value:.6f}", dt_value, product_id, f"{cooldown_until:.6f}", int(cooldown_minutes), cooldown_type, int(can_escape_early), reason])
+                    market_state = "near_miss"
+
+                reason = (
+                    f"not_live_eligible_now;market_state={market_state};"
+                    f"buy_ok={buy_ok};walk_forward_ok={walk_forward_ok};sell_path_ok={sell_path_ok};"
+                    f"selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};"
+                    f"wf_folds={wf_folds};wf_positive={positive_buy_folds};"
+                    f"sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
+                )
+
             gate_rows.append([f"{ts_value:.6f}", dt_value, product_id, int(selected_count), f"{win_rate:.6f}", f"{avg_net:.6f}", f"{median_net:.6f}", f"{score:.6f}", profitability_mode, int(wf_folds), int(positive_buy_folds), f"{wf_avg_net:.6f}", f"{wf_avg_return:.6f}", int(sell_path_rows), f"{sell_path_avg:.6f}", f"{sell_path_return:.6f}", int(1 if approved else 0), int(cooldown_minutes), reason])
         except Exception:
             continue
@@ -2236,6 +2296,193 @@ def _estimate_trade_frequency_rows(
 
     return rows
 
+def _fifth_pass_row_market_eligible(row: pd.Series, approved_products: set) -> Tuple[bool, str]:
+    """
+    Historical/backlog version of the live market eligibility gate.
+
+    This is intentionally conservative. It lets the fifth pass simulate the way
+    the live bot should behave after calibration:
+    - approved products can trade if the setup is favorable enough,
+    - non-approved products can only trade if the current setup is exceptional.
+    """
+    try:
+        product_id = str(row.get("product_id") or "")
+
+        def f(name: str, default: float = 0.0) -> float:
+            try:
+                return float(row.get(name, default) or default)
+            except Exception:
+                return float(default)
+
+        approved = product_id in approved_products
+
+        spread_bps = f("spread_bps", 0.0)
+        expected_utility_bps = f("expected_utility_bps", f("expected_net_edge_bps", 0.0))
+        maker_adjusted_ev_bps = f("maker_adjusted_expected_value_bps", expected_utility_bps)
+        calibrated_p_win = f("calibrated_p_win", f("estimated_prob_up", 0.50))
+        payoff_ratio = f("payoff_ratio", 1.0 if expected_utility_bps > 0 else 0.0)
+        buy_vs_wait_edge_bps = f("buy_vs_wait_edge_bps", expected_utility_bps)
+        council_score = f("four_pass_buy_council_score", 0.0)
+        threshold = f("four_pass_buy_product_threshold", 0.0)
+
+        value_state = str(row.get("value_acceptance_state", "") or "").lower()
+        volume_node_state = str(row.get("volume_node_state", "") or "").lower()
+        poc_distance_bps = f("poc_distance_bps", 9999.0)
+        wait_score = f("volume_profile_leader_wait_score", 0.50)
+
+        if spread_bps and spread_bps > 25.0:
+            return False, f"spread_too_wide:{spread_bps:.2f}"
+        if volume_node_state == "low_volume_node":
+            return False, "low_volume_node"
+        if value_state == "accepted_above_value":
+            return False, "accepted_above_value_chase"
+        if value_state in {"inside_fair_value", "inside_value_near_poc"} and poc_distance_bps <= 20.0 and wait_score >= 0.58:
+            return False, "inside_value_or_poc_chop"
+
+        if approved:
+            if expected_utility_bps < 20.0:
+                return False, f"approved_product_utility_too_low:{expected_utility_bps:.2f}"
+            if calibrated_p_win < 0.56:
+                return False, f"approved_product_probability_too_low:{calibrated_p_win:.3f}"
+            if payoff_ratio < 0.75:
+                return False, f"approved_product_payoff_too_low:{payoff_ratio:.3f}"
+            return True, "approved_product_market_eligible"
+
+        if expected_utility_bps < 85.0:
+            return False, f"nonapproved_utility_too_low:{expected_utility_bps:.2f}"
+        if maker_adjusted_ev_bps < 18.0:
+            return False, f"nonapproved_maker_ev_too_low:{maker_adjusted_ev_bps:.2f}"
+        if calibrated_p_win < 0.64:
+            return False, f"nonapproved_probability_too_low:{calibrated_p_win:.3f}"
+        if payoff_ratio < 0.95:
+            return False, f"nonapproved_payoff_too_low:{payoff_ratio:.3f}"
+        if buy_vs_wait_edge_bps < 18.0:
+            return False, f"nonapproved_buy_vs_wait_too_low:{buy_vs_wait_edge_bps:.2f}"
+        if threshold > 0 and (council_score - threshold) < 0.04:
+            return False, f"nonapproved_council_margin_too_low:{(council_score - threshold):.3f}"
+
+        return True, "nonapproved_exceptional_market_eligible"
+    except Exception as exc:
+        return False, f"market_eligibility_error:{exc}"
+
+
+def _fifth_pass_live_style_replay_rows(
+    council_buy_entries: pd.DataFrame,
+    product_live_gate_rows: List[List[Any]],
+    *,
+    dedupe_minutes: int = 60,
+) -> Tuple[List[List[Any]], List[List[Any]], List[List[Any]], List[List[Any]]]:
+    ts_value = _utc_ts()
+    dt_value = _utc_dt(ts_value)
+    if council_buy_entries is None or council_buy_entries.empty:
+        return [], [], [], []
+    frame = council_buy_entries.copy()
+    if "product_id" not in frame.columns:
+        return [], [], [], []
+    approved_products = set()
+    for gate_row in product_live_gate_rows or []:
+        try:
+            if str(gate_row[16]).strip() in {"1", "true", "True", "yes", "YES"}:
+                approved_products.add(str(gate_row[2]))
+        except Exception:
+            pass
+    time_col = next((c for c in ["replay_ts", "entry_ts", "ts"] if c in frame.columns), None)
+    if not time_col:
+        return [], [], [], []
+    frame["_time"] = pd.to_numeric(frame[time_col], errors="coerce")
+    frame = frame.dropna(subset=["_time"]).sort_values("_time").copy()
+    if frame.empty:
+        return [], [], [], []
+    if "buy_net_bps" in frame.columns:
+        frame["_net"] = pd.to_numeric(frame["buy_net_bps"], errors="coerce").fillna(0.0)
+        source_mode = "buy_net_bps_live_style_proxy"
+    elif "net_pnl_bps" in frame.columns:
+        frame["_net"] = pd.to_numeric(frame["net_pnl_bps"], errors="coerce").fillna(0.0)
+        source_mode = "net_pnl_bps_live_style_proxy"
+    elif "binance_taker_taker_net_pnl_bps" in frame.columns:
+        frame["_net"] = pd.to_numeric(frame["binance_taker_taker_net_pnl_bps"], errors="coerce").fillna(0.0)
+        source_mode = "binance_taker_taker_net_pnl_bps"
+    else:
+        return [], [], [], []
+    days = _training_days_from_frame(frame)
+    gap_seconds = float(dedupe_minutes) * 60.0
+    replay_rows: List[List[Any]] = []
+    blocker_counts: Dict[str, int] = {}
+    last_trade_time_by_product: Dict[str, float] = {}
+    for _, row in frame.iterrows():
+        product_id = str(row.get("product_id") or "")
+        t = float(row["_time"])
+        last_t = float(last_trade_time_by_product.get(product_id, -1e30))
+        eligible, elig_reason = _fifth_pass_row_market_eligible(row, approved_products)
+        if not eligible:
+            blocker_counts[f"{product_id}|{elig_reason}"] = blocker_counts.get(f"{product_id}|{elig_reason}", 0) + 1
+            continue
+        if t - last_t < gap_seconds:
+            blocker = f"dedupe_spacing_{dedupe_minutes}m"
+            blocker_counts[f"{product_id}|{blocker}"] = blocker_counts.get(f"{product_id}|{blocker}", 0) + 1
+            continue
+        net = float(row.get("_net", 0.0) or 0.0)
+        entry_score = float(row.get("four_pass_buy_council_score", 0.0) or 0.0)
+        threshold = float(row.get("four_pass_buy_product_threshold", 0.0) or 0.0)
+        entry_ts = t
+        exit_ts = float(row.get("exit_ts", row.get("decision_ts", entry_ts)) or entry_ts)
+        held_minutes = max(0.0, (exit_ts - entry_ts) / 60.0)
+        last_trade_time_by_product[product_id] = t
+        replay_rows.append([f"{ts_value:.6f}", dt_value, product_id, f"{entry_ts:.6f}", f"{exit_ts:.6f}", f"{held_minutes:.3f}", f"{entry_score:.6f}", f"{threshold:.6f}", 1, elig_reason, f"{net:.6f}", int(1 if net > 0 else 0), source_mode, f"fifth_pass_live_style;dedupe_minutes={dedupe_minutes}"])
+    summary_rows: List[List[Any]] = []
+    contribution_rows: List[List[Any]] = []
+    blocker_rows: List[List[Any]] = []
+    def summarize(scope: str, product_id: str, rows: List[List[Any]]) -> None:
+        if not rows:
+            return
+        vals = pd.Series([float(r[10]) for r in rows])
+        wins = vals[vals > 0]
+        losses = vals[vals <= 0]
+        trade_count = int(len(vals))
+        trades_per_day = float(trade_count) / max(1.0, float(days))
+        win_rate = float((vals > 0).mean())
+        avg_net = float(vals.mean())
+        median_net = float(vals.median())
+        avg_win = float(wins.mean()) if not wins.empty else 0.0
+        avg_loss = float(abs(losses.mean())) if not losses.empty else 0.0
+        reference_return = float(vals.sum() * 5.0 / 10000.0)
+        if trade_count <= 0:
+            verdict = "no_live_style_trades"
+        elif avg_net > 0 and median_net > 0 and win_rate >= 0.55:
+            verdict = "live_style_profitable"
+        elif avg_net > 0:
+            verdict = "positive_average_weak_median_or_win_rate"
+        else:
+            verdict = "not_live_style_profitable"
+        summary_rows.append([f"{ts_value:.6f}", dt_value, scope, product_id, f"{float(days):.6f}", int(len(frame)), trade_count, f"{trades_per_day:.6f}", f"{win_rate:.6f}", f"{avg_net:.6f}", f"{median_net:.6f}", f"{avg_win:.6f}", f"{avg_loss:.6f}", f"{reference_return:.6f}", verdict, f"fifth_pass_live_style_summary;dedupe_minutes={dedupe_minutes};source_mode={source_mode}"])
+    summarize("all_live_style", "ALL", replay_rows)
+    grouped: Dict[str, List[List[Any]]] = {}
+    for r in replay_rows:
+        grouped.setdefault(str(r[2]), []).append(r)
+    product_stats = []
+    for pid, rows in grouped.items():
+        vals = pd.Series([float(r[10]) for r in rows])
+        trade_count = int(len(vals))
+        trades_per_day = float(trade_count) / max(1.0, float(days))
+        win_rate = float((vals > 0).mean())
+        avg_net = float(vals.mean())
+        median_net = float(vals.median())
+        reference_return = float(vals.sum() * 5.0 / 10000.0)
+        product_stats.append((pid, trade_count, trades_per_day, win_rate, avg_net, median_net, reference_return))
+        summarize("product_live_style", pid, rows)
+    product_stats.sort(key=lambda x: float(x[6]), reverse=True)
+    for rank, item in enumerate(product_stats, start=1):
+        pid, trade_count, trades_per_day, win_rate, avg_net, median_net, reference_return = item
+        contribution_rows.append([f"{ts_value:.6f}", dt_value, pid, int(trade_count), f"{trades_per_day:.6f}", f"{win_rate:.6f}", f"{avg_net:.6f}", f"{median_net:.6f}", f"{reference_return:.6f}", int(rank), "fifth_pass_product_contribution;ranked_by_reference_return"])
+    for key, count in sorted(blocker_counts.items(), key=lambda kv: kv[1], reverse=True):
+        try:
+            pid, blocker = key.split("|", 1)
+        except Exception:
+            pid, blocker = "UNKNOWN", key
+        blocker_rows.append([f"{ts_value:.6f}", dt_value, pid, blocker, int(count), "fifth_pass_blocker_count"])
+    return replay_rows, summary_rows, contribution_rows, blocker_rows
+
+
 def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     buy_agent_rows, buy_weights, buy_frame, buy_context_rows = _four_pass_buy_agent_rows(base_dir)
     walk_forward_buy_rows = _purged_walk_forward_rows(base_dir, buy_frame, side="BUY")
@@ -2253,9 +2500,47 @@ def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     agent_decision_influence_rows = _agent_decision_influence_rows(buy_agent_rows, sell_agent_rows, buy_frame, sell_frame)
     product_agent_influence_rows = _product_agent_influence_rows(buy_context_rows, buy_frame)
     trade_frequency_estimate_rows = _estimate_trade_frequency_rows(council_buy_entries, council_buy_rows, product_live_gate_rows)
-    profitability_summary_rows = _four_pass_profitability_summary_rows(buy_agent_rows, council_buy_rows, sell_agent_rows, council_sell_rows, sell_path_replay_rows)
+
+    fifth_pass_replay_rows, fifth_pass_summary_rows, fifth_pass_product_contribution_rows, fifth_pass_blocker_rows = _fifth_pass_live_style_replay_rows(
+        council_buy_entries,
+        product_live_gate_rows,
+        dedupe_minutes=60,
+    )
+
+    profitability_summary_rows = _four_pass_profitability_summary_rows(
+        buy_agent_rows,
+        council_buy_rows,
+        sell_agent_rows,
+        council_sell_rows,
+        sell_path_replay_rows,
+    )
+
     feature_store_summary_rows = _feature_store_summary_rows(base_dir)
-    return {"buy_agent_rows": buy_agent_rows, "buy_weights": buy_weights, "council_buy_rows": council_buy_rows, "council_buy_entries": council_buy_entries, "sell_agent_rows": sell_agent_rows, "sell_weights": sell_weights, "council_sell_rows": council_sell_rows, "sell_path_replay_rows": sell_path_replay_rows, "purged_walk_forward_rows": walk_forward_buy_rows + walk_forward_sell_rows, "final_rating_rows": final_rating_rows, "profitability_summary_rows": profitability_summary_rows, "context_rating_rows": buy_context_rows, "feature_store_summary_rows": feature_store_summary_rows, "product_live_gate_rows": product_live_gate_rows, "product_cooldown_rows": product_cooldown_rows, "agent_decision_influence_rows": agent_decision_influence_rows, "product_agent_influence_rows": product_agent_influence_rows, "trade_frequency_estimate_rows": trade_frequency_estimate_rows}
+
+    return {
+        "buy_agent_rows": buy_agent_rows,
+        "buy_weights": buy_weights,
+        "council_buy_rows": council_buy_rows,
+        "council_buy_entries": council_buy_entries,
+        "sell_agent_rows": sell_agent_rows,
+        "sell_weights": sell_weights,
+        "council_sell_rows": council_sell_rows,
+        "sell_path_replay_rows": sell_path_replay_rows,
+        "purged_walk_forward_rows": walk_forward_buy_rows + walk_forward_sell_rows,
+        "final_rating_rows": final_rating_rows,
+        "profitability_summary_rows": profitability_summary_rows,
+        "context_rating_rows": buy_context_rows,
+        "feature_store_summary_rows": feature_store_summary_rows,
+        "product_live_gate_rows": product_live_gate_rows,
+        "product_cooldown_rows": [],
+        "agent_decision_influence_rows": agent_decision_influence_rows,
+        "product_agent_influence_rows": product_agent_influence_rows,
+        "trade_frequency_estimate_rows": trade_frequency_estimate_rows,
+        "fifth_pass_replay_rows": fifth_pass_replay_rows,
+        "fifth_pass_summary_rows": fifth_pass_summary_rows,
+        "fifth_pass_product_contribution_rows": fifth_pass_product_contribution_rows,
+        "fifth_pass_blocker_rows": fifth_pass_blocker_rows,
+    }
 
 
 def _agent_ablation_rows(base_dir: str) -> List[List[Any]]:
@@ -2375,6 +2660,10 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     agent_decision_influence_path = os.path.join(base_dir, "agent_decision_influence.csv")
     product_agent_influence_path = os.path.join(base_dir, "product_agent_influence.csv")
     trade_frequency_estimate_path = os.path.join(base_dir, "trade_frequency_estimate.csv")
+    fifth_pass_replay_path = os.path.join(base_dir, "fifth_pass_live_style_replay.csv")
+    fifth_pass_summary_path = os.path.join(base_dir, "fifth_pass_live_style_summary.csv")
+    fifth_pass_product_contribution_path = os.path.join(base_dir, "fifth_pass_product_contribution.csv")
+    fifth_pass_blockers_path = os.path.join(base_dir, "fifth_pass_blockers.csv")
     summary_path = os.path.join(base_dir, "backtest_summary.csv")
 
     _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
@@ -2393,11 +2682,16 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     _write_rows(four_pass_sell_path_replay_path, FOUR_PASS_SELL_PATH_REPLAY_COLUMNS, four_pass["sell_path_replay_rows"])
     _write_rows(four_pass_purged_walk_forward_path, FOUR_PASS_PURGED_WALK_FORWARD_COLUMNS, four_pass["purged_walk_forward_rows"])
     _write_rows(four_pass_product_live_gate_path, FOUR_PASS_PRODUCT_LIVE_GATE_COLUMNS, four_pass["product_live_gate_rows"])
-    _write_rows(product_cooldowns_path, PRODUCT_COOLDOWN_COLUMNS, four_pass["product_cooldown_rows"])
+    # Product cooldown timers are retired. Keep the file/header only for compatibility.
+    _write_rows(product_cooldowns_path, PRODUCT_COOLDOWN_COLUMNS, [])
     _write_rows(feature_store_summary_path, FEATURE_STORE_SUMMARY_COLUMNS, four_pass["feature_store_summary_rows"])
     _write_rows(agent_decision_influence_path, AGENT_DECISION_INFLUENCE_COLUMNS, four_pass["agent_decision_influence_rows"])
     _write_rows(product_agent_influence_path, PRODUCT_AGENT_INFLUENCE_COLUMNS, four_pass["product_agent_influence_rows"])
     _write_rows(trade_frequency_estimate_path, TRADE_FREQUENCY_ESTIMATE_COLUMNS, four_pass["trade_frequency_estimate_rows"])
+    _write_rows(fifth_pass_replay_path, FIFTH_PASS_LIVE_STYLE_REPLAY_COLUMNS, four_pass["fifth_pass_replay_rows"])
+    _write_rows(fifth_pass_summary_path, FIFTH_PASS_LIVE_STYLE_SUMMARY_COLUMNS, four_pass["fifth_pass_summary_rows"])
+    _write_rows(fifth_pass_product_contribution_path, FIFTH_PASS_PRODUCT_CONTRIBUTION_COLUMNS, four_pass["fifth_pass_product_contribution_rows"])
+    _write_rows(fifth_pass_blockers_path, FIFTH_PASS_BLOCKER_COLUMNS, four_pass["fifth_pass_blocker_rows"])
 
     ts_value = _utc_ts()
     summary_rows = [
@@ -2416,10 +2710,14 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_sell_path_replay_rows", len(four_pass["sell_path_replay_rows"]), "true sell-path replay rows when realized sell path data exists"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_purged_walk_forward_rows", len(four_pass["purged_walk_forward_rows"]), "purged walk-forward validation rows"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_product_live_gate_rows", len(four_pass["product_live_gate_rows"]), "product-level live buy approval rows"],
-        [f"{ts_value:.6f}", _utc_dt(ts_value), "product_cooldown_rows", len(four_pass["product_cooldown_rows"]), "product-level cooldown rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "product_cooldown_rows", 0, "timer-based product cooldowns retired; market eligibility is used instead"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_decision_influence_rows", len(four_pass["agent_decision_influence_rows"]), "frequency weighted global agent decision influence"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "product_agent_influence_rows", len(four_pass["product_agent_influence_rows"]), "frequency weighted product agent decision influence"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "trade_frequency_estimate_rows", len(four_pass["trade_frequency_estimate_rows"]), "deduped trade frequency and avg win/loss estimates"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "fifth_pass_live_style_replay_rows", len(four_pass["fifth_pass_replay_rows"]), "final live-style replay rows using market eligibility instead of timer cooldowns"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "fifth_pass_live_style_summary_rows", len(four_pass["fifth_pass_summary_rows"]), "final live-style profitability, win rate, and trades/day"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "fifth_pass_product_contribution_rows", len(four_pass["fifth_pass_product_contribution_rows"]), "per-product contribution from final live-style replay"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "fifth_pass_blocker_rows", len(four_pass["fifth_pass_blocker_rows"]), "why candidates were excluded from final live-style replay"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
     ]
     _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
@@ -2480,6 +2778,10 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
             "agent_decision_influence": agent_decision_influence_path,
             "product_agent_influence": product_agent_influence_path,
             "trade_frequency_estimate": trade_frequency_estimate_path,
+            "fifth_pass_live_style_replay": fifth_pass_replay_path,
+            "fifth_pass_live_style_summary": fifth_pass_summary_path,
+            "fifth_pass_product_contribution": fifth_pass_product_contribution_path,
+            "fifth_pass_blockers": fifth_pass_blockers_path,
             "backtest_summary": summary_path,
         },
         "recommendations": buy_recs,

@@ -616,6 +616,8 @@ MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.
 MAKER_MISS_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_miss_outcomes.csv")
 ORDER_BOOK_SNAPSHOTS_CSV_PATH: str = os.path.join(BASE_DIR, "order_book_snapshots.csv")
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
+ACCOUNT_BALANCE_DIAGNOSTICS_CSV_PATH: str = os.path.join(BASE_DIR, "account_balance_diagnostics.csv")
+LIVE_TRADE_BLOCKERS_CSV_PATH: str = os.path.join(BASE_DIR, "live_trade_blockers.csv")
 
 RUNTIME_CSV_ROW_LIMITS = {
     "market.csv": 15000,
@@ -636,6 +638,8 @@ RUNTIME_CSV_ROW_LIMITS = {
     "historical_replay_1d_2y.csv": 20000,
     "four_pass_product_live_gate.csv": 10000,
     "product_cooldowns.csv": 10000,
+    "account_balance_diagnostics.csv": 10000,
+    "live_trade_blockers.csv": 50000,
 }
 
 SHADOW_SELL_REPLAY_COLUMNS: List[str] = [
@@ -7214,17 +7218,69 @@ class TradingBot:
     def _get_account_balances_live(self) -> Dict[str, Any]:
         return self._active_adapter().get_account_snapshot()
 
-    def _get_available_quote_live(self) -> float:
-        return self._active_adapter().get_available_asset("USDT")
+    def _get_available_quote_live(self, product_id: str = "") -> float:
+        adapter = self._active_adapter()
+        if product_id:
+            return float(adapter.get_available_quote_for_product(product_id))
+        return float(adapter.get_total_tradable_quote_cash())
 
-    def _get_total_quote_live(self) -> float:
-        return self._active_adapter().get_total_asset("USDT")
+    def _get_total_quote_live(self, product_id: str = "") -> float:
+        adapter = self._active_adapter()
+        if product_id:
+            return float(adapter.get_total_quote_for_product(product_id))
+        balances = adapter.balances_by_asset()
+        total = 0.0
+        for asset in getattr(adapter, "quote_asset_priority", ["USD", "USDT", "USDC"]):
+            total += float(balances.get(asset, {}).get("total", 0.0) or 0.0)
+        return float(total)
+
+    def _get_quote_asset_live(self, product_id: str) -> str:
+        return str(self._active_adapter().quote_asset_for_product(product_id))
 
     def _get_base_qty_live(self, product_id: str) -> float:
         adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_total_asset(rules.base_asset)
 
     def _get_available_base_qty_live(self, product_id: str) -> float:
         adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_available_asset(rules.base_asset)
+
+    def _write_account_balance_diagnostics(self) -> None:
+        try:
+            path = ACCOUNT_BALANCE_DIAGNOSTICS_CSV_PATH
+            columns = ["ts", "dt_mst", "asset", "free", "locked", "total", "preferred_quote_asset", "quote_asset_priority", "tradable_quote_cash", "reason"]
+            self._ensure_csv_header(path, columns)
+            adapter = self._active_adapter()
+            balances = adapter.balances_by_asset()
+            tradable_cash = float(adapter.get_total_tradable_quote_cash())
+            rows = []
+            ts_val = now_ts()
+            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            for asset in ["USD", "USDT", "USDC"]:
+                b = balances.get(asset, {})
+                rows.append({"ts": ts_val, "dt_mst": dt_mst, "asset": asset, "free": float(b.get("free", 0.0) or 0.0), "locked": float(b.get("locked", 0.0) or 0.0), "total": float(b.get("total", 0.0) or 0.0), "preferred_quote_asset": str(getattr(adapter, "preferred_quote_asset", "")), "quote_asset_priority": ",".join(getattr(adapter, "quote_asset_priority", [])), "tradable_quote_cash": tradable_cash, "reason": "binance_quote_balance_diagnostic"})
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=columns)
+                for row in rows:
+                    writer.writerow(row)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "write_account_balance_diagnostics_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
+
+    def _write_live_trade_blocker_row(self, *, product_id: str, block_reasons: List[str], action: str = "", product_gate_ok: Optional[bool] = None, top_of_book_age_sec: Optional[float] = None, candidate_notional_usd: float = 0.0) -> None:
+        try:
+            path = LIVE_TRADE_BLOCKERS_CSV_PATH
+            columns = ["ts", "dt_mst", "product_id", "symbol", "quote_asset", "quote_available", "quote_total", "action", "product_gate_ok", "top_of_book_age_sec", "candidate_notional_usd", "block_reasons"]
+            self._ensure_csv_header(path, columns)
+            adapter = self._active_adapter()
+            symbol = adapter.product_to_symbol(product_id)
+            quote_asset = adapter.quote_asset_for_product(product_id)
+            quote_available = float(adapter.get_available_quote_for_product(product_id))
+            quote_total = float(adapter.get_total_quote_for_product(product_id))
+            ts_val = now_ts()
+            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            row = {"ts": ts_val, "dt_mst": dt_mst, "product_id": product_id, "symbol": symbol, "quote_asset": quote_asset, "quote_available": quote_available, "quote_total": quote_total, "action": str(action or ""), "product_gate_ok": "" if product_gate_ok is None else int(bool(product_gate_ok)), "top_of_book_age_sec": "" if top_of_book_age_sec is None else float(top_of_book_age_sec), "candidate_notional_usd": float(candidate_notional_usd or 0.0), "block_reasons": ";".join(str(x) for x in block_reasons)}
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=columns).writerow(row)
+        except Exception:
+            pass
 
     def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = False) -> ExchangeOrderResult:
         return self._active_adapter().place_market_buy(product_id, float(quote_usd))
@@ -13327,9 +13383,17 @@ class TradingBot:
                     return False, "live_buy_blocked:binance_real_orders_disabled"
             product_id = str(candidate.get("product_id", ""))
             if bool(REQUIRE_FRESH_TOP_OF_BOOK_FOR_BUY):
-                tob_age = self._top_of_book_age_sec(product_id)
-                if tob_age is None or tob_age > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
-                    return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age}")
+                tob = self.tob.get(product_id)
+                tob_age = now_ts() - float(tob.ts) if tob else 999999.0
+                if tob_age > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
+                    try:
+                        self._rest_backfill_top_of_book([product_id])
+                        tob = self.tob.get(product_id)
+                        tob_age = now_ts() - float(tob.ts) if tob else 999999.0
+                    except Exception:
+                        pass
+                if tob_age > float(TOP_OF_BOOK_STALE_BLOCK_LIVE_BUY_SEC):
+                    return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age:.2f}")
             product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
             if not product_gate_ok:
                 return False, f"live_buy_blocked:{product_gate_reason}"
@@ -14650,6 +14714,13 @@ class TradingBot:
                 )
 
                 log(f"[level8-live-gate] shadowed {product_id}: {live_quality_reason}")
+                try:
+                    tob = self.tob.get(product_id)
+                    age = None if not tob else now_ts() - float(tob.ts)
+                    product_gate_ok, _product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+                    self._write_live_trade_blocker_row(product_id=product_id, block_reasons=[str(live_quality_reason)], action=str(action), product_gate_ok=product_gate_ok, top_of_book_age_sec=age, candidate_notional_usd=float(info.get("recommended_position_pct", 0.0) or 0.0) * float(self._portfolio_value_usdt_estimate()))
+                except Exception:
+                    pass
             else:
                 info["reason"] = f"{info.get('reason', '')};{live_quality_reason}"
 
@@ -16591,11 +16662,24 @@ class TradingBot:
     def _get_account_balances_live(self) -> Dict[str, Any]:
         return self._active_adapter().get_account_snapshot()
 
-    def _get_available_quote_live(self) -> float:
-        return self._active_adapter().get_available_asset("USDT")
+    def _get_available_quote_live(self, product_id: str = "") -> float:
+        adapter = self._active_adapter()
+        if product_id:
+            return float(adapter.get_available_quote_for_product(product_id))
+        return float(adapter.get_total_tradable_quote_cash())
 
-    def _get_total_quote_live(self) -> float:
-        return self._active_adapter().get_total_asset("USDT")
+    def _get_total_quote_live(self, product_id: str = "") -> float:
+        adapter = self._active_adapter()
+        if product_id:
+            return float(adapter.get_total_quote_for_product(product_id))
+        balances = adapter.balances_by_asset()
+        total = 0.0
+        for asset in getattr(adapter, "quote_asset_priority", ["USD", "USDT", "USDC"]):
+            total += float(balances.get(asset, {}).get("total", 0.0) or 0.0)
+        return float(total)
+
+    def _get_quote_asset_live(self, product_id: str) -> str:
+        return str(self._active_adapter().quote_asset_for_product(product_id))
 
     def _get_base_qty_live(self, product_id: str) -> float:
         adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_total_asset(rules.base_asset)
@@ -19870,7 +19954,7 @@ class TradingBot:
         entry_fee_bps = self._entry_fee_bps_for_mode(
             execution_mode=ENTRY_EXECUTION_MODE
         )
-        if not await self._live_can_afford(quote_usd, entry_fee_bps):
+        if not await self._live_can_afford(quote_usd, entry_fee_bps, product_id=product_id):
             log(
                 f"{INVERTED_LOG_PREFIX} {product_id} buy_skip cannot_afford "
                 f"quote_usd={quote_usd:.2f}"
@@ -21841,17 +21925,25 @@ class TradingBot:
     def _portfolio_value_usdt_estimate(self) -> float:
         adapter = self._active_adapter()
         balances = adapter.balances_by_asset()
-        total = float(balances.get("USDT", {}).get("total", 0.0) or 0.0)
+
+        total = 0.0
+        for asset in getattr(adapter, "quote_asset_priority", ["USD", "USDT", "USDC"]):
+            total += float(balances.get(asset, {}).get("total", 0.0) or 0.0)
+
         for product_id in PRODUCTS:
             try:
                 symbol = adapter.product_to_symbol(product_id)
                 rules = adapter.symbol_rules(symbol)
                 qty = float(balances.get(str(rules.base_asset), {}).get("total", 0.0) or 0.0)
-                if qty <= 0: continue
+                if qty <= 0:
+                    continue
                 tob = self.tob.get(product_id)
                 mid = float(tob.mid) if tob and tob.mid > 0 else float(adapter.get_top_of_book(product_id).get("mid", 0.0) or 0.0)
-                if mid > 0: total += qty * mid
-            except Exception: continue
+                if mid > 0:
+                    total += qty * mid
+            except Exception:
+                continue
+
         return float(max(0.0, total))
 
     def _order_size_bounds_usdt(self, product_id: str) -> Dict[str, float]:
@@ -21869,7 +21961,19 @@ class TradingBot:
         try:
             await self._wait_for_tob_ready(timeout_sec=TOP_OF_BOOK_WAIT_SEC)
             adapter = self._active_adapter(); balances = await asyncio.to_thread(adapter.balances_by_asset)
-            quote_free = float(balances.get("USDT", {}).get("free", 0.0) or 0.0); quote_total = float(balances.get("USDT", {}).get("total", 0.0) or 0.0)
+            try:
+                self._write_account_balance_diagnostics()
+            except Exception:
+                pass
+            quote_free = 0.0
+            quote_total = 0.0
+            quote_breakdown = {}
+            for asset in getattr(adapter, "quote_asset_priority", ["USD", "USDT", "USDC"]):
+                free_val = float(balances.get(asset, {}).get("free", 0.0) or 0.0)
+                total_val = float(balances.get(asset, {}).get("total", 0.0) or 0.0)
+                quote_free += free_val
+                quote_total += total_val
+                quote_breakdown[asset] = {"free": free_val, "total": total_val}
             adopted_count = 0; skipped_count = 0
             for product_id in PRODUCTS:
                 try:
@@ -21893,7 +21997,7 @@ class TradingBot:
                     log(f"[startup-binance] adopted existing {product_id} symbol={symbol} qty={total_qty:.12f} entry≈{approx_entry:.8f} value≈${usd_value:.4f}")
                 except Exception as product_exc:
                     skipped_count += 1; log(f"[startup-binance] adoption failed for {product_id}: {product_exc}")
-            log(f"[startup-binance] complete quote_free={quote_free:.2f} quote_total={quote_total:.2f} adopted={adopted_count} skipped={skipped_count}")
+            log(f"[startup-binance] complete quote_free={quote_free:.2f} quote_total={quote_total:.2f} quote_breakdown={quote_breakdown} adopted={adopted_count} skipped={skipped_count}")
         except Exception as exc:
             module_exception(MODULE_NAME, "startup_binance_portfolio_reconcile_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
 
@@ -22231,8 +22335,8 @@ class TradingBot:
     async def _live_refresh_cash(self) -> float:
         return float(await asyncio.to_thread(self._get_available_quote_live))
 
-    async def _live_can_afford(self, notional_usd: float, fee_bps: Optional[float] = None) -> bool:
-        available = await self._live_refresh_cash()
+    async def _live_can_afford(self, notional_usd: float, fee_bps: Optional[float] = None, product_id: str = "") -> bool:
+        available = await asyncio.to_thread(self._get_available_quote_live, product_id)
         if fee_bps is None:
             fee_bps = float(self.current_taker_fee_bps)
         required = float(notional_usd) * (1.0 + float(fee_bps) / 10000.0) + float(RESERVE_USD)
@@ -23440,7 +23544,7 @@ class TradingBot:
                 # after Coinbase has already reserved/spent funds on a prior order.
                 try:
                     live_snapshot_for_buy = await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
-                    live_cash_for_buy = await self._live_refresh_cash()
+                    live_cash_for_buy = await asyncio.to_thread(self._get_available_quote_live, product_id)
                     if live_cash_for_buy >= 0:
                         cash_usd = float(live_cash_for_buy)
                         equity_usd = float(await asyncio.to_thread(self._portfolio_value_usdt_estimate))
@@ -23494,11 +23598,16 @@ class TradingBot:
                             f"action={candidate.get('level8_action', '')} "
                             f"{graduated_sizing_reason}"
                         )
+                        try:
+                            tob = self.tob.get(product_id); age = None if not tob else now_ts() - float(tob.ts)
+                            self._write_live_trade_blocker_row(product_id=product_id, block_reasons=["level8_no_positive_size", graduated_sizing_reason], action=str(candidate.get("level8_action", "")), top_of_book_age_sec=age, candidate_notional_usd=0.0)
+                        except Exception:
+                            pass
                         continue
 
                 else:
                     entry_notional = self.compute_entry_notional(
-                        available_cash_usd=cash_usd,
+                        available_cash_usd=float(await asyncio.to_thread(self._get_available_quote_live, product_id)),
                         current_total_exposure_usd=total_exposure,
                         current_equity_usd=equity_usd,
                         current_product_exposure_usd=product_exposure,
@@ -23559,6 +23668,11 @@ class TradingBot:
                             f"remaining_eval_budget={remaining_eval_budget:.6f};"
                             f"{sizing_floor_reason}"
                         )
+                        try:
+                            tob = self.tob.get(product_id); age = None if not tob else now_ts() - float(tob.ts)
+                            self._write_live_trade_blocker_row(product_id=product_id, block_reasons=["entry_notional_blocked_by_mechanical_cap", sizing_floor_reason], action=str(candidate.get("level8_action", "")), top_of_book_age_sec=age, candidate_notional_usd=float(entry_notional))
+                        except Exception:
+                            pass
                         continue
                     log(
                         f"[level8] {product_id} entry_notional sized "
@@ -23574,6 +23688,11 @@ class TradingBot:
                             f"min_order={min_order:.2f} cash={cash_usd:.2f} "
                             f"equity={equity_usd:.2f}"
                         )
+                        try:
+                            tob = self.tob.get(product_id); age = None if not tob else now_ts() - float(tob.ts)
+                            self._write_live_trade_blocker_row(product_id=product_id, block_reasons=["below_min_order"], action=str(candidate.get("level8_action", "")), top_of_book_age_sec=age, candidate_notional_usd=float(entry_notional))
+                        except Exception:
+                            pass
                         continue
 
                 bid, ask = candidate["bid"], candidate["ask"]
@@ -23594,7 +23713,7 @@ class TradingBot:
                     execution_mode=entry_mode_for_this_trade
                 )
 
-                can_afford = await self._live_can_afford(entry_notional, entry_fee_bps)
+                can_afford = await self._live_can_afford(entry_notional, entry_fee_bps, product_id=product_id)
 
                 if not can_afford:
                     log(
@@ -23603,6 +23722,11 @@ class TradingBot:
                         f"cash={cash_usd:.2f} "
                         f"entry_fee_bps={entry_fee_bps:.3f}"
                     )
+                    try:
+                        tob = self.tob.get(product_id); age = None if not tob else now_ts() - float(tob.ts)
+                        self._write_live_trade_blocker_row(product_id=product_id, block_reasons=["cannot_afford"], action=str(candidate.get("level8_action", "")), top_of_book_age_sec=age, candidate_notional_usd=float(entry_notional))
+                    except Exception:
+                        pass
                     continue
 
                 trade_id = f"{product_id}-{int(now_ts())}-{uuid.uuid4().hex[:8]}"
@@ -23610,7 +23734,7 @@ class TradingBot:
                 before_buy_cash = float(cash_usd)
                 try:
                     before_buy_base = float(await asyncio.to_thread(self._get_base_qty_live, product_id))
-                    before_buy_cash = float(await self._live_refresh_cash())
+                    before_buy_cash = float(await asyncio.to_thread(self._get_available_quote_live, product_id))
                 except Exception as exc:
                     log(f"[reconcile] Binance pre-buy snapshot failed for {product_id}: {exc}")
 
@@ -24153,6 +24277,10 @@ class TradingBot:
                 snap_live = self.cached_account_snapshot
                 cash_usd = await asyncio.to_thread(self._get_available_quote_live)
                 equity_usd = await asyncio.to_thread(self._portfolio_value_usdt_estimate)
+                try:
+                    self._write_account_balance_diagnostics()
+                except Exception:
+                    pass
             except Exception as e:
                 log(f"[telemetry] Binance.US equity refresh failed: {e}")
                 snap_live = None

@@ -305,7 +305,7 @@ def _read_csv(path: str) -> pd.DataFrame:
     try:
         if not path or not os.path.exists(path) or os.path.getsize(path) <= 0:
             return pd.DataFrame()
-        return pd.read_csv(path)
+        return pd.read_csv(path, on_bad_lines="skip", engine="python")
     except Exception:
         return pd.DataFrame()
 
@@ -1742,15 +1742,17 @@ def _four_pass_product_live_gate_rows(
             realized_mode = "realized" in profitability_mode.lower() or "exit" in profitability_mode.lower()
             buy_ok = selected_count >= 10 and win_rate >= 0.56 and avg_net > 0.0 and median_net > 0.0 and score >= 0.50
             if proxy_mode and not realized_mode:
-                buy_ok = selected_count >= 25 and win_rate >= 0.60 and avg_net >= 20.0 and median_net >= 8.0 and score >= 0.55
+                buy_ok = selected_count >= 50 and win_rate >= 0.64 and avg_net >= 35.0 and median_net >= 18.0 and score >= 0.58
             walk_forward_ok = wf_folds >= 2 and positive_buy_folds >= max(1, int(wf_folds * 0.50)) and wf_avg_net > 0.0
             sell_path_ok = True
+            sell_path_note = "no_sell_path_rows_available"
             if sell_path_rows > 0:
                 sell_path_ok = sell_path_avg > 0.0
+                sell_path_note = "sell_path_positive" if sell_path_ok else "sell_path_negative"
             approved = bool(buy_ok and walk_forward_ok and sell_path_ok)
             if approved:
                 cooldown_minutes = 0
-                reason = f"approved;selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f}"
+                reason = f"approved;selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
             else:
                 if avg_net < 0 or median_net < 0:
                     cooldown_minutes = 1440
@@ -1758,7 +1760,7 @@ def _four_pass_product_live_gate_rows(
                     cooldown_minutes = 720
                 else:
                     cooldown_minutes = 360
-                reason = f"blocked;buy_ok={buy_ok};walk_forward_ok={walk_forward_ok};sell_path_ok={sell_path_ok};selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f}"
+                reason = f"blocked;buy_ok={buy_ok};walk_forward_ok={walk_forward_ok};sell_path_ok={sell_path_ok};selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
                 cooldown_until = float(ts_value) + float(cooldown_minutes * 60)
                 cooldown_rows.append([f"{ts_value:.6f}", dt_value, product_id, f"{cooldown_until:.6f}", int(cooldown_minutes), reason])
             gate_rows.append([f"{ts_value:.6f}", dt_value, product_id, int(selected_count), f"{win_rate:.6f}", f"{avg_net:.6f}", f"{median_net:.6f}", f"{score:.6f}", profitability_mode, int(wf_folds), int(positive_buy_folds), f"{wf_avg_net:.6f}", f"{wf_avg_return:.6f}", int(sell_path_rows), f"{sell_path_avg:.6f}", f"{sell_path_return:.6f}", int(1 if approved else 0), int(cooldown_minutes), reason])

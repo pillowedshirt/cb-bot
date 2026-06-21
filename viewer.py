@@ -74,6 +74,8 @@ STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT = 100
 STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "strategy_variant_replay_summary.csv")
 REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
 EXCHANGE_PRODUCT_MAP_CSV_PATH = os.path.join(BASE_DIR, "exchange_product_map.csv")
+ACCOUNT_BALANCE_DIAGNOSTICS_PATH = os.path.join(BASE_DIR, "account_balance_diagnostics.csv")
+LIVE_TRADE_BLOCKERS_PATH = os.path.join(BASE_DIR, "live_trade_blockers.csv")
 MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
 CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
 CHART_15M_30D_CSV_PATH = os.path.join(BASE_DIR, "chart_15m_30d.csv")
@@ -2942,6 +2944,8 @@ def render_live_dashboard(selected, refresh_config):
     four_pass_purged_walk_forward_df = load_csv_tail(FOUR_PASS_PURGED_WALK_FORWARD_PATH, max_lines=10000)
     four_pass_product_live_gate_df = load_csv_tail(FOUR_PASS_PRODUCT_LIVE_GATE_PATH, max_lines=10000)
     product_cooldowns_df = load_csv_tail(PRODUCT_COOLDOWNS_PATH, max_lines=10000)
+    account_balance_diagnostics_df = load_csv_tail(ACCOUNT_BALANCE_DIAGNOSTICS_PATH, max_lines=1000)
+    live_trade_blockers_df = load_csv_tail(LIVE_TRADE_BLOCKERS_PATH, max_lines=5000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
@@ -2949,6 +2953,16 @@ def render_live_dashboard(selected, refresh_config):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):
         render_strategy_variant_replay_panel()
+    if account_balance_diagnostics_df is not None and not account_balance_diagnostics_df.empty:
+        st.markdown("### Binance Quote Balance Diagnostics")
+        latest_balance = account_balance_diagnostics_df.tail(3)
+        st.dataframe(latest_balance[[c for c in ["asset", "free", "locked", "total", "preferred_quote_asset", "quote_asset_priority", "tradable_quote_cash", "reason"] if c in latest_balance.columns]], use_container_width=True, hide_index=True)
+
+    if live_trade_blockers_df is not None and not live_trade_blockers_df.empty:
+        st.markdown("### Live Trade Blockers")
+        latest_blockers = live_trade_blockers_df.tail(50)
+        st.dataframe(latest_blockers[[c for c in ["dt_mst", "product_id", "symbol", "quote_asset", "quote_available", "quote_total", "action", "product_gate_ok", "top_of_book_age_sec", "candidate_notional_usd", "block_reasons"] if c in latest_blockers.columns]], use_container_width=True, hide_index=True)
+
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df, four_pass_agent_buy_df, four_pass_council_buy_df, four_pass_agent_sell_df, four_pass_council_sell_df, four_pass_final_agent_ratings_df, four_pass_profitability_summary_df, four_pass_agent_context_ratings_df, four_pass_sell_path_replay_df, four_pass_purged_walk_forward_df, four_pass_product_live_gate_df, product_cooldowns_df); st.markdown('</section>', unsafe_allow_html=True)
 
 

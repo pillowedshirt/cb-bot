@@ -926,8 +926,23 @@ def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
         micro_progress = min(1.0, micro_rows / max(1.0, float(STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT)))
         candle_15m_progress = min(1.0, candle_15m_rows / max(1.0, float(STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT)))
         candle_1h_progress = min(1.0, candle_1h_rows / max(1.0, float(STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT)))
-        replay_15m_progress = min(1.0, replay_15m_rows / max(1.0, float(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)))
-        replay_1h_progress = min(1.0, replay_1h_rows / max(1.0, float(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)))
+        replay_15m_row_progress = min(
+            1.0,
+            replay_15m_rows / max(1.0, float(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)),
+        )
+        replay_1h_row_progress = min(
+            1.0,
+            replay_1h_rows / max(1.0, float(STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT)),
+        )
+
+        replay_15m_progress = max(
+            replay_15m_row_progress,
+            1.0 if _viewer_worker_timeframe_done(manifest, product_id, "primary_15m_90d") else 0.0,
+        )
+        replay_1h_progress = max(
+            replay_1h_row_progress,
+            1.0 if _viewer_worker_timeframe_done(manifest, product_id, "regime_1h_365d") else 0.0,
+        )
 
         historical_candle_progress = (candle_15m_progress + candle_1h_progress) / 2.0
         historical_replay_progress = (replay_15m_progress + replay_1h_progress) / 2.0
@@ -1072,9 +1087,11 @@ def load_calculation_status(snapshot: dict | None = None) -> dict:
         try:
             status_ts = float(status.get("ts", 0.0) or 0.0)
             if status_ts > 0 and time.time() - status_ts <= 15.0:
-                return _stabilize_calculation_status_for_viewer(status)
+                promoted = _promote_status_if_runtime_complete(status, snapshot)
+                return _stabilize_calculation_status_for_viewer(promoted)
         except Exception:
-            return _stabilize_calculation_status_for_viewer(status)
+            promoted = _promote_status_if_runtime_complete(status, snapshot)
+            return _stabilize_calculation_status_for_viewer(promoted)
 
     # Only synthesize fallback progress when there is no completed latch/status.
     synthesized = _synthesize_calculation_status_for_viewer(snapshot or load_viewer_snapshot())
@@ -1088,6 +1105,7 @@ def load_calculation_status(snapshot: dict | None = None) -> dict:
     else:
         synthesized["bot_calculation_status_missing"] = True
 
+    synthesized = _promote_status_if_runtime_complete(synthesized, snapshot)
     return _stabilize_calculation_status_for_viewer(synthesized)
 
 
@@ -1137,22 +1155,103 @@ def _viewer_csv_product_coverage(path: str, product_ids: list[str]) -> float:
         return 0.0
 
 
+def _viewer_worker_timeframe_done(manifest: dict, product_id: str, timeframe: str) -> bool:
+    try:
+        jobs = (manifest or {}).get("jobs", {}) or {}
+        for job in jobs.values():
+            if str(job.get("product_id", "")) != str(product_id):
+                continue
+            if str(job.get("timeframe", "")) != str(timeframe):
+                continue
+            status = str(job.get("status", "")).strip().lower()
+            if status in {"merged", "done", "completed", "success"}:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _viewer_worker_product_done(manifest: dict, product_id: str) -> bool:
+    return bool(
+        _viewer_worker_timeframe_done(manifest, product_id, "primary_15m_90d")
+        and _viewer_worker_timeframe_done(manifest, product_id, "regime_1h_365d")
+    )
+
+
+def _viewer_worker_all_products_done(manifest: dict, product_ids: list[str]) -> bool:
+    if not product_ids:
+        return False
+    return all(_viewer_worker_product_done(manifest, product_id) for product_id in product_ids)
+
+
 def _viewer_derived_verdict_progress(product_ids: list[str]) -> float:
-    checks = [
-        _viewer_csv_has_meaningful_rows(FOUR_PASS_PRODUCT_LIVE_GATE_PATH, min_rows=1),
-        _viewer_csv_has_meaningful_rows(FIFTH_PASS_LIVE_STYLE_SUMMARY_PATH, min_rows=1),
-        _viewer_csv_has_meaningful_rows(RISK_LIVE_GATE_PATH, min_rows=1),
-        _viewer_csv_has_meaningful_rows(RISK_EV_CONFIDENCE_PATH, min_rows=1),
-    ]
-    quant_checks = [
-        _viewer_csv_has_meaningful_rows(FEATURE_OUTCOME_CORRELATION_PATH, min_rows=1),
-        _viewer_csv_has_meaningful_rows(MARKOV_REGIME_POLICY_PATH, min_rows=1),
-        _viewer_csv_has_meaningful_rows(KALMAN_FILTER_POLICY_PATH, min_rows=1),
-    ]
-    core_progress = sum(1.0 for x in checks if x) / max(1, len(checks))
+    four_pass_done = _viewer_csv_has_meaningful_rows(FOUR_PASS_PRODUCT_LIVE_GATE_PATH, min_rows=1)
+
+    fifth_pass_done = bool(
+        _viewer_csv_has_meaningful_rows(FIFTH_PASS_LIVE_STYLE_SUMMARY_PATH, min_rows=1)
+        or _viewer_csv_has_meaningful_rows(FIFTH_PASS_BLOCKERS_PATH, min_rows=1)
+        or _viewer_csv_has_meaningful_rows(FIFTH_PASS_PRODUCT_CONTRIBUTION_PATH, min_rows=1)
+    )
+
+    risk_gate_done = _viewer_csv_has_meaningful_rows(RISK_LIVE_GATE_PATH, min_rows=1)
+    ev_confidence_done = _viewer_csv_has_meaningful_rows(RISK_EV_CONFIDENCE_PATH, min_rows=1)
+
+    feature_done = _viewer_csv_has_meaningful_rows(FEATURE_OUTCOME_CORRELATION_PATH, min_rows=1)
+    markov_done = _viewer_csv_has_meaningful_rows(MARKOV_REGIME_POLICY_PATH, min_rows=1)
+    kalman_done = _viewer_csv_has_meaningful_rows(KALMAN_FILTER_POLICY_PATH, min_rows=1)
+
+    core_checks = [four_pass_done, fifth_pass_done, risk_gate_done, ev_confidence_done]
+    quant_checks = [feature_done, markov_done, kalman_done]
+
+    core_progress = sum(1.0 for x in core_checks if x) / max(1, len(core_checks))
     quant_progress = sum(1.0 for x in quant_checks if x) / max(1, len(quant_checks))
+
     return float(max(0.0, min(1.0, core_progress * 0.80 + quant_progress * 0.20)))
 
+
+def _promote_status_if_runtime_complete(status: dict, snapshot: dict | None = None) -> dict:
+    if not isinstance(status, dict):
+        return status
+
+    out = dict(status)
+
+    manifest = {}
+    if os.path.exists(HISTORICAL_REPLAY_MANIFEST_JSON_PATH):
+        try:
+            with open(HISTORICAL_REPLAY_MANIFEST_JSON_PATH, "r", encoding="utf-8") as file:
+                manifest = json.load(file)
+        except Exception:
+            manifest = {}
+
+    product_status = out.get("product_status") or {}
+    product_ids = list(product_status.keys()) if isinstance(product_status, dict) else []
+    if not product_ids:
+        product_ids = _viewer_product_ids(snapshot or {}, manifest, {})
+
+    worker_all_done = _viewer_worker_all_products_done(manifest, product_ids)
+    derived_done = _viewer_derived_verdict_progress(product_ids) >= 1.0
+
+    if worker_all_done and derived_done:
+        out["viewer_runtime_completion_override"] = True
+        out["viewer_runtime_completion_reason"] = (
+            "worker manifest shows all product/timeframe jobs merged and derived verdict/risk/quant files exist"
+        )
+        out["full_viewer_unlocked"] = True
+        out["calculation_work_complete"] = True
+        out["calculation_complete_latched"] = True
+        out["overall_progress"] = 1.0
+        out["overall_progress_pct"] = 100.0
+        out["phase_label"] = "Complete"
+        phase_progress = dict(out.get("phase_progress") or {})
+        phase_progress["micro_backlog"] = 1.0
+        phase_progress["historical_candle_backlog"] = 1.0
+        phase_progress["historical_replay"] = 1.0
+        phase_progress["replay_calibration_verdicts"] = 1.0
+        out["phase_progress"] = phase_progress
+        out["complete_products"] = len(product_ids)
+        out["incomplete_products"] = 0
+
+    return out
 
 def _stabilize_calculation_status_for_viewer(status: dict) -> dict:
     if not isinstance(status, dict):
@@ -2613,6 +2712,22 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
 
     if calc_status.get("viewer_synthesized_complete"):
         st.success("Runtime files indicate startup calculations are complete. Viewer is unlocking from synthesized status.")
+
+    if calc_status.get("viewer_runtime_completion_override"):
+        st.success(str(calc_status.get("viewer_runtime_completion_reason", "")))
+
+    product_status = calc_status.get("product_status", {}) or {}
+    low_signal_done = [
+        product_id
+        for product_id, row in product_status.items()
+        if bool((row or {}).get("low_signal_count_but_worker_done"))
+    ]
+
+    if low_signal_done:
+        st.info(
+            "Replay workers are complete for these products even though accepted replay signal rows were below the old threshold: "
+            + ", ".join(low_signal_done)
+        )
     status_ts = float(calc_status.get("ts", 0.0) or 0.0)
     age_sec = max(0.0, time.time() - status_ts) if status_ts > 0 else 0.0
     status_source = str(calc_status.get("viewer_status_source") or "calculation_status.json")
@@ -3231,6 +3346,158 @@ def render_strategy_variant_replay_panel():
         st.markdown("#### Overall by variant")
         st.dataframe(by_variant, width="stretch", hide_index=True)
 
+def render_backlog_simulation_results_panel(
+    historical_replay_summary_df,
+    strategy_variant_replay_summary_df,
+    four_pass_product_live_gate_df,
+    four_pass_profitability_summary_df,
+    four_pass_purged_walk_forward_df,
+    trade_frequency_estimate_df,
+    fifth_pass_summary_df,
+    fifth_pass_blockers_df,
+    risk_monte_carlo_df,
+):
+    st.markdown("### Backlog Simulation Results")
+    st.caption(
+        "This section summarizes the replay/backlog simulations currently driving calibration, risk, and live-gate decisions."
+    )
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Historical replay products", 0 if historical_replay_summary_df is None or historical_replay_summary_df.empty or "product_id" not in historical_replay_summary_df.columns else historical_replay_summary_df["product_id"].astype(str).nunique())
+    metric_cols[1].metric("Strategy variant rows", 0 if strategy_variant_replay_summary_df is None else len(strategy_variant_replay_summary_df))
+    metric_cols[2].metric("Four-pass gate rows", 0 if four_pass_product_live_gate_df is None else len(four_pass_product_live_gate_df))
+    metric_cols[3].metric("Walk-forward rows", 0 if four_pass_purged_walk_forward_df is None else len(four_pass_purged_walk_forward_df))
+    metric_cols[4].metric("Monte Carlo rows", 0 if risk_monte_carlo_df is None else len(risk_monte_carlo_df))
+
+    if historical_replay_summary_df is not None and not historical_replay_summary_df.empty:
+        hist = historical_replay_summary_df.copy()
+        for col in ["avg_net_pnl_bps", "median_net_pnl_bps", "win_rate", "rows"]:
+            if col in hist.columns:
+                hist[col] = pd.to_numeric(hist[col], errors="coerce").fillna(0.0)
+        if "ts" in hist.columns:
+            hist["ts"] = pd.to_numeric(hist["ts"], errors="coerce").fillna(0.0)
+            hist = hist.sort_values("ts")
+        if "product_id" in hist.columns:
+            hist = hist.groupby("product_id", as_index=False).tail(1)
+        if {"product_id", "avg_net_pnl_bps", "win_rate"}.issubset(hist.columns):
+            fig = go.Figure()
+            fig.add_bar(x=hist["product_id"].astype(str), y=hist["avg_net_pnl_bps"], name="Avg net bps")
+            fig.add_scatter(x=hist["product_id"].astype(str), y=hist["win_rate"] * 100.0, name="Win rate %", mode="lines+markers", yaxis="y2")
+            fig.add_hline(y=0.0)
+            fig.update_layout(title="Historical Replay Simulation — Product Edge", yaxis=dict(title="Avg net bps"), yaxis2=dict(title="Win rate %", overlaying="y", side="right"))
+            st.plotly_chart(_quant_fig_layout(fig, "Historical Replay Simulation — Product Edge", height=420), width="stretch")
+
+    if strategy_variant_replay_summary_df is not None and not strategy_variant_replay_summary_df.empty:
+        sv = strategy_variant_replay_summary_df.copy()
+        for col in ["binance_maker_maker_avg_bps", "binance_maker_taker_avg_bps", "binance_taker_taker_avg_bps", "rows"]:
+            if col in sv.columns:
+                sv[col] = pd.to_numeric(sv[col], errors="coerce").fillna(0.0)
+        if {"product_id", "strategy_variant", "binance_maker_maker_avg_bps"}.issubset(sv.columns):
+            latest = sv.copy()
+            if "ts" in latest.columns:
+                latest["ts"] = pd.to_numeric(latest["ts"], errors="coerce").fillna(0.0)
+                latest = latest.sort_values("ts")
+            group_cols = [c for c in ["product_id", "timeframe", "strategy_variant"] if c in latest.columns]
+            latest = latest.groupby(group_cols, as_index=False).tail(1) if group_cols else latest
+            ranked = latest.sort_values("binance_maker_maker_avg_bps", ascending=False).head(30)
+            fig = go.Figure()
+            fig.add_bar(x=ranked["binance_maker_maker_avg_bps"], y=ranked["product_id"].astype(str) + " · " + ranked["strategy_variant"].astype(str), orientation="h", name="Maker/Maker avg bps")
+            fig.add_vline(x=0.0)
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(_quant_fig_layout(fig, "Strategy Variant Simulation — Top Binance Maker/Maker Edges", height=620), width="stretch")
+
+    if four_pass_product_live_gate_df is not None and not four_pass_product_live_gate_df.empty:
+        gate = four_pass_product_live_gate_df.copy()
+        for col in ["buy_avg_net_bps", "buy_win_rate", "walk_forward_avg_validation_net_bps", "sell_path_avg_realized_net_bps", "approved_for_live_buy"]:
+            if col in gate.columns:
+                gate[col] = pd.to_numeric(gate[col], errors="coerce").fillna(0.0)
+        if {"product_id", "buy_avg_net_bps", "buy_win_rate"}.issubset(gate.columns):
+            fig = go.Figure()
+            fig.add_bar(x=gate["product_id"].astype(str), y=gate["buy_avg_net_bps"], name="Four-pass buy avg bps")
+            if "sell_path_avg_realized_net_bps" in gate.columns:
+                fig.add_scatter(x=gate["product_id"].astype(str), y=gate["sell_path_avg_realized_net_bps"], mode="lines+markers", name="Sell-path avg bps")
+            fig.add_hline(y=0.0)
+            st.plotly_chart(_quant_fig_layout(fig, "Four-Pass Live-Gate Simulation — Buy Edge vs Sell-Path Proof", height=420), width="stretch")
+
+    if four_pass_purged_walk_forward_df is not None and not four_pass_purged_walk_forward_df.empty:
+        wf = four_pass_purged_walk_forward_df.copy()
+        for col in ["fold_id", "validation_avg_net_bps", "validation_reference_return_pct", "validation_win_rate"]:
+            if col in wf.columns:
+                wf[col] = pd.to_numeric(wf[col], errors="coerce").fillna(0.0)
+        if {"fold_id", "validation_avg_net_bps", "validation_reference_return_pct"}.issubset(wf.columns):
+            fig = go.Figure()
+            fig.add_bar(x=wf["fold_id"].astype(str), y=wf["validation_avg_net_bps"], name="Validation avg net bps")
+            fig.add_scatter(x=wf["fold_id"].astype(str), y=wf["validation_reference_return_pct"], name="Validation reference return %", mode="lines+markers", yaxis="y2")
+            fig.add_hline(y=0.0)
+            fig.update_layout(yaxis=dict(title="Validation avg net bps"), yaxis2=dict(title="Reference return %", overlaying="y", side="right"))
+            st.plotly_chart(_quant_fig_layout(fig, "Purged Walk-Forward Simulation — Validation Performance", height=420), width="stretch")
+
+    if trade_frequency_estimate_df is not None and not trade_frequency_estimate_df.empty:
+        freq = trade_frequency_estimate_df.copy()
+        for col in ["estimated_trades_per_day", "expected_daily_net_bps_if_all_traded", "dedupe_minutes", "win_rate"]:
+            if col in freq.columns:
+                freq[col] = pd.to_numeric(freq[col], errors="coerce").fillna(0.0)
+        if {"product_id", "dedupe_minutes", "estimated_trades_per_day", "expected_daily_net_bps_if_all_traded"}.issubset(freq.columns):
+            latest = freq[freq["product_id"].astype(str) != "ALL"].copy()
+            options = sorted(latest["dedupe_minutes"].dropna().unique().tolist())
+            if options:
+                selected_dedupe = st.selectbox("Trade frequency simulation spacing", options, index=0, key="backlog_trade_frequency_dedupe")
+                view = latest[latest["dedupe_minutes"].eq(selected_dedupe)].copy()
+                fig = go.Figure()
+                fig.add_bar(x=view["product_id"].astype(str), y=view["estimated_trades_per_day"], name="Estimated trades/day")
+                fig.add_scatter(x=view["product_id"].astype(str), y=view["expected_daily_net_bps_if_all_traded"], name="Expected daily net bps", mode="lines+markers", yaxis="y2")
+                fig.update_layout(yaxis=dict(title="Trades/day"), yaxis2=dict(title="Expected daily net bps", overlaying="y", side="right"))
+                st.plotly_chart(_quant_fig_layout(fig, f"Trade Frequency Simulation — {int(selected_dedupe)} Minute Dedupe", height=420), width="stretch")
+
+    if risk_monte_carlo_df is not None and not risk_monte_carlo_df.empty:
+        mc = risk_monte_carlo_df.copy()
+        for col in ["horizon_days", "median_return_pct", "p05_return_pct", "p95_return_pct", "p95_max_drawdown_pct"]:
+            if col in mc.columns:
+                mc[col] = pd.to_numeric(mc[col], errors="coerce").fillna(0.0)
+        if {"product_id", "horizon_days", "median_return_pct", "p05_return_pct", "p95_return_pct"}.issubset(mc.columns):
+            mc = mc[mc["product_id"].astype(str) != "ALL"].copy()
+            if "ts" in mc.columns:
+                mc["ts"] = pd.to_numeric(mc["ts"], errors="coerce").fillna(0.0)
+                mc = mc.sort_values("ts")
+            mc = mc.groupby(["product_id", "horizon_days"], as_index=False).tail(1)
+            fig = go.Figure()
+            for product_id, group in mc.groupby("product_id"):
+                fig.add_scatter(x=group["horizon_days"], y=group["median_return_pct"], mode="lines+markers", name=str(product_id))
+            st.plotly_chart(_quant_fig_layout(fig, "Monte Carlo Simulation — Median Return by Product/Horizon", height=460), width="stretch")
+
+    if fifth_pass_summary_df is not None and not fifth_pass_summary_df.empty:
+        st.success("Final fifth-pass live-style simulation produced trade rows.")
+    elif fifth_pass_blockers_df is not None and not fifth_pass_blockers_df.empty:
+        blockers = fifth_pass_blockers_df.copy()
+        if "count" in blockers.columns:
+            blockers["count"] = pd.to_numeric(blockers["count"], errors="coerce").fillna(0.0)
+        if {"product_id", "blocker", "count"}.issubset(blockers.columns):
+            ranked = blockers.sort_values("count", ascending=False).head(25)
+            fig = go.Figure()
+            fig.add_bar(x=ranked["count"], y=ranked["product_id"].astype(str) + " · " + ranked["blocker"].astype(str), orientation="h", name="Blocker count")
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(_quant_fig_layout(fig, "Final Fifth-Pass Live-Style Simulation — Why No Final Trades Passed", height=620), width="stretch")
+            st.warning("Final fifth-pass simulation ran, but produced no final live-style trades. The blocker chart above explains why.")
+
+    with st.expander("Backlog simulation raw result tables", expanded=False):
+        for label, df in [
+            ("Historical replay summary", historical_replay_summary_df),
+            ("Strategy variant replay summary", strategy_variant_replay_summary_df),
+            ("Four-pass product live gate", four_pass_product_live_gate_df),
+            ("Four-pass profitability summary", four_pass_profitability_summary_df),
+            ("Purged walk-forward", four_pass_purged_walk_forward_df),
+            ("Trade frequency estimate", trade_frequency_estimate_df),
+            ("Fifth-pass summary", fifth_pass_summary_df),
+            ("Fifth-pass blockers", fifth_pass_blockers_df),
+            ("Monte Carlo risk summary", risk_monte_carlo_df),
+        ]:
+            st.markdown(f"#### {label}")
+            if df is not None and not df.empty:
+                st.dataframe(df.tail(200), width="stretch", hide_index=True)
+            else:
+                st.info(f"{label} has no populated rows yet.")
+
+
 def render_profitability_diagnostics_panel():
     st.markdown("### Profitability Diagnostics")
     variant_df = load_csv_tail(STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH, max_lines=10000)
@@ -3498,6 +3765,10 @@ def render_live_dashboard(selected, refresh_config):
     shadow_sell_replay_df = load_csv_tail(SHADOW_SELL_REPLAY_CSV_PATH, max_lines=20000)
     historical_replay_df = load_csv_tail(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=50000)
     historical_replay_summary_df = load_csv_tail(HISTORICAL_REPLAY_SUMMARY_CSV_PATH, max_lines=5000)
+    strategy_variant_replay_summary_df = load_csv_tail(
+        STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH,
+        max_lines=10000,
+    )
     four_pass_agent_buy_df = load_csv_tail(FOUR_PASS_AGENT_BUY_PATH, max_lines=5000)
     four_pass_council_buy_df = load_csv_tail(FOUR_PASS_COUNCIL_BUY_PATH, max_lines=5000)
     four_pass_agent_sell_df = load_csv_tail(FOUR_PASS_AGENT_SELL_PATH, max_lines=5000)
@@ -3532,6 +3803,18 @@ def render_live_dashboard(selected, refresh_config):
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
+    with st.expander("Backlog simulation results", expanded=True):
+        render_backlog_simulation_results_panel(
+            historical_replay_summary_df,
+            strategy_variant_replay_summary_df,
+            four_pass_product_live_gate_df,
+            four_pass_profitability_summary_df,
+            four_pass_purged_walk_forward_df,
+            trade_frequency_estimate_df,
+            fifth_pass_summary_df,
+            fifth_pass_blockers_df,
+            risk_monte_carlo_df,
+        )
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):

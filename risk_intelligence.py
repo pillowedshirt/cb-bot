@@ -49,6 +49,14 @@ RISK_LIVE_GATE_COLUMNS = [
     "live_allowed", "size_multiplier", "reason",
 ]
 
+SOURCE_QUALITY_WEIGHTS: Dict[str, float] = {
+    "fifth_pass_live_style_replay": 0.90,
+    "historical_shadow_replay": 0.75,
+    "candidate_replay_proxy": 0.45,
+    "council_observed": 0.80,
+    "live_realized": 1.00,
+}
+
 
 def _utc_ts() -> float:
     return float(time.time())
@@ -103,6 +111,20 @@ def context_key_from_mapping(mapping: Dict[str, Any]) -> str:
     return "|".join(p.strip().lower().replace(" ", "_") for p in parts)
 
 
+def context_lookup_keys_from_mapping(product_id: str, mapping: Dict[str, Any]) -> List[str]:
+    regime = str(mapping.get("market_regime") or mapping.get("regime_tag") or "unknown_regime").strip().lower().replace(" ", "_")
+    session = str(mapping.get("session_liquidity_setup") or "unknown_session").strip().lower().replace(" ", "_")
+    structure = str(mapping.get("structure_state") or "unknown_structure").strip().lower().replace(" ", "_")
+    quant = str(mapping.get("quant_boundary_state") or "unknown_quant").strip().lower().replace(" ", "_")
+    full = context_key_from_mapping(mapping)
+    return [
+        f"{product_id}||full||{full}",
+        f"{product_id}||regime_session_structure||{regime}|{session}|{structure}",
+        f"{product_id}||regime_quant||{regime}|{quant}",
+        f"{product_id}||regime_only||{regime}",
+        f"ALL||regime_only||{regime}",
+    ]
+
 def _infer_day_key(frame: pd.DataFrame) -> pd.Series:
     for col in ["entry_ts", "replay_ts", "ts"]:
         if col in frame.columns:
@@ -137,16 +159,25 @@ def _standardize_source_frame(frame: pd.DataFrame, source_name: str) -> pd.DataF
         out["market_regime"] = out["regime_tag"].astype(str) if "regime_tag" in out.columns else "unknown_regime"
     out["context_key"] = out.apply(lambda row: context_key_from_mapping(row.to_dict()), axis=1)
     out["source_name"] = source_name
+    out["source_weight"] = float(SOURCE_QUALITY_WEIGHTS.get(source_name, 0.50))
     out["max_adverse_bps"] = _numeric(out, "max_adverse_bps", 0.0).abs() if "max_adverse_bps" in out.columns else 0.0
-    out = out[["product_id", "outcome_bps", "day_key", "market_regime", "context_key", "source_name", "max_adverse_bps"]].copy()
+    keep = ["product_id", "outcome_bps", "day_key", "market_regime", "context_key", "source_name", "source_weight", "max_adverse_bps"]
+    out = out[keep].copy()
     out["outcome_bps"] = pd.to_numeric(out["outcome_bps"], errors="coerce")
+    out["source_weight"] = pd.to_numeric(out["source_weight"], errors="coerce").fillna(0.50)
     out = out.dropna(subset=["outcome_bps"])
     return out[np.isfinite(out["outcome_bps"])]
 
 
 def _training_frame(base_dir: str) -> pd.DataFrame:
     frames = []
-    for filename, source_name in [("fifth_pass_live_style_replay.csv", "fifth_pass_live_style_replay"), ("historical_shadow_replay.csv", "historical_shadow_replay"), ("candidate_replay.csv", "candidate_replay_proxy")]:
+    sources = [
+        ("fifth_pass_live_style_replay.csv", "fifth_pass_live_style_replay"),
+        ("historical_shadow_replay.csv", "historical_shadow_replay"),
+        ("candidate_replay.csv", "candidate_replay_proxy"),
+        ("council_observation_outcomes.csv", "council_observed"),
+    ]
+    for filename, source_name in sources:
         frame = _standardize_source_frame(_read_csv(os.path.join(base_dir, filename)), source_name)
         if not frame.empty:
             frames.append(frame)
@@ -154,35 +185,23 @@ def _training_frame(base_dir: str) -> pd.DataFrame:
         return pd.DataFrame()
     combined = pd.concat(frames, ignore_index=True)
     combined["outcome_bps"] = pd.to_numeric(combined["outcome_bps"], errors="coerce").fillna(0.0)
+    combined["source_weight"] = pd.to_numeric(combined["source_weight"], errors="coerce").fillna(0.50)
     return combined[combined["product_id"].astype(str).str.len() > 0].copy()
 
-
-def _bootstrap_ev_stats(values: pd.Series, *, trials: int = 2000, seed: int = 7) -> Dict[str, float]:
-    vals = pd.to_numeric(values, errors="coerce").dropna().to_numpy(dtype=float)
-    vals = vals[np.isfinite(vals)]
+def _bootstrap_ev_stats(values: pd.Series, *, weights: Optional[pd.Series] = None, trials: int = 2000, seed: int = 7) -> Dict[str, float]:
+    local = pd.DataFrame({"value": pd.to_numeric(values, errors="coerce"), "weight": pd.to_numeric(weights, errors="coerce") if weights is not None else 1.0}).dropna()
+    if local.empty:
+        return {"sample_count": 0.0, "raw_win_rate": 0.0, "ev_mean_bps": 0.0, "ev_median_bps": 0.0, "ev_ci_low_bps": 0.0, "ev_ci_high_bps": 0.0, "prob_ev_positive": 0.0, "avg_win_bps": 0.0, "avg_loss_bps": 0.0}
+    local = local[np.isfinite(local["value"])]
+    vals = local["value"].to_numpy(dtype=float); w = local["weight"].clip(lower=0.05).to_numpy(dtype=float)
     if len(vals) <= 0:
         return {"sample_count": 0.0, "raw_win_rate": 0.0, "ev_mean_bps": 0.0, "ev_median_bps": 0.0, "ev_ci_low_bps": 0.0, "ev_ci_high_bps": 0.0, "prob_ev_positive": 0.0, "avg_win_bps": 0.0, "avg_loss_bps": 0.0}
-    rng = np.random.default_rng(seed)
-    n = len(vals)
-    means = np.empty(int(trials), dtype=float)
+    probability = w / max(float(w.sum()), 1e-12); rng = np.random.default_rng(seed); n = len(vals); means = np.empty(int(trials), dtype=float)
     for i in range(int(trials)):
-        means[i] = float(np.mean(rng.choice(vals, size=n, replace=True)))
-    wins = vals[vals > 0.0]
-    losses = vals[vals <= 0.0]
-    return {"sample_count": float(n), "raw_win_rate": float(np.mean(vals > 0.0)), "ev_mean_bps": float(np.mean(vals)), "ev_median_bps": float(np.median(vals)), "ev_ci_low_bps": float(np.percentile(means, 5)), "ev_ci_high_bps": float(np.percentile(means, 95)), "prob_ev_positive": float(np.mean(means > 0.0)), "avg_win_bps": float(np.mean(wins)) if len(wins) else 0.0, "avg_loss_bps": float(abs(np.mean(losses))) if len(losses) else 0.0}
-
-
-def _confidence_grade(stats: Dict[str, float]) -> Tuple[str, str, float]:
-    n, ev, low, p_pos = (float(stats.get(k, 0.0)) for k in ("sample_count", "ev_mean_bps", "ev_ci_low_bps", "prob_ev_positive"))
-    if n < 30:
-        return "INSUFFICIENT_SAMPLE", "shadow_or_min_size", 0.50
-    if low > 0.0 and p_pos >= 0.75 and ev > 0.0:
-        return "STRONG_POSITIVE_EV", "allow_normal_or_larger_size", 1.10
-    if low > -5.0 and p_pos >= 0.62 and ev > 0.0:
-        return "WEAK_POSITIVE_EV", "allow_reduced_size", 0.75
-    if p_pos >= 0.52 and ev > -3.0:
-        return "UNCERTAIN_EV", "allow_min_size_only", 0.50
-    return "NEGATIVE_OR_UNRELIABLE_EV", "block_or_shadow", 0.0
+        idx = rng.choice(np.arange(n), size=n, replace=True, p=probability)
+        means[i] = float(np.average(vals[idx], weights=w[idx]))
+    wins = vals[vals > 0.0]; losses = vals[vals <= 0.0]
+    return {"sample_count": float(n), "raw_win_rate": float(np.mean(vals > 0.0)), "ev_mean_bps": float(np.average(vals, weights=w)), "ev_median_bps": float(np.median(vals)), "ev_ci_low_bps": float(np.percentile(means, 5)), "ev_ci_high_bps": float(np.percentile(means, 95)), "prob_ev_positive": float(np.mean(means > 0.0)), "avg_win_bps": float(np.mean(wins)) if len(wins) else 0.0, "avg_loss_bps": float(abs(np.mean(losses))) if len(losses) else 0.0}
 
 
 def _monte_carlo_path_stats(frame: pd.DataFrame, *, horizon_days: int, trials: int, position_size_pct: float, seed: int) -> Dict[str, float]:
@@ -190,23 +209,24 @@ def _monte_carlo_path_stats(frame: pd.DataFrame, *, horizon_days: int, trials: i
         return {"median_return_pct": 0.0, "p05_return_pct": 0.0, "p95_return_pct": 0.0, "prob_loss": 1.0, "median_max_drawdown_pct": 0.0, "p95_max_drawdown_pct": 0.0, "prob_drawdown_gt_3pct": 0.0, "prob_drawdown_gt_5pct": 0.0}
     local = frame.copy()
     local["outcome_bps"] = pd.to_numeric(local["outcome_bps"], errors="coerce").fillna(0.0)
-    daily_blocks = [list(group["outcome_bps"].astype(float).values) for _, group in local.groupby("day_key") if len(group) > 0] or [list(local["outcome_bps"].astype(float).values)]
-    rng = np.random.default_rng(seed)
-    terminal_returns, max_drawdowns = [], []
+    local["source_weight"] = pd.to_numeric(local.get("source_weight", 0.50), errors="coerce").fillna(0.50)
+    daily_blocks = []; daily_weights = []
+    for _, group in local.groupby("day_key"):
+        if len(group) <= 0: continue
+        daily_blocks.append(list(group["outcome_bps"].astype(float).values)); daily_weights.append(float(group["source_weight"].mean()))
+    if not daily_blocks:
+        daily_blocks = [list(local["outcome_bps"].astype(float).values)]; daily_weights = [float(local["source_weight"].mean())]
+    daily_weights_np = np.clip(np.asarray(daily_weights, dtype=float), 0.05, None); daily_prob = daily_weights_np / max(float(daily_weights_np.sum()), 1e-12)
+    rng = np.random.default_rng(seed); terminal_returns = []; max_drawdowns = []
     for _ in range(int(trials)):
         equity_pct = peak_pct = max_dd = 0.0
         for _day in range(int(horizon_days)):
-            block = daily_blocks[int(rng.integers(0, len(daily_blocks)))]
+            idx = int(rng.choice(np.arange(len(daily_blocks)), p=daily_prob)); block = daily_blocks[idx]
             day_return_pct = float(np.sum(block)) * float(position_size_pct) / 100.0
-            equity_pct += day_return_pct
-            peak_pct = max(peak_pct, equity_pct)
-            max_dd = max(max_dd, peak_pct - equity_pct)
-        terminal_returns.append(equity_pct)
-        max_drawdowns.append(max_dd)
-    terminal = np.asarray(terminal_returns, dtype=float)
-    drawdowns = np.asarray(max_drawdowns, dtype=float)
+            equity_pct += day_return_pct; peak_pct = max(peak_pct, equity_pct); max_dd = max(max_dd, peak_pct - equity_pct)
+        terminal_returns.append(equity_pct); max_drawdowns.append(max_dd)
+    terminal = np.asarray(terminal_returns, dtype=float); drawdowns = np.asarray(max_drawdowns, dtype=float)
     return {"median_return_pct": float(np.percentile(terminal, 50)), "p05_return_pct": float(np.percentile(terminal, 5)), "p95_return_pct": float(np.percentile(terminal, 95)), "prob_loss": float(np.mean(terminal < 0.0)), "median_max_drawdown_pct": float(np.percentile(drawdowns, 50)), "p95_max_drawdown_pct": float(np.percentile(drawdowns, 95)), "prob_drawdown_gt_3pct": float(np.mean(drawdowns > 3.0)), "prob_drawdown_gt_5pct": float(np.mean(drawdowns > 5.0))}
-
 
 def _risk_grade_from_mc(stats: Dict[str, float]) -> str:
     p_loss = float(stats.get("prob_loss", 1.0)); dd95 = float(stats.get("p95_max_drawdown_pct", 99.0)); p_dd3 = float(stats.get("prob_drawdown_gt_3pct", 1.0))
@@ -242,7 +262,7 @@ def run_risk_intelligence(*, base_dir: str, log_fn=None, bootstrap_trials: int =
     product_groups = [("ALL", frame)] + [(str(pid), group.copy()) for pid, group in frame.groupby("product_id")]
     product_ev_map: Dict[str, Dict[str, float]] = {}
     for product_id, group in product_groups:
-        stats = _bootstrap_ev_stats(group["outcome_bps"], trials=int(bootstrap_trials), seed=11)
+        stats = _bootstrap_ev_stats(group["outcome_bps"], weights=group.get("source_weight"), trials=int(bootstrap_trials), seed=11)
         grade, action, size_mult = _confidence_grade(stats); product_ev_map[product_id] = stats
         ev_rows.append([f"{ts_value:.6f}", dt_value, "product" if product_id != "ALL" else "portfolio", product_id, "ALL", "ALL", int(stats["sample_count"]), f"{stats['raw_win_rate']:.6f}", f"{stats['ev_mean_bps']:.6f}", f"{stats['ev_median_bps']:.6f}", f"{stats['ev_ci_low_bps']:.6f}", f"{stats['ev_ci_high_bps']:.6f}", f"{stats['prob_ev_positive']:.6f}", f"{stats['avg_win_bps']:.6f}", f"{stats['avg_loss_bps']:.6f}", grade, action, f"{size_mult:.6f}", f"bootstrap_ev;product={product_id};n={int(stats['sample_count'])};ev={stats['ev_mean_bps']:.2f};ci_low={stats['ev_ci_low_bps']:.2f};p_ev_positive={stats['prob_ev_positive']:.3f}"])
         for horizon in [1, 7, 30]:
@@ -251,13 +271,13 @@ def run_risk_intelligence(*, base_dir: str, log_fn=None, bootstrap_trials: int =
             mc_rows.append([f"{ts_value:.6f}", dt_value, "product" if product_id != "ALL" else "portfolio", product_id, int(horizon), int(monte_carlo_trials), int(len(group)), f"{float(position_size_pct):.6f}", f"{mc['median_return_pct']:.6f}", f"{mc['p05_return_pct']:.6f}", f"{mc['p95_return_pct']:.6f}", f"{mc['prob_loss']:.6f}", f"{mc['median_max_drawdown_pct']:.6f}", f"{mc['p95_max_drawdown_pct']:.6f}", f"{mc['prob_drawdown_gt_3pct']:.6f}", f"{mc['prob_drawdown_gt_5pct']:.6f}", risk_grade, f"monte_carlo_block_bootstrap;product={product_id};horizon_days={horizon};trials={monte_carlo_trials};position_size_pct={position_size_pct:.3f}"])
     for (product_id, regime, context_key), group in frame.groupby(["product_id", "market_regime", "context_key"]):
         if len(group) < 12: continue
-        stats = _bootstrap_ev_stats(group["outcome_bps"], trials=max(500, int(bootstrap_trials / 2)), seed=33)
+        stats = _bootstrap_ev_stats(group["outcome_bps"], weights=group.get("source_weight"), trials=max(500, int(bootstrap_trials / 2)), seed=33)
         grade, action, size_mult = _confidence_grade(stats)
         avg_adverse = float(pd.to_numeric(group.get("max_adverse_bps", pd.Series([0.0] * len(group))), errors="coerce").fillna(0.0).abs().mean())
         context_live_allowed = not (int(stats["sample_count"]) >= 30 and (float(stats["ev_ci_low_bps"]) < -8.0 or float(stats["prob_ev_positive"]) < 0.45))
         context_rows.append([f"{ts_value:.6f}", dt_value, str(product_id), str(regime), str(context_key), int(stats["sample_count"]), f"{stats['raw_win_rate']:.6f}", f"{stats['ev_mean_bps']:.6f}", f"{stats['ev_ci_low_bps']:.6f}", f"{stats['prob_ev_positive']:.6f}", f"{avg_adverse:.6f}", grade, bool(context_live_allowed), f"{size_mult:.6f}", f"context_ev;product={product_id};regime={regime};n={int(stats['sample_count'])};ev={stats['ev_mean_bps']:.2f};ci_low={stats['ev_ci_low_bps']:.2f};p_ev_positive={stats['prob_ev_positive']:.3f};action={action}"])
     for product_id, group in frame.groupby("product_id"):
-        stats = product_ev_map.get(str(product_id)) or _bootstrap_ev_stats(group["outcome_bps"], trials=int(bootstrap_trials), seed=44)
+        stats = product_ev_map.get(str(product_id)) or _bootstrap_ev_stats(group["outcome_bps"], weights=group.get("source_weight"), trials=int(bootstrap_trials), seed=44)
         grade, action, size_mult = _confidence_grade(stats); mc7 = _latest_product_mc(mc_rows, str(product_id), 7) or {}; mc30 = _latest_product_mc(mc_rows, str(product_id), 30) or {}
         p95_dd30 = float(mc30.get("p95_max_drawdown_pct", 99.0)); prob_loss7 = float(mc7.get("prob_loss", 1.0)); prob_dd3_30 = float(mc30.get("prob_drawdown_gt_3pct", 1.0)); path_grade = str(mc30.get("risk_grade", "UNKNOWN_PATH_RISK"))
         live_allowed = True; block_reasons = []
@@ -291,11 +311,39 @@ def load_risk_live_gate_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
     return _latest_by_key(_read_csv(os.path.join(base_dir, "risk_live_gate.csv")), "product_id")
 
 
+def _weighted_summary_rows_to_context_map(frame: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    output: Dict[str, Dict[str, Any]] = {}
+    if frame.empty:
+        return output
+    frame = frame.copy()
+    frame["sample_count"] = pd.to_numeric(frame.get("sample_count", 0), errors="coerce").fillna(0.0)
+    frame["ev_mean_bps"] = pd.to_numeric(frame.get("ev_mean_bps", 0.0), errors="coerce").fillna(0.0)
+    frame["ev_ci_low_bps"] = pd.to_numeric(frame.get("ev_ci_low_bps", 0.0), errors="coerce").fillna(0.0)
+    frame["prob_ev_positive"] = pd.to_numeric(frame.get("prob_ev_positive", 0.0), errors="coerce").fillna(0.0)
+    frame["context_size_multiplier"] = pd.to_numeric(frame.get("context_size_multiplier", 1.0), errors="coerce").fillna(1.0)
+    def add_row(key: str, rows: pd.DataFrame, tier: str) -> None:
+        total_n = float(rows["sample_count"].sum())
+        if total_n <= 0: return
+        weights = rows["sample_count"].clip(lower=1.0)
+        ev = float(np.average(rows["ev_mean_bps"], weights=weights)); ci_low = float(np.average(rows["ev_ci_low_bps"], weights=weights)); prob_pos = float(np.average(rows["prob_ev_positive"], weights=weights)); size_mult = float(np.average(rows["context_size_multiplier"], weights=weights))
+        allowed = not (total_n >= 30 and (ci_low < -8.0 or prob_pos < 0.45))
+        output[key] = {"map_key": key, "context_tier": tier, "sample_count": total_n, "ev_mean_bps": ev, "ev_ci_low_bps": ci_low, "prob_ev_positive": prob_pos, "context_live_allowed": allowed, "context_size_multiplier": size_mult if allowed else 0.0, "reason": f"context_fallback_tier={tier};n={total_n:.0f};ev={ev:.2f};ci_low={ci_low:.2f};p_ev_positive={prob_pos:.3f}"}
+    for _, row in frame.iterrows():
+        product_id = str(row.get("product_id", "")); context_key = str(row.get("context_key", ""))
+        if product_id and context_key:
+            key = f"{product_id}||full||{context_key}"; output[key] = row.to_dict(); output[key]["map_key"] = key; output[key]["context_tier"] = "full"
+    for (product_id, regime), rows in frame.groupby(["product_id", "market_regime"]):
+        add_row(f"{product_id}||regime_only||{str(regime).strip().lower().replace(' ', '_')}", rows, "product_regime_only")
+    for regime, rows in frame.groupby("market_regime"):
+        add_row(f"ALL||regime_only||{str(regime).strip().lower().replace(' ', '_')}", rows, "portfolio_regime_only")
+    return output
+
+
 def load_risk_context_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
     frame = _read_csv(os.path.join(base_dir, "risk_context_performance.csv"))
-    if frame.empty: return {}
-    frame = frame.copy(); frame["map_key"] = frame["product_id"].astype(str) + "||" + frame["context_key"].astype(str)
-    return _latest_by_key(frame, "map_key")
+    if frame.empty:
+        return {}
+    return _weighted_summary_rows_to_context_map(frame)
 
 
 if __name__ == "__main__":

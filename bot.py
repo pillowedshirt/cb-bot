@@ -148,11 +148,26 @@ try:
         load_risk_live_gate_map,
         load_risk_context_map,
         context_key_from_mapping,
+        context_lookup_keys_from_mapping,
     )
 except Exception:
     load_risk_live_gate_map = None
     load_risk_context_map = None
     context_key_from_mapping = None
+    context_lookup_keys_from_mapping = None
+
+try:
+    from quant_state_engine import (
+        load_feature_policy_map,
+        load_markov_policy_map,
+        load_kalman_policy_map,
+        candidate_feature_value,
+    )
+except Exception:
+    load_feature_policy_map = None
+    load_markov_policy_map = None
+    load_kalman_policy_map = None
+    candidate_feature_value = None
 
 try:
     from session_liquidity import (
@@ -680,6 +695,13 @@ RISK_EV_CONFIDENCE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_ev_confidence.cs
 RISK_MONTE_CARLO_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "risk_monte_carlo_summary.csv")
 RISK_CONTEXT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_context_performance.csv")
 RISK_LIVE_GATE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_live_gate.csv")
+FEATURE_OUTCOME_CORRELATION_CSV_PATH: str = os.path.join(BASE_DIR, "feature_outcome_correlation.csv")
+FEATURE_CORRELATION_MATRIX_CSV_PATH: str = os.path.join(BASE_DIR, "feature_correlation_matrix.csv")
+MARKOV_REGIME_TRANSITIONS_CSV_PATH: str = os.path.join(BASE_DIR, "markov_regime_transitions.csv")
+MARKOV_REGIME_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "markov_regime_policy.csv")
+KALMAN_FILTER_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "kalman_filter_policy.csv")
+KALMAN_LIVE_STATE_CSV_PATH: str = os.path.join(BASE_DIR, "kalman_live_state.csv")
+QUANT_STATE_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "quant_state_summary.csv")
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
 ACCOUNT_BALANCE_DIAGNOSTICS_CSV_PATH: str = os.path.join(BASE_DIR, "account_balance_diagnostics.csv")
 LIVE_TRADE_BLOCKERS_CSV_PATH: str = os.path.join(BASE_DIR, "live_trade_blockers.csv")
@@ -2379,10 +2401,28 @@ ENABLE_RISK_INTELLIGENCE_LIVE_GATE: bool = True
 ENABLE_RISK_INTELLIGENCE_CONTEXT_GATE: bool = True
 RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK: int = 60
 RISK_CONTEXT_MIN_ROWS_TO_BLOCK: int = 30
-RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER: float = 0.60
+RISK_INTELLIGENCE_BLOCK_WHEN_MISSING: bool = True
+RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER: float = 0.0
 RISK_CONTEXT_WEAK_SIZE_MULTIPLIER: float = 0.60
 RISK_INTELLIGENCE_MIN_SIZE_MULTIPLIER: float = 0.25
 RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER: float = 1.10
+ENABLE_COVARIANCE_CORRELATION_LIVE_GATE: bool = True
+ENABLE_MARKOV_REGIME_LIVE_GATE: bool = True
+ENABLE_KALMAN_STATE_FILTER: bool = True
+COVARIANCE_MIN_ACTIVE_FEATURES: int = 2
+COVARIANCE_MIN_SAMPLE_COUNT_TO_BLOCK: int = 60
+COVARIANCE_BLOCK_SCORE_BELOW: float = -0.28
+COVARIANCE_SIZE_DOWN_SCORE_BELOW: float = -0.08
+COVARIANCE_SIZE_MULTIPLIER_MIN: float = 0.35
+COVARIANCE_SIZE_MULTIPLIER_MAX: float = 1.10
+MARKOV_MIN_SAMPLE_COUNT_TO_BLOCK: int = 10
+MARKOV_MISSING_POLICY_SIZE_MULTIPLIER: float = 0.85
+KALMAN_DOWNSLOPE_BLOCK_BPS_PER_MIN: float = -8.0
+KALMAN_OVEREXTENSION_BLOCK_BPS: float = 120.0
+KALMAN_NEGATIVE_RESIDUAL_BLOCK_BPS: float = -80.0
+KALMAN_SIZE_MULTIPLIER_MIN: float = 0.35
+KALMAN_SIZE_MULTIPLIER_MAX: float = 1.05
+KALMAN_LIVE_STATE_WRITE_EVERY_SEC: float = 10.0
 ENABLE_STALE_DATA_LIVE_BUY_GATE: bool = True
 MAX_MARKET_DATA_AGE_FOR_LIVE_BUY_SEC: float = 15.0
 MAX_VIEWER_SNAPSHOT_AGE_WARN_SEC: float = 12.0
@@ -6921,6 +6961,14 @@ class TradingBot:
         self._risk_live_gate_cache_ts: float = 0.0
         self._risk_context_gate_cache: Dict[str, Dict[str, Any]] = {}
         self._risk_context_gate_cache_ts: float = 0.0
+        self._feature_policy_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._feature_policy_cache_ts: float = 0.0
+        self._markov_policy_cache: Dict[str, Dict[str, Any]] = {}
+        self._markov_policy_cache_ts: float = 0.0
+        self._kalman_policy_cache: Dict[str, Dict[str, Any]] = {}
+        self._kalman_policy_cache_ts: float = 0.0
+        self._kalman_state_by_product: Dict[str, Dict[str, Any]] = {}
+        self._last_kalman_state_write_ts: float = 0.0
         self.last_ai_train_ts: float = 0.0
         self._ai_training_running: bool = False
         self._backtest_reload_running: bool = False
@@ -14460,52 +14508,154 @@ class TradingBot:
         if not bool(ENABLE_RISK_INTELLIGENCE_LIVE_GATE):
             return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "risk_intelligence_gate_disabled"}
         if load_risk_live_gate_map is None:
-            return {"available": False, "allowed": True, "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": "risk_intelligence_module_unavailable"}
+            return {"available": False, "allowed": not bool(RISK_INTELLIGENCE_BLOCK_WHEN_MISSING), "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": "risk_intelligence_module_unavailable"}
         try:
             now_value = now_ts()
             if not self._risk_live_gate_cache or now_value - float(self._risk_live_gate_cache_ts or 0.0) > 15.0:
-                self._risk_live_gate_cache = load_risk_live_gate_map(BASE_DIR)
-                self._risk_live_gate_cache_ts = now_value
+                self._risk_live_gate_cache = load_risk_live_gate_map(BASE_DIR); self._risk_live_gate_cache_ts = now_value
             row = dict(self._risk_live_gate_cache.get(str(product_id), {}) or {})
             if not row:
-                return {"available": False, "allowed": True, "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": f"risk_live_gate_waiting_for_rows product_id={product_id}"}
-            sample_count = int(float(row.get("sample_count", 0) or 0))
-            live_allowed = str(row.get("live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}
+                return {"available": False, "allowed": not bool(RISK_INTELLIGENCE_BLOCK_WHEN_MISSING), "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": f"risk_live_gate_missing_blocks_live_buy={bool(RISK_INTELLIGENCE_BLOCK_WHEN_MISSING)};product_id={product_id}"}
+            sample_count = int(float(row.get("sample_count", 0) or 0)); live_allowed = str(row.get("live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}
             size_multiplier = clamp_float(float(row.get("size_multiplier", 1.0) or 1.0), float(RISK_INTELLIGENCE_MIN_SIZE_MULTIPLIER), float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER))
             if sample_count < int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK):
-                return {"available": True, "allowed": True, "size_multiplier": min(size_multiplier, float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER)), "sample_count": sample_count, "reason": f"risk_live_gate_sample_immature sample_count={sample_count};min_to_block={int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK)};row_reason={row.get('reason', '')}"}
+                return {"available": True, "allowed": True, "size_multiplier": min(size_multiplier, 0.50), "sample_count": sample_count, "reason": f"risk_live_gate_sample_immature;sample_count={sample_count};min_to_block={int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK)};row_reason={row.get('reason', '')}"}
             if not live_allowed:
                 return {"available": True, "allowed": False, "size_multiplier": 0.0, "sample_count": sample_count, "reason": f"risk_live_gate_blocked {row.get('reason', '')}"}
             return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "sample_count": sample_count, "risk_grade": str(row.get("risk_grade", "")), "ev_ci_low_bps": float(row.get("ev_ci_low_bps", 0.0) or 0.0), "prob_ev_positive": float(row.get("prob_ev_positive", 0.0) or 0.0), "p95_max_drawdown_pct_30d": float(row.get("p95_max_drawdown_pct_30d", 0.0) or 0.0), "reason": f"risk_live_gate_allowed {row.get('reason', '')}"}
         except Exception as exc:
-            return {"available": False, "allowed": True, "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": f"risk_live_gate_error:{exc}"}
+            return {"available": False, "allowed": not bool(RISK_INTELLIGENCE_BLOCK_WHEN_MISSING), "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": f"risk_live_gate_error:{exc}"}
 
     def _risk_context_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         if not bool(ENABLE_RISK_INTELLIGENCE_CONTEXT_GATE):
             return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "risk_context_gate_disabled"}
-        if load_risk_context_map is None or context_key_from_mapping is None:
+        if load_risk_context_map is None or context_lookup_keys_from_mapping is None:
             return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "risk_context_module_unavailable"}
         try:
-            product_id = str(candidate.get("product_id", ""))
-            context_key = context_key_from_mapping(candidate)
-            map_key = f"{product_id}||{context_key}"
+            product_id = str(candidate.get("product_id", "")); lookup_keys = context_lookup_keys_from_mapping(product_id, candidate)
             now_value = now_ts()
             if not self._risk_context_gate_cache or now_value - float(self._risk_context_gate_cache_ts or 0.0) > 15.0:
-                self._risk_context_gate_cache = load_risk_context_map(BASE_DIR)
-                self._risk_context_gate_cache_ts = now_value
-            row = dict(self._risk_context_gate_cache.get(map_key, {}) or {})
+                self._risk_context_gate_cache = load_risk_context_map(BASE_DIR); self._risk_context_gate_cache_ts = now_value
+            row = {}; matched_key = ""
+            for key in lookup_keys:
+                if key in self._risk_context_gate_cache:
+                    row = dict(self._risk_context_gate_cache.get(key, {}) or {}); matched_key = key; break
             if not row:
-                return {"available": False, "allowed": True, "size_multiplier": 1.0, "context_key": context_key, "reason": f"risk_context_waiting_for_rows context_key={context_key}"}
-            sample_count = int(float(row.get("sample_count", 0) or 0))
-            context_allowed = str(row.get("context_live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}
+                return {"available": False, "allowed": True, "size_multiplier": 0.85, "context_key": lookup_keys[0] if lookup_keys else "", "matched_key": "", "reason": f"risk_context_no_fallback_match;lookup_keys={','.join(lookup_keys)}"}
+            sample_count = int(float(row.get("sample_count", 0) or 0)); context_allowed = str(row.get("context_live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}
             size_multiplier = clamp_float(float(row.get("context_size_multiplier", 1.0) or 1.0), 0.0, float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER))
             if sample_count < int(RISK_CONTEXT_MIN_ROWS_TO_BLOCK):
-                return {"available": True, "allowed": True, "size_multiplier": min(1.0, max(size_multiplier, float(RISK_CONTEXT_WEAK_SIZE_MULTIPLIER))), "context_key": context_key, "sample_count": sample_count, "reason": f"risk_context_sample_immature sample_count={sample_count};context_key={context_key};row_reason={row.get('reason', '')}"}
+                return {"available": True, "allowed": True, "size_multiplier": min(1.0, max(size_multiplier, float(RISK_CONTEXT_WEAK_SIZE_MULTIPLIER))), "context_key": lookup_keys[0] if lookup_keys else "", "matched_key": matched_key, "sample_count": sample_count, "reason": f"risk_context_sample_immature;matched_key={matched_key};sample_count={sample_count};row_reason={row.get('reason', '')}"}
             if not context_allowed:
-                return {"available": True, "allowed": False, "size_multiplier": 0.0, "context_key": context_key, "sample_count": sample_count, "reason": f"risk_context_blocked {row.get('reason', '')}"}
-            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "context_key": context_key, "sample_count": sample_count, "reason": f"risk_context_allowed {row.get('reason', '')}"}
+                return {"available": True, "allowed": False, "size_multiplier": 0.0, "context_key": lookup_keys[0] if lookup_keys else "", "matched_key": matched_key, "sample_count": sample_count, "reason": f"risk_context_blocked matched_key={matched_key};{row.get('reason', '')}"}
+            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "context_key": lookup_keys[0] if lookup_keys else "", "matched_key": matched_key, "sample_count": sample_count, "reason": f"risk_context_allowed matched_key={matched_key};{row.get('reason', '')}"}
         except Exception as exc:
-            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": f"risk_context_gate_error:{exc}"}
+            return {"available": False, "allowed": True, "size_multiplier": 0.85, "reason": f"risk_context_gate_error:{exc}"}
+
+    def _candidate_market_regime(self, candidate: Dict[str, Any]) -> str:
+        return str(candidate.get("market_regime") or candidate.get("regime_tag") or candidate.get("volatility_cluster") or "unknown_regime").strip()
+
+    def _feature_correlation_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(ENABLE_COVARIANCE_CORRELATION_LIVE_GATE):
+            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "covariance_correlation_gate_disabled"}
+        if load_feature_policy_map is None or candidate_feature_value is None:
+            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "covariance_correlation_module_unavailable"}
+        try:
+            now_value = now_ts()
+            if not self._feature_policy_cache or now_value - float(self._feature_policy_cache_ts or 0.0) > 15.0:
+                self._feature_policy_cache = load_feature_policy_map(BASE_DIR); self._feature_policy_cache_ts = now_value
+            product_id = str(candidate.get("product_id", "")); rows = list(self._feature_policy_cache.get(product_id, []) or []); rows.extend(list(self._feature_policy_cache.get("ALL", []) or []))
+            if not rows: return {"available": False, "allowed": True, "size_multiplier": 0.85, "reason": "covariance_correlation_policy_missing"}
+            contributions: List[float] = []; reasons: List[str] = []; total_sample = 0
+            for row in rows:
+                feature_name = str(row.get("feature_name", "")); value = candidate_feature_value(candidate, feature_name)
+                if value is None: continue
+                feature_mean = float(row.get("feature_mean", 0.0) or 0.0); feature_std = abs(float(row.get("feature_std", 0.0) or 0.0))
+                if feature_std <= 1e-12: continue
+                z_score = clamp_float((float(value) - feature_mean) / feature_std, -3.0, 3.0); feature_weight = float(row.get("feature_weight", 0.0) or 0.0); reliability = float(row.get("reliability", 0.0) or 0.0); sample_count = int(float(row.get("sample_count", 0) or 0))
+                contribution = float(z_score) * float(feature_weight); contributions.append(contribution); total_sample += sample_count
+                if abs(contribution) >= 0.02: reasons.append(f"{feature_name}:value={float(value):.4f};z={z_score:.2f};weight={feature_weight:.4f};contrib={contribution:.4f};rel={reliability:.3f}")
+            if len(contributions) < int(COVARIANCE_MIN_ACTIVE_FEATURES):
+                return {"available": True, "allowed": True, "size_multiplier": 0.85, "active_features": len(contributions), "reason": f"covariance_correlation_not_enough_live_features;active={len(contributions)};min={int(COVARIANCE_MIN_ACTIVE_FEATURES)}"}
+            edge_score = float(np.mean(contributions)); size_multiplier = clamp_float(1.0 + edge_score * 1.75, float(COVARIANCE_SIZE_MULTIPLIER_MIN), float(COVARIANCE_SIZE_MULTIPLIER_MAX))
+            if total_sample >= int(COVARIANCE_MIN_SAMPLE_COUNT_TO_BLOCK) and edge_score <= float(COVARIANCE_BLOCK_SCORE_BELOW):
+                return {"available": True, "allowed": False, "size_multiplier": 0.0, "edge_score": edge_score, "active_features": len(contributions), "reason": f"covariance_correlation_blocked;edge_score={edge_score:.4f};sample_count={total_sample};features={'|'.join(reasons[:8])}"}
+            if edge_score <= float(COVARIANCE_SIZE_DOWN_SCORE_BELOW): size_multiplier = min(size_multiplier, 0.65)
+            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "edge_score": edge_score, "active_features": len(contributions), "sample_count": total_sample, "reason": f"covariance_correlation_allowed;edge_score={edge_score:.4f};size_multiplier={size_multiplier:.3f};features={'|'.join(reasons[:8])}"}
+        except Exception as exc:
+            return {"available": False, "allowed": True, "size_multiplier": 0.85, "reason": f"covariance_correlation_gate_error:{exc}"}
+
+    def _markov_regime_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(ENABLE_MARKOV_REGIME_LIVE_GATE): return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "markov_regime_gate_disabled"}
+        if load_markov_policy_map is None: return {"available": False, "allowed": True, "size_multiplier": float(MARKOV_MISSING_POLICY_SIZE_MULTIPLIER), "reason": "markov_regime_module_unavailable"}
+        try:
+            now_value = now_ts()
+            if not self._markov_policy_cache or now_value - float(self._markov_policy_cache_ts or 0.0) > 15.0:
+                self._markov_policy_cache = load_markov_policy_map(BASE_DIR); self._markov_policy_cache_ts = now_value
+            product_id = str(candidate.get("product_id", "")); regime = self._candidate_market_regime(candidate); row = dict(self._markov_policy_cache.get(f"{product_id}||{regime}", {}) or self._markov_policy_cache.get(f"ALL||{regime}", {}) or {})
+            if not row: return {"available": False, "allowed": True, "size_multiplier": float(MARKOV_MISSING_POLICY_SIZE_MULTIPLIER), "regime": regime, "reason": f"markov_policy_missing product_id={product_id};regime={regime}"}
+            sample_count = int(float(row.get("sample_count", 0) or 0)); live_allowed = str(row.get("live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}; size_multiplier = clamp_float(float(row.get("size_multiplier", 1.0) or 1.0), 0.0, 1.05)
+            if sample_count < int(MARKOV_MIN_SAMPLE_COUNT_TO_BLOCK): return {"available": True, "allowed": True, "size_multiplier": min(size_multiplier, float(MARKOV_MISSING_POLICY_SIZE_MULTIPLIER)), "regime": regime, "sample_count": sample_count, "reason": f"markov_sample_immature;{row.get('reason', '')}"}
+            if not live_allowed: return {"available": True, "allowed": False, "size_multiplier": 0.0, "regime": regime, "sample_count": sample_count, "reason": f"markov_regime_blocked;{row.get('reason', '')}"}
+            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "regime": regime, "sample_count": sample_count, "negative_next_probability": float(row.get("negative_next_probability", 0.0) or 0.0), "high_vol_next_probability": float(row.get("high_vol_next_probability", 0.0) or 0.0), "reason": f"markov_regime_allowed;{row.get('reason', '')}"}
+        except Exception as exc:
+            return {"available": False, "allowed": True, "size_multiplier": float(MARKOV_MISSING_POLICY_SIZE_MULTIPLIER), "reason": f"markov_regime_gate_error:{exc}"}
+
+    def _kalman_policy_for_product(self, product_id: str) -> Dict[str, Any]:
+        if load_kalman_policy_map is None: return {}
+        now_value = now_ts()
+        if not self._kalman_policy_cache or now_value - float(self._kalman_policy_cache_ts or 0.0) > 15.0:
+            self._kalman_policy_cache = load_kalman_policy_map(BASE_DIR); self._kalman_policy_cache_ts = now_value
+        return dict(self._kalman_policy_cache.get(str(product_id), {}) or self._kalman_policy_cache.get("ALL", {}) or {})
+
+    def _candidate_observed_price(self, candidate: Dict[str, Any]) -> float:
+        return float(candidate.get("price", 0.0) or candidate.get("mid", 0.0) or candidate.get("current_price", 0.0) or 0.0)
+
+    def _append_kalman_live_state_row(self, product_id: str, data: Dict[str, Any]) -> None:
+        try:
+            now_value = now_ts()
+            if now_value - float(self._last_kalman_state_write_ts or 0.0) < float(KALMAN_LIVE_STATE_WRITE_EVERY_SEC): return
+            self._last_kalman_state_write_ts = now_value
+            columns = ["ts", "dt_mst", "product_id", "observed_price", "filtered_price", "velocity_price_per_min", "slope_bps_per_min", "residual_bps", "kalman_gain", "measurement_noise_bps", "process_noise_bps", "size_multiplier", "live_allowed", "reason"]
+            write_header = not os.path.exists(KALMAN_LIVE_STATE_CSV_PATH) or os.path.getsize(KALMAN_LIVE_STATE_CSV_PATH) == 0
+            dt_mst = datetime.fromtimestamp(now_value, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            with open(KALMAN_LIVE_STATE_CSV_PATH, "a", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                if write_header: writer.writerow(columns)
+                writer.writerow([f"{now_value:.6f}", dt_mst, product_id, f"{float(data.get('observed_price', 0.0) or 0.0):.12f}", f"{float(data.get('filtered_price', 0.0) or 0.0):.12f}", f"{float(data.get('velocity_price_per_min', 0.0) or 0.0):.12f}", f"{float(data.get('slope_bps_per_min', 0.0) or 0.0):.6f}", f"{float(data.get('residual_bps', 0.0) or 0.0):.6f}", f"{float(data.get('kalman_gain', 0.0) or 0.0):.6f}", f"{float(data.get('measurement_noise_bps', 0.0) or 0.0):.6f}", f"{float(data.get('process_noise_bps', 0.0) or 0.0):.6f}", f"{float(data.get('size_multiplier', 1.0) or 1.0):.6f}", bool(data.get("live_allowed", True)), str(data.get("reason", ""))])
+        except Exception as exc:
+            try: log(f"[kalman] live state append failed {product_id}: {exc}")
+            except Exception: pass
+
+    def _apply_kalman_context_to_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(ENABLE_KALMAN_STATE_FILTER):
+            candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 1.0, "kalman_reason": "kalman_filter_disabled"}); return candidate
+        try:
+            product_id = str(candidate.get("product_id", "")); observed_price = self._candidate_observed_price(candidate)
+            if not product_id or observed_price <= 0:
+                candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 0.85, "kalman_reason": "kalman_missing_product_or_price"}); return candidate
+            policy = self._kalman_policy_for_product(product_id); measurement_noise_bps = float(policy.get("measurement_noise_bps", 12.0) or 12.0); process_noise_bps = float(policy.get("process_noise_bps", 2.0) or 2.0)
+            current_ts = now_ts(); state = self._kalman_state_by_product.get(product_id) or {"ts": current_ts, "price": observed_price, "velocity": 0.0, "p00": 1.0, "p01": 0.0, "p10": 0.0, "p11": 1.0}
+            last_ts = float(state.get("ts", current_ts) or current_ts); dt_min = clamp_float((current_ts - last_ts) / 60.0, 0.05, 10.0)
+            x0 = float(state.get("price", observed_price) or observed_price); x1 = float(state.get("velocity", 0.0) or 0.0); p00 = float(state.get("p00", 1.0) or 1.0); p01 = float(state.get("p01", 0.0) or 0.0); p10 = float(state.get("p10", 0.0) or 0.0); p11 = float(state.get("p11", 1.0) or 1.0)
+            predicted_price = x0 + x1 * dt_min; predicted_velocity = x1; price_scale = max(observed_price, 1e-9); process_var = (price_scale * process_noise_bps / 10000.0) ** 2; measurement_var = (price_scale * measurement_noise_bps / 10000.0) ** 2
+            pp00 = p00 + dt_min * (p10 + p01) + (dt_min ** 2) * p11 + process_var; pp01 = p01 + dt_min * p11; pp10 = p10 + dt_min * p11; pp11 = p11 + process_var * 0.05
+            residual = observed_price - predicted_price; smat = pp00 + measurement_var; kgp = pp00 / max(smat, 1e-12); kgv = pp10 / max(smat, 1e-12)
+            updated_price = predicted_price + kgp * residual; updated_velocity = predicted_velocity + kgv * residual
+            self._kalman_state_by_product[product_id] = {"ts": current_ts, "price": updated_price, "velocity": updated_velocity, "p00": (1.0 - kgp) * pp00, "p01": (1.0 - kgp) * pp01, "p10": pp10 - kgv * pp00, "p11": pp11 - kgv * pp01}
+            slope_bps_per_min = (updated_velocity / max(updated_price, 1e-9)) * 10000.0; residual_bps = (residual / max(observed_price, 1e-9)) * 10000.0
+            live_allowed = True; size_multiplier = 1.0; reason_parts = []
+            if slope_bps_per_min <= float(KALMAN_DOWNSLOPE_BLOCK_BPS_PER_MIN): live_allowed = False; size_multiplier = 0.0; reason_parts.append(f"kalman_downslope_block slope={slope_bps_per_min:.2f}")
+            if residual_bps >= float(KALMAN_OVEREXTENSION_BLOCK_BPS): live_allowed = False; size_multiplier = 0.0; reason_parts.append(f"kalman_overextension_block residual={residual_bps:.2f}")
+            if residual_bps <= float(KALMAN_NEGATIVE_RESIDUAL_BLOCK_BPS): live_allowed = False; size_multiplier = 0.0; reason_parts.append(f"kalman_negative_residual_block residual={residual_bps:.2f}")
+            if live_allowed:
+                size_multiplier = 0.65 if slope_bps_per_min < 0.0 else 0.75 if residual_bps > 60.0 else 1.05 if slope_bps_per_min > 4.0 and abs(residual_bps) < 80.0 else 0.90
+                size_multiplier = clamp_float(size_multiplier, float(KALMAN_SIZE_MULTIPLIER_MIN), float(KALMAN_SIZE_MULTIPLIER_MAX)); reason_parts.append(f"kalman_allowed slope={slope_bps_per_min:.2f};residual={residual_bps:.2f}")
+            data = {"observed_price": observed_price, "filtered_price": updated_price, "velocity_price_per_min": updated_velocity, "slope_bps_per_min": slope_bps_per_min, "residual_bps": residual_bps, "kalman_gain": kgp, "measurement_noise_bps": measurement_noise_bps, "process_noise_bps": process_noise_bps, "size_multiplier": size_multiplier, "live_allowed": live_allowed, "reason": ";".join(reason_parts)}
+            candidate.update({"kalman_available": True, "kalman_filtered_price": float(updated_price), "kalman_velocity_price_per_min": float(updated_velocity), "kalman_slope_bps_per_min": float(slope_bps_per_min), "kalman_residual_bps": float(residual_bps), "kalman_gain": float(kgp), "kalman_measurement_noise_bps": float(measurement_noise_bps), "kalman_process_noise_bps": float(process_noise_bps), "kalman_live_allowed": bool(live_allowed), "kalman_size_multiplier": float(size_multiplier), "kalman_reason": str(data["reason"])})
+            self._append_kalman_live_state_row(product_id, data); return candidate
+        except Exception as exc:
+            candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 0.85, "kalman_reason": f"kalman_filter_error:{exc}"}); return candidate
 
     def _level8_live_buy_quality_ok(
         self,
@@ -14580,6 +14730,30 @@ class TradingBot:
                     "live_buy_blocked:risk_context_gate "
                     f"product_id={product_id};reason={context_gate.get('reason', '')}"
                 )
+
+            feature_gate = self._feature_correlation_gate_for_candidate(candidate)
+            candidate["feature_correlation_gate_available"] = bool(feature_gate.get("available", False))
+            candidate["feature_correlation_gate_allowed"] = bool(feature_gate.get("allowed", True))
+            candidate["feature_correlation_size_multiplier"] = float(feature_gate.get("size_multiplier", 1.0) or 1.0)
+            candidate["feature_correlation_edge_score"] = float(feature_gate.get("edge_score", 0.0) or 0.0)
+            candidate["feature_correlation_gate_reason"] = str(feature_gate.get("reason", ""))
+            if not bool(feature_gate.get("allowed", True)):
+                return False, ("live_buy_blocked:covariance_correlation_feature_gate " f"product_id={product_id};reason={feature_gate.get('reason', '')}")
+
+            markov_gate = self._markov_regime_gate_for_candidate(candidate)
+            candidate["markov_regime_gate_available"] = bool(markov_gate.get("available", False))
+            candidate["markov_regime_gate_allowed"] = bool(markov_gate.get("allowed", True))
+            candidate["markov_regime_size_multiplier"] = float(markov_gate.get("size_multiplier", 1.0) or 1.0)
+            candidate["markov_regime_gate_reason"] = str(markov_gate.get("reason", ""))
+            candidate["markov_regime_negative_next_probability"] = float(markov_gate.get("negative_next_probability", 0.0) or 0.0)
+            candidate["markov_regime_high_vol_next_probability"] = float(markov_gate.get("high_vol_next_probability", 0.0) or 0.0)
+            if not bool(markov_gate.get("allowed", True)):
+                return False, ("live_buy_blocked:markov_regime_transition_gate " f"product_id={product_id};reason={markov_gate.get('reason', '')}")
+
+            kalman_allowed = bool(candidate.get("kalman_live_allowed", True))
+            candidate["kalman_size_multiplier"] = float(candidate.get("kalman_size_multiplier", 1.0) or 1.0)
+            if not kalman_allowed:
+                return False, ("live_buy_blocked:kalman_state_filter " f"product_id={product_id};reason={candidate.get('kalman_reason', '')}")
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
@@ -15160,6 +15334,9 @@ class TradingBot:
                 f"volume_adjust={volume_profile_utility_adjust_bps:.2f};"
                 f"risk_gate={candidate.get('risk_live_gate_reason', '')};"
                 f"context_gate={candidate.get('risk_context_gate_reason', '')};"
+                f"feature_gate={candidate.get('feature_correlation_gate_reason', '')};"
+                f"markov_gate={candidate.get('markov_regime_gate_reason', '')};"
+                f"kalman_gate={candidate.get('kalman_reason', '')};"
                 f"{backtest_reason}"
             )
 
@@ -24901,6 +25078,8 @@ class TradingBot:
                     c["manager_strategy"] = "LEVEL8_DIRECT"
                     if bool(ENABLE_ORDER_BOOK_CONTEXT):
                         c = self._apply_order_book_context_to_candidate(c)
+                    if bool(ENABLE_KALMAN_STATE_FILTER):
+                        c = self._apply_kalman_context_to_candidate(c)
                     c["entry_reason"] = (
                         f"level8_direct_market_candidate;"
                         f"score={float(c.get('score', 0.0)):.2f};"
@@ -25350,8 +25529,23 @@ class TradingBot:
                         0.0,
                         float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
                     )
+                    feature_size_multiplier = clamp_float(
+                        float(candidate.get("feature_correlation_size_multiplier", 1.0) or 1.0),
+                        0.0,
+                        float(COVARIANCE_SIZE_MULTIPLIER_MAX),
+                    )
+                    markov_size_multiplier = clamp_float(
+                        float(candidate.get("markov_regime_size_multiplier", 1.0) or 1.0),
+                        0.0,
+                        1.05,
+                    )
+                    kalman_size_multiplier = clamp_float(
+                        float(candidate.get("kalman_size_multiplier", 1.0) or 1.0),
+                        0.0,
+                        float(KALMAN_SIZE_MULTIPLIER_MAX),
+                    )
                     combined_risk_multiplier = clamp_float(
-                        risk_size_multiplier * context_size_multiplier,
+                        risk_size_multiplier * context_size_multiplier * feature_size_multiplier * markov_size_multiplier * kalman_size_multiplier,
                         0.0,
                         float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
                     )
@@ -25369,9 +25563,15 @@ class TradingBot:
                         f"{graduated_sizing_reason};"
                         f"risk_size_multiplier={risk_size_multiplier:.3f};"
                         f"context_size_multiplier={context_size_multiplier:.3f};"
+                        f"feature_size_multiplier={feature_size_multiplier:.3f};"
+                        f"markov_size_multiplier={markov_size_multiplier:.3f};"
+                        f"kalman_size_multiplier={kalman_size_multiplier:.3f};"
                         f"combined_risk_multiplier={combined_risk_multiplier:.3f};"
                         f"risk_reason={candidate.get('risk_live_gate_reason', '')};"
-                        f"context_reason={candidate.get('risk_context_gate_reason', '')}"
+                        f"context_reason={candidate.get('risk_context_gate_reason', '')};"
+                        f"feature_reason={candidate.get('feature_correlation_gate_reason', '')};"
+                        f"markov_reason={candidate.get('markov_regime_gate_reason', '')};"
+                        f"kalman_reason={candidate.get('kalman_reason', '')}"
                     )
 
                     l8_pct = adjusted_l8_pct

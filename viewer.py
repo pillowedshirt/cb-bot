@@ -65,6 +65,13 @@ RISK_EV_CONFIDENCE_PATH = os.path.join(BASE_DIR, "risk_ev_confidence.csv")
 RISK_MONTE_CARLO_SUMMARY_PATH = os.path.join(BASE_DIR, "risk_monte_carlo_summary.csv")
 RISK_CONTEXT_PERFORMANCE_PATH = os.path.join(BASE_DIR, "risk_context_performance.csv")
 RISK_LIVE_GATE_PATH = os.path.join(BASE_DIR, "risk_live_gate.csv")
+FEATURE_OUTCOME_CORRELATION_PATH = os.path.join(BASE_DIR, "feature_outcome_correlation.csv")
+FEATURE_CORRELATION_MATRIX_PATH = os.path.join(BASE_DIR, "feature_correlation_matrix.csv")
+MARKOV_REGIME_TRANSITIONS_PATH = os.path.join(BASE_DIR, "markov_regime_transitions.csv")
+MARKOV_REGIME_POLICY_PATH = os.path.join(BASE_DIR, "markov_regime_policy.csv")
+KALMAN_FILTER_POLICY_PATH = os.path.join(BASE_DIR, "kalman_filter_policy.csv")
+KALMAN_LIVE_STATE_PATH = os.path.join(BASE_DIR, "kalman_live_state.csv")
+QUANT_STATE_SUMMARY_PATH = os.path.join(BASE_DIR, "quant_state_summary.csv")
 MICRO_HISTORY_CSV_PATH = os.path.join(BASE_DIR, "micro_history.csv")
 MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
 MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
@@ -3128,6 +3135,44 @@ def render_risk_intelligence_panel(
         st.markdown("#### Context/Regime Risk")
         st.dataframe(risk_context_df.tail(100)[ctx_cols], width="stretch", hide_index=True)
 
+def render_active_quant_state_panel(
+    feature_corr_df,
+    feature_matrix_df,
+    markov_policy_df,
+    markov_transitions_df,
+    kalman_policy_df,
+    kalman_live_df,
+    quant_state_summary_df,
+):
+    st.markdown("### Active Quant State Engine")
+    if quant_state_summary_df is not None and not quant_state_summary_df.empty:
+        st.markdown("#### Quant State Summary")
+        st.dataframe(quant_state_summary_df.tail(50), width="stretch", hide_index=True)
+    if feature_corr_df is not None and not feature_corr_df.empty:
+        cols = [c for c in ["dt_utc", "scope", "product_id", "feature_name", "sample_count", "feature_mean", "feature_std", "outcome_corr", "feature_weight", "reliability", "edge_direction", "live_enabled", "reason"] if c in feature_corr_df.columns]
+        st.markdown("#### Active Covariance / Correlation Feature Edge")
+        st.dataframe(feature_corr_df.tail(150)[cols], width="stretch", hide_index=True)
+    if feature_matrix_df is not None and not feature_matrix_df.empty:
+        cols = [c for c in ["dt_utc", "scope", "product_id", "feature_a", "feature_b", "sample_count", "correlation", "redundant_pair", "reason"] if c in feature_matrix_df.columns]
+        st.markdown("#### Feature Correlation Matrix")
+        st.dataframe(feature_matrix_df.tail(150)[cols], width="stretch", hide_index=True)
+    if markov_policy_df is not None and not markov_policy_df.empty:
+        cols = [c for c in ["dt_utc", "scope", "product_id", "current_regime", "sample_count", "negative_next_probability", "high_vol_next_probability", "continuation_probability", "steady_state_negative_probability", "markov_grade", "live_allowed", "size_multiplier", "reason"] if c in markov_policy_df.columns]
+        st.markdown("#### Active Markov Regime Policy")
+        st.dataframe(markov_policy_df.tail(150)[cols], width="stretch", hide_index=True)
+    if markov_transitions_df is not None and not markov_transitions_df.empty:
+        cols = [c for c in ["dt_utc", "scope", "product_id", "from_regime", "to_regime", "transition_count", "transition_probability", "reason"] if c in markov_transitions_df.columns]
+        st.markdown("#### Markov Regime Transitions")
+        st.dataframe(markov_transitions_df.tail(150)[cols], width="stretch", hide_index=True)
+    if kalman_policy_df is not None and not kalman_policy_df.empty:
+        cols = [c for c in ["dt_utc", "scope", "product_id", "sample_count", "median_abs_return_bps", "measurement_noise_bps", "process_noise_bps", "kalman_enabled", "reason"] if c in kalman_policy_df.columns]
+        st.markdown("#### Kalman Filter Policy")
+        st.dataframe(kalman_policy_df.tail(100)[cols], width="stretch", hide_index=True)
+    if kalman_live_df is not None and not kalman_live_df.empty:
+        cols = [c for c in ["dt_mst", "product_id", "observed_price", "filtered_price", "velocity_price_per_min", "slope_bps_per_min", "residual_bps", "kalman_gain", "measurement_noise_bps", "process_noise_bps", "size_multiplier", "live_allowed", "reason"] if c in kalman_live_df.columns]
+        st.markdown("#### Live Kalman State")
+        st.dataframe(kalman_live_df.tail(150)[cols], width="stretch", hide_index=True)
+
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
@@ -3173,6 +3218,13 @@ def render_live_dashboard(selected, refresh_config):
     risk_monte_carlo_df = load_csv_tail(RISK_MONTE_CARLO_SUMMARY_PATH, max_lines=5000)
     risk_context_df = load_csv_tail(RISK_CONTEXT_PERFORMANCE_PATH, max_lines=10000)
     risk_live_gate_df = load_csv_tail(RISK_LIVE_GATE_PATH, max_lines=5000)
+    feature_corr_df = load_csv_tail(FEATURE_OUTCOME_CORRELATION_PATH, max_lines=10000)
+    feature_matrix_df = load_csv_tail(FEATURE_CORRELATION_MATRIX_PATH, max_lines=10000)
+    markov_policy_df = load_csv_tail(MARKOV_REGIME_POLICY_PATH, max_lines=10000)
+    markov_transitions_df = load_csv_tail(MARKOV_REGIME_TRANSITIONS_PATH, max_lines=10000)
+    kalman_policy_df = load_csv_tail(KALMAN_FILTER_POLICY_PATH, max_lines=5000)
+    kalman_live_df = load_csv_tail(KALMAN_LIVE_STATE_PATH, max_lines=5000)
+    quant_state_summary_df = load_csv_tail(QUANT_STATE_SUMMARY_PATH, max_lines=5000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
@@ -3186,6 +3238,16 @@ def render_live_dashboard(selected, refresh_config):
             risk_ev_confidence_df,
             risk_monte_carlo_df,
             risk_context_df,
+        )
+    with st.expander("Active quant state engine", expanded=True):
+        render_active_quant_state_panel(
+            feature_corr_df,
+            feature_matrix_df,
+            markov_policy_df,
+            markov_transitions_df,
+            kalman_policy_df,
+            kalman_live_df,
+            quant_state_summary_df,
         )
     if account_balance_diagnostics_df is not None and not account_balance_diagnostics_df.empty:
         st.markdown("### Binance Quote Balance Diagnostics")

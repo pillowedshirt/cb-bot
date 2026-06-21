@@ -551,12 +551,33 @@ EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED = STARTUP_BOOTSTRAP_REGIME_MIN_DAYS_COVE
 EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT = STARTUP_BOOTSTRAP_PRIMARY_MIN_ROWS_PER_PRODUCT if FAST_STARTUP_CALCULATION_MODE else 8000
 EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT = STARTUP_BOOTSTRAP_REGIME_MIN_ROWS_PER_PRODUCT if FAST_STARTUP_CALCULATION_MODE else 8000
 POST_PATCH_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "post_patch_audit.csv")
+STARTUP_RUNTIME_INVENTORY_CSV_PATH: str = os.path.join(BASE_DIR, "startup_runtime_inventory.csv")
 
 RAW_RUNTIME_FILES_TO_PRESERVE = [
     "historical_replay_15m_90d.csv", "historical_replay_1h_365d.csv",
     "micro_history.csv", "macro_day.csv", "macro_week.csv", "market.csv",
     "shadow_trades.csv", "shadow_sell_replay.csv",
 ]
+STARTUP_RUNTIME_INVENTORY_COLUMNS = [
+    "ts",
+    "dt_mst",
+    "filename",
+    "path",
+    "exists",
+    "size_bytes",
+    "rows",
+    "products",
+    "min_ts",
+    "max_ts",
+    "days_covered",
+    "rows_per_product_min",
+    "rows_per_product_max",
+    "category",
+    "usable",
+    "needs_rebuild",
+    "reason",
+]
+
 DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE = [
     "calibration.csv", "calculation_status.json", "calculation_complete_latch.json",
     "four_pass_product_live_gate.csv", "four_pass_profitability_summary.csv",
@@ -565,7 +586,6 @@ DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE = [
     "fifth_pass_live_style_summary.csv", "fifth_pass_live_style_replay.csv",
     "fifth_pass_blockers.csv", "trade_frequency_estimate.csv",
     "approved_but_shadowed.csv", "live_trade_blockers.csv", "viewer_snapshot.json",
-    "historical_replay_manifest.json",
 ]
 
 # ============================================================
@@ -1070,6 +1090,115 @@ def generated_file_is_current(path: str) -> bool:
     return str(meta.get("generation_version", "")) == str(NEXT_PATCH_GENERATION_VERSION)
 
 
+
+def _csv_basic_inventory(path: str) -> Dict[str, Any]:
+    result = {
+        "path": path,
+        "exists": os.path.exists(path),
+        "size_bytes": 0,
+        "rows": 0,
+        "products": 0,
+        "min_ts": "",
+        "max_ts": "",
+        "days_covered": 0.0,
+        "rows_per_product_min": 0,
+        "rows_per_product_max": 0,
+        "reason": "",
+    }
+    try:
+        if not os.path.exists(path):
+            result["reason"] = "missing"
+            return result
+        result["size_bytes"] = int(os.path.getsize(path))
+        if result["size_bytes"] <= 0:
+            result["reason"] = "empty_file"
+            return result
+        if not str(path).lower().endswith(".csv"):
+            result["reason"] = "non_csv_exists"
+            return result
+        df = pd.read_csv(path)
+        if df.empty:
+            result["reason"] = "header_only_or_empty_dataframe"
+            return result
+        result["rows"] = int(len(df))
+        if "product_id" in df.columns:
+            counts = df.groupby(df["product_id"].astype(str)).size()
+            result["products"] = int(counts.shape[0])
+            result["rows_per_product_min"] = int(counts.min())
+            result["rows_per_product_max"] = int(counts.max())
+        if "ts" in df.columns:
+            ts = pd.to_numeric(df["ts"], errors="coerce").dropna()
+            if not ts.empty:
+                result["min_ts"] = float(ts.min())
+                result["max_ts"] = float(ts.max())
+                result["days_covered"] = float((ts.max() - ts.min()) / 86400.0)
+        result["reason"] = "csv_inventory_ok"
+        return result
+    except Exception as exc:
+        result["reason"] = f"csv_inventory_failed:{exc}"
+        return result
+
+
+def _runtime_inventory_targets() -> List[Tuple[str, str]]:
+    return [
+        ("raw_cache", "historical_replay_15m_90d.csv"), ("raw_cache", "historical_replay_1h_365d.csv"),
+        ("raw_cache", "historical_shadow_replay.csv"), ("raw_cache", "micro_history.csv"),
+        ("raw_cache", "macro_day.csv"), ("raw_cache", "macro_week.csv"), ("raw_cache", "market.csv"),
+        ("raw_cache", "trade_outcomes.csv"), ("derived", "calibration.csv"),
+        ("derived", "four_pass_product_live_gate.csv"), ("derived", "four_pass_profitability_summary.csv"),
+        ("derived", "four_pass_purged_walk_forward.csv"), ("derived", "four_pass_sell_path_replay.csv"),
+        ("derived", "fifth_pass_live_style_summary.csv"), ("derived", "fifth_pass_live_style_replay.csv"),
+        ("derived", "fifth_pass_blockers.csv"), ("derived", "risk_live_gate.csv"),
+        ("derived", "risk_ev_confidence.csv"), ("derived", "risk_monte_carlo_summary.csv"),
+        ("derived", "risk_context_performance.csv"), ("derived", "feature_outcome_correlation.csv"),
+        ("derived", "feature_correlation_matrix.csv"), ("derived", "markov_regime_policy.csv"),
+        ("derived", "markov_regime_transitions.csv"), ("derived", "kalman_filter_policy.csv"),
+        ("runtime_state", "historical_replay_manifest.json"), ("runtime_state", "calculation_status.json"),
+        ("runtime_state", "calculation_complete_latch.json"), ("runtime_state", "viewer_snapshot.json"),
+    ]
+
+
+def scan_startup_runtime_inventory() -> Dict[str, Any]:
+    rows = []
+    usable_files = []
+    rebuild_files = []
+    now_value = now_ts()
+    dt_value = datetime.fromtimestamp(now_value, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    for category, filename in _runtime_inventory_targets():
+        path = os.path.join(BASE_DIR, filename)
+        inv = _csv_basic_inventory(path)
+        usable = False
+        needs_rebuild = False
+        reason = str(inv.get("reason", ""))
+        if category == "raw_cache":
+            usable = bool(inv.get("exists") and inv.get("size_bytes", 0) > 0 and inv.get("rows", 0) > 0)
+            needs_rebuild = not usable
+        elif category == "derived":
+            if inv.get("exists") and inv.get("size_bytes", 0) > 0:
+                usable = bool(inv.get("rows", 0) > 0 or filename in {"fifth_pass_blockers.csv"})
+                needs_rebuild = not generated_file_is_current(path)
+                if usable and needs_rebuild:
+                    reason = "usable_but_meta_stale_regenerate_when_safe"
+            else:
+                needs_rebuild = True
+        elif category == "runtime_state":
+            usable = bool(inv.get("exists") and inv.get("size_bytes", 0) > 2)
+            needs_rebuild = not usable
+        if usable:
+            usable_files.append(filename)
+        if needs_rebuild:
+            rebuild_files.append(filename)
+        rows.append([f"{now_value:.6f}", dt_value, filename, path, bool(inv.get("exists")), int(inv.get("size_bytes", 0) or 0), int(inv.get("rows", 0) or 0), int(inv.get("products", 0) or 0), inv.get("min_ts", ""), inv.get("max_ts", ""), f"{float(inv.get('days_covered', 0.0) or 0.0):.6f}", int(inv.get("rows_per_product_min", 0) or 0), int(inv.get("rows_per_product_max", 0) or 0), category, bool(usable), bool(needs_rebuild), reason])
+    try:
+        with open(STARTUP_RUNTIME_INVENTORY_CSV_PATH, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(STARTUP_RUNTIME_INVENTORY_COLUMNS)
+            writer.writerows(rows)
+        write_generated_file_meta(STARTUP_RUNTIME_INVENTORY_CSV_PATH, reason="startup_runtime_inventory_scan")
+    except Exception:
+        pass
+    return {"usable_files": usable_files, "rebuild_files": rebuild_files, "rows": len(rows), "path": STARTUP_RUNTIME_INVENTORY_CSV_PATH}
+
 def _csv_product_time_coverage(path: str) -> Dict[str, Any]:
     result = {"path": path, "exists": os.path.exists(path), "rows": 0, "products": 0, "min_ts": None, "max_ts": None, "days_covered": 0.0, "rows_per_product_min": 0, "rows_per_product_max": 0, "rows_per_product_avg": 0.0, "ok": False, "reason": ""}
     try:
@@ -1114,14 +1243,44 @@ def derived_outputs_are_stale() -> Tuple[bool, Dict[str, Any]]:
 def remove_stale_derived_outputs_if_needed() -> Dict[str, Any]:
     is_stale, info = derived_outputs_are_stale()
     removed, kept = [], []
+
     if not is_stale:
-        return {"stale": False, "removed": removed, "kept": DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE, "info": info}
+        return {
+            "stale": False,
+            "removed": removed,
+            "kept": DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE,
+            "info": info,
+        }
+
+    replay_info = info.get("replay_info", {}) or {}
+    raw_replay_ok = bool(replay_info.get("primary_ok") and replay_info.get("regime_ok"))
+
     for filename in DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE:
         path = os.path.join(BASE_DIR, filename)
         try:
-            if os.path.exists(path): os.remove(path); removed.append(filename)
+            if raw_replay_ok and str(filename).endswith(".csv") and os.path.exists(path) and os.path.getsize(path) > 0:
+                kept.append({"filename": filename, "reason": "kept_as_warm_start_evidence_raw_replay_ok"})
+                continue
+            if filename in {"calculation_status.json", "calculation_complete_latch.json", "viewer_snapshot.json"}:
+                if os.path.exists(path):
+                    os.remove(path); removed.append(filename)
+                meta_path = _sidecar_meta_path(path)
+                if os.path.exists(meta_path):
+                    os.remove(meta_path)
+                continue
+            if os.path.exists(path):
+                try:
+                    if str(path).lower().endswith(".csv") and not _csv_has_meaningful_data_rows(path):
+                        os.remove(path); removed.append(filename)
+                    elif not str(path).lower().endswith(".csv"):
+                        os.remove(path); removed.append(filename)
+                    else:
+                        kept.append({"filename": filename, "reason": "kept_nonempty_derived_csv_for_warm_start"})
+                except Exception:
+                    kept.append({"filename": filename, "reason": "kept_due_cleanup_read_failure"})
             meta_path = _sidecar_meta_path(path)
-            if os.path.exists(meta_path): os.remove(meta_path)
+            if os.path.exists(meta_path) and filename in removed:
+                os.remove(meta_path)
         except Exception as exc:
             kept.append({"filename": filename, "error": str(exc)})
     return {"stale": True, "removed": removed, "kept": kept, "info": info}
@@ -6786,12 +6945,20 @@ class TradingBot:
         # create header-only CSV files or current-run rows.
         self.previous_runtime_import_result = import_previous_runtime_state_if_available()
         self.startup_had_existing_runtime_state: bool = has_existing_runtime_csv_state()
+        self.startup_runtime_inventory = scan_startup_runtime_inventory()
         self.post_patch_cleanup_result = remove_stale_derived_outputs_if_needed()
         module_debug(
             MODULE_NAME,
             "post_patch_stale_output_cleanup",
             data=self.post_patch_cleanup_result,
             level="WARN" if self.post_patch_cleanup_result.get("stale") else "INFO",
+            also_overall=True,
+        )
+        module_debug(
+            MODULE_NAME,
+            "startup_runtime_inventory_completed",
+            data=self.startup_runtime_inventory,
+            level="INFO",
             also_overall=True,
         )
         needs_expansion, replay_expansion_info = replay_history_needs_expansion()
@@ -6883,6 +7050,14 @@ class TradingBot:
         self._historical_worker_pool = None
         try:
             self._ensure_historical_replay_manifest()
+            manifest_rebuild = self._reconstruct_historical_manifest_from_master_csv()
+            module_debug(
+                MODULE_NAME,
+                "historical_replay_manifest_reconstructed_from_master",
+                data=manifest_rebuild,
+                level="INFO",
+                also_overall=True,
+            )
         except Exception as exc:
             module_exception(MODULE_NAME, "ensure_historical_replay_manifest_init_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
         module_debug(
@@ -18799,21 +18974,36 @@ class TradingBot:
 
     def _job_already_satisfied_in_master(self, product_id: str, timeframe: str) -> Tuple[bool, str, int]:
         try:
-            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=750000)
+            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=1000000)
             if frame.empty or "product_id" not in frame.columns or "timeframe" not in frame.columns:
                 return False, "master_missing_or_empty", 0
-            sub = frame[frame["product_id"].astype(str).eq(str(product_id)) & frame["timeframe"].astype(str).eq(str(timeframe))].copy()
+
+            sub = frame[
+                frame["product_id"].astype(str).eq(str(product_id))
+                & frame["timeframe"].astype(str).eq(str(timeframe))
+            ].copy()
+
             if sub.empty:
                 return False, "no_rows_for_job", 0
-            if "strategy_variant" not in sub.columns:
-                sub["strategy_variant"] = "baseline"
-            variant_counts = sub["strategy_variant"].fillna("baseline").astype(str).value_counts().to_dict()
-            missing = [f"{v}:{int(variant_counts.get(v, 0))}" for v in REQUIRED_REPLAY_STRATEGY_VARIANTS if int(variant_counts.get(v, 0)) < int(MIN_REPLAY_ROWS_PER_VARIANT_PER_JOB)]
-            if missing:
-                return False, f"missing_variant_coverage {';'.join(missing)}", int(len(sub))
-            return True, f"variant_coverage_ok rows={len(sub)};variants={variant_counts}", int(len(sub))
+
+            rows = int(len(sub))
+            min_resume_rows = 20 if str(timeframe) == "regime_1h_365d" else 60
+
+            if rows >= int(min_resume_rows):
+                variant_counts = {}
+                if "strategy_variant" in sub.columns:
+                    variant_counts = sub["strategy_variant"].fillna("baseline").astype(str).value_counts().to_dict()
+                return True, (
+                    f"resume_rows_ok rows={rows};"
+                    f"min_resume_rows={min_resume_rows};"
+                    f"variant_counts={variant_counts}"
+                ), rows
+
+            return False, f"resume_rows_too_low rows={rows};min_resume_rows={min_resume_rows}", rows
+
         except Exception as exc:
             return False, f"master_check_failed:{exc}", 0
+
 
     def _read_worker_output_rows(self, output_path: str) -> List[Dict[str, Any]]:
         try:
@@ -20988,7 +21178,7 @@ class TradingBot:
                     phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "fast_calibration_core_available": bool(FAST_CALIBRATION_CORE_AVAILABLE), "fast_calibration_core_import_error": str(FAST_CALIBRATION_CORE_IMPORT_ERROR), "fast_calibration_core_batch_available": bool(FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None and hasattr(fast_calibration_core, "evaluate_best_windows_batch_from_arrays")), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            status = {"ts": now_ts(), "fast_calibration_core_available": bool(FAST_CALIBRATION_CORE_AVAILABLE), "fast_calibration_warning": ("C++ fast calibration core is unavailable; Python fallback is active. Restore the cpp folder / compiled fast_calibration_core if you want the fastest startup." if not bool(FAST_CALIBRATION_CORE_AVAILABLE) else ""), "fast_calibration_core_import_error": str(FAST_CALIBRATION_CORE_IMPORT_ERROR), "fast_calibration_core_batch_available": bool(FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None and hasattr(fast_calibration_core, "evaluate_best_windows_batch_from_arrays")), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(data=status)
                 try:
@@ -24374,6 +24564,48 @@ class TradingBot:
                     pass
         except Exception:
             pass
+
+    def _reconstruct_historical_manifest_from_master_csv(self) -> Dict[str, Any]:
+        try:
+            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=1000000)
+            if frame.empty or "product_id" not in frame.columns or "timeframe" not in frame.columns:
+                return {"updated_jobs": 0, "reason": "historical_shadow_replay_missing_or_unusable"}
+            updated_jobs = 0
+            for product_id in PRODUCTS:
+                for timeframe in HISTORICAL_REPLAY_WORKER_TIMEFRAMES:
+                    job_id = safe_job_id(product_id, timeframe)
+                    sub = frame[frame["product_id"].astype(str).eq(str(product_id)) & frame["timeframe"].astype(str).eq(str(timeframe))].copy()
+                    if sub.empty:
+                        continue
+                    rows = int(len(sub))
+                    variant_counts = {}
+                    if "strategy_variant" in sub.columns:
+                        variant_counts = sub["strategy_variant"].fillna("baseline").astype(str).value_counts().to_dict()
+                    merge_note = f"reconstructed_from_master_csv;rows={rows};variant_counts={variant_counts}"
+                    update_job(
+                        path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH,
+                        job_id=job_id,
+                        updates={
+                            "status": JOB_MERGED,
+                            "started_ts": now_ts(),
+                            "finished_ts": now_ts(),
+                            "merged_ts": now_ts(),
+                            "rows_written": rows,
+                            "rows_appended_to_master": 0,
+                            "accepted_rows": rows,
+                            "qualified_rows": rows,
+                            "source": "historical_shadow_replay_master_csv",
+                            "merge_note": merge_note,
+                            "error": "",
+                        },
+                    )
+                    updated_jobs += 1
+            self._calculation_status_cache_ts = 0.0
+            self._historical_replay_counts_cache_ts = 0.0
+            return {"updated_jobs": int(updated_jobs), "reason": "manifest_reconstructed_from_historical_shadow_replay"}
+        except Exception as exc:
+            module_exception(MODULE_NAME, "reconstruct_historical_manifest_from_master_csv_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+            return {"updated_jobs": 0, "reason": f"failed:{exc}"}
 
     def _ensure_historical_replay_manifest(self) -> Dict[str, Any]:
         os.makedirs(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, exist_ok=True)

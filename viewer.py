@@ -80,6 +80,7 @@ SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
 HISTORICAL_SHADOW_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_summary.csv")
 HISTORICAL_REPLAY_MANIFEST_JSON_PATH = os.path.join(BASE_DIR, "historical_replay_manifest.json")
+STARTUP_RUNTIME_INVENTORY_PATH = os.path.join(BASE_DIR, "startup_runtime_inventory.csv")
 HIST_REPLAY_15M_90D_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_15m_90d.csv")
 HIST_REPLAY_1H_365D_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_1h_365d.csv")
 
@@ -937,11 +938,11 @@ def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
 
         replay_15m_progress = max(
             replay_15m_row_progress,
-            1.0 if _viewer_worker_timeframe_done(manifest, product_id, "primary_15m_90d") else 0.0,
+            1.0 if _viewer_timeframe_done_any_source(manifest, product_id, "primary_15m_90d") else 0.0,
         )
         replay_1h_progress = max(
             replay_1h_row_progress,
-            1.0 if _viewer_worker_timeframe_done(manifest, product_id, "regime_1h_365d") else 0.0,
+            1.0 if _viewer_timeframe_done_any_source(manifest, product_id, "regime_1h_365d") else 0.0,
         )
 
         historical_candle_progress = (candle_15m_progress + candle_1h_progress) / 2.0
@@ -1171,10 +1172,37 @@ def _viewer_worker_timeframe_done(manifest: dict, product_id: str, timeframe: st
         return False
 
 
+def _viewer_master_replay_timeframe_done(product_id: str, timeframe: str) -> bool:
+    try:
+        frame = load_csv_tail(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=1000000)
+        if frame is None or frame.empty:
+            return False
+        if "product_id" not in frame.columns or "timeframe" not in frame.columns:
+            return False
+
+        sub = frame[
+            frame["product_id"].astype(str).eq(str(product_id))
+            & frame["timeframe"].astype(str).eq(str(timeframe))
+        ]
+
+        min_rows = 20 if str(timeframe) == "regime_1h_365d" else 60
+        return bool(len(sub) >= min_rows)
+
+    except Exception:
+        return False
+
+
+def _viewer_timeframe_done_any_source(manifest: dict, product_id: str, timeframe: str) -> bool:
+    return bool(
+        _viewer_worker_timeframe_done(manifest, product_id, timeframe)
+        or _viewer_master_replay_timeframe_done(product_id, timeframe)
+    )
+
+
 def _viewer_worker_product_done(manifest: dict, product_id: str) -> bool:
     return bool(
-        _viewer_worker_timeframe_done(manifest, product_id, "primary_15m_90d")
-        and _viewer_worker_timeframe_done(manifest, product_id, "regime_1h_365d")
+        _viewer_timeframe_done_any_source(manifest, product_id, "primary_15m_90d")
+        and _viewer_timeframe_done_any_source(manifest, product_id, "regime_1h_365d")
     )
 
 
@@ -2701,6 +2729,8 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         unsafe_allow_html=True,
     )
     st.progress(progress)
+    if calc_status.get("fast_calibration_warning"):
+        st.warning(str(calc_status.get("fast_calibration_warning")))
     if calc_status.get("viewer_progress_stabilized"):
         st.caption(str(calc_status.get("viewer_progress_stabilized_reason", "")))
 
@@ -3744,6 +3774,52 @@ def render_live_gate_visual_summary(
             st.plotly_chart(_quant_fig_layout(fig, "Risk Gate Approval Split"), width="stretch")
         else: _empty_quant_chart("No risk live-gate rows yet.")
 
+def render_startup_runtime_inventory_panel(startup_runtime_inventory_df):
+    st.markdown("### Startup Runtime Inventory")
+
+    if startup_runtime_inventory_df is None or startup_runtime_inventory_df.empty:
+        st.info("No startup runtime inventory has been written yet.")
+        return
+
+    inv = startup_runtime_inventory_df.copy()
+    if "usable" in inv.columns:
+        inv["usable_bool"] = inv["usable"].astype(str).str.lower().isin({"true", "1", "yes", "y"})
+    else:
+        inv["usable_bool"] = False
+    if "needs_rebuild" in inv.columns:
+        inv["needs_rebuild_bool"] = inv["needs_rebuild"].astype(str).str.lower().isin({"true", "1", "yes", "y"})
+    else:
+        inv["needs_rebuild_bool"] = False
+
+    cols = st.columns(4)
+    cols[0].metric("Inventory files", len(inv))
+    cols[1].metric("Usable", int(inv["usable_bool"].sum()))
+    cols[2].metric("Needs rebuild", int(inv["needs_rebuild_bool"].sum()))
+    cols[3].metric("Missing/unusable", int((~inv["usable_bool"]).sum()))
+
+    if {"filename", "rows", "category"}.issubset(inv.columns):
+        inv["rows"] = pd.to_numeric(inv["rows"], errors="coerce").fillna(0.0)
+        fig = go.Figure()
+        fig.add_bar(
+            x=inv["filename"].astype(str),
+            y=inv["rows"],
+            name="Rows",
+            hovertemplate="File=%{x}<br>Rows=%{y}<extra></extra>",
+        )
+        st.plotly_chart(_quant_fig_layout(fig, "Startup CSV Inventory — Existing Rows by File", height=420), width="stretch")
+
+    with st.expander("Startup inventory table", expanded=False):
+        cols_to_show = [
+            c for c in [
+                "filename", "category", "exists", "size_bytes", "rows", "products",
+                "days_covered", "rows_per_product_min", "usable",
+                "needs_rebuild", "reason",
+            ]
+            if c in inv.columns
+        ]
+        st.dataframe(inv[cols_to_show], width="stretch", hide_index=True)
+
+
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
@@ -3800,6 +3876,7 @@ def render_live_dashboard(selected, refresh_config):
     kalman_policy_df = load_csv_tail(KALMAN_FILTER_POLICY_PATH, max_lines=5000)
     kalman_live_df = load_csv_tail(KALMAN_LIVE_STATE_PATH, max_lines=5000)
     quant_state_summary_df = load_csv_tail(QUANT_STATE_SUMMARY_PATH, max_lines=5000)
+    startup_runtime_inventory_df = load_csv_tail(STARTUP_RUNTIME_INVENTORY_PATH, max_lines=500)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
@@ -3815,6 +3892,8 @@ def render_live_dashboard(selected, refresh_config):
             fifth_pass_blockers_df,
             risk_monte_carlo_df,
         )
+    with st.expander("Startup runtime inventory", expanded=False):
+        render_startup_runtime_inventory_panel(startup_runtime_inventory_df)
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):

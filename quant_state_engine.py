@@ -43,8 +43,17 @@ QUANT_STATE_SUMMARY_COLUMNS = [
 
 
 FEATURE_CANDIDATES = [
-    "score", "probability", "estimated_prob_up", "calibrated_p_win",
-    "expected_net_edge_bps", "projected_forward_gain_bps", "expected_utility_bps",
+    "score",
+    "entry_score",
+    "score_at_entry",
+    "probability",
+    "prob_at_entry",
+    "estimated_prob_up",
+    "calibrated_p_win",
+    "expected_net_edge_bps",
+    "ev_at_entry",
+    "spread_at_entry",
+    "move_bps", "projected_forward_gain_bps", "expected_utility_bps",
     "buy_vs_wait_edge_bps", "maker_adjusted_expected_value_bps", "payoff_ratio",
     "cost_bps", "spread_bps", "walk_forward_penalty_bps", "uncertainty_penalty_bps",
     "momentum_1_bps", "momentum_3_bps", "momentum_5_bps", "momentum_15_bps",
@@ -91,7 +100,7 @@ def _num(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
 
 
 def _extract_outcome_bps(frame: pd.DataFrame) -> pd.Series:
-    for col in ["realized_or_proxy_net_bps", "binance_taker_taker_net_pnl_bps", "binance_maker_taker_net_pnl_bps", "net_pnl_bps", "buy_net_bps", "realized_net_pnl_bps", "primary_net_pnl_bps", "outcome_bps"]:
+    for col in ["realized_or_proxy_net_bps", "binance_taker_taker_net_pnl_bps", "binance_maker_taker_net_pnl_bps", "net_pnl_bps", "buy_net_bps", "realized_net_pnl_bps", "primary_net_pnl_bps", "outcome_bps", "move_bps", "ev_at_entry"]:
         if col in frame.columns:
             return _num(frame, col, 0.0)
     if "max_favorable_bps" in frame.columns and "max_adverse_bps" in frame.columns:
@@ -105,9 +114,22 @@ def _extract_outcome_bps(frame: pd.DataFrame) -> pd.Series:
 
 
 def _infer_regime(frame: pd.DataFrame) -> pd.Series:
-    for col in ["market_regime", "regime_tag", "volatility_cluster", "trend_regime"]:
+    for col in [
+        "market_regime",
+        "regime_tag",
+        "quant_volatility_cluster_state",
+        "volatility_cluster",
+        "trend_regime",
+    ]:
         if col in frame.columns:
-            return frame[col].astype(str).fillna("unknown_regime")
+            return (
+                frame[col]
+                .astype(str)
+                .fillna("unknown_regime")
+                .str.strip()
+                .str.lower()
+                .str.replace(" ", "_", regex=False)
+            )
     return pd.Series(["unknown_regime"] * len(frame), index=frame.index)
 
 
@@ -119,7 +141,14 @@ def _infer_ts(frame: pd.DataFrame) -> pd.Series:
 
 
 def _source_frames(base_dir: str) -> pd.DataFrame:
-    sources = [("fifth_pass_live_style_replay.csv", "fifth_pass", 0.90), ("historical_shadow_replay.csv", "historical_shadow", 0.75), ("candidate_replay.csv", "candidate_proxy", 0.45), ("council_observation_outcomes.csv", "council_observed", 0.80), ("missed_opportunities.csv", "missed_opportunity", 0.60)]
+    sources = [
+        ("fifth_pass_live_style_replay.csv", "fifth_pass", 0.90),
+        ("historical_shadow_replay.csv", "historical_shadow", 0.75),
+        ("candidate_replay.csv", "candidate_proxy", 0.45),
+        ("council_observation_outcomes.csv", "council_observed", 0.80),
+        ("trade_outcomes.csv", "fixed_window_trade_outcome", 0.70),
+        ("missed_opportunities.csv", "missed_opportunity", 0.60),
+    ]
     frames: List[pd.DataFrame] = []
     for filename, source_name, source_weight in sources:
         raw = _read_csv(os.path.join(base_dir, filename))
@@ -200,10 +229,29 @@ def _steady_state(matrix: np.ndarray) -> np.ndarray:
 
 def _markov_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[List[List[Any]], List[List[Any]]]:
     transition_rows: List[List[Any]] = []; policy_rows: List[List[Any]] = []
-    groups: List[Tuple[str, str, pd.DataFrame]] = [("portfolio", "ALL", frame)]
-    groups.extend(("product", str(pid), group.copy()) for pid, group in frame.groupby("product_id"))
+    # Markov transitions must be built from one product's time series at a time.
+    # Do not build portfolio-level transitions by sorting interleaved products,
+    # because that creates fake transitions from one product's regime into another product's regime.
+    groups: List[Tuple[str, str, pd.DataFrame]] = [
+        ("product", str(pid), group.copy())
+        for pid, group in frame.groupby("product_id")
+    ]
     for scope, product_id, group in groups:
-        local = group[["market_regime", "row_ts"]].copy().dropna().sort_values("row_ts")
+        local = group[["market_regime", "row_ts"]].copy().dropna()
+        local["market_regime"] = (
+            local["market_regime"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace(" ", "_", regex=False)
+        )
+        local = local[
+            (local["market_regime"] != "")
+            & (local["market_regime"] != "unknown_regime")
+            & (local["market_regime"] != "nan")
+        ].copy()
+        local = local.sort_values("row_ts")
+
         regimes = sorted([str(x) for x in local["market_regime"].dropna().unique()])
         if len(local) < 20 or len(regimes) < 2: continue
         idx = {regime: i for i, regime in enumerate(regimes)}; counts = np.zeros((len(regimes), len(regimes)), dtype=float); values = list(local["market_regime"].astype(str).values)
@@ -277,12 +325,21 @@ def load_feature_policy_map(base_dir: str) -> Dict[str, List[Dict[str, Any]]]:
     return output
 
 
+def _normalize_regime_key(value: Any) -> str:
+    return (
+        str(value if value not in (None, "") else "unknown_regime")
+        .strip()
+        .lower()
+        .replace(" ", "_")
+    )
+
+
 def load_markov_policy_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
     frame = _latest_frame(os.path.join(base_dir, "markov_regime_policy.csv"))
     if frame.empty: return {}
     if "ts" in frame.columns: frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce").fillna(0.0); frame = frame.sort_values("ts")
     output: Dict[str, Dict[str, Any]] = {}
-    for _, row in frame.iterrows(): output[f"{row.get('product_id', 'ALL')}||{row.get('current_regime', 'unknown_regime')}"] = row.to_dict()
+    for _, row in frame.iterrows(): output[f"{row.get('product_id', 'ALL')}||{_normalize_regime_key(row.get('current_regime', 'unknown_regime'))}"] = row.to_dict()
     return output
 
 
@@ -296,7 +353,21 @@ def load_kalman_policy_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
 
 
 def candidate_feature_value(candidate: Dict[str, Any], feature_name: str) -> Optional[float]:
-    aliases = {"probability": ["probability", "estimated_prob_up"], "estimated_prob_up": ["estimated_prob_up", "probability"], "expected_net_edge_bps": ["expected_net_edge_bps", "ev_bps"]}
+    aliases = {
+        "score": ["score", "entry_score", "score_at_entry"],
+        "entry_score": ["score", "entry_score", "score_at_entry"],
+        "score_at_entry": ["score", "entry_score", "score_at_entry"],
+
+        "probability": ["probability", "estimated_prob_up", "prob_at_entry"],
+        "estimated_prob_up": ["estimated_prob_up", "probability", "prob_at_entry"],
+        "prob_at_entry": ["estimated_prob_up", "probability", "prob_at_entry"],
+
+        "expected_net_edge_bps": ["expected_net_edge_bps", "ev_bps", "ev_at_entry"],
+        "ev_at_entry": ["expected_net_edge_bps", "ev_bps", "ev_at_entry"],
+
+        "spread_bps": ["spread_bps", "spread_at_entry"],
+        "spread_at_entry": ["spread_bps", "spread_at_entry"],
+    }
     for key in aliases.get(feature_name, [feature_name]):
         try:
             if key in candidate:

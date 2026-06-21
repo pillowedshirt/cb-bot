@@ -6968,7 +6968,7 @@ class TradingBot:
         self._kalman_policy_cache: Dict[str, Dict[str, Any]] = {}
         self._kalman_policy_cache_ts: float = 0.0
         self._kalman_state_by_product: Dict[str, Dict[str, Any]] = {}
-        self._last_kalman_state_write_ts: float = 0.0
+        self._last_kalman_state_write_ts_by_product: Dict[str, float] = {}
         self.last_ai_train_ts: float = 0.0
         self._ai_training_running: bool = False
         self._backtest_reload_running: bool = False
@@ -14552,8 +14552,22 @@ class TradingBot:
         except Exception as exc:
             return {"available": False, "allowed": True, "size_multiplier": 0.85, "reason": f"risk_context_gate_error:{exc}"}
 
+    def _normalized_regime_key(self, value: Any) -> str:
+        return (
+            str(value if value not in (None, "") else "unknown_regime")
+            .strip()
+            .lower()
+            .replace(" ", "_")
+        )
+
     def _candidate_market_regime(self, candidate: Dict[str, Any]) -> str:
-        return str(candidate.get("market_regime") or candidate.get("regime_tag") or candidate.get("volatility_cluster") or "unknown_regime").strip()
+        return self._normalized_regime_key(
+            candidate.get("market_regime")
+            or candidate.get("regime_tag")
+            or candidate.get("quant_volatility_cluster_state")
+            or candidate.get("volatility_cluster")
+            or "unknown_regime"
+        )
 
     def _feature_correlation_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         if not bool(ENABLE_COVARIANCE_CORRELATION_LIVE_GATE):
@@ -14565,7 +14579,7 @@ class TradingBot:
             if not self._feature_policy_cache or now_value - float(self._feature_policy_cache_ts or 0.0) > 15.0:
                 self._feature_policy_cache = load_feature_policy_map(BASE_DIR); self._feature_policy_cache_ts = now_value
             product_id = str(candidate.get("product_id", "")); rows = list(self._feature_policy_cache.get(product_id, []) or []); rows.extend(list(self._feature_policy_cache.get("ALL", []) or []))
-            if not rows: return {"available": False, "allowed": True, "size_multiplier": 0.85, "reason": "covariance_correlation_policy_missing"}
+            if not rows: return {"available": False, "allowed": True, "size_multiplier": 0.75, "reason": "covariance_correlation_policy_missing_size_down"}
             contributions: List[float] = []; reasons: List[str] = []; total_sample = 0
             for row in rows:
                 feature_name = str(row.get("feature_name", "")); value = candidate_feature_value(candidate, feature_name)
@@ -14592,8 +14606,10 @@ class TradingBot:
             now_value = now_ts()
             if not self._markov_policy_cache or now_value - float(self._markov_policy_cache_ts or 0.0) > 15.0:
                 self._markov_policy_cache = load_markov_policy_map(BASE_DIR); self._markov_policy_cache_ts = now_value
-            product_id = str(candidate.get("product_id", "")); regime = self._candidate_market_regime(candidate); row = dict(self._markov_policy_cache.get(f"{product_id}||{regime}", {}) or self._markov_policy_cache.get(f"ALL||{regime}", {}) or {})
-            if not row: return {"available": False, "allowed": True, "size_multiplier": float(MARKOV_MISSING_POLICY_SIZE_MULTIPLIER), "regime": regime, "reason": f"markov_policy_missing product_id={product_id};regime={regime}"}
+            product_id = str(candidate.get("product_id", "")); regime = self._candidate_market_regime(candidate); key = f"{product_id}||{regime}"
+            # Use product-specific Markov policy only. Portfolio-level Markov transitions are intentionally not used because interleaved product regimes can create fake transitions.
+            row = dict(self._markov_policy_cache.get(key, {}) or {})
+            if not row: return {"available": False, "allowed": True, "size_multiplier": min(float(MARKOV_MISSING_POLICY_SIZE_MULTIPLIER), 0.75), "regime": regime, "reason": f"markov_policy_missing_size_down;product_id={product_id};regime={regime}"}
             sample_count = int(float(row.get("sample_count", 0) or 0)); live_allowed = str(row.get("live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}; size_multiplier = clamp_float(float(row.get("size_multiplier", 1.0) or 1.0), 0.0, 1.05)
             if sample_count < int(MARKOV_MIN_SAMPLE_COUNT_TO_BLOCK): return {"available": True, "allowed": True, "size_multiplier": min(size_multiplier, float(MARKOV_MISSING_POLICY_SIZE_MULTIPLIER)), "regime": regime, "sample_count": sample_count, "reason": f"markov_sample_immature;{row.get('reason', '')}"}
             if not live_allowed: return {"available": True, "allowed": False, "size_multiplier": 0.0, "regime": regime, "sample_count": sample_count, "reason": f"markov_regime_blocked;{row.get('reason', '')}"}
@@ -14614,8 +14630,9 @@ class TradingBot:
     def _append_kalman_live_state_row(self, product_id: str, data: Dict[str, Any]) -> None:
         try:
             now_value = now_ts()
-            if now_value - float(self._last_kalman_state_write_ts or 0.0) < float(KALMAN_LIVE_STATE_WRITE_EVERY_SEC): return
-            self._last_kalman_state_write_ts = now_value
+            last_write = float(self._last_kalman_state_write_ts_by_product.get(product_id, 0.0) or 0.0)
+            if now_value - last_write < float(KALMAN_LIVE_STATE_WRITE_EVERY_SEC): return
+            self._last_kalman_state_write_ts_by_product[product_id] = now_value
             columns = ["ts", "dt_mst", "product_id", "observed_price", "filtered_price", "velocity_price_per_min", "slope_bps_per_min", "residual_bps", "kalman_gain", "measurement_noise_bps", "process_noise_bps", "size_multiplier", "live_allowed", "reason"]
             write_header = not os.path.exists(KALMAN_LIVE_STATE_CSV_PATH) or os.path.getsize(KALMAN_LIVE_STATE_CSV_PATH) == 0
             dt_mst = datetime.fromtimestamp(now_value, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -14634,11 +14651,23 @@ class TradingBot:
             product_id = str(candidate.get("product_id", "")); observed_price = self._candidate_observed_price(candidate)
             if not product_id or observed_price <= 0:
                 candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 0.85, "kalman_reason": "kalman_missing_product_or_price"}); return candidate
-            policy = self._kalman_policy_for_product(product_id); measurement_noise_bps = float(policy.get("measurement_noise_bps", 12.0) or 12.0); process_noise_bps = float(policy.get("process_noise_bps", 2.0) or 2.0)
-            current_ts = now_ts(); state = self._kalman_state_by_product.get(product_id) or {"ts": current_ts, "price": observed_price, "velocity": 0.0, "p00": 1.0, "p01": 0.0, "p10": 0.0, "p11": 1.0}
+            policy = self._kalman_policy_for_product(product_id)
+            measurement_noise_bps = float(policy.get("measurement_noise_bps", 12.0) or 12.0)
+            process_noise_bps = float(policy.get("process_noise_bps", 2.0) or 2.0)
+
+            current_ts = now_ts()
+            price_scale = max(observed_price, 1e-9)
+            measurement_var = max((price_scale * measurement_noise_bps / 10000.0) ** 2, 1e-12)
+            process_var = max((price_scale * process_noise_bps / 10000.0) ** 2, 1e-12)
+
+            state = self._kalman_state_by_product.get(product_id)
+            if not state:
+                state = {"ts": current_ts, "price": observed_price, "velocity": 0.0, "p00": measurement_var * 4.0, "p01": 0.0, "p10": 0.0, "p11": process_var}
+
             last_ts = float(state.get("ts", current_ts) or current_ts); dt_min = clamp_float((current_ts - last_ts) / 60.0, 0.05, 10.0)
-            x0 = float(state.get("price", observed_price) or observed_price); x1 = float(state.get("velocity", 0.0) or 0.0); p00 = float(state.get("p00", 1.0) or 1.0); p01 = float(state.get("p01", 0.0) or 0.0); p10 = float(state.get("p10", 0.0) or 0.0); p11 = float(state.get("p11", 1.0) or 1.0)
-            predicted_price = x0 + x1 * dt_min; predicted_velocity = x1; price_scale = max(observed_price, 1e-9); process_var = (price_scale * process_noise_bps / 10000.0) ** 2; measurement_var = (price_scale * measurement_noise_bps / 10000.0) ** 2
+            x0 = float(state.get("price", observed_price) or observed_price); x1 = float(state.get("velocity", 0.0) or 0.0)
+            p00 = float(state.get("p00", measurement_var) or measurement_var); p01 = float(state.get("p01", 0.0) or 0.0); p10 = float(state.get("p10", 0.0) or 0.0); p11 = float(state.get("p11", process_var) or process_var)
+            predicted_price = x0 + x1 * dt_min; predicted_velocity = x1
             pp00 = p00 + dt_min * (p10 + p01) + (dt_min ** 2) * p11 + process_var; pp01 = p01 + dt_min * p11; pp10 = p10 + dt_min * p11; pp11 = p11 + process_var * 0.05
             residual = observed_price - predicted_price; smat = pp00 + measurement_var; kgp = pp00 / max(smat, 1e-12); kgv = pp10 / max(smat, 1e-12)
             updated_price = predicted_price + kgp * residual; updated_velocity = predicted_velocity + kgv * residual
@@ -14655,7 +14684,7 @@ class TradingBot:
             candidate.update({"kalman_available": True, "kalman_filtered_price": float(updated_price), "kalman_velocity_price_per_min": float(updated_velocity), "kalman_slope_bps_per_min": float(slope_bps_per_min), "kalman_residual_bps": float(residual_bps), "kalman_gain": float(kgp), "kalman_measurement_noise_bps": float(measurement_noise_bps), "kalman_process_noise_bps": float(process_noise_bps), "kalman_live_allowed": bool(live_allowed), "kalman_size_multiplier": float(size_multiplier), "kalman_reason": str(data["reason"])})
             self._append_kalman_live_state_row(product_id, data); return candidate
         except Exception as exc:
-            candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 0.85, "kalman_reason": f"kalman_filter_error:{exc}"}); return candidate
+            candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 0.65, "kalman_reason": f"kalman_filter_error_size_down:{exc}"}); return candidate
 
     def _level8_live_buy_quality_ok(
         self,
@@ -24982,6 +25011,11 @@ class TradingBot:
                     "quant_confidence": float(getattr(live_signal, "quant_confidence", 0.10)),
                     "quant_boundary_state": str(getattr(live_signal, "quant_boundary_state", "")),
                     "quant_volatility_cluster_state": str(getattr(live_signal, "quant_volatility_cluster_state", "")),
+                    "market_regime": str(
+                        getattr(live_signal, "quant_volatility_cluster_state", "")
+                        or getattr(live_signal, "regime_tag", "")
+                        or "unknown_regime"
+                    ).strip().lower().replace(" ", "_"),
                     "quant_stationarity_score": float(getattr(live_signal, "quant_stationarity_score", 0.0)),
                     "quant_forecast_return_bps": float(getattr(live_signal, "quant_forecast_return_bps", 0.0)),
                     "quant_conditional_volatility_bps": float(getattr(live_signal, "quant_conditional_volatility_bps", 0.0)),

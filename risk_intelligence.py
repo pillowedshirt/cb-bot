@@ -50,11 +50,12 @@ RISK_LIVE_GATE_COLUMNS = [
 ]
 
 SOURCE_QUALITY_WEIGHTS: Dict[str, float] = {
-    "fifth_pass_live_style_replay": 0.90,
-    "historical_shadow_replay": 0.75,
-    "candidate_replay_proxy": 0.45,
-    "council_observed": 0.80,
     "live_realized": 1.00,
+    "fifth_pass_live_style_replay": 0.90,
+    "council_observed": 0.80,
+    "historical_shadow_replay": 0.75,
+    "fixed_window_trade_outcome": 0.70,
+    "candidate_replay_proxy": 0.45,
 }
 
 
@@ -98,25 +99,53 @@ def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
     return values.isin({"true", "1", "yes", "y"})
 
 
+def _normalize_context_part(value: Any, default: str) -> str:
+    text = str(value if value not in (None, "") else default)
+    text = text.strip().lower().replace(" ", "_")
+    return text or default
+
+
+def _regime_from_mapping(mapping: Dict[str, Any]) -> str:
+    return (
+        str(
+            mapping.get("market_regime")
+            or mapping.get("regime_tag")
+            or mapping.get("quant_volatility_cluster_state")
+            or mapping.get("volatility_cluster")
+            or mapping.get("trend_regime")
+            or "unknown_regime"
+        )
+        .strip()
+        .lower()
+        .replace(" ", "_")
+    )
+
+
 def context_key_from_mapping(mapping: Dict[str, Any]) -> str:
-    parts = [
-        str(mapping.get("market_regime") or mapping.get("regime_tag") or "unknown_regime"),
-        str(mapping.get("session_liquidity_setup") or "unknown_session"),
-        str(mapping.get("structure_state") or "unknown_structure"),
-        str(mapping.get("value_area_state") or mapping.get("value_acceptance_state") or "unknown_value"),
-        str(mapping.get("fvg_state") or "unknown_fvg"),
-        str(mapping.get("volume_node_state") or "unknown_volume_node"),
-        str(mapping.get("quant_boundary_state") or "unknown_quant"),
-    ]
-    return "|".join(p.strip().lower().replace(" ", "_") for p in parts)
+    regime = _normalize_context_part(_regime_from_mapping(mapping), "unknown_regime")
+    session = _normalize_context_part(mapping.get("session_liquidity_setup"), "unknown_session")
+    structure = _normalize_context_part(mapping.get("structure_state"), "unknown_structure")
+    value_area = _normalize_context_part(
+        mapping.get("value_area_state") or mapping.get("value_acceptance_state"),
+        "unknown_value",
+    )
+    fvg = _normalize_context_part(mapping.get("fvg_state"), "unknown_fvg")
+    volume_node = _normalize_context_part(mapping.get("volume_node_state"), "unknown_volume_node")
+    quant = _normalize_context_part(mapping.get("quant_boundary_state"), "unknown_quant")
+
+    return "|".join([regime, session, structure, value_area, fvg, volume_node, quant])
 
 
 def context_lookup_keys_from_mapping(product_id: str, mapping: Dict[str, Any]) -> List[str]:
-    regime = str(mapping.get("market_regime") or mapping.get("regime_tag") or "unknown_regime").strip().lower().replace(" ", "_")
-    session = str(mapping.get("session_liquidity_setup") or "unknown_session").strip().lower().replace(" ", "_")
-    structure = str(mapping.get("structure_state") or "unknown_structure").strip().lower().replace(" ", "_")
-    quant = str(mapping.get("quant_boundary_state") or "unknown_quant").strip().lower().replace(" ", "_")
     full = context_key_from_mapping(mapping)
+    parts = full.split("|")
+
+    while len(parts) < 7:
+        parts.append("unknown")
+
+    regime, session, structure, _value_area, _fvg, _volume_node, quant = parts[:7]
+    product_id = str(product_id or mapping.get("product_id", "")).strip()
+
     return [
         f"{product_id}||full||{full}",
         f"{product_id}||regime_session_structure||{regime}|{session}|{structure}",
@@ -124,6 +153,7 @@ def context_lookup_keys_from_mapping(product_id: str, mapping: Dict[str, Any]) -
         f"{product_id}||regime_only||{regime}",
         f"ALL||regime_only||{regime}",
     ]
+
 
 def _infer_day_key(frame: pd.DataFrame) -> pd.Series:
     for col in ["entry_ts", "replay_ts", "ts"]:
@@ -134,7 +164,7 @@ def _infer_day_key(frame: pd.DataFrame) -> pd.Series:
 
 
 def _extract_outcome_bps(frame: pd.DataFrame, source_name: str) -> pd.Series:
-    for col in ["realized_or_proxy_net_bps", "binance_taker_taker_net_pnl_bps", "binance_maker_taker_net_pnl_bps", "net_pnl_bps", "buy_net_bps", "realized_net_pnl_bps", "primary_net_pnl_bps"]:
+    for col in ["realized_or_proxy_net_bps", "binance_taker_taker_net_pnl_bps", "binance_maker_taker_net_pnl_bps", "net_pnl_bps", "buy_net_bps", "realized_net_pnl_bps", "primary_net_pnl_bps", "move_bps", "ev_at_entry"]:
         if col in frame.columns:
             return _numeric(frame, col, 0.0)
     if "max_favorable_bps" in frame.columns and "max_adverse_bps" in frame.columns:
@@ -151,21 +181,38 @@ def _extract_outcome_bps(frame: pd.DataFrame, source_name: str) -> pd.Series:
 def _standardize_source_frame(frame: pd.DataFrame, source_name: str) -> pd.DataFrame:
     if frame is None or frame.empty or "product_id" not in frame.columns:
         return pd.DataFrame()
+
     out = frame.copy()
     out["product_id"] = out["product_id"].astype(str)
     out["outcome_bps"] = _extract_outcome_bps(out, source_name)
     out["day_key"] = _infer_day_key(out)
-    if "market_regime" not in out.columns:
-        out["market_regime"] = out["regime_tag"].astype(str) if "regime_tag" in out.columns else "unknown_regime"
+
+    out["market_regime"] = out.apply(lambda row: _regime_from_mapping(row.to_dict()), axis=1)
     out["context_key"] = out.apply(lambda row: context_key_from_mapping(row.to_dict()), axis=1)
     out["source_name"] = source_name
     out["source_weight"] = float(SOURCE_QUALITY_WEIGHTS.get(source_name, 0.50))
-    out["max_adverse_bps"] = _numeric(out, "max_adverse_bps", 0.0).abs() if "max_adverse_bps" in out.columns else 0.0
-    keep = ["product_id", "outcome_bps", "day_key", "market_regime", "context_key", "source_name", "source_weight", "max_adverse_bps"]
+
+    if "max_adverse_bps" in out.columns:
+        out["max_adverse_bps"] = _numeric(out, "max_adverse_bps", 0.0).abs()
+    else:
+        out["max_adverse_bps"] = 0.0
+
+    keep = [
+        "product_id",
+        "outcome_bps",
+        "day_key",
+        "market_regime",
+        "context_key",
+        "source_name",
+        "source_weight",
+        "max_adverse_bps",
+    ]
+
     out = out[keep].copy()
     out["outcome_bps"] = pd.to_numeric(out["outcome_bps"], errors="coerce")
     out["source_weight"] = pd.to_numeric(out["source_weight"], errors="coerce").fillna(0.50)
     out = out.dropna(subset=["outcome_bps"])
+
     return out[np.isfinite(out["outcome_bps"])]
 
 
@@ -176,6 +223,7 @@ def _training_frame(base_dir: str) -> pd.DataFrame:
         ("historical_shadow_replay.csv", "historical_shadow_replay"),
         ("candidate_replay.csv", "candidate_replay_proxy"),
         ("council_observation_outcomes.csv", "council_observed"),
+        ("trade_outcomes.csv", "fixed_window_trade_outcome"),
     ]
     for filename, source_name in sources:
         frame = _standardize_source_frame(_read_csv(os.path.join(base_dir, filename)), source_name)
@@ -227,6 +275,27 @@ def _monte_carlo_path_stats(frame: pd.DataFrame, *, horizon_days: int, trials: i
         terminal_returns.append(equity_pct); max_drawdowns.append(max_dd)
     terminal = np.asarray(terminal_returns, dtype=float); drawdowns = np.asarray(max_drawdowns, dtype=float)
     return {"median_return_pct": float(np.percentile(terminal, 50)), "p05_return_pct": float(np.percentile(terminal, 5)), "p95_return_pct": float(np.percentile(terminal, 95)), "prob_loss": float(np.mean(terminal < 0.0)), "median_max_drawdown_pct": float(np.percentile(drawdowns, 50)), "p95_max_drawdown_pct": float(np.percentile(drawdowns, 95)), "prob_drawdown_gt_3pct": float(np.mean(drawdowns > 3.0)), "prob_drawdown_gt_5pct": float(np.mean(drawdowns > 5.0))}
+
+def _confidence_grade(stats: Dict[str, float]) -> Tuple[str, str, float]:
+    n = float(stats.get("sample_count", 0.0) or 0.0)
+    ev = float(stats.get("ev_mean_bps", 0.0) or 0.0)
+    ci_low = float(stats.get("ev_ci_low_bps", 0.0) or 0.0)
+    prob_pos = float(stats.get("prob_ev_positive", 0.0) or 0.0)
+
+    if n < 30:
+        return "INSUFFICIENT_SAMPLE", "shadow_or_min_size", 0.50
+
+    if ev > 0.0 and ci_low > 0.0 and prob_pos >= 0.75:
+        return "STRONG_POSITIVE_EV", "allow_normal_or_larger_size", 1.10
+
+    if ev > 0.0 and ci_low > -5.0 and prob_pos >= 0.62:
+        return "WEAK_POSITIVE_EV", "allow_reduced_size", 0.75
+
+    if ev > -3.0 and prob_pos >= 0.52:
+        return "UNCERTAIN_EV", "allow_min_size_only", 0.50
+
+    return "NEGATIVE_OR_UNRELIABLE_EV", "block_or_shadow", 0.0
+
 
 def _risk_grade_from_mc(stats: Dict[str, float]) -> str:
     p_loss = float(stats.get("prob_loss", 1.0)); dd95 = float(stats.get("p95_max_drawdown_pct", 99.0)); p_dd3 = float(stats.get("prob_drawdown_gt_3pct", 1.0))
@@ -311,31 +380,110 @@ def load_risk_live_gate_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
     return _latest_by_key(_read_csv(os.path.join(base_dir, "risk_live_gate.csv")), "product_id")
 
 
+def _split_context_key(context_key: str) -> Dict[str, str]:
+    parts = str(context_key or "").split("|")
+    while len(parts) < 7:
+        parts.append("unknown")
+
+    return {
+        "regime": _normalize_context_part(parts[0], "unknown_regime"),
+        "session": _normalize_context_part(parts[1], "unknown_session"),
+        "structure": _normalize_context_part(parts[2], "unknown_structure"),
+        "value_area": _normalize_context_part(parts[3], "unknown_value"),
+        "fvg": _normalize_context_part(parts[4], "unknown_fvg"),
+        "volume_node": _normalize_context_part(parts[5], "unknown_volume_node"),
+        "quant": _normalize_context_part(parts[6], "unknown_quant"),
+    }
+
+
 def _weighted_summary_rows_to_context_map(frame: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     output: Dict[str, Dict[str, Any]] = {}
+
     if frame.empty:
         return output
+
     frame = frame.copy()
     frame["sample_count"] = pd.to_numeric(frame.get("sample_count", 0), errors="coerce").fillna(0.0)
     frame["ev_mean_bps"] = pd.to_numeric(frame.get("ev_mean_bps", 0.0), errors="coerce").fillna(0.0)
     frame["ev_ci_low_bps"] = pd.to_numeric(frame.get("ev_ci_low_bps", 0.0), errors="coerce").fillna(0.0)
     frame["prob_ev_positive"] = pd.to_numeric(frame.get("prob_ev_positive", 0.0), errors="coerce").fillna(0.0)
     frame["context_size_multiplier"] = pd.to_numeric(frame.get("context_size_multiplier", 1.0), errors="coerce").fillna(1.0)
+
+    parsed = frame["context_key"].apply(_split_context_key)
+    frame["_regime_key"] = parsed.apply(lambda x: x["regime"])
+    frame["_session_key"] = parsed.apply(lambda x: x["session"])
+    frame["_structure_key"] = parsed.apply(lambda x: x["structure"])
+    frame["_quant_key"] = parsed.apply(lambda x: x["quant"])
+
     def add_row(key: str, rows: pd.DataFrame, tier: str) -> None:
         total_n = float(rows["sample_count"].sum())
-        if total_n <= 0: return
+        if total_n <= 0:
+            return
+
         weights = rows["sample_count"].clip(lower=1.0)
-        ev = float(np.average(rows["ev_mean_bps"], weights=weights)); ci_low = float(np.average(rows["ev_ci_low_bps"], weights=weights)); prob_pos = float(np.average(rows["prob_ev_positive"], weights=weights)); size_mult = float(np.average(rows["context_size_multiplier"], weights=weights))
+        ev = float(np.average(rows["ev_mean_bps"], weights=weights))
+        ci_low = float(np.average(rows["ev_ci_low_bps"], weights=weights))
+        prob_pos = float(np.average(rows["prob_ev_positive"], weights=weights))
+        size_mult = float(np.average(rows["context_size_multiplier"], weights=weights))
+
         allowed = not (total_n >= 30 and (ci_low < -8.0 or prob_pos < 0.45))
-        output[key] = {"map_key": key, "context_tier": tier, "sample_count": total_n, "ev_mean_bps": ev, "ev_ci_low_bps": ci_low, "prob_ev_positive": prob_pos, "context_live_allowed": allowed, "context_size_multiplier": size_mult if allowed else 0.0, "reason": f"context_fallback_tier={tier};n={total_n:.0f};ev={ev:.2f};ci_low={ci_low:.2f};p_ev_positive={prob_pos:.3f}"}
+
+        output[key] = {
+            "map_key": key,
+            "context_tier": tier,
+            "sample_count": total_n,
+            "ev_mean_bps": ev,
+            "ev_ci_low_bps": ci_low,
+            "prob_ev_positive": prob_pos,
+            "context_live_allowed": allowed,
+            "context_size_multiplier": size_mult if allowed else 0.0,
+            "reason": (
+                f"context_fallback_tier={tier};n={total_n:.0f};"
+                f"ev={ev:.2f};ci_low={ci_low:.2f};p_ev_positive={prob_pos:.3f}"
+            ),
+        }
+
     for _, row in frame.iterrows():
-        product_id = str(row.get("product_id", "")); context_key = str(row.get("context_key", ""))
+        product_id = str(row.get("product_id", ""))
+        context_key = str(row.get("context_key", ""))
         if product_id and context_key:
-            key = f"{product_id}||full||{context_key}"; output[key] = row.to_dict(); output[key]["map_key"] = key; output[key]["context_tier"] = "full"
-    for (product_id, regime), rows in frame.groupby(["product_id", "market_regime"]):
-        add_row(f"{product_id}||regime_only||{str(regime).strip().lower().replace(' ', '_')}", rows, "product_regime_only")
-    for regime, rows in frame.groupby("market_regime"):
-        add_row(f"ALL||regime_only||{str(regime).strip().lower().replace(' ', '_')}", rows, "portfolio_regime_only")
+            key = f"{product_id}||full||{context_key}"
+            output[key] = row.to_dict()
+            output[key]["map_key"] = key
+            output[key]["context_tier"] = "full"
+
+    for (product_id, regime, session, structure), rows in frame.groupby(
+        ["product_id", "_regime_key", "_session_key", "_structure_key"]
+    ):
+        add_row(
+            f"{product_id}||regime_session_structure||{regime}|{session}|{structure}",
+            rows,
+            "product_regime_session_structure",
+        )
+
+    for (product_id, regime, quant), rows in frame.groupby(
+        ["product_id", "_regime_key", "_quant_key"]
+    ):
+        add_row(
+            f"{product_id}||regime_quant||{regime}|{quant}",
+            rows,
+            "product_regime_quant",
+        )
+
+    for (product_id, regime), rows in frame.groupby(["product_id", "_regime_key"]):
+        add_row(
+            f"{product_id}||regime_only||{regime}",
+            rows,
+            "product_regime_only",
+        )
+
+    for regime, rows in frame.groupby("_regime_key"):
+        add_row(
+            f"ALL||regime_only||{regime}",
+            rows,
+            "portfolio_regime_only",
+        )
+
     return output
 
 

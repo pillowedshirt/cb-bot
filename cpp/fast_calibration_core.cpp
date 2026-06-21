@@ -331,6 +331,148 @@ static py::dict evaluate_best_window_from_arrays(
     return out;
 }
 
+
+static py::dict evaluate_best_windows_batch_from_arrays(
+    py::array_t<double, py::array::c_style | py::array::forcecast> entry_prices,
+    py::array_t<double, py::array::c_style | py::array::forcecast> highs,
+    py::array_t<double, py::array::c_style | py::array::forcecast> lows,
+    py::array_t<int, py::array::c_style | py::array::forcecast> start_indices,
+    py::array_t<int, py::array::c_style | py::array::forcecast> forward_windows,
+    py::array_t<double, py::array::c_style | py::array::forcecast> target_bps_values,
+    py::array_t<double, py::array::c_style | py::array::forcecast> cost_bps_values,
+    double min_net_gain_bps,
+    double bar_minutes,
+    double max_adverse_before_profit_bps,
+    double preferred_time_to_min_profit_minutes
+) {
+    auto entries = entry_prices.unchecked<1>();
+    auto starts = start_indices.unchecked<1>();
+    auto targets = target_bps_values.unchecked<1>();
+    auto costs = cost_bps_values.unchecked<1>();
+
+    const ssize_t n = entries.shape(0);
+
+    if (
+        starts.shape(0) != n ||
+        targets.shape(0) != n ||
+        costs.shape(0) != n
+    ) {
+        throw std::runtime_error("evaluate_best_windows_batch_from_arrays received mismatched input lengths");
+    }
+
+    py::list found_values;
+    py::list chosen_window_bars_values;
+    py::list quality_score_values;
+    py::list max_favorable_bps_values;
+    py::list max_adverse_bps_values;
+    py::list reached_min_profit_values;
+    py::list reached_target_values;
+    py::list win_bps_values;
+    py::list loss_bps_values;
+    py::list time_to_min_profit_bars_values;
+    py::list time_to_min_profit_minutes_values;
+    py::list forward_window_minutes_values;
+    py::list selected_forward_window_minutes_values;
+    py::list post_profit_max_favorable_bps_values;
+    py::list post_profit_extra_gain_bps_values;
+    py::list adverse_before_profit_bps_values;
+    py::list survived_to_profit_values;
+    py::list expected_value_bps_values;
+
+    for (ssize_t row = 0; row < n; ++row) {
+        const double entry_price = entries(row);
+        const int start_index = starts(row);
+        const double target_bps = targets(row);
+        const double cost_bps = costs(row);
+
+        py::dict result;
+
+        try {
+            result = evaluate_best_window_from_arrays(
+                entry_price,
+                highs,
+                lows,
+                start_index,
+                forward_windows,
+                target_bps,
+                cost_bps,
+                min_net_gain_bps,
+                bar_minutes,
+                max_adverse_before_profit_bps,
+                preferred_time_to_min_profit_minutes
+            );
+        } catch (...) {
+            result = py::dict();
+            result["found"] = false;
+        }
+
+        const bool found = result.contains("found") ? py::cast<bool>(result["found"]) : false;
+
+        found_values.append(found);
+
+        if (!found) {
+            chosen_window_bars_values.append(0);
+            quality_score_values.append(0.0);
+            max_favorable_bps_values.append(0.0);
+            max_adverse_bps_values.append(0.0);
+            reached_min_profit_values.append(false);
+            reached_target_values.append(false);
+            win_bps_values.append(0.0);
+            loss_bps_values.append(0.0);
+            time_to_min_profit_bars_values.append(-1);
+            time_to_min_profit_minutes_values.append(0.0);
+            forward_window_minutes_values.append(0.0);
+            selected_forward_window_minutes_values.append(0.0);
+            post_profit_max_favorable_bps_values.append(0.0);
+            post_profit_extra_gain_bps_values.append(0.0);
+            adverse_before_profit_bps_values.append(0.0);
+            survived_to_profit_values.append(false);
+            expected_value_bps_values.append(0.0);
+            continue;
+        }
+
+        chosen_window_bars_values.append(py::cast<int>(result["chosen_window_bars"]));
+        quality_score_values.append(py::cast<double>(result["quality_score"]));
+        max_favorable_bps_values.append(py::cast<double>(result["max_favorable_bps"]));
+        max_adverse_bps_values.append(py::cast<double>(result["max_adverse_bps"]));
+        reached_min_profit_values.append(py::cast<bool>(result["reached_min_profit"]));
+        reached_target_values.append(py::cast<bool>(result["reached_target"]));
+        win_bps_values.append(py::cast<double>(result["win_bps"]));
+        loss_bps_values.append(py::cast<double>(result["loss_bps"]));
+        time_to_min_profit_bars_values.append(py::cast<int>(result["time_to_min_profit_bars"]));
+        time_to_min_profit_minutes_values.append(py::cast<double>(result["time_to_min_profit_minutes"]));
+        forward_window_minutes_values.append(py::cast<double>(result["forward_window_minutes"]));
+        selected_forward_window_minutes_values.append(py::cast<double>(result["selected_forward_window_minutes"]));
+        post_profit_max_favorable_bps_values.append(py::cast<double>(result["post_profit_max_favorable_bps"]));
+        post_profit_extra_gain_bps_values.append(py::cast<double>(result["post_profit_extra_gain_bps"]));
+        adverse_before_profit_bps_values.append(py::cast<double>(result["adverse_before_profit_bps"]));
+        survived_to_profit_values.append(py::cast<bool>(result["survived_to_profit"]));
+        expected_value_bps_values.append(py::cast<double>(result["expected_value_bps"]));
+    }
+
+    py::dict out;
+    out["found"] = found_values;
+    out["chosen_window_bars"] = chosen_window_bars_values;
+    out["quality_score"] = quality_score_values;
+    out["max_favorable_bps"] = max_favorable_bps_values;
+    out["max_adverse_bps"] = max_adverse_bps_values;
+    out["reached_min_profit"] = reached_min_profit_values;
+    out["reached_target"] = reached_target_values;
+    out["win_bps"] = win_bps_values;
+    out["loss_bps"] = loss_bps_values;
+    out["time_to_min_profit_bars"] = time_to_min_profit_bars_values;
+    out["time_to_min_profit_minutes"] = time_to_min_profit_minutes_values;
+    out["forward_window_minutes"] = forward_window_minutes_values;
+    out["selected_forward_window_minutes"] = selected_forward_window_minutes_values;
+    out["post_profit_max_favorable_bps"] = post_profit_max_favorable_bps_values;
+    out["post_profit_extra_gain_bps"] = post_profit_extra_gain_bps_values;
+    out["adverse_before_profit_bps"] = adverse_before_profit_bps_values;
+    out["survived_to_profit"] = survived_to_profit_values;
+    out["expected_value_bps"] = expected_value_bps_values;
+
+    return out;
+}
+
 PYBIND11_MODULE(fast_calibration_core, m) {
     m.doc() = "Fast C++ calibration helpers for the Binance.US trading bot";
     m.def("evaluate_outcome_arrays", &evaluate_outcome_arrays, py::arg("entry_price"), py::arg("highs"), py::arg("lows"), py::arg("target_bps"), py::arg("cost_bps"), py::arg("min_net_gain_bps"), py::arg("bar_minutes"), py::arg("max_adverse_before_profit_bps"));
@@ -346,6 +488,21 @@ PYBIND11_MODULE(fast_calibration_core, m) {
         py::arg("forward_windows"),
         py::arg("target_bps"),
         py::arg("cost_bps"),
+        py::arg("min_net_gain_bps"),
+        py::arg("bar_minutes"),
+        py::arg("max_adverse_before_profit_bps"),
+        py::arg("preferred_time_to_min_profit_minutes")
+    );
+    m.def(
+        "evaluate_best_windows_batch_from_arrays",
+        &evaluate_best_windows_batch_from_arrays,
+        py::arg("entry_prices"),
+        py::arg("highs"),
+        py::arg("lows"),
+        py::arg("start_indices"),
+        py::arg("forward_windows"),
+        py::arg("target_bps_values"),
+        py::arg("cost_bps_values"),
         py::arg("min_net_gain_bps"),
         py::arg("bar_minutes"),
         py::arg("max_adverse_before_profit_bps"),

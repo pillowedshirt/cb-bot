@@ -44,6 +44,13 @@ VIEWER_SNAPSHOT_PATH = os.path.join(BASE_DIR, "viewer_snapshot.json")
 VIEWER_SNAPSHOT_CSV_SAFE_PATH = VIEWER_SNAPSHOT_PATH
 CALCULATION_STATUS_JSON_PATH = os.path.join(BASE_DIR, "calculation_status.json")
 CALCULATION_COMPLETE_LATCH_JSON_PATH = os.path.join(BASE_DIR, "calculation_complete_latch.json")
+CALIBRATION_CSV_PATH = os.path.join(BASE_DIR, "calibration.csv")
+POST_PATCH_AUDIT_CSV_PATH = os.path.join(BASE_DIR, "post_patch_audit.csv")
+NEXT_PATCH_GENERATION_VERSION = "post_patch_recalc_v2_2026_06_21"
+EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED = 85
+EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED = 340
+EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
+EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
 MARKET_CSV_PATH = os.path.join(BASE_DIR, "market.csv")
 TRADES_CSV_PATH = os.path.join(BASE_DIR, "trades.csv")
 POSITION_TARGETS_PATH = os.path.join(BASE_DIR, "position_targets.csv")
@@ -474,6 +481,85 @@ div[data-testid="stButton"] button:focus {
 </style>
     """, unsafe_allow_html=True)
 
+
+
+def _sidecar_meta_path(path: str) -> str:
+    return f"{path}.meta.json"
+
+
+def _read_generated_file_meta(path: str) -> Dict[str, Any]:
+    try:
+        meta_path = _sidecar_meta_path(path)
+        if not os.path.exists(meta_path):
+            return {}
+        with open(meta_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _generated_file_is_current(path: str) -> bool:
+    return str(_read_generated_file_meta(path).get("generation_version", "")) == NEXT_PATCH_GENERATION_VERSION
+
+
+def _csv_product_time_coverage(path: str) -> Dict[str, Any]:
+    out = {"path": path, "exists": os.path.exists(path), "rows": 0, "products": 0, "days_covered": 0.0, "rows_per_product_min": 0, "ok": False, "reason": ""}
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            out["reason"] = "missing_or_empty"; return out
+        df = pd.read_csv(path)
+        if df.empty or "product_id" not in df.columns or "ts" not in df.columns:
+            out["reason"] = "empty_or_missing_product_ts"; return out
+        df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+        df = df.dropna(subset=["ts"])
+        if df.empty:
+            out["reason"] = "no_valid_ts"; return out
+        counts = df.groupby(df["product_id"].astype(str)).size()
+        out.update({"rows": int(len(df)), "products": int(len(counts)), "days_covered": float((df["ts"].max() - df["ts"].min()) / 86400.0), "rows_per_product_min": int(counts.min()), "ok": True, "reason": "ok"})
+    except Exception as exc:
+        out["reason"] = f"coverage_failed:{exc}"
+    return out
+
+
+def post_patch_viewer_state(four_pass_product_live_gate_df=None, snapshot=None) -> Dict[str, Any]:
+    files = {"calculation_status.json": CALCULATION_STATUS_JSON_PATH, "calibration.csv": CALIBRATION_CSV_PATH, "four_pass_product_live_gate.csv": FOUR_PASS_PRODUCT_LIVE_GATE_PATH, "viewer_snapshot.json": VIEWER_SNAPSHOT_PATH, "post_patch_audit.csv": POST_PATCH_AUDIT_CSV_PATH}
+    current, stale = [], []
+    for name, path in files.items():
+        (current if _generated_file_is_current(path) else stale).append(name)
+    primary = _csv_product_time_coverage(HIST_REPLAY_15M_90D_CSV_PATH)
+    regime = _csv_product_time_coverage(HIST_REPLAY_1H_365D_CSV_PATH)
+    primary_ok = bool(primary.get("ok") and primary.get("days_covered", 0.0) >= EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED and primary.get("rows_per_product_min", 0) >= EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT)
+    regime_ok = bool(regime.get("ok") and regime.get("days_covered", 0.0) >= EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED and regime.get("rows_per_product_min", 0) >= EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT)
+    approved = []
+    try:
+        df = four_pass_product_live_gate_df
+        if df is None or df.empty:
+            df = pd.read_csv(FOUR_PASS_PRODUCT_LIVE_GATE_PATH) if os.path.exists(FOUR_PASS_PRODUCT_LIVE_GATE_PATH) else pd.DataFrame()
+        if not df.empty and "approved_for_live_buy" in df.columns and "product_id" in df.columns:
+            mask = df["approved_for_live_buy"].astype(str).isin(["1", "true", "True", "yes", "YES"])
+            approved = sorted(df.loc[mask, "product_id"].astype(str).unique().tolist())
+    except Exception:
+        approved = []
+    readiness = (snapshot or {}).get("readiness", {}) or {}
+    live_allowed = bool(not stale and primary_ok and regime_ok and approved and readiness.get("fee_tier_ready") and readiness.get("safe_to_run_overnight"))
+    return {"generation_version": NEXT_PATCH_GENERATION_VERSION, "current_files": current, "stale_files": stale, "primary_coverage": primary, "regime_coverage": regime, "replay_coverage_ok": bool(primary_ok and regime_ok), "approved_products": approved, "live_trading_allowed": live_allowed}
+
+
+def render_post_patch_warning(snapshot: Dict[str, Any], four_pass_product_live_gate_df=None) -> None:
+    state = post_patch_viewer_state(four_pass_product_live_gate_df, snapshot)
+    if state["stale_files"] or not state["replay_coverage_ok"]:
+        st.warning("Warning: this viewer is showing mixed-version bot output. Let startup calculation finish before trusting live readiness.")
+    cols = st.columns(5)
+    cols[0].metric("Generation", state["generation_version"])
+    cols[1].metric("Stale files", len(state["stale_files"]))
+    cols[2].metric("15m days", f"{state['primary_coverage'].get('days_covered', 0.0):.1f}")
+    cols[3].metric("1h days", f"{state['regime_coverage'].get('days_covered', 0.0):.1f}")
+    cols[4].metric("Live allowed", str(state["live_trading_allowed"]))
+    if state["stale_files"]:
+        st.caption("Stale/missing generated files: " + ", ".join(state["stale_files"]))
+    st.caption("Current generated files: " + (", ".join(state["current_files"]) or "none"))
+    st.caption("Approved products: " + (", ".join(state["approved_products"]) or "none"))
 
 def file_signature(path: str) -> tuple:
     try:
@@ -2731,6 +2817,7 @@ def render_four_pass_backtest_box(
 def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None, four_pass_agent_buy_df=None, four_pass_council_buy_df=None, four_pass_agent_sell_df=None, four_pass_council_sell_df=None, four_pass_final_agent_ratings_df=None, four_pass_profitability_summary_df=None, four_pass_agent_context_ratings_df=None, four_pass_sell_path_replay_df=None, four_pass_purged_walk_forward_df=None, four_pass_product_live_gate_df=None, product_cooldowns_df=None, agent_decision_influence_df=None, product_agent_influence_df=None, trade_frequency_estimate_df=None, approved_but_shadowed_df=None, fifth_pass_summary_df=None, fifth_pass_product_contribution_df=None, fifth_pass_blockers_df=None):
     st.markdown('<div class="hud-header"><div class="hud-title">Launch / Debug Health</div><div class="hud-subtitle">Startup readiness, early-learning files, orders, and raw health.</div></div>', unsafe_allow_html=True)
     readiness = snapshot.get("readiness", {}) or {}
+    render_post_patch_warning(snapshot, four_pass_product_live_gate_df)
     st.metric("Trading Mode", readiness.get("live_trading_mode_label", readiness.get("trading_aggression_mode", "unknown")))
     cols = st.columns(6)
     cols[0].metric("WebSocket Recent", str(readiness.get("websocket_recent")))
@@ -2745,7 +2832,11 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
     if readiness.get("websocket_recent") is False:
         st.warning("WebSocket/top-of-book freshness is not healthy. The bot may shadow valid setups as stale_market_data until top-of-book refresh is repaired.")
     if readiness.get("safe_to_run_overnight") is False:
-        st.warning("safe_to_run_overnight is false. Check websocket freshness, duplicate process status, writable logs, and risk pause status before unattended running.")
+        blockers = readiness.get("readiness_explanation") or []
+        if blockers:
+            st.warning("safe_to_run_overnight is false. Blockers: " + "; ".join(str(x) for x in blockers))
+        else:
+            st.warning("safe_to_run_overnight is false. Check websocket freshness, duplicate process status, writable logs, and risk pause status before unattended running.")
 
 
     st.markdown("### Historical Shadow Replay Calibration")

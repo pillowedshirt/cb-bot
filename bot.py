@@ -493,6 +493,32 @@ HISTORICAL_REPLAY_15M_90D_CSV_PATH: str = HIST_REPLAY_15M_90D_CSV_PATH
 HISTORICAL_REPLAY_1H_365D_CSV_PATH: str = HIST_REPLAY_1H_365D_CSV_PATH
 HISTORICAL_REPLAY_1D_2Y_CSV_PATH: str = HIST_REPLAY_1D_2Y_CSV_PATH
 
+# Post-patch generated-output versioning and replay coverage requirements.
+NEXT_PATCH_GENERATION_VERSION = "post_patch_recalc_v2_2026_06_21"
+EXPECTED_PRIMARY_REPLAY_LOOKBACK_DAYS = 90
+EXPECTED_REGIME_REPLAY_LOOKBACK_DAYS = 365
+EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED = 85
+EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED = 340
+EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
+EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
+POST_PATCH_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "post_patch_audit.csv")
+
+RAW_RUNTIME_FILES_TO_PRESERVE = [
+    "historical_replay_15m_90d.csv", "historical_replay_1h_365d.csv",
+    "micro_history.csv", "macro_day.csv", "macro_week.csv", "market.csv",
+    "shadow_trades.csv", "shadow_sell_replay.csv",
+]
+DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE = [
+    "calibration.csv", "calculation_status.json", "calculation_complete_latch.json",
+    "four_pass_product_live_gate.csv", "four_pass_profitability_summary.csv",
+    "four_pass_council_buy_timing.csv", "four_pass_council_sell_timing.csv",
+    "four_pass_purged_walk_forward.csv", "four_pass_sell_path_replay.csv",
+    "fifth_pass_live_style_summary.csv", "fifth_pass_live_style_replay.csv",
+    "fifth_pass_blockers.csv", "trade_frequency_estimate.csv",
+    "approved_but_shadowed.csv", "live_trade_blockers.csv", "viewer_snapshot.json",
+    "historical_replay_manifest.json",
+]
+
 # ============================================================
 # HISTORICAL DATA PROVIDER CONFIG
 # ============================================================
@@ -947,6 +973,125 @@ def _runtime_file_has_meaningful_state(path: str) -> bool:
     except Exception:
         return False
 
+
+
+def _sidecar_meta_path(path: str) -> str:
+    return f"{path}.meta.json"
+
+
+def write_generated_file_meta(path: str, *, reason: str = "") -> None:
+    try:
+        meta = {
+            "generation_version": NEXT_PATCH_GENERATION_VERSION,
+            "generated_at_ts": now_ts(),
+            "generated_at_iso": datetime.now(timezone.utc).isoformat(),
+            "reason": str(reason or ""),
+        }
+        with open(_sidecar_meta_path(path), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+def read_generated_file_meta(path: str) -> Dict[str, Any]:
+    try:
+        meta_path = _sidecar_meta_path(path)
+        if not os.path.exists(meta_path):
+            return {}
+        with open(meta_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def generated_file_is_current(path: str) -> bool:
+    meta = read_generated_file_meta(path)
+    return str(meta.get("generation_version", "")) == str(NEXT_PATCH_GENERATION_VERSION)
+
+
+def _csv_product_time_coverage(path: str) -> Dict[str, Any]:
+    result = {"path": path, "exists": os.path.exists(path), "rows": 0, "products": 0, "min_ts": None, "max_ts": None, "days_covered": 0.0, "rows_per_product_min": 0, "rows_per_product_max": 0, "rows_per_product_avg": 0.0, "ok": False, "reason": ""}
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            result["reason"] = "missing_or_empty"; return result
+        df = pd.read_csv(path)
+        if df.empty:
+            result["reason"] = "empty_dataframe"; return result
+        if "product_id" not in df.columns or "ts" not in df.columns:
+            result["reason"] = "missing_product_id_or_ts"; return result
+        df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+        df = df.dropna(subset=["ts"])
+        if df.empty:
+            result["reason"] = "no_valid_ts"; return result
+        counts = df.groupby(df["product_id"].astype(str)).size()
+        result.update({"rows": int(len(df)), "products": int(counts.shape[0]), "min_ts": float(df["ts"].min()), "max_ts": float(df["ts"].max()), "days_covered": float((df["ts"].max() - df["ts"].min()) / 86400.0), "rows_per_product_min": int(counts.min()), "rows_per_product_max": int(counts.max()), "rows_per_product_avg": float(counts.mean()), "ok": True, "reason": "ok"})
+        return result
+    except Exception as exc:
+        result["reason"] = f"coverage_failed:{exc}"; return result
+
+
+def replay_history_needs_expansion() -> Tuple[bool, Dict[str, Any]]:
+    primary = _csv_product_time_coverage(HIST_REPLAY_15M_90D_CSV_PATH)
+    regime = _csv_product_time_coverage(HIST_REPLAY_1H_365D_CSV_PATH)
+    primary_ok = bool(primary.get("ok") and float(primary.get("days_covered", 0.0)) >= float(EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED) and int(primary.get("rows_per_product_min", 0)) >= int(EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT))
+    regime_ok = bool(regime.get("ok") and float(regime.get("days_covered", 0.0)) >= float(EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED) and int(regime.get("rows_per_product_min", 0)) >= int(EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT))
+    needs_expansion = not bool(primary_ok and regime_ok)
+    return needs_expansion, {"primary": primary, "regime": regime, "primary_ok": primary_ok, "regime_ok": regime_ok, "needs_expansion": needs_expansion}
+
+
+def derived_outputs_are_stale() -> Tuple[bool, Dict[str, Any]]:
+    stale, current, missing = [], [], []
+    for filename in DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE:
+        path = os.path.join(BASE_DIR, filename)
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            missing.append(filename); stale.append(filename); continue
+        (current if generated_file_is_current(path) else stale).append(filename)
+    replay_needs_expansion, replay_info = replay_history_needs_expansion()
+    return bool(stale or replay_needs_expansion), {"stale_files": stale, "current_files": current, "missing_files": missing, "replay_needs_expansion": replay_needs_expansion, "replay_info": replay_info, "generation_version": NEXT_PATCH_GENERATION_VERSION}
+
+
+def remove_stale_derived_outputs_if_needed() -> Dict[str, Any]:
+    is_stale, info = derived_outputs_are_stale()
+    removed, kept = [], []
+    if not is_stale:
+        return {"stale": False, "removed": removed, "kept": DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE, "info": info}
+    for filename in DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE:
+        path = os.path.join(BASE_DIR, filename)
+        try:
+            if os.path.exists(path): os.remove(path); removed.append(filename)
+            meta_path = _sidecar_meta_path(path)
+            if os.path.exists(meta_path): os.remove(meta_path)
+        except Exception as exc:
+            kept.append({"filename": filename, "error": str(exc)})
+    return {"stale": True, "removed": removed, "kept": kept, "info": info}
+
+
+def calibration_row_is_live_safe(row: Dict[str, Any]) -> Tuple[bool, str]:
+    try:
+        status = str(row.get("calibration_status", row.get("status", "")) or "").lower()
+        min_prob = float(row.get("min_probability", row.get("probability", 0.0)) or 0.0)
+        sample_count = int(float(row.get("selected_sample_count", row.get("sample_count", 0)) or 0))
+        projected_net = float(row.get("calibrated_projected_net_bps", row.get("expected_value_bps", 0.0)) or 0.0)
+        ev = float(row.get("expected_value_bps", 0.0) or 0.0)
+        if min_prob < float(LIVE_BUY_MIN_PROBABILITY_FLOOR): return False, f"min_probability_below_live_floor:{min_prob}"
+        if "top_motion_no_winners" in status or "no_winner" in status or "no_winning" in status: return False, f"winnerless_status:{status}"
+        if sample_count and sample_count < int(CALIB_EXACT_MIN_SAMPLES): return False, f"sample_count_too_low:{sample_count}"
+        if projected_net < 0: return False, f"negative_projected_net:{projected_net}"
+        if ev < float(CALIB_MIN_EXPECTED_VALUE_BPS): return False, f"ev_below_min:{ev}"
+        return True, "live_safe"
+    except Exception as exc:
+        return False, f"validation_failed:{exc}"
+
+
+def write_post_patch_audit(rows: List[Dict[str, Any]]) -> None:
+    try:
+        if not rows:
+            rows = [{"ts": now_ts(), "event": "post_patch_audit_empty", "generation_version": NEXT_PATCH_GENERATION_VERSION}]
+        pd.DataFrame(rows).to_csv(POST_PATCH_AUDIT_CSV_PATH, index=False)
+        write_generated_file_meta(POST_PATCH_AUDIT_CSV_PATH, reason="post_patch_audit_written")
+    except Exception as exc:
+        module_debug(MODULE_NAME, "post_patch_audit_write_failed", data={"error": str(exc)}, level="WARN", also_overall=True)
 
 def import_previous_runtime_state_if_available() -> Dict[str, Any]:
     """
@@ -4623,6 +4768,7 @@ class CalibrationLogger:
                 profile.calibrated_probability_model_note,
                 profile.reason,
             ])
+        write_generated_file_meta(self.path, reason="calibration_regenerated")
 
 
 class MicroHistoryLogger:
@@ -6471,6 +6617,19 @@ class TradingBot:
         # create header-only CSV files or current-run rows.
         self.previous_runtime_import_result = import_previous_runtime_state_if_available()
         self.startup_had_existing_runtime_state: bool = has_existing_runtime_csv_state()
+        self.post_patch_cleanup_result = remove_stale_derived_outputs_if_needed()
+        module_debug(
+            MODULE_NAME,
+            "post_patch_stale_output_cleanup",
+            data=self.post_patch_cleanup_result,
+            level="WARN" if self.post_patch_cleanup_result.get("stale") else "INFO",
+            also_overall=True,
+        )
+        needs_expansion, replay_expansion_info = replay_history_needs_expansion()
+        self.force_historical_replay_rebuild = bool(needs_expansion)
+        self.force_startup_calculation_rebuild = bool(needs_expansion or self.post_patch_cleanup_result.get("stale"))
+        if needs_expansion:
+            module_debug(MODULE_NAME, "historical_replay_requires_expansion", data=replay_expansion_info, level="WARN", also_overall=True)
 
         self.live_exchange = EXCHANGE_BINANCE_US
         self.exchange_adapter = BinanceUSAdapter(dry_run=False, allow_real_orders=True)
@@ -9546,6 +9705,9 @@ class TradingBot:
         try:
             if not os.path.exists(CALIBRATION_CSV_PATH):
                 return
+            if not generated_file_is_current(CALIBRATION_CSV_PATH):
+                module_debug(MODULE_NAME, "calibration_seed_blocked_stale_meta", data={"path": CALIBRATION_CSV_PATH, "meta": read_generated_file_meta(CALIBRATION_CSV_PATH)}, level="WARN", also_overall=True)
+                return
             with open(CALIBRATION_CSV_PATH, "r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
@@ -9568,10 +9730,13 @@ class TradingBot:
                 if not row:
                     self._product_calibration_ready[product_id] = False
                     continue
-                is_ready = str(row.get("is_calibrated") or "").strip().lower() in {"1", "true", "yes"}
+                live_safe, live_safe_reason = calibration_row_is_live_safe(row)
+                is_ready = str(row.get("is_calibrated") or "").strip().lower() in {"1", "true", "yes"} and bool(live_safe)
                 self._product_calibration_ready[product_id] = bool(is_ready)
                 if is_ready:
                     ready_count += 1
+                else:
+                    module_debug(MODULE_NAME, "calibration_seed_row_blocked", data={"product_id": product_id, "reason": live_safe_reason}, level="WARN", also_overall=False)
             if ready_count == len(PRODUCTS):
                 self._startup_calibration_ready = True
             module_debug(MODULE_NAME, "product_calibration_ready_seeded_from_csv", data={"ready_count": ready_count, "product_count": len(PRODUCTS), "startup_calibration_ready": bool(getattr(self, "_startup_calibration_ready", False))}, level="INFO", also_overall=True)
@@ -9581,7 +9746,10 @@ class TradingBot:
     async def calibrate_products_on_startup_background(self) -> None:
         try:
             await self.calibrate_products_on_startup()
-            self._startup_calibration_ready = True
+            if getattr(self, "startup_calibration_blocker", ""):
+                self._startup_calibration_ready = False
+            else:
+                self._startup_calibration_ready = True
             self.last_hourly_calibration_update_ts = now_ts()
             module_debug(MODULE_NAME, "startup_calibration_ready", data={"products": PRODUCTS, "product_calibration_ready_count": sum(1 for v in getattr(self, "_product_calibration_ready", {}).values() if v)}, level="INFO", also_overall=True)
         except Exception as exc:
@@ -9594,6 +9762,13 @@ class TradingBot:
             log("[calibration] disabled")
             return
         log("[calibration] startup walk-forward calibration started")
+        needs_expansion, replay_info = replay_history_needs_expansion()
+        if needs_expansion:
+            self._startup_calibration_ready = False
+            self.startup_calibration_blocker = "historical_replay_not_expanded_to_required_lookback"
+            module_debug(MODULE_NAME, "calibration_blocked_until_replay_expanded", data=replay_info, level="WARN", also_overall=True)
+            return
+        self.startup_calibration_blocker = ""
         end_ts = int(now_ts_i())
         start_day = end_ts - CALIB_DAY_LOOKBACK_MINUTES * 60
         start_week = end_ts - CALIB_WEEK_LOOKBACK_MINUTES * 60
@@ -12929,6 +13104,22 @@ class TradingBot:
         )
 
 
+    def _latest_live_gate_summary(self) -> Dict[str, Any]:
+        try:
+            path = FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH
+            if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                return {"exists": False, "approved_products": [], "rows": 0}
+            df = pd.read_csv(path)
+            if df.empty:
+                return {"exists": True, "approved_products": [], "rows": 0}
+            approved = []
+            if "approved_for_live_buy" in df.columns and "product_id" in df.columns:
+                mask = df["approved_for_live_buy"].astype(str).isin(["1", "true", "True", "yes", "YES"])
+                approved = sorted(df.loc[mask, "product_id"].astype(str).unique().tolist())
+            return {"exists": True, "rows": int(len(df)), "approved_products": approved}
+        except Exception as exc:
+            return {"exists": False, "error": str(exc), "approved_products": [], "rows": 0}
+
     def _latest_product_live_gate(self, product_id: str) -> Dict[str, Any]:
         try:
             frame = self._read_csv_tail_for_bot(FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH, max_lines=10000)
@@ -12966,6 +13157,8 @@ class TradingBot:
         an approved product should trade now, but they cannot override a product
         that failed the product-level replay gate.
         """
+        if not generated_file_is_current(FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH):
+            return False, "stale_four_pass_product_live_gate"
         gate = self._latest_product_live_gate(product_id)
         if not gate:
             return False, "missing_four_pass_product_live_gate"
@@ -12974,6 +13167,21 @@ class TradingBot:
         is_approved = approved in {"1", "true", "True", "yes", "YES"}
 
         if is_approved:
+            tob = self.tob.get(str(product_id)) if hasattr(self, "tob") else None
+            current_spread_bps = None
+            try:
+                if tob is not None:
+                    current_spread_bps = float(getattr(tob, "spread_bps", 0.0) or 0.0)
+            except Exception:
+                current_spread_bps = None
+            median_spread_bps = safe_float(gate.get("median_spread_bps"), current_spread_bps if current_spread_bps is not None else 999999.0)
+            if current_spread_bps is None:
+                return False, "spread_unavailable_product_live_gate_block"
+            spread_ok = bool(current_spread_bps <= 20.0)
+            if str(product_id) in {"SHIB-USD"}:
+                spread_ok = bool(current_spread_bps <= 12.0 and median_spread_bps <= 15.0)
+            if not spread_ok:
+                return False, f"spread_liquidity_hard_block current_spread_bps={current_spread_bps:.2f};median_spread_bps={median_spread_bps:.2f}"
             return True, str(gate.get("gate_reason", "four_pass_product_gate_approved"))
 
         return False, str(gate.get("gate_reason", "four_pass_product_gate_not_live_eligible"))
@@ -16026,12 +16234,31 @@ class TradingBot:
         if calculation_complete_latched:
             status["startup_calibration_ready"] = True
             status["calculation_complete_latched"] = True
+        replay_needs_expansion, replay_info = replay_history_needs_expansion()
+        stale_outputs, stale_info = derived_outputs_are_stale()
+        live_gate_summary = self._latest_live_gate_summary()
+        status["generation_version"] = NEXT_PATCH_GENERATION_VERSION
+        status["generated_file_state"] = stale_info
+        status["replay_coverage"] = replay_info
+        status["approved_products"] = live_gate_summary.get("approved_products", [])
+        status["approved_products_count"] = len(status["approved_products"])
+        status["calculation_status_current"] = generated_file_is_current(CALCULATION_STATUS_JSON_PATH)
+        status["calibration_current"] = generated_file_is_current(CALIBRATION_CSV_PATH)
+        status["product_live_gate_current"] = generated_file_is_current(FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH)
+        status["replay_coverage_ok"] = not bool(replay_needs_expansion)
+        status["no_stale_derived_outputs"] = not bool(stale_outputs)
         status["safe_to_run_overnight"] = bool(
-            status.get("viewer_snapshot_recent")
+            status.get("calculation_status_current")
+            and status.get("calibration_current")
+            and status.get("product_live_gate_current")
+            and status.get("replay_coverage_ok")
+            and status.get("fee_tier_ready")
+            and status.get("approved_products_count", 0) > 0
+            and status.get("no_stale_derived_outputs")
+            and status.get("viewer_snapshot_recent")
             and status.get("websocket_recent")
             and status.get("market_csv_recent")
             and status.get("council_recent")
-            and status.get("fee_tier_ready")
             and not status.get("risk_pause_active")
             and not status.get("drawdown_brake_active")
             and status.get("learning_files_writable")
@@ -16045,8 +16272,25 @@ class TradingBot:
             status["readiness_explanation"].append("top-of-book data is not fresh enough yet")
         if not status.get("market_csv_recent"):
             status["readiness_explanation"].append("market.csv has not been refreshed recently")
+        if not status.get("calculation_status_current"):
+            status["readiness_explanation"].append("calculation_csv_generated_by_old_patch")
+        if not status.get("calibration_current"):
+            status["readiness_explanation"].append("calibration_csv_generated_by_old_patch")
+        if not status.get("product_live_gate_current"):
+            status["readiness_explanation"].append("product_live_gate_generated_by_old_patch")
+        if replay_needs_expansion:
+            p_days = int(float((replay_info.get("primary") or {}).get("days_covered", 0.0) or 0.0))
+            r_days = int(float((replay_info.get("regime") or {}).get("days_covered", 0.0) or 0.0))
+            status["readiness_explanation"].append(f"historical_replay_15m_90d_only_covers_{p_days}_days")
+            status["readiness_explanation"].append(f"historical_replay_1h_365d_only_covers_{r_days}_days")
+        if not status.get("approved_products_count", 0):
+            status["readiness_explanation"].append("no_current_approved_products")
+        if stale_outputs:
+            status["readiness_explanation"].append("stale_derived_outputs_present")
+        if not status.get("fee_tier_ready"):
+            status["readiness_explanation"].append("fee_state_using_fallback")
         if not status.get("safe_to_run_overnight"):
-            status["readiness_explanation"].append("overnight mode remains disabled until snapshot, market, council, fee, file, and top-of-book checks are all fresh")
+            status["readiness_explanation"].append("overnight mode remains disabled until generated files, replay coverage, approved products, fees, market data, and file checks are all fresh")
         if include_calculation:
             try:
                 calc_status = self._calculation_status(include_readiness=False, readiness_override=status)
@@ -17684,6 +17928,7 @@ class TradingBot:
                     writer.writeheader()
                 for row in rows:
                     writer.writerow({col: row.get(col, "") for col in columns})
+            write_generated_file_meta(path, reason="historical_replay_expanded")
             module_debug(MODULE_NAME, "historical_replay_candle_cache_appended", data={"path": path, "product_id": product_id, "rows_appended": len(rows)}, level="INFO", also_overall=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "write_historical_replay_candle_cache_failed", exc, data={"path": path, "product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
@@ -17715,6 +17960,7 @@ class TradingBot:
             if not ok:
                 module_debug(MODULE_NAME, "runtime_csv_compact_replace_skipped_locked_file", data={"path": path, "tmp": tmp}, level="WARN", also_overall=False)
                 return
+            write_generated_file_meta(path, reason="historical_replay_expanded")
             module_debug(MODULE_NAME, "historical_replay_candle_cache_compacted", data={"path": path, "rows": int(len(frame))}, level="INFO", also_overall=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "compact_historical_replay_candle_cache_failed", exc, data={"path": path, "traceback": traceback.format_exc()}, also_overall=False)
@@ -19444,6 +19690,14 @@ class TradingBot:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(status, f, indent=2, sort_keys=True)
             os.replace(tmp, CALCULATION_STATUS_JSON_PATH)
+            write_generated_file_meta(CALCULATION_STATUS_JSON_PATH, reason="calculation_status_regenerated")
+            write_post_patch_audit([
+                {"ts": now_ts(), "event": "previous_runtime_import", "generation_version": NEXT_PATCH_GENERATION_VERSION, "details": json.dumps(getattr(self, "previous_runtime_import_result", {}), sort_keys=True)},
+                {"ts": now_ts(), "event": "stale_output_cleanup", "generation_version": NEXT_PATCH_GENERATION_VERSION, "details": json.dumps(getattr(self, "post_patch_cleanup_result", {}), sort_keys=True)},
+                {"ts": now_ts(), "event": "replay_coverage", "generation_version": NEXT_PATCH_GENERATION_VERSION, "details": json.dumps(replay_history_needs_expansion()[1], sort_keys=True)},
+                {"ts": now_ts(), "event": "live_gate_summary", "generation_version": NEXT_PATCH_GENERATION_VERSION, "details": json.dumps(self._latest_live_gate_summary(), sort_keys=True)},
+                {"ts": now_ts(), "event": "live_readiness", "generation_version": NEXT_PATCH_GENERATION_VERSION, "details": json.dumps((status.get("readiness") or {}), sort_keys=True)},
+            ])
             module_debug(MODULE_NAME, "calculation_status_written", data={"progress_pct": round(float(status.get("overall_progress_pct", 0.0)), 2), "phase": status.get("phase_label"), "full_viewer_unlocked": bool(status.get("full_viewer_unlocked")), "complete_products": status.get("complete_products"), "profit_ready_products": status.get("profit_ready_products"), "blocked_products": status.get("blocked_products")}, level="DEBUG", also_overall=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "write_calculation_status_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
@@ -22278,6 +22532,7 @@ class TradingBot:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2)
             os.replace(tmp_path, VIEWER_SNAPSHOT_PATH)
+            write_generated_file_meta(VIEWER_SNAPSHOT_PATH, reason="viewer_snapshot_regenerated")
             rows = dict(snapshot.get("coins", {}) or {})
             if now_ts() - float(getattr(self, "_last_viewer_snapshot_success_log_ts", 0.0) or 0.0) >= 30.0:
                 log(
@@ -22837,6 +23092,7 @@ class TradingBot:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
         os.replace(tmp, CALCULATION_COMPLETE_LATCH_PATH)
+        write_generated_file_meta(CALCULATION_COMPLETE_LATCH_PATH, reason="calculation_complete_latch_regenerated")
 
     def _replay_fee_scenario_bps(self, product_id: str) -> Dict[str, Dict[str, float]]:
         try:

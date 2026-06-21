@@ -109,9 +109,246 @@ static py::dict find_best_threshold_profile(py::array_t<double, py::array::c_sty
     py::dict out; out["found"]=found; if(!found) return out; py::list py_indices; for(int idx:best_indices) py_indices.append(idx); out["score_threshold"]=best_score_threshold; out["prob_threshold"]=best_probability_threshold; out["win_rate"]=best_win_rate; out["avg_win"]=best_avg_win; out["avg_loss"]=best_avg_loss; out["ev"]=best_ev; out["projected_gross_bps"]=best_projected_gross_bps; out["median_time_to_min_profit"]=best_median_time_to_min_profit; out["median_forward_window"]=best_median_forward_window; out["median_selected_window"]=best_median_selected_window; out["median_post_profit_extra_gain"]=best_median_post_profit_extra_gain; out["median_adverse_before_profit"]=best_median_adverse_before_profit; out["n"]=best_sample_count; out["quality_score"]=best_quality; out["selected_indices"]=py_indices; return out;
 }
 
+
+static py::dict evaluate_best_window_from_arrays(
+    double entry_price,
+    py::array_t<double, py::array::c_style | py::array::forcecast> highs,
+    py::array_t<double, py::array::c_style | py::array::forcecast> lows,
+    int start_index,
+    py::array_t<int, py::array::c_style | py::array::forcecast> forward_windows,
+    double target_bps,
+    double cost_bps,
+    double min_net_gain_bps,
+    double bar_minutes,
+    double max_adverse_before_profit_bps,
+    double preferred_time_to_min_profit_minutes
+) {
+    auto h = highs.unchecked<1>();
+    auto l = lows.unchecked<1>();
+    auto windows = forward_windows.unchecked<1>();
+
+    const ssize_t n = h.shape(0);
+
+    py::dict out;
+    out["found"] = false;
+
+    if (
+        entry_price <= 0.0 ||
+        n <= 0 ||
+        l.shape(0) != n ||
+        start_index < 0 ||
+        windows.shape(0) <= 0
+    ) {
+        return out;
+    }
+
+    const double required_profit_bps = cost_bps + min_net_gain_bps;
+
+    bool found = false;
+    double best_quality = -std::numeric_limits<double>::infinity();
+
+    int best_window_bars = 0;
+    double best_max_favorable_bps = 0.0;
+    double best_max_adverse_bps = 0.0;
+    bool best_reached_min_profit = false;
+    bool best_reached_target = false;
+    double best_win_bps = 0.0;
+    double best_loss_bps = 0.0;
+    int best_time_to_min_profit_bars = -1;
+    double best_time_to_min_profit_minutes = 0.0;
+    double best_forward_window_minutes = 0.0;
+    double best_post_profit_max_favorable_bps = 0.0;
+    double best_post_profit_extra_gain_bps = 0.0;
+    double best_adverse_before_profit_bps = 0.0;
+    bool best_survived_to_profit = false;
+    double best_expected_value_bps = 0.0;
+
+    for (ssize_t wi = 0; wi < windows.shape(0); ++wi) {
+        const int forward_bars = windows(wi);
+
+        if (forward_bars <= 0) {
+            continue;
+        }
+
+        const int end_index = start_index + forward_bars;
+
+        if (end_index > n) {
+            continue;
+        }
+
+        double max_high = 0.0;
+        double min_low = std::numeric_limits<double>::infinity();
+        double max_favorable_bps = 0.0;
+        double max_adverse_bps = 0.0;
+
+        int time_to_min_profit_bars = -1;
+        int profit_hit_index = -1;
+        double time_to_min_profit_minutes = 0.0;
+        double adverse_before_profit_bps = 0.0;
+        double low_before_profit = entry_price;
+
+        for (int idx = start_index; idx < end_index; ++idx) {
+            const double high = h(idx);
+            const double low = l(idx);
+
+            if (
+                high <= 0.0 ||
+                low <= 0.0 ||
+                !std::isfinite(high) ||
+                !std::isfinite(low)
+            ) {
+                continue;
+            }
+
+            max_high = std::max(max_high, high);
+            min_low = std::min(min_low, low);
+
+            max_favorable_bps = std::max(
+                max_favorable_bps,
+                ((max_high / entry_price) - 1.0) * 10000.0
+            );
+
+            max_adverse_bps = std::max(
+                max_adverse_bps,
+                ((entry_price / min_low) - 1.0) * 10000.0
+            );
+
+            if (time_to_min_profit_bars < 0) {
+                low_before_profit = std::min(low_before_profit, low);
+
+                const double high_gain_bps =
+                    ((high / entry_price) - 1.0) * 10000.0;
+
+                if (high_gain_bps >= required_profit_bps) {
+                    time_to_min_profit_bars = idx - start_index + 1;
+                    time_to_min_profit_minutes =
+                        static_cast<double>(time_to_min_profit_bars) * bar_minutes;
+                    profit_hit_index = idx;
+                    adverse_before_profit_bps =
+                        ((entry_price / low_before_profit) - 1.0) * 10000.0;
+                }
+            }
+        }
+
+        const bool reached_min_profit = time_to_min_profit_bars >= 0;
+        const bool reached_target =
+            max_favorable_bps >= std::max(target_bps, required_profit_bps);
+
+        const double win_bps = std::max(0.0, max_favorable_bps - cost_bps);
+        const double loss_bps = std::max(0.0, max_adverse_bps);
+
+        const double forward_window_minutes =
+            static_cast<double>(forward_bars) * bar_minutes;
+
+        double post_profit_max_favorable_bps = 0.0;
+        double post_profit_extra_gain_bps = 0.0;
+
+        if (reached_min_profit && profit_hit_index >= start_index) {
+            double post_profit_high = 0.0;
+
+            for (int idx = profit_hit_index; idx < end_index; ++idx) {
+                const double high = h(idx);
+                if (high > 0.0 && std::isfinite(high)) {
+                    post_profit_high = std::max(post_profit_high, high);
+                }
+            }
+
+            if (post_profit_high > 0.0) {
+                post_profit_max_favorable_bps =
+                    ((post_profit_high / entry_price) - 1.0) * 10000.0;
+                post_profit_extra_gain_bps =
+                    std::max(0.0, post_profit_max_favorable_bps - required_profit_bps);
+            }
+        }
+
+        const bool survived_to_profit =
+            reached_min_profit &&
+            adverse_before_profit_bps <= max_adverse_before_profit_bps;
+
+        const double expected_value_bps =
+            reached_min_profit ? win_bps : -loss_bps;
+
+        const double time_penalty =
+            reached_min_profit
+                ? std::max(
+                    0.0,
+                    time_to_min_profit_minutes - preferred_time_to_min_profit_minutes
+                ) * 0.05
+                : 0.0;
+
+        const double quality =
+            expected_value_bps +
+            post_profit_extra_gain_bps * 0.35 -
+            adverse_before_profit_bps * 0.45 -
+            time_penalty -
+            (survived_to_profit ? 0.0 : 1000.0);
+
+        if (!found || quality > best_quality) {
+            found = true;
+            best_quality = quality;
+            best_window_bars = forward_bars;
+            best_max_favorable_bps = max_favorable_bps;
+            best_max_adverse_bps = max_adverse_bps;
+            best_reached_min_profit = reached_min_profit;
+            best_reached_target = reached_target;
+            best_win_bps = win_bps;
+            best_loss_bps = loss_bps;
+            best_time_to_min_profit_bars = time_to_min_profit_bars;
+            best_time_to_min_profit_minutes = time_to_min_profit_minutes;
+            best_forward_window_minutes = forward_window_minutes;
+            best_post_profit_max_favorable_bps = post_profit_max_favorable_bps;
+            best_post_profit_extra_gain_bps = post_profit_extra_gain_bps;
+            best_adverse_before_profit_bps = adverse_before_profit_bps;
+            best_survived_to_profit = survived_to_profit;
+            best_expected_value_bps = expected_value_bps;
+        }
+    }
+
+    out["found"] = found;
+
+    if (!found) {
+        return out;
+    }
+
+    out["chosen_window_bars"] = best_window_bars;
+    out["quality_score"] = best_quality;
+    out["max_favorable_bps"] = best_max_favorable_bps;
+    out["max_adverse_bps"] = best_max_adverse_bps;
+    out["reached_min_profit"] = best_reached_min_profit;
+    out["reached_target"] = best_reached_target;
+    out["win_bps"] = best_win_bps;
+    out["loss_bps"] = best_loss_bps;
+    out["time_to_min_profit_bars"] = best_time_to_min_profit_bars;
+    out["time_to_min_profit_minutes"] = best_time_to_min_profit_minutes;
+    out["forward_window_minutes"] = best_forward_window_minutes;
+    out["selected_forward_window_minutes"] = best_forward_window_minutes;
+    out["post_profit_max_favorable_bps"] = best_post_profit_max_favorable_bps;
+    out["post_profit_extra_gain_bps"] = best_post_profit_extra_gain_bps;
+    out["adverse_before_profit_bps"] = best_adverse_before_profit_bps;
+    out["survived_to_profit"] = best_survived_to_profit;
+    out["expected_value_bps"] = best_expected_value_bps;
+
+    return out;
+}
+
 PYBIND11_MODULE(fast_calibration_core, m) {
     m.doc() = "Fast C++ calibration helpers for the Binance.US trading bot";
     m.def("evaluate_outcome_arrays", &evaluate_outcome_arrays, py::arg("entry_price"), py::arg("highs"), py::arg("lows"), py::arg("target_bps"), py::arg("cost_bps"), py::arg("min_net_gain_bps"), py::arg("bar_minutes"), py::arg("max_adverse_before_profit_bps"));
     m.def("simulate_armed_exit_net_bps", &simulate_armed_exit_net_bps, py::arg("entry_price"), py::arg("highs"), py::arg("lows"), py::arg("closes"), py::arg("target_bps"), py::arg("cost_bps"), py::arg("pullback_pct"));
     m.def("find_best_threshold_profile", &find_best_threshold_profile, py::arg("scores"), py::arg("probabilities"), py::arg("expected_values"), py::arg("costs"), py::arg("spreads"), py::arg("reached_min_profit"), py::arg("survived_to_profit"), py::arg("max_favorable_bps"), py::arg("time_to_min_profit_minutes"), py::arg("forward_window_minutes"), py::arg("selected_forward_window_minutes"), py::arg("post_profit_extra_gain_bps"), py::arg("adverse_before_profit_bps"), py::arg("score_candidates"), py::arg("probability_candidates"), py::arg("calib_exact_min_samples"), py::arg("similar_score_band"), py::arg("similar_prob_band"), py::arg("similar_cost_band_bps"), py::arg("similar_spread_band_bps"), py::arg("calib_min_win_rate"), py::arg("calib_min_expected_value_bps"), py::arg("preferred_time_to_min_profit_minutes"));
+    m.def(
+        "evaluate_best_window_from_arrays",
+        &evaluate_best_window_from_arrays,
+        py::arg("entry_price"),
+        py::arg("highs"),
+        py::arg("lows"),
+        py::arg("start_index"),
+        py::arg("forward_windows"),
+        py::arg("target_bps"),
+        py::arg("cost_bps"),
+        py::arg("min_net_gain_bps"),
+        py::arg("bar_minutes"),
+        py::arg("max_adverse_before_profit_bps"),
+        py::arg("preferred_time_to_min_profit_minutes")
+    );
 }

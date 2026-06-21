@@ -8831,11 +8831,26 @@ class TradingBot:
         if not candles or len(candles) < min_prefix + forward_bars + 1:
             return observations
 
+        bar_minutes = 1.0 if timeframe in ("day_1m", "live_rolling_1m") else 15.0
+
+        fast_highs = None
+        fast_lows = None
+        fast_windows = None
+        if FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None:
+            try:
+                fast_highs = np.asarray([float(c.high) for c in candles], dtype=np.float64)
+                fast_lows = np.asarray([float(c.low) for c in candles], dtype=np.float64)
+                fast_windows = np.asarray([int(forward_bars)], dtype=np.int32)
+            except Exception:
+                fast_highs = None
+                fast_lows = None
+                fast_windows = None
+
         for i in range(min_prefix, len(candles) - forward_bars):
             prefix = candles[:i]
-            future = candles[i:i + forward_bars]
-            if not prefix or not future:
+            if not prefix:
                 continue
+
             entry_price = float(prefix[-1].close)
             if entry_price <= 0:
                 continue
@@ -8844,6 +8859,7 @@ class TradingBot:
             available_weekly = None
             if weekly_candles:
                 available_weekly = [c for c in weekly_candles if int(c.ts) <= replay_ts]
+
             try:
                 signal = self._build_historical_signal_from_candles(
                     product_id=product_id,
@@ -8853,31 +8869,90 @@ class TradingBot:
                 )
             except Exception:
                 continue
-            bar_minutes = 1.0 if timeframe in ("day_1m", "live_rolling_1m") else 15.0
-            (
-                max_favorable_bps,
-                max_adverse_bps,
-                reached_min_profit,
-                reached_target,
-                win_bps,
-                loss_bps,
-                _,
-                time_to_min_profit_bars,
-                time_to_min_profit_minutes,
-                forward_window_minutes,
-                post_profit_max_favorable_bps,
-                post_profit_extra_gain_bps,
-                adverse_before_profit_bps,
-                survived_to_profit,
-            ) = self._evaluate_forward_outcome(
-                entry_price=entry_price,
-                future_candles=future,
-                target_bps=signal.target_bps,
-                cost_bps=signal.cost_bps,
-                min_net_gain_bps=MIN_NET_GAIN_AFTER_FEES_BPS,
-                bar_minutes=bar_minutes,
-            )
-            expected_value_bps = win_bps if reached_min_profit else -loss_bps
+
+            result: Optional[Dict[str, Any]] = None
+
+            if (
+                FAST_CALIBRATION_CORE_AVAILABLE
+                and fast_calibration_core is not None
+                and fast_highs is not None
+                and fast_lows is not None
+                and fast_windows is not None
+            ):
+                try:
+                    fast_result = fast_calibration_core.evaluate_best_window_from_arrays(
+                        float(entry_price),
+                        fast_highs,
+                        fast_lows,
+                        int(i),
+                        fast_windows,
+                        float(signal.target_bps),
+                        float(signal.cost_bps),
+                        float(MIN_NET_GAIN_AFTER_FEES_BPS),
+                        float(bar_minutes),
+                        float(MAX_ADVERSE_BEFORE_PROFIT_BPS),
+                        float(PREFERRED_TIME_TO_MIN_PROFIT_MINUTES),
+                    )
+                    if bool(fast_result.get("found", False)):
+                        result = dict(fast_result)
+                except Exception:
+                    result = None
+
+            if result is not None:
+                max_favorable_bps = float(result.get("max_favorable_bps", 0.0))
+                max_adverse_bps = float(result.get("max_adverse_bps", 0.0))
+                reached_min_profit = bool(result.get("reached_min_profit", False))
+                reached_target = bool(result.get("reached_target", False))
+                win_bps = float(result.get("win_bps", 0.0))
+                loss_bps = float(result.get("loss_bps", 0.0))
+
+                bars_raw = int(result.get("time_to_min_profit_bars", -1))
+                time_to_min_profit_bars = bars_raw if bars_raw > 0 else None
+                time_to_min_profit_minutes = (
+                    float(result.get("time_to_min_profit_minutes", 0.0))
+                    if time_to_min_profit_bars is not None
+                    else None
+                )
+
+                forward_window_minutes = float(result.get("forward_window_minutes", 0.0))
+                post_profit_max_favorable_bps = float(result.get("post_profit_max_favorable_bps", 0.0))
+                post_profit_extra_gain_bps = float(result.get("post_profit_extra_gain_bps", 0.0))
+                adverse_before_profit_bps = float(result.get("adverse_before_profit_bps", 0.0))
+                survived_to_profit = bool(result.get("survived_to_profit", False))
+                expected_value_bps = float(result.get(
+                    "expected_value_bps",
+                    win_bps if reached_min_profit else -loss_bps,
+                ))
+            else:
+                future = candles[i:i + forward_bars]
+                if len(future) < forward_bars:
+                    continue
+
+                (
+                    max_favorable_bps,
+                    max_adverse_bps,
+                    reached_min_profit,
+                    reached_target,
+                    win_bps,
+                    loss_bps,
+                    _,
+                    time_to_min_profit_bars,
+                    time_to_min_profit_minutes,
+                    forward_window_minutes,
+                    post_profit_max_favorable_bps,
+                    post_profit_extra_gain_bps,
+                    adverse_before_profit_bps,
+                    survived_to_profit,
+                ) = self._evaluate_forward_outcome(
+                    entry_price=entry_price,
+                    future_candles=future,
+                    target_bps=signal.target_bps,
+                    cost_bps=signal.cost_bps,
+                    min_net_gain_bps=MIN_NET_GAIN_AFTER_FEES_BPS,
+                    bar_minutes=bar_minutes,
+                )
+                expected_value_bps = win_bps if reached_min_profit else -loss_bps
+
             historical_smt_context = self._historical_smt_context_for_product(
                 product_id=product_id,
                 own_candles=prefix,
@@ -8889,6 +8964,7 @@ class TradingBot:
                 product_id=product_id,
                 smt_context_override=historical_smt_context,
             )
+
             observations.append(CalibrationObservation(
                 product_id=product_id,
                 timeframe=timeframe,
@@ -8918,6 +8994,7 @@ class TradingBot:
                 trend_buy_score=float(getattr(signal, "trend_buy_score", 0.0)),
                 **setup_context,
             ))
+
         return observations
 
     def _walk_forward_observations_multi_window(
@@ -8935,34 +9012,123 @@ class TradingBot:
         observations: List[CalibrationObservation] = []
         if not candles or not forward_windows:
             return observations
+
         windows = sorted({int(x) for x in forward_windows if int(x) > 0})
         if not windows:
             return observations
+
         max_forward = max(windows)
         if len(candles) < min_prefix + max_forward + 1:
             return observations
+
+        bar_minutes = 1.0 if timeframe in ("day_1m", "live_rolling_1m") else 15.0
+
+        fast_highs = None
+        fast_lows = None
+        fast_windows = None
+        if FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None:
+            try:
+                fast_highs = np.asarray([float(c.high) for c in candles], dtype=np.float64)
+                fast_lows = np.asarray([float(c.low) for c in candles], dtype=np.float64)
+                fast_windows = np.asarray(windows, dtype=np.int32)
+            except Exception:
+                fast_highs = None
+                fast_lows = None
+                fast_windows = None
 
         for i in range(min_prefix, len(candles) - max_forward):
             prefix = candles[:i]
             entry_price = float(prefix[-1].close) if prefix else 0.0
             if entry_price <= 0:
                 continue
+
             replay_ts = int(prefix[-1].ts)
             available_weekly = [c for c in weekly_candles if int(c.ts) <= replay_ts] if weekly_candles else None
+
             try:
                 signal = self._build_historical_signal_from_candles(
-                    product_id=product_id, candles=prefix,
-                    weekly_candles=available_weekly, spread_bps=spread_bps,
+                    product_id=product_id,
+                    candles=prefix,
+                    weekly_candles=available_weekly,
+                    spread_bps=spread_bps,
                 )
             except Exception:
                 continue
-            bar_minutes = 1.0 if timeframe in ("day_1m", "live_rolling_1m") else 15.0
+
+            historical_smt_context = self._historical_smt_context_for_product(
+                product_id=product_id,
+                own_candles=prefix,
+                replay_ts=int(prefix[-1].ts),
+            )
+
+            setup_context = self._calibration_context_kwargs_from_signal(
+                signal=signal,
+                product_id=product_id,
+                smt_context_override=historical_smt_context,
+            )
+
+            if (
+                FAST_CALIBRATION_CORE_AVAILABLE
+                and fast_calibration_core is not None
+                and fast_highs is not None
+                and fast_lows is not None
+                and fast_windows is not None
+            ):
+                try:
+                    result = fast_calibration_core.evaluate_best_window_from_arrays(
+                        float(entry_price), fast_highs, fast_lows, int(i), fast_windows,
+                        float(signal.target_bps), float(signal.cost_bps),
+                        float(MIN_NET_GAIN_AFTER_FEES_BPS), float(bar_minutes),
+                        float(MAX_ADVERSE_BEFORE_PROFIT_BPS),
+                        float(PREFERRED_TIME_TO_MIN_PROFIT_MINUTES),
+                    )
+
+                    if bool(result.get("found", False)):
+                        max_favorable_bps = float(result.get("max_favorable_bps", 0.0))
+                        max_adverse_bps = float(result.get("max_adverse_bps", 0.0))
+                        reached_min_profit = bool(result.get("reached_min_profit", False))
+                        reached_target = bool(result.get("reached_target", False))
+                        win_bps = float(result.get("win_bps", 0.0))
+                        loss_bps = float(result.get("loss_bps", 0.0))
+                        bars_raw = int(result.get("time_to_min_profit_bars", -1))
+                        time_to_min_profit_bars = bars_raw if bars_raw > 0 else None
+                        time_to_min_profit_minutes = (float(result.get("time_to_min_profit_minutes", 0.0)) if time_to_min_profit_bars is not None else None)
+                        forward_window_minutes = float(result.get("forward_window_minutes", 0.0))
+                        selected_forward_window_minutes = float(result.get("selected_forward_window_minutes", forward_window_minutes))
+                        post_profit_max_favorable_bps = float(result.get("post_profit_max_favorable_bps", 0.0))
+                        post_profit_extra_gain_bps = float(result.get("post_profit_extra_gain_bps", 0.0))
+                        adverse_before_profit_bps = float(result.get("adverse_before_profit_bps", 0.0))
+                        survived_to_profit = bool(result.get("survived_to_profit", False))
+                        expected_value_bps = float(result.get("expected_value_bps", win_bps if reached_min_profit else -loss_bps))
+
+                        observations.append(CalibrationObservation(
+                            product_id=product_id, timeframe=timeframe, ts=replay_ts,
+                            score=float(signal.score), probability=float(signal.estimated_prob_up),
+                            expected_net_edge_bps=float(signal.expected_net_edge_bps), target_bps=float(signal.target_bps),
+                            cost_bps=float(signal.cost_bps), spread_bps=float(spread_bps),
+                            max_favorable_bps=float(max_favorable_bps), max_adverse_bps=float(max_adverse_bps),
+                            reached_min_profit=bool(reached_min_profit), reached_target=bool(reached_target),
+                            expected_value_bps=float(expected_value_bps), win_bps=float(win_bps), loss_bps=float(loss_bps),
+                            time_to_min_profit_bars=time_to_min_profit_bars, time_to_min_profit_minutes=time_to_min_profit_minutes,
+                            forward_window_minutes=forward_window_minutes, projected_forward_gain_bps=float(max_favorable_bps),
+                            selected_forward_window_minutes=float(selected_forward_window_minutes),
+                            post_profit_max_favorable_bps=float(post_profit_max_favorable_bps),
+                            post_profit_extra_gain_bps=float(post_profit_extra_gain_bps),
+                            adverse_before_profit_bps=float(adverse_before_profit_bps), survived_to_profit=bool(survived_to_profit),
+                            **setup_context,
+                        ))
+                        continue
+                except Exception:
+                    pass
+
             best_obs: Optional[CalibrationObservation] = None
             best_quality = -float("inf")
+
             for forward_bars in windows:
                 future = candles[i:i + forward_bars]
                 if len(future) < forward_bars:
                     continue
+
                 (
                     max_favorable_bps, max_adverse_bps, reached_min_profit,
                     reached_target, win_bps, loss_bps, _, time_to_min_profit_bars,
@@ -8975,18 +9141,8 @@ class TradingBot:
                     min_net_gain_bps=MIN_NET_GAIN_AFTER_FEES_BPS,
                     bar_minutes=bar_minutes,
                 )
-                expected_value_bps = win_bps if reached_min_profit else -loss_bps
-                historical_smt_context = self._historical_smt_context_for_product(
-                    product_id=product_id,
-                    own_candles=prefix,
-                    replay_ts=int(prefix[-1].ts),
-                )
 
-                setup_context = self._calibration_context_kwargs_from_signal(
-                    signal=signal,
-                    product_id=product_id,
-                    smt_context_override=historical_smt_context,
-                )
+                expected_value_bps = win_bps if reached_min_profit else -loss_bps
                 time_penalty = 0.0 if time_to_min_profit_minutes is None else max(
                     0.0, time_to_min_profit_minutes - PREFERRED_TIME_TO_MIN_PROFIT_MINUTES
                 ) * 0.05
@@ -8998,27 +9154,26 @@ class TradingBot:
                 obs = CalibrationObservation(
                     product_id=product_id, timeframe=timeframe, ts=replay_ts,
                     score=float(signal.score), probability=float(signal.estimated_prob_up),
-                    expected_net_edge_bps=float(signal.expected_net_edge_bps),
-                    target_bps=float(signal.target_bps), cost_bps=float(signal.cost_bps),
-                    spread_bps=float(spread_bps), max_favorable_bps=float(max_favorable_bps),
-                    max_adverse_bps=float(max_adverse_bps), reached_min_profit=bool(reached_min_profit),
-                    reached_target=bool(reached_target), expected_value_bps=float(expected_value_bps),
-                    win_bps=float(win_bps), loss_bps=float(loss_bps),
-                    time_to_min_profit_bars=time_to_min_profit_bars,
-                    time_to_min_profit_minutes=time_to_min_profit_minutes,
-                    forward_window_minutes=forward_window_minutes,
-                    projected_forward_gain_bps=float(max_favorable_bps),
+                    expected_net_edge_bps=float(signal.expected_net_edge_bps), target_bps=float(signal.target_bps),
+                    cost_bps=float(signal.cost_bps), spread_bps=float(spread_bps),
+                    max_favorable_bps=float(max_favorable_bps), max_adverse_bps=float(max_adverse_bps),
+                    reached_min_profit=bool(reached_min_profit), reached_target=bool(reached_target),
+                    expected_value_bps=float(expected_value_bps), win_bps=float(win_bps), loss_bps=float(loss_bps),
+                    time_to_min_profit_bars=time_to_min_profit_bars, time_to_min_profit_minutes=time_to_min_profit_minutes,
+                    forward_window_minutes=forward_window_minutes, projected_forward_gain_bps=float(max_favorable_bps),
                     selected_forward_window_minutes=float(forward_window_minutes),
                     post_profit_max_favorable_bps=float(post_profit_max_favorable_bps),
                     post_profit_extra_gain_bps=float(post_profit_extra_gain_bps),
-                    adverse_before_profit_bps=float(adverse_before_profit_bps),
-                    survived_to_profit=bool(survived_to_profit),
+                    adverse_before_profit_bps=float(adverse_before_profit_bps), survived_to_profit=bool(survived_to_profit),
                     **setup_context,
                 )
                 if quality > best_quality:
-                    best_quality, best_obs = quality, obs
+                    best_quality = quality
+                    best_obs = obs
+
             if best_obs is not None:
                 observations.append(best_obs)
+
         return observations
 
     def _win_rate(self, observations: List[CalibrationObservation]) -> float:

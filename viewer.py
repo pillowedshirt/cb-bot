@@ -1805,7 +1805,7 @@ def render_confirmed_trades(trades: pd.DataFrame) -> None:
     st.markdown('### Confirmed Trades Only')
     if trades.empty: st.info("No confirmed trades yet."); return
     cols=[c for c in ["ts","product_id","side","price","qty","size","fee","fee_usd","order_id"] if c in trades.columns]
-    st.dataframe(trades[cols] if cols else trades, use_container_width=True, hide_index=True)
+    st.dataframe(trades[cols] if cols else trades, width="stretch", hide_index=True)
 
 
 def render_coin_analytics(coin: Dict[str, Any]) -> None:
@@ -1947,12 +1947,12 @@ def render_all_coin_landing_page(snapshot, market_df, decisions_df, council_vote
                 if st.button(
                     "Click here",
                     key=f"coin_card_click_{product_id}",
-                    use_container_width=True,
+                    width="stretch",
                     type="secondary",
                 ):
                     set_selected_coin(product_id)
     with st.expander("All-coin sortable table", expanded=False):
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, decision_row: dict, votes: pd.DataFrame):
     st.markdown('<div class="agent-ticker"><b>Live Agent Debate</b><div class="muted">The highlighted analyst rotates automatically as the viewer refreshes.</div></div>', unsafe_allow_html=True)
@@ -1964,7 +1964,7 @@ def render_agent_debate_stream(selected_coin: str, latest_decision_id: str, deci
     st.markdown("".join(highlighted), unsafe_allow_html=True)
     with st.expander("Full debate transcript for this decision", expanded=False):
         display_cols = [c for c in ["agent", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reason"] if c in votes.columns]
-        st.dataframe(votes[display_cols] if display_cols else votes, use_container_width=True, hide_index=True)
+        st.dataframe(votes[display_cols] if display_cols else votes, width="stretch", hide_index=True)
 
 
 def render_agent_dialogue_panel(agent_name: str, votes: pd.DataFrame):
@@ -2071,7 +2071,7 @@ def render_agent_roster_no_buttons(selected_coin: str, votes: pd.DataFrame, agen
                 if st.button(
                     "Click here",
                     key=f"agent_card_click_{selected_coin}_{row_key}",
-                    use_container_width=True,
+                    width="stretch",
                     type="secondary",
                 ):
                     set_selected_agent(agent)
@@ -2140,7 +2140,7 @@ def render_strategy_screen(selected, snapshot, market_df, decisions_df, council_
     fig = build_coin_chart(chart_df, chart_meta, dict((snapshot.get("coins") or {}).get(selected, {}) or {}), market_df, confirmed, shadow_df, decisions_df, target, overlays, full_chart=True)
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         key=f"main_chart_{selected}_{timeframe}",
         config={"displayModeBar": True, "scrollZoom": True, "responsive": True},
     )
@@ -2271,7 +2271,7 @@ def render_deep_learning_screen(selected, snapshot, market_df, decisions_df, cou
         render_agent_disagreement_summary(votes)
         display_cols = [c for c in ["agent", "adjusted_buy_score", "adjusted_sell_score", "adjusted_hold_score", "adjusted_wait_score", "confidence", "reason"] if c in votes.columns]
         if display_cols and not votes.empty:
-            st.dataframe(votes[display_cols], use_container_width=True, hide_index=True)
+            st.dataframe(votes[display_cols], width="stretch", hide_index=True)
         else:
             st.info("No council vote rows yet for this coin.")
     with st.expander("Raw context rows", expanded=False):
@@ -2424,19 +2424,19 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
 
         if failed_errors:
             st.error("Historical replay workers are failing. Open the table below before waiting longer; the loading bar will not advance while these jobs fail.")
-            st.dataframe(pd.DataFrame(failed_errors), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(failed_errors), width="stretch", hide_index=True)
 
         if running_detail:
             with st.expander("Currently running replay worker jobs", expanded=False):
-                st.dataframe(pd.DataFrame(running_detail), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(running_detail), width="stretch", hide_index=True)
 
         if pending_detail:
             with st.expander("Next pending replay worker jobs", expanded=False):
-                st.dataframe(pd.DataFrame(pending_detail), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(pending_detail), width="stretch", hide_index=True)
     exchange_map_df = load_csv(EXCHANGE_PRODUCT_MAP_CSV_PATH)
     if exchange_map_df is not None and not exchange_map_df.empty:
         with st.expander("Canonical product ↔ Binance.US symbol mapping", expanded=False):
-            st.dataframe(exchange_map_df, use_container_width=True, hide_index=True)
+            st.dataframe(exchange_map_df, width="stretch", hide_index=True)
     phase = calc_status.get("phase_progress", {}) or {}
     st.markdown("### Phase progress")
     pcols = st.columns(5)
@@ -2452,7 +2452,7 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
             rows.append({"product_id": product_id, "overall_progress_pct": round(float(status.get("overall_product_progress", 0.0)) * 100.0, 1), "verdict": status.get("verdict", "unknown"), "micro_rows": status.get("micro_rows", 0), "15m_candles": status.get("historical_15m_candle_rows", 0), "15m_required": status.get("required_15m_candle_rows", 0), "1h_candles": status.get("historical_1h_candle_rows", 0), "1h_required": status.get("required_1h_candle_rows", 0), "15m_replay": status.get("primary_15m_90d_rows", 0), "1h_replay": status.get("regime_1h_365d_rows", 0), "qualified_rows": status.get("qualified_rows", 0), "avg_net_bps": round(float(status.get("avg_net_pnl_bps", 0.0)), 2), "complete": bool(status.get("complete")), "live_trade_allowed": bool(status.get("live_trade_allowed")), "reason": status.get("reason", "")})
         df = pd.DataFrame(rows).sort_values(["complete", "overall_progress_pct"], ascending=[True, True])
         st.markdown("### Product calculation status")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
     with st.expander("Raw calculation status", expanded=False):
         st.json(calc_status)
     st.info("When this reaches 100%, refreshing localhost will show the normal All-Coin Command Deck. If a product is replay-complete but unprofitable, it still counts as calculated, but live buys remain blocked for that product.")
@@ -2478,7 +2478,7 @@ def render_replay_fee_comparison_panel():
     cols[2].metric("Rows flipped profitable", flipped)
     cols[3].metric("Products/timeframes", len(latest))
     show_cols = [c for c in ["product_id", "timeframe", "rows", "primary_avg_net_bps", "comparison_avg_net_bps", "avg_improvement_bps", "primary_win_rate", "comparison_win_rate", "rows_flipped_to_profit_by_comparison", "primary_fee_model", "comparison_fee_model"] if c in latest.columns]
-    st.dataframe(latest[show_cols], use_container_width=True, hide_index=True)
+    st.dataframe(latest[show_cols], width="stretch", hide_index=True)
 
 def render_four_pass_backtest_box(
     four_pass_agent_buy_df: pd.DataFrame,
@@ -2539,24 +2539,24 @@ def render_four_pass_backtest_box(
     if buy_agent_rows > 0:
         st.markdown("#### BUY Agent Weights")
         display_cols = [c for c in ["agent", "selected_count", "win_rate", "avg_net_bps", "median_net_bps", "score", "buy_weight_pct"] if c in four_pass_agent_buy_df.columns]
-        st.dataframe(four_pass_agent_buy_df.sort_values("buy_weight_pct", ascending=False)[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(four_pass_agent_buy_df.sort_values("buy_weight_pct", ascending=False)[display_cols], width="stretch", hide_index=True)
 
     if buy_council_rows > 0:
         st.markdown("#### Weighted BUY Council")
         display_cols = [c for c in ["product_id", "selected_count", "threshold", "win_rate", "avg_net_bps", "median_net_bps", "portfolio_return_pct_100_ref", "score", "profitability_mode"] if c in four_pass_council_buy_df.columns]
-        st.dataframe(four_pass_council_buy_df.sort_values("score", ascending=False)[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(four_pass_council_buy_df.sort_values("score", ascending=False)[display_cols], width="stretch", hide_index=True)
 
     if sell_agent_rows > 0:
         st.markdown("#### SELL Analyst Weights")
         display_cols = [c for c in ["agent", "selected_count", "good_exit_rate", "too_early_rate", "avg_move_after_sell_bps", "score", "sell_weight_pct"] if c in four_pass_agent_sell_df.columns]
-        st.dataframe(four_pass_agent_sell_df.sort_values("sell_weight_pct", ascending=False)[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(four_pass_agent_sell_df.sort_values("sell_weight_pct", ascending=False)[display_cols], width="stretch", hide_index=True)
     else:
         st.warning("Sell-side four-pass data is not ready yet. This is expected until sell_outcomes.csv or synthetic sell replay rows exist.")
 
     if sell_council_rows > 0:
         st.markdown("#### Weighted SELL Council")
         display_cols = [c for c in ["product_id", "selected_count", "threshold", "good_exit_rate", "too_early_rate", "avg_move_after_sell_bps", "avg_realized_net_bps", "portfolio_return_pct_100_ref", "score", "profitability_mode"] if c in four_pass_council_sell_df.columns]
-        st.dataframe(four_pass_council_sell_df.sort_values("score", ascending=False)[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(four_pass_council_sell_df.sort_values("score", ascending=False)[display_cols], width="stretch", hide_index=True)
 
     if four_pass_agent_context_ratings_df is not None and not four_pass_agent_context_ratings_df.empty:
         st.markdown("#### Product + Regime Agent Weights")
@@ -2571,7 +2571,7 @@ def render_four_pass_backtest_box(
         ]
         st.dataframe(
             four_pass_agent_context_ratings_df.sort_values(["side", "product_id", "weight_pct"], ascending=[True, True, False])[display_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2588,7 +2588,7 @@ def render_four_pass_backtest_box(
         ]
         st.dataframe(
             four_pass_sell_path_replay_df.sort_values("realized_net_bps", ascending=False)[display_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -2607,7 +2607,7 @@ def render_four_pass_backtest_box(
         ]
         st.dataframe(
             four_pass_purged_walk_forward_df[display_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2631,7 +2631,7 @@ def render_four_pass_backtest_box(
                 ["approved_for_live_buy", "buy_avg_net_bps"],
                 ascending=[False, False],
             )[display_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2644,7 +2644,7 @@ def render_four_pass_backtest_box(
         for col in ["decision_weight_pct", "decision_influence_score", "frequency_per_day", "smoothed_win_rate", "ev_bps", "avg_net_bps"]:
             if col in display_df.columns:
                 display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
-        st.dataframe(display_df.sort_values(["side", "decision_weight_pct"], ascending=[True, False])[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(display_df.sort_values(["side", "decision_weight_pct"], ascending=[True, False])[show_cols], width="stretch", hide_index=True)
 
     if product_agent_influence_df is not None and not product_agent_influence_df.empty:
         st.markdown("#### Product-Specific Agent Influence")
@@ -2655,7 +2655,7 @@ def render_four_pass_backtest_box(
         for col in ["decision_weight_pct", "frequency_per_day", "smoothed_win_rate", "ev_bps", "avg_net_bps"]:
             if col in display_df.columns:
                 display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
-        st.dataframe(display_df.sort_values(["product_id", "side", "decision_weight_pct"], ascending=[True, True, False])[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(display_df.sort_values(["product_id", "side", "decision_weight_pct"], ascending=[True, True, False])[show_cols], width="stretch", hide_index=True)
 
     if trade_frequency_estimate_df is not None and not trade_frequency_estimate_df.empty:
         st.markdown("#### Estimated Trades Per Day / Avg Win-Loss")
@@ -2666,25 +2666,25 @@ def render_four_pass_backtest_box(
         for col in ["estimated_trades_per_day", "win_rate", "avg_net_bps", "avg_win_bps", "avg_loss_bps", "expected_daily_net_bps_if_all_traded"]:
             if col in display_df.columns:
                 display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
-        st.dataframe(display_df.sort_values(["dedupe_minutes", "estimated_trades_per_day"], ascending=[True, False])[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(display_df.sort_values(["dedupe_minutes", "estimated_trades_per_day"], ascending=[True, False])[show_cols], width="stretch", hide_index=True)
 
     if approved_but_shadowed_df is not None and not approved_but_shadowed_df.empty:
         st.markdown("#### Approved But Shadowed")
         st.caption("Products that passed the product gate but were still blocked by final live execution logic.")
 
         show_cols = [c for c in ["dt_mst", "product_id", "symbol", "quote_asset", "council_action", "expected_utility_bps", "candidate_notional_usd", "top_of_book_age_sec", "block_reasons", "next_best_action"] if c in approved_but_shadowed_df.columns]
-        st.dataframe(approved_but_shadowed_df.tail(100)[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(approved_but_shadowed_df.tail(100)[show_cols], width="stretch", hide_index=True)
 
     if product_cooldowns_df is not None and not product_cooldowns_df.empty:
         st.markdown("#### Product Cooldowns")
         st.caption("Cooldowns are soft unless marked otherwise. Coins remain monitored and can re-qualify.")
 
         show_cols = [c for c in ["product_id", "cooldown_until_ts", "cooldown_minutes", "cooldown_type", "can_escape_early", "reason"] if c in product_cooldowns_df.columns]
-        st.dataframe(product_cooldowns_df.tail(100)[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(product_cooldowns_df.tail(100)[show_cols], width="stretch", hide_index=True)
 
     if four_pass_final_agent_ratings_df is not None and not four_pass_final_agent_ratings_df.empty:
         with st.expander("Final four-pass side-specific analyst ratings", expanded=False):
-            st.dataframe(four_pass_final_agent_ratings_df.tail(200), use_container_width=True, hide_index=True)
+            st.dataframe(four_pass_final_agent_ratings_df.tail(200), width="stretch", hide_index=True)
 
 
 def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df=None, shadow_sell_replay_df=None, historical_replay_df=None, historical_replay_summary_df=None, four_pass_agent_buy_df=None, four_pass_council_buy_df=None, four_pass_agent_sell_df=None, four_pass_council_sell_df=None, four_pass_final_agent_ratings_df=None, four_pass_profitability_summary_df=None, four_pass_agent_context_ratings_df=None, four_pass_sell_path_replay_df=None, four_pass_purged_walk_forward_df=None, four_pass_product_live_gate_df=None, product_cooldowns_df=None, agent_decision_influence_df=None, product_agent_influence_df=None, trade_frequency_estimate_df=None, approved_but_shadowed_df=None):
@@ -2762,7 +2762,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
             summary["ts_num"] = pd.to_numeric(summary["ts"], errors="coerce")
             summary = summary.sort_values("ts_num").groupby("product_id").tail(1)
         show_cols = [c for c in ["product_id", "rows", "wins", "losses", "win_rate", "median_net_pnl_bps", "avg_net_pnl_bps", "days_covered", "calibration_ready", "recommended_min_score", "recommended_min_probability", "recommended_min_expected_value_bps"] if c in summary.columns]
-        st.dataframe(summary[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(summary[show_cols], width="stretch", hide_index=True)
         net = pd.to_numeric(summary.get("median_net_pnl_bps", pd.Series(dtype=float)), errors="coerce").dropna()
         if not net.empty:
             st.write(f"Across ready products, median replay net P/L is {net.median():.2f} bps. Positive values mean the entry+sell model was net-profitable in historical replay.")
@@ -2784,7 +2784,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
                 ]
                 if c in historical_replay_df.columns
             ]
-            st.dataframe(historical_replay_df.tail(200)[show_cols], use_container_width=True, hide_index=True)
+            st.dataframe(historical_replay_df.tail(200)[show_cols], width="stretch", hide_index=True)
 
     with st.expander("Binance.US replay fee scenarios", expanded=False):
         render_replay_fee_comparison_panel()
@@ -2792,7 +2792,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
     fee_comparison_df = load_csv_tail(REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH, max_lines=5000)
     if fee_comparison_df is not None and not fee_comparison_df.empty:
         with st.expander("replay_fee_comparison_summary.csv", expanded=False):
-            st.dataframe(fee_comparison_df, use_container_width=True, hide_index=True)
+            st.dataframe(fee_comparison_df, width="stretch", hide_index=True)
 
     explanations = readiness.get("readiness_explanation") or []
     if explanations:
@@ -2855,7 +2855,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
                 st.warning("The shadow sell replay is currently net-negative at the median. This means buying all shadow entries would still likely lose money with the current sell model.")
         with st.expander("Latest shadow sell replay rows", expanded=False):
             show_cols = [c for c in ["product_id", "decision_id", "entry_price", "exit_price", "exit_reason", "net_pnl_bps", "max_favorable_bps", "max_adverse_bps", "would_have_won", "would_have_hit_stop", "would_have_hit_min_profit"] if c in replay.columns]
-            st.dataframe(replay.tail(200)[show_cols], use_container_width=True, hide_index=True)
+            st.dataframe(replay.tail(200)[show_cols], width="stretch", hide_index=True)
 
     st.markdown("### Overnight Run Summary")
     try:
@@ -2908,7 +2908,7 @@ def render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_
         st.json(readiness)
     for name, df in [("trades", trades_df), ("orders", orders_df), ("market", market_df), ("council_decisions", decisions_df), ("council_votes", council_votes_df)]:
         with st.expander(name, expanded=False):
-            st.dataframe(df.tail(100), use_container_width=True, hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
+            st.dataframe(df.tail(100), width="stretch", hide_index=True) if not df.empty else st.info(f"{name}.csv has no rows yet.")
 
 
 def render_strategy_variant_replay_panel():
@@ -2929,7 +2929,7 @@ def render_strategy_variant_replay_panel():
         "hard_stop_rate", "profit_pullback_rate", "early_adverse_exit_rate",
         "avg_mfe_bps", "avg_mae_bps",
     ] if c in latest.columns]
-    st.dataframe(latest[show_cols], use_container_width=True, hide_index=True)
+    st.dataframe(latest[show_cols], width="stretch", hide_index=True)
     if "strategy_variant" in latest.columns:
         by_variant = latest.groupby("strategy_variant").agg({
             "rows": "sum",
@@ -2943,7 +2943,7 @@ def render_strategy_variant_replay_panel():
             "profit_pullback_rate": "mean",
         }).reset_index()
         st.markdown("#### Overall by variant")
-        st.dataframe(by_variant, use_container_width=True, hide_index=True)
+        st.dataframe(by_variant, width="stretch", hide_index=True)
 
 def render_profitability_diagnostics_panel():
     st.markdown("### Profitability Diagnostics")
@@ -2952,15 +2952,15 @@ def render_profitability_diagnostics_panel():
     component_df = load_csv_tail(AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH, max_lines=5000)
     if variant_df is not None and not variant_df.empty:
         st.markdown("#### Strategy variant performance")
-        st.dataframe(variant_df.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1), use_container_width=True, hide_index=True)
+        st.dataframe(variant_df.sort_values("ts").groupby(["product_id", "timeframe", "strategy_variant"], as_index=False).tail(1), width="stretch", hide_index=True)
     if agent_policy_df is not None and not agent_policy_df.empty:
         st.markdown("#### Agent trade policy")
         latest = agent_policy_df.sort_values("ts").groupby("agent", as_index=False).tail(1)
-        st.dataframe(latest, use_container_width=True, hide_index=True)
+        st.dataframe(latest, width="stretch", hide_index=True)
     if component_df is not None and not component_df.empty:
         st.markdown("#### Replay component attribution")
         latest = component_df.sort_values("ts").groupby("component", as_index=False).tail(1)
-        st.dataframe(latest, use_container_width=True, hide_index=True)
+        st.dataframe(latest, width="stretch", hide_index=True)
 
 
 def render_live_dashboard(selected, refresh_config):
@@ -3011,12 +3011,12 @@ def render_live_dashboard(selected, refresh_config):
     if account_balance_diagnostics_df is not None and not account_balance_diagnostics_df.empty:
         st.markdown("### Binance Quote Balance Diagnostics")
         latest_balance = account_balance_diagnostics_df.tail(3)
-        st.dataframe(latest_balance[[c for c in ["asset", "free", "locked", "total", "preferred_quote_asset", "quote_asset_priority", "tradable_quote_cash", "reason"] if c in latest_balance.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(latest_balance[[c for c in ["asset", "free", "locked", "total", "preferred_quote_asset", "quote_asset_priority", "tradable_quote_cash", "reason"] if c in latest_balance.columns]], width="stretch", hide_index=True)
 
     if live_trade_blockers_df is not None and not live_trade_blockers_df.empty:
         st.markdown("### Live Trade Blockers")
         latest_blockers = live_trade_blockers_df.tail(50)
-        st.dataframe(latest_blockers[[c for c in ["dt_mst", "product_id", "symbol", "quote_asset", "quote_available", "quote_total", "action", "product_gate_ok", "top_of_book_age_sec", "candidate_notional_usd", "block_reasons"] if c in latest_blockers.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(latest_blockers[[c for c in ["dt_mst", "product_id", "symbol", "quote_asset", "quote_available", "quote_total", "action", "product_gate_ok", "top_of_book_age_sec", "candidate_notional_usd", "block_reasons"] if c in latest_blockers.columns]], width="stretch", hide_index=True)
 
     with st.container(): st.markdown('<section class="screen-section debug-health">', unsafe_allow_html=True); render_debug_launch_screen(snapshot, market_df, decisions_df, council_votes_df, trades_df, orders_df, missed_df, shadow_sell_replay_df, historical_replay_df, historical_replay_summary_df, four_pass_agent_buy_df, four_pass_council_buy_df, four_pass_agent_sell_df, four_pass_council_sell_df, four_pass_final_agent_ratings_df, four_pass_profitability_summary_df, four_pass_agent_context_ratings_df, four_pass_sell_path_replay_df, four_pass_purged_walk_forward_df, four_pass_product_live_gate_df, product_cooldowns_df, agent_decision_influence_df, product_agent_influence_df, trade_frequency_estimate_df, approved_but_shadowed_df); st.markdown('</section>', unsafe_allow_html=True)
 
@@ -3056,7 +3056,7 @@ def render_viewer_tick(refresh_config: dict) -> None:
                 "verdict": str(row.get("verdict") or ""),
                 "reason": str(row.get("reason") or ""),
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def main() -> None:

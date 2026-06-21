@@ -473,7 +473,7 @@ CALCULATION_STATUS_JSON_PATH: str = os.path.join(BASE_DIR, "calculation_status.j
 CALCULATION_COMPLETE_LATCH_PATH: str = os.path.join(BASE_DIR, "calculation_complete_latch.json")
 CALCULATION_UNLOCK_REQUIRES_LIVE_DATA_FRESHNESS: bool = False
 CALCULATION_STATUS_WRITE_EVERY_SEC: float = 5.0
-CALCULATION_STATUS_RESCAN_EVERY_SEC: float = 10.0
+CALCULATION_STATUS_RESCAN_EVERY_SEC: float = 1.0
 MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
 MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
 MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
@@ -494,13 +494,27 @@ HISTORICAL_REPLAY_1H_365D_CSV_PATH: str = HIST_REPLAY_1H_365D_CSV_PATH
 HISTORICAL_REPLAY_1D_2Y_CSV_PATH: str = HIST_REPLAY_1D_2Y_CSV_PATH
 
 # Post-patch generated-output versioning and replay coverage requirements.
-NEXT_PATCH_GENERATION_VERSION = "post_patch_recalc_v2_2026_06_21"
+NEXT_PATCH_GENERATION_VERSION = "fast_startup_calc_v1_2026_06_21"
+
+FAST_STARTUP_CALCULATION_MODE: bool = env_bool("FAST_STARTUP_CALCULATION_MODE", True)
+STARTUP_REPLAY_INITIAL_SLEEP_SEC: float = env_float("STARTUP_REPLAY_INITIAL_SLEEP_SEC", 0.5)
+STARTUP_CALIBRATION_RETRY_EVERY_SEC: float = env_float("STARTUP_CALIBRATION_RETRY_EVERY_SEC", 1.0)
+
+STARTUP_BOOTSTRAP_PRIMARY_LOOKBACK_DAYS: int = env_int("STARTUP_BOOTSTRAP_PRIMARY_LOOKBACK_DAYS", 4)
+STARTUP_BOOTSTRAP_REGIME_LOOKBACK_DAYS: int = env_int("STARTUP_BOOTSTRAP_REGIME_LOOKBACK_DAYS", 7)
+
+STARTUP_BOOTSTRAP_PRIMARY_MIN_DAYS_COVERED: float = env_float("STARTUP_BOOTSTRAP_PRIMARY_MIN_DAYS_COVERED", 2.5)
+STARTUP_BOOTSTRAP_REGIME_MIN_DAYS_COVERED: float = env_float("STARTUP_BOOTSTRAP_REGIME_MIN_DAYS_COVERED", 4.0)
+
+STARTUP_BOOTSTRAP_PRIMARY_MIN_ROWS_PER_PRODUCT: int = env_int("STARTUP_BOOTSTRAP_PRIMARY_MIN_ROWS_PER_PRODUCT", 120)
+STARTUP_BOOTSTRAP_REGIME_MIN_ROWS_PER_PRODUCT: int = env_int("STARTUP_BOOTSTRAP_REGIME_MIN_ROWS_PER_PRODUCT", 80)
+
 EXPECTED_PRIMARY_REPLAY_LOOKBACK_DAYS = 90
 EXPECTED_REGIME_REPLAY_LOOKBACK_DAYS = 365
-EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED = 85
-EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED = 340
-EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
-EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
+EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED = STARTUP_BOOTSTRAP_PRIMARY_MIN_DAYS_COVERED if FAST_STARTUP_CALCULATION_MODE else 85
+EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED = STARTUP_BOOTSTRAP_REGIME_MIN_DAYS_COVERED if FAST_STARTUP_CALCULATION_MODE else 340
+EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT = STARTUP_BOOTSTRAP_PRIMARY_MIN_ROWS_PER_PRODUCT if FAST_STARTUP_CALCULATION_MODE else 8000
+EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT = STARTUP_BOOTSTRAP_REGIME_MIN_ROWS_PER_PRODUCT if FAST_STARTUP_CALCULATION_MODE else 8000
 POST_PATCH_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "post_patch_audit.csv")
 
 RAW_RUNTIME_FILES_TO_PRESERVE = [
@@ -1441,7 +1455,7 @@ BACKTEST_INTELLIGENCE_MIN_NEW_ROWS: int = env_int("BACKTEST_INTELLIGENCE_MIN_NEW
 BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE: bool = env_bool("BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE", True)
 FOUR_PASS_CACHE_WARMUP_ENABLED: bool = env_bool("FOUR_PASS_CACHE_WARMUP_ENABLED", True)
 CALCULATION_PARALLEL_PHASES_ENABLED: bool = env_bool("CALCULATION_PARALLEL_PHASES_ENABLED", True)
-STARTUP_STATUS_MIN_UPDATE_SECONDS: float = env_float("STARTUP_STATUS_MIN_UPDATE_SECONDS", 2.0)
+STARTUP_STATUS_MIN_UPDATE_SECONDS: float = env_float("STARTUP_STATUS_MIN_UPDATE_SECONDS", 0.5)
 BACKTEST_RELOAD_MIN_SECONDS: float = env_float("BACKTEST_RELOAD_MIN_SECONDS", 60.0)
 BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS: bool = True
 BACKTEST_USE_PRODUCT_SELL_RECOMMENDATIONS: bool = True
@@ -1765,17 +1779,17 @@ HIST_REPLAY_MAX_PARALLEL_FETCHES: int = max(
 # Multiple workers can calculate at the same time, but only one should append to shared CSVs at a time.
 HIST_REPLAY_SERIALIZE_OUTPUT_WRITES: bool = True
 # After each parallel batch during startup, sleep briefly.
-HIST_REPLAY_STARTUP_BATCH_SLEEP_SEC: float = 0.25
+HIST_REPLAY_STARTUP_BATCH_SLEEP_SEC: float = 0.0
 # Keep normal background replay slower after the viewer unlocks.
 HIST_REPLAY_NORMAL_SLEEP_SEC: float = 90.0
 # Keep old sequential setting as fallback only.
 HIST_REPLAY_STARTUP_JOBS_PER_CYCLE: int = 6
-HIST_REPLAY_STARTUP_SLEEP_SEC: float = 0.25
+HIST_REPLAY_STARTUP_SLEEP_SEC: float = 0.0
 HIST_REPLAY_MAX_CANDIDATES_PER_PASS: int = 180
 HIST_REPLAY_MAX_RUNTIME_SEC: float = 25.0
 HIST_REPLAY_EVERY_SEC: float = 120.0
 HIST_REPLAY_CACHE_COMPACT_EVERY_SEC: float = 30 * 60.0
-HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC: float = 1.0
+HIST_REPLAY_CANDLE_REQUEST_PAUSE_SEC: float = 0.0
 HIST_REPLAY_PRIORITIZE_PRODUCTS_WITH_FEWEST_ROWS: bool = True
 HIST_REPLAY_STEP_BARS_15M: int = 1
 HIST_REPLAY_STEP_BARS_1H: int = 1
@@ -1783,9 +1797,9 @@ HIST_REPLAY_MIN_PREFIX_15M: int = 96
 HIST_REPLAY_MIN_PREFIX_1H: int = 120
 HIST_REPLAY_FORWARD_BARS_15M: List[int] = [4, 8, 12, 16, 24, 32]
 HIST_REPLAY_FORWARD_BARS_1H: List[int] = [2, 4, 8, 12, 24]
-HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION: int = 350
-HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION: int = 40
-HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION: int = 60
+HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION: int = 120
+HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION: int = 10
+HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION: int = 2
 HIST_REPLAY_REQUIRE_POSITIVE_AVG_FOR_CALIBRATION: bool = True
 HIST_REPLAY_REQUIRE_POSITIVE_MEDIAN_FOR_CALIBRATION: bool = True
 HIST_REPLAY_MIN_AVG_NET_PNL_BPS_FOR_CALIBRATION: float = 15.0
@@ -1808,13 +1822,13 @@ REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY: bool = True
 REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY: bool = False
 ALLOW_STRONG_UTILITY_OVERRIDE_WITHOUT_REPLAY: bool = False
 LIVE_USE_HIGH_WIN_RATE_VARIANT_ONLY_AFTER_REPLAY_PROVEN: bool = False
-STARTUP_CALC_USE_FULL_HISTORICAL_CACHE_TARGETS: bool = True
+STARTUP_CALC_USE_FULL_HISTORICAL_CACHE_TARGETS: bool = False
 STARTUP_CALC_HISTORICAL_CACHE_COVERAGE_RATIO: float = 0.92
 STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT: int = 120
 STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT: int = 300
 STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT: int = 100
-STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT: int = 300
-STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT: int = 100
+STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT: int = 120
+STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT: int = 80
 STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE: bool = True
 STRONG_UTILITY_OVERRIDE_MIN_BPS: float = 175.0
 HIST_REPLAY_RECENCY_HALFLIFE_DAYS: float = 30.0
@@ -6974,15 +6988,45 @@ class TradingBot:
         self.last_fee_tier_reason: str = "not_refreshed_yet"
 
     async def preload_micro_history(self) -> None:
-        """Preload true 1-minute OHLCV into bot buffers and viewer history."""
+        """Preload true 1-minute OHLCV into bot buffers and viewer history.
+
+        Fast-start patch: fetch product histories concurrently instead of one product
+        at a time. This keeps the same data target, but removes avoidable startup
+        serialization.
+        """
         history_rows: List[Dict[str, Any]] = []
 
         try:
             end_ts = int(now_ts())
             start_ts = end_ts - int(MICRO_PRELOAD_MINUTES) * 60
+            sem = asyncio.Semaphore(max(1, int(HISTORY_FETCH_CONCURRENCY)))
 
-            for product in PRODUCTS:
-                candles = await self.fetcher.fetch_chunked(product, start_ts, end_ts, "ONE_MINUTE")
+            async def _fetch_one(product: str) -> Tuple[str, List[Candle]]:
+                async with sem:
+                    try:
+                        candles = await self.fetcher.fetch_chunked(product, start_ts, end_ts, "ONE_MINUTE")
+                        return product, list(candles or [])
+                    except Exception as exc:
+                        module_debug(
+                            MODULE_NAME,
+                            "startup_micro_preload_product_failed",
+                            data={"product_id": product, "error": str(exc)},
+                            level="WARN",
+                            also_overall=False,
+                        )
+                        return product, []
+
+            results = await asyncio.gather(
+                *[asyncio.create_task(_fetch_one(product)) for product in PRODUCTS],
+                return_exceptions=True,
+            )
+
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+
+                product, candles = result
+
                 if not candles:
                     log(f"[startup] no micro preload candles for {product}")
                     continue
@@ -7007,6 +7051,7 @@ class TradingBot:
                         volume=volume,
                     )
                     self.mid_series[product].push(float(minute_ts) + 30.0, close_price)
+
                     history_rows.append({
                         "ts": minute_ts,
                         "product_id": product,
@@ -7020,6 +7065,7 @@ class TradingBot:
             self.micro_history_log.write_rows(history_rows)
             self._micro_history_ready = bool(history_rows)
             log(f"[startup] preloaded {MICRO_PRELOAD_MINUTES}m true micro candles; rows={len(history_rows)}")
+
         except Exception as e:
             log(f"[startup] micro preload failed: {e}")
             self._micro_history_ready = False
@@ -9817,7 +9863,10 @@ class TradingBot:
             try:
                 historical_profit_ready = (
                     bool(ENABLE_PROFIT_REPLAY_BASED_CALIBRATION)
-                    and bool(self._historical_replay_is_ready_for_product(product))
+                    and (
+                        bool(self._historical_replay_is_ready_for_product(product))
+                        or bool(self._historical_replay_has_startup_bootstrap_for_product(product))
+                    )
                 )
                 if self._is_product_calibration_ready(product) and not historical_profit_ready:
                     module_debug(MODULE_NAME, "startup_calibration_using_existing_ready_product", data={"product_id": product, "historical_profit_ready": False, "calibration_source": "existing_walk_forward_or_cached"}, level="INFO", also_overall=False)
@@ -9870,7 +9919,10 @@ class TradingBot:
                 historical_profit_obs: List[CalibrationObservation] = []
                 if bool(ENABLE_PROFIT_REPLAY_BASED_CALIBRATION):
                     historical_profit_obs = self._calibration_observations_from_historical_replay(product)
-                    if historical_profit_obs and self._historical_replay_is_ready_for_product(product):
+                    if historical_profit_obs and (
+                        self._historical_replay_is_ready_for_product(product)
+                        or self._historical_replay_has_startup_bootstrap_for_product(product)
+                    ):
                         module_debug(MODULE_NAME, "calibration_using_historical_profit_replay", data={"product_id": product, "rows": len(historical_profit_obs), "wins": sum(1 for o in historical_profit_obs if o.expected_value_bps > 0)}, level="INFO", also_overall=True)
                         self._append_calibration_observations(product_id=product, observations=historical_profit_obs)
                         profile = self._build_calibration_profile(product_id=product, day_obs=historical_profit_obs, week_obs=[])
@@ -17862,13 +17914,30 @@ class TradingBot:
 
     def _expected_candle_rows_for_timeframe(self, timeframe: str) -> int:
         tf = str(timeframe)
+
+        startup_bootstrap = False
+        try:
+            startup_bootstrap = bool(FAST_STARTUP_CALCULATION_MODE) and not bool(
+                self._load_calculation_complete_latch().get("calculation_complete_latched")
+            )
+        except Exception:
+            startup_bootstrap = bool(FAST_STARTUP_CALCULATION_MODE)
+
         if tf == "primary_15m_90d":
+            if startup_bootstrap:
+                return int(STARTUP_BOOTSTRAP_PRIMARY_MIN_ROWS_PER_PRODUCT)
             return int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS) * 24 * 4
+
         if tf == "regime_1h_365d":
+            if startup_bootstrap:
+                return int(STARTUP_BOOTSTRAP_REGIME_MIN_ROWS_PER_PRODUCT)
             return int(HIST_REPLAY_REGIME_LOOKBACK_DAYS) * 24
+
         if tf == "daily_1d_2y":
             return int(HIST_REPLAY_DAILY_CONTEXT_DAYS)
+
         return 0
+
 
     def _required_candle_rows_for_timeframe(self, timeframe: str) -> int:
         expected = self._expected_candle_rows_for_timeframe(timeframe)
@@ -18343,16 +18412,36 @@ class TradingBot:
     async def _get_historical_replay_candles(self, *, product_id: str, timeframe: str) -> Tuple[List[Candle], str, str]:
         now_i = int(now_ts())
         tf = str(timeframe)
+        startup_bootstrap = False
+        try:
+            startup_bootstrap = bool(FAST_STARTUP_CALCULATION_MODE) and not bool(
+                self._load_calculation_complete_latch().get("calculation_complete_latched")
+            )
+        except Exception:
+            startup_bootstrap = bool(FAST_STARTUP_CALCULATION_MODE)
+
         if tf == "primary_15m_90d":
             granularity = HIST_REPLAY_PRIMARY_GRANULARITY
-            lookback_sec = int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS) * 86400
+            lookback_days = (
+                int(STARTUP_BOOTSTRAP_PRIMARY_LOOKBACK_DAYS)
+                if startup_bootstrap
+                else int(HIST_REPLAY_PRIMARY_LOOKBACK_DAYS)
+            )
+            lookback_sec = int(lookback_days) * 86400
             fallback_path = HIST_REPLAY_15M_90D_CSV_PATH
             min_needed = int(self._required_candle_rows_for_timeframe("primary_15m_90d"))
+
         elif tf == "regime_1h_365d":
             granularity = HIST_REPLAY_REGIME_GRANULARITY
-            lookback_sec = int(HIST_REPLAY_REGIME_LOOKBACK_DAYS) * 86400
+            lookback_days = (
+                int(STARTUP_BOOTSTRAP_REGIME_LOOKBACK_DAYS)
+                if startup_bootstrap
+                else int(HIST_REPLAY_REGIME_LOOKBACK_DAYS)
+            )
+            lookback_sec = int(lookback_days) * 86400
             fallback_path = HIST_REPLAY_1H_365D_CSV_PATH
             min_needed = int(self._required_candle_rows_for_timeframe("regime_1h_365d"))
+
         else:
             granularity = HIST_REPLAY_DAILY_GRANULARITY
             lookback_sec = int(HIST_REPLAY_DAILY_CONTEXT_DAYS) * 86400
@@ -19548,7 +19637,7 @@ class TradingBot:
             self._historical_replay_running = False
 
     async def historical_shadow_replay_loop(self) -> None:
-        await asyncio.sleep(10.0)
+        await asyncio.sleep(float(STARTUP_REPLAY_INITIAL_SLEEP_SEC))
         await self._historical_replay_worker_pool_health_check()
         while not self._stop_event.is_set():
             try:
@@ -19559,6 +19648,19 @@ class TradingBot:
                     module_debug(MODULE_NAME, "historical_replay_startup_acceleration_cycle", data={"parallel_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "fetch_concurrency": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "progress_pct": round(float(calc_status.get("overall_progress_pct", 0.0)), 2), "phase": calc_status.get("phase_label")}, level="INFO", also_overall=False)
                     if bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE):
                         await self._run_manifest_worker_batch()
+
+                        try:
+                            if getattr(self, "startup_calibration_blocker", ""):
+                                await self.calibrate_products_on_startup_background()
+                        except Exception as cal_exc:
+                            module_debug(
+                                MODULE_NAME,
+                                "startup_calibration_retry_after_replay_batch_failed",
+                                data={"error": str(cal_exc)},
+                                level="WARN",
+                                also_overall=False,
+                            )
+
                     elif bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED):
                         await self._run_historical_shadow_replay_parallel_batch(force=True)
                     else:
@@ -19763,6 +19865,44 @@ class TradingBot:
         positive_median_ok = median_net >= float(HIST_REPLAY_MIN_MEDIAN_NET_PNL_BPS_FOR_STRONG_CALIBRATION) if bool(HIST_REPLAY_REQUIRE_POSITIVE_MEDIAN_FOR_CALIBRATION) else True
         ready = (rows >= int(HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION) and wins >= int(HIST_REPLAY_MIN_WINS_FOR_PRODUCT_CALIBRATION) and days_covered >= float(HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION) and positive_avg_ok and positive_median_ok)
         self._historical_replay_ready_by_product[product_id] = bool(ready); return bool(ready)
+
+    def _historical_replay_has_startup_bootstrap_for_product(self, product_id: str) -> bool:
+        """Return True once replay has enough rows to build a bootstrap startup calibration profile.
+
+        This intentionally does not require profitable replay. Profitability still affects
+        the live product verdict and buy gates; this helper only prevents startup from
+        falling back to slower direct day/week calibration fetches when replay data is
+        already available.
+        """
+        try:
+            frame = self._historical_replay_rows_for_product(product_id)
+            if frame.empty:
+                return False
+
+            rows = int(len(frame))
+
+            if "replay_ts" in frame.columns:
+                replay_ts = pd.to_numeric(frame.get("replay_ts"), errors="coerce").dropna()
+                days_covered = (
+                    max(0.0, (float(replay_ts.max()) - float(replay_ts.min())) / 86400.0)
+                    if not replay_ts.empty
+                    else 0.0
+                )
+            else:
+                days_covered = 0.0
+
+            required_rows = min(
+                int(HIST_REPLAY_MIN_ROWS_FOR_PRODUCT_CALIBRATION),
+                max(20, int(STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT)),
+            )
+
+            return bool(
+                rows >= required_rows
+                and days_covered >= float(HIST_REPLAY_MIN_DAYS_COVERED_FOR_PRODUCT_CALIBRATION)
+            )
+
+        except Exception:
+            return False
 
     def _calibration_observations_from_historical_replay(self, product_id: str) -> List[CalibrationObservation]:
         frame = self._historical_replay_rows_for_product(product_id)
@@ -23424,10 +23564,18 @@ class TradingBot:
             return False
 
     async def startup_calibration_loop(self) -> None:
-        """Run startup calibration once, then exit."""
-        if bool(getattr(self, "_startup_calibration_ready", False)):
-            return
-        await self.calibrate_products_on_startup_background()
+        """Retry startup calibration until replay bootstrap coverage is available."""
+        while not self._stop_event.is_set():
+            if bool(getattr(self, "_startup_calibration_ready", False)):
+                return
+
+            await self.calibrate_products_on_startup_background()
+
+            if bool(getattr(self, "_startup_calibration_ready", False)):
+                return
+
+            await asyncio.sleep(float(STARTUP_CALIBRATION_RETRY_EVERY_SEC))
+
 
     async def _refresh_macro_context_for_product(self, product_id: str) -> None:
         """Refresh macro day/week candle CSVs from Binance.US klines."""
@@ -23507,7 +23655,6 @@ class TradingBot:
         self._write_startup_viewer_snapshot("bot_started_waiting_for_live_quotes")
         book_ticker_task = asyncio.create_task(self.binance_book_ticker_loop())
         try:
-            await asyncio.sleep(2.0)
             await asyncio.to_thread(self._rest_backfill_top_of_book, PRODUCTS)
             try:
                 await self.preload_micro_history()

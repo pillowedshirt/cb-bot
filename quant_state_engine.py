@@ -99,18 +99,48 @@ def _num(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
     return pd.to_numeric(frame[column], errors="coerce").fillna(default)
 
 
-def _extract_outcome_bps(frame: pd.DataFrame) -> pd.Series:
-    for col in ["realized_or_proxy_net_bps", "binance_taker_taker_net_pnl_bps", "binance_maker_taker_net_pnl_bps", "net_pnl_bps", "buy_net_bps", "realized_net_pnl_bps", "primary_net_pnl_bps", "outcome_bps", "move_bps", "ev_at_entry"]:
+def _extract_outcome_bps(frame: pd.DataFrame, source_name: str) -> pd.Series:
+    """
+    Source-aware outcome extraction.
+
+    Realized/fixed-window rows should use actual outcome fields.
+    Candidate/replay rows may use proxy EV only when no better outcome exists.
+    """
+    realized_cols = [
+        "realized_or_proxy_net_bps",
+        "binance_taker_taker_net_pnl_bps",
+        "binance_maker_taker_net_pnl_bps",
+        "net_pnl_bps",
+        "buy_net_bps",
+        "realized_net_pnl_bps",
+        "primary_net_pnl_bps",
+        "outcome_bps",
+        "move_bps",
+    ]
+
+    for col in realized_cols:
         if col in frame.columns:
             return _num(frame, col, 0.0)
+
     if "max_favorable_bps" in frame.columns and "max_adverse_bps" in frame.columns:
         fav = _num(frame, "max_favorable_bps", 0.0)
         adv = _num(frame, "max_adverse_bps", 0.0).abs()
         cost = _num(frame, "cost_bps", 0.0)
         return fav - adv * 0.35 - cost
-    if "expected_net_edge_bps" in frame.columns:
-        return _num(frame, "expected_net_edge_bps", 0.0)
-    return pd.Series([0.0] * len(frame), index=frame.index)
+
+    proxy_allowed_sources = {
+        "candidate_proxy",
+        "historical_shadow",
+        "fifth_pass",
+        "council_observed",
+    }
+
+    if source_name in proxy_allowed_sources:
+        for col in ["expected_net_edge_bps", "ev_at_entry"]:
+            if col in frame.columns:
+                return _num(frame, col, 0.0)
+
+    return pd.Series([np.nan] * len(frame), index=frame.index)
 
 
 def _infer_regime(frame: pd.DataFrame) -> pd.Series:
@@ -147,7 +177,6 @@ def _source_frames(base_dir: str) -> pd.DataFrame:
         ("candidate_replay.csv", "candidate_proxy", 0.45),
         ("council_observation_outcomes.csv", "council_observed", 0.80),
         ("trade_outcomes.csv", "fixed_window_trade_outcome", 0.70),
-        ("missed_opportunities.csv", "missed_opportunity", 0.60),
     ]
     frames: List[pd.DataFrame] = []
     for filename, source_name, source_weight in sources:
@@ -156,7 +185,7 @@ def _source_frames(base_dir: str) -> pd.DataFrame:
             continue
         out = pd.DataFrame(index=raw.index)
         out["product_id"] = raw["product_id"].astype(str)
-        out["outcome_bps"] = _extract_outcome_bps(raw)
+        out["outcome_bps"] = _extract_outcome_bps(raw, source_name)
         out["market_regime"] = _infer_regime(raw).astype(str)
         out["row_ts"] = _infer_ts(raw)
         out["source_name"] = source_name
@@ -174,12 +203,49 @@ def _source_frames(base_dir: str) -> pd.DataFrame:
     return combined
 
 
-def _safe_corr(a: pd.Series, b: pd.Series) -> float:
-    local = pd.DataFrame({"a": pd.to_numeric(a, errors="coerce"), "b": pd.to_numeric(b, errors="coerce")}).dropna()
-    if len(local) < 20 or float(local["a"].std(ddof=0) or 0.0) <= 1e-12 or float(local["b"].std(ddof=0) or 0.0) <= 1e-12:
+def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    weights = np.clip(weights.astype(float), 0.05, None)
+    return float(np.average(values.astype(float), weights=weights))
+
+
+def _weighted_std(values: np.ndarray, weights: np.ndarray) -> float:
+    weights = np.clip(weights.astype(float), 0.05, None)
+    mean = _weighted_mean(values, weights)
+    variance = np.average((values.astype(float) - mean) ** 2, weights=weights)
+    return float(math.sqrt(max(variance, 0.0)))
+
+
+def _weighted_corr(a: pd.Series, b: pd.Series, weights: Optional[pd.Series] = None) -> float:
+    local = pd.DataFrame({
+        "a": pd.to_numeric(a, errors="coerce"),
+        "b": pd.to_numeric(b, errors="coerce"),
+        "w": pd.to_numeric(weights, errors="coerce") if weights is not None else 1.0,
+    }).dropna()
+
+    if len(local) < 20:
         return 0.0
-    val = float(local["a"].corr(local["b"]))
-    return val if math.isfinite(val) else 0.0
+
+    av = local["a"].to_numpy(dtype=float)
+    bv = local["b"].to_numpy(dtype=float)
+    wv = np.clip(local["w"].to_numpy(dtype=float), 0.05, None)
+
+    a_std = _weighted_std(av, wv)
+    b_std = _weighted_std(bv, wv)
+
+    if a_std <= 1e-12 or b_std <= 1e-12:
+        return 0.0
+
+    a_mean = _weighted_mean(av, wv)
+    b_mean = _weighted_mean(bv, wv)
+
+    cov = float(np.average((av - a_mean) * (bv - b_mean), weights=wv))
+    corr = cov / max(a_std * b_std, 1e-12)
+
+    return float(corr) if math.isfinite(corr) else 0.0
+
+
+def _safe_corr(a: pd.Series, b: pd.Series) -> float:
+    return _weighted_corr(a, b, None)
 
 
 def _reliability(n: int, abs_corr: float) -> float:
@@ -189,23 +255,102 @@ def _reliability(n: int, abs_corr: float) -> float:
 def _feature_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[List[List[Any]], List[List[Any]]]:
     feature_rows: List[List[Any]] = []
     matrix_rows: List[List[Any]] = []
+
     groups: List[Tuple[str, str, pd.DataFrame]] = [("portfolio", "ALL", frame)]
     groups.extend(("product", str(pid), group.copy()) for pid, group in frame.groupby("product_id"))
+
     for scope, product_id, group in groups:
-        features = [feature for feature in FEATURE_CANDIDATES if feature in group.columns and pd.to_numeric(group[feature], errors="coerce").notna().sum() >= 20]
+        if "source_weight" not in group.columns:
+            group = group.copy()
+            group["source_weight"] = 0.50
+
+        features = [
+            feature for feature in FEATURE_CANDIDATES
+            if feature in group.columns
+            and pd.to_numeric(group[feature], errors="coerce").notna().sum() >= 20
+        ]
+
         for feature in features:
-            local = group[[feature, "outcome_bps"]].copy(); local[feature] = pd.to_numeric(local[feature], errors="coerce"); local = local.dropna(); n = len(local)
-            if n < 20: continue
-            corr = _safe_corr(local[feature], local["outcome_bps"]); abs_corr = abs(corr); reliability = _reliability(n, abs_corr); feature_weight = corr * reliability
-            direction = "positive_edge_when_high" if corr > 0 else "negative_edge_when_high" if corr < 0 else "neutral"
+            local = group[[feature, "outcome_bps", "source_weight"]].copy()
+            local[feature] = pd.to_numeric(local[feature], errors="coerce")
+            local["outcome_bps"] = pd.to_numeric(local["outcome_bps"], errors="coerce")
+            local["source_weight"] = pd.to_numeric(local["source_weight"], errors="coerce").fillna(0.50)
+            local = local.dropna()
+
+            n = len(local)
+            if n < 20:
+                continue
+
+            values = local[feature].to_numpy(dtype=float)
+            weights = np.clip(local["source_weight"].to_numpy(dtype=float), 0.05, None)
+
+            corr = _weighted_corr(local[feature], local["outcome_bps"], local["source_weight"])
+            abs_corr = abs(corr)
+            reliability = _reliability(n, abs_corr)
+            feature_weight = corr * reliability
+
+            direction = (
+                "positive_edge_when_high"
+                if corr > 0
+                else "negative_edge_when_high"
+                if corr < 0
+                else "neutral"
+            )
+
             live_enabled = bool(n >= 40 and abs_corr >= 0.05 and reliability >= 0.05)
-            feature_rows.append([f"{ts_value:.6f}", dt_value, scope, product_id, feature, int(n), f"{float(local[feature].mean()):.8f}", f"{float(local[feature].std(ddof=0) or 0.0):.8f}", f"{corr:.8f}", f"{abs_corr:.8f}", f"{feature_weight:.8f}", f"{reliability:.8f}", direction, live_enabled, f"feature_outcome_corr;feature={feature};n={n};corr={corr:.4f};reliability={reliability:.3f}"])
+
+            feature_rows.append([
+                f"{ts_value:.6f}",
+                dt_value,
+                scope,
+                product_id,
+                feature,
+                int(n),
+                f"{_weighted_mean(values, weights):.8f}",
+                f"{_weighted_std(values, weights):.8f}",
+                f"{corr:.8f}",
+                f"{abs_corr:.8f}",
+                f"{feature_weight:.8f}",
+                f"{reliability:.8f}",
+                direction,
+                live_enabled,
+                (
+                    f"source_weighted_feature_outcome_corr;"
+                    f"feature={feature};n={n};corr={corr:.4f};"
+                    f"reliability={reliability:.3f}"
+                ),
+            ])
+
         for i, feature_a in enumerate(features):
             for feature_b in features[i + 1:]:
-                local = group[[feature_a, feature_b]].copy(); local[feature_a] = pd.to_numeric(local[feature_a], errors="coerce"); local[feature_b] = pd.to_numeric(local[feature_b], errors="coerce"); local = local.dropna()
-                if len(local) < 30: continue
-                corr = _safe_corr(local[feature_a], local[feature_b]); redundant = bool(abs(corr) >= 0.85)
-                matrix_rows.append([f"{ts_value:.6f}", dt_value, scope, product_id, feature_a, feature_b, int(len(local)), f"{corr:.8f}", redundant, f"feature_pair_corr;abs_corr={abs(corr):.4f};redundant={redundant}"])
+                local = group[[feature_a, feature_b, "source_weight"]].copy()
+                local[feature_a] = pd.to_numeric(local[feature_a], errors="coerce")
+                local[feature_b] = pd.to_numeric(local[feature_b], errors="coerce")
+                local["source_weight"] = pd.to_numeric(local["source_weight"], errors="coerce").fillna(0.50)
+                local = local.dropna()
+
+                if len(local) < 30:
+                    continue
+
+                corr = _weighted_corr(local[feature_a], local[feature_b], local["source_weight"])
+                redundant = bool(abs(corr) >= 0.85)
+
+                matrix_rows.append([
+                    f"{ts_value:.6f}",
+                    dt_value,
+                    scope,
+                    product_id,
+                    feature_a,
+                    feature_b,
+                    int(len(local)),
+                    f"{corr:.8f}",
+                    redundant,
+                    (
+                        f"source_weighted_feature_pair_corr;"
+                        f"abs_corr={abs(corr):.4f};redundant={redundant}"
+                    ),
+                ])
+
     return feature_rows, matrix_rows
 
 
@@ -237,7 +382,7 @@ def _markov_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[L
         for pid, group in frame.groupby("product_id")
     ]
     for scope, product_id, group in groups:
-        local = group[["market_regime", "row_ts"]].copy().dropna()
+        local = group[["market_regime", "row_ts", "source_weight"]].copy().dropna()
         local["market_regime"] = (
             local["market_regime"]
             .astype(str)
@@ -245,17 +390,25 @@ def _markov_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[L
             .str.lower()
             .str.replace(" ", "_", regex=False)
         )
+        local["row_ts"] = pd.to_numeric(local["row_ts"], errors="coerce").fillna(0.0)
+        local["source_weight"] = pd.to_numeric(local["source_weight"], errors="coerce").fillna(0.50).clip(lower=0.05)
+
         local = local[
             (local["market_regime"] != "")
             & (local["market_regime"] != "unknown_regime")
             & (local["market_regime"] != "nan")
+            & (local["row_ts"] > 0.0)
         ].copy()
+
         local = local.sort_values("row_ts")
 
         regimes = sorted([str(x) for x in local["market_regime"].dropna().unique()])
         if len(local) < 20 or len(regimes) < 2: continue
         idx = {regime: i for i, regime in enumerate(regimes)}; counts = np.zeros((len(regimes), len(regimes)), dtype=float); values = list(local["market_regime"].astype(str).values)
-        for current_regime, next_regime in zip(values[:-1], values[1:]): counts[idx[current_regime], idx[next_regime]] += 1.0
+        weights = list(local["source_weight"].astype(float).values)
+        for k, (current_regime, next_regime) in enumerate(zip(values[:-1], values[1:])):
+            transition_weight = float((weights[k] + weights[k + 1]) / 2.0)
+            counts[idx[current_regime], idx[next_regime]] += transition_weight
         row_sums = counts.sum(axis=1); probs = np.zeros_like(counts)
         for i in range(len(regimes)):
             if row_sums[i] > 0: probs[i, :] = counts[i, :] / row_sums[i]
@@ -283,14 +436,47 @@ def _markov_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[L
 
 def _kalman_policy_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> List[List[Any]]:
     rows: List[List[Any]] = []
+
     groups: List[Tuple[str, str, pd.DataFrame]] = [("portfolio", "ALL", frame)]
     groups.extend(("product", str(pid), group.copy()) for pid, group in frame.groupby("product_id"))
+
     for scope, product_id, group in groups:
-        values = pd.to_numeric(group["outcome_bps"], errors="coerce").dropna().astype(float)
-        if len(values) < 20: continue
-        mad = float(np.median(np.abs(values - np.median(values))))
-        meas = max(2.0, mad * 0.75); proc = max(0.25, mad * 0.10)
-        rows.append([f"{ts_value:.6f}", dt_value, scope, product_id, int(len(values)), f"{mad:.8f}", f"{meas:.8f}", f"{proc:.8f}", True, f"kalman_policy;mad={mad:.3f};measurement_noise={meas:.3f};process_noise={proc:.3f}"])
+        local = group[["outcome_bps", "source_weight"]].copy()
+        local["outcome_bps"] = pd.to_numeric(local["outcome_bps"], errors="coerce")
+        local["source_weight"] = pd.to_numeric(local["source_weight"], errors="coerce").fillna(0.50).clip(lower=0.05)
+        local = local.dropna()
+
+        if len(local) < 20:
+            continue
+
+        values = local["outcome_bps"].to_numpy(dtype=float)
+        weights = local["source_weight"].to_numpy(dtype=float)
+
+        weighted_center = _weighted_mean(values, weights)
+        weighted_abs_dev = np.abs(values - weighted_center)
+        median_abs_return_bps = float(np.median(weighted_abs_dev))
+
+        measurement_noise_bps = max(2.0, median_abs_return_bps * 0.75)
+        process_noise_bps = max(0.25, median_abs_return_bps * 0.10)
+
+        rows.append([
+            f"{ts_value:.6f}",
+            dt_value,
+            scope,
+            product_id,
+            int(len(local)),
+            f"{median_abs_return_bps:.8f}",
+            f"{measurement_noise_bps:.8f}",
+            f"{process_noise_bps:.8f}",
+            True,
+            (
+                f"source_weighted_kalman_policy;"
+                f"mad={median_abs_return_bps:.3f};"
+                f"measurement_noise={measurement_noise_bps:.3f};"
+                f"process_noise={process_noise_bps:.3f}"
+            ),
+        ])
+
     return rows
 
 

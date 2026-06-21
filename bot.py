@@ -14518,8 +14518,41 @@ class TradingBot:
                 return {"available": False, "allowed": not bool(RISK_INTELLIGENCE_BLOCK_WHEN_MISSING), "size_multiplier": float(RISK_INTELLIGENCE_MISSING_DATA_SIZE_MULTIPLIER), "reason": f"risk_live_gate_missing_blocks_live_buy={bool(RISK_INTELLIGENCE_BLOCK_WHEN_MISSING)};product_id={product_id}"}
             sample_count = int(float(row.get("sample_count", 0) or 0)); live_allowed = str(row.get("live_allowed", "True")).strip().lower() in {"true", "1", "yes", "y"}
             size_multiplier = clamp_float(float(row.get("size_multiplier", 1.0) or 1.0), float(RISK_INTELLIGENCE_MIN_SIZE_MULTIPLIER), float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER))
+            ev_ci_low_bps = float(row.get("ev_ci_low_bps", 0.0) or 0.0)
+            prob_ev_positive = float(row.get("prob_ev_positive", 0.0) or 0.0)
+
             if sample_count < int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK):
-                return {"available": True, "allowed": True, "size_multiplier": min(size_multiplier, 0.50), "sample_count": sample_count, "reason": f"risk_live_gate_sample_immature;sample_count={sample_count};min_to_block={int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK)};row_reason={row.get('reason', '')}"}
+                if sample_count >= 30 and (prob_ev_positive < 0.40 or ev_ci_low_bps < -20.0):
+                    return {
+                        "available": True,
+                        "allowed": False,
+                        "size_multiplier": 0.0,
+                        "sample_count": sample_count,
+                        "reason": (
+                            f"risk_live_gate_immature_but_bad_blocked;"
+                            f"sample_count={sample_count};"
+                            f"prob_ev_positive={prob_ev_positive:.3f};"
+                            f"ev_ci_low_bps={ev_ci_low_bps:.2f};"
+                            f"row_reason={row.get('reason', '')}"
+                        ),
+                    }
+
+                immature_size = 0.25 if sample_count < 30 else 0.40
+
+                return {
+                    "available": True,
+                    "allowed": True,
+                    "size_multiplier": min(size_multiplier, immature_size),
+                    "sample_count": sample_count,
+                    "reason": (
+                        f"risk_live_gate_sample_immature_size_down;"
+                        f"sample_count={sample_count};"
+                        f"min_to_block={int(RISK_INTELLIGENCE_MIN_ROWS_TO_BLOCK)};"
+                        f"prob_ev_positive={prob_ev_positive:.3f};"
+                        f"ev_ci_low_bps={ev_ci_low_bps:.2f};"
+                        f"row_reason={row.get('reason', '')}"
+                    ),
+                }
             if not live_allowed:
                 return {"available": True, "allowed": False, "size_multiplier": 0.0, "sample_count": sample_count, "reason": f"risk_live_gate_blocked {row.get('reason', '')}"}
             return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "sample_count": sample_count, "risk_grade": str(row.get("risk_grade", "")), "ev_ci_low_bps": float(row.get("ev_ci_low_bps", 0.0) or 0.0), "prob_ev_positive": float(row.get("prob_ev_positive", 0.0) or 0.0), "p95_max_drawdown_pct_30d": float(row.get("p95_max_drawdown_pct_30d", 0.0) or 0.0), "reason": f"risk_live_gate_allowed {row.get('reason', '')}"}
@@ -14578,7 +14611,18 @@ class TradingBot:
             now_value = now_ts()
             if not self._feature_policy_cache or now_value - float(self._feature_policy_cache_ts or 0.0) > 15.0:
                 self._feature_policy_cache = load_feature_policy_map(BASE_DIR); self._feature_policy_cache_ts = now_value
-            product_id = str(candidate.get("product_id", "")); rows = list(self._feature_policy_cache.get(product_id, []) or []); rows.extend(list(self._feature_policy_cache.get("ALL", []) or []))
+            product_id = str(candidate.get("product_id", ""))
+            product_rows = list(self._feature_policy_cache.get(product_id, []) or [])
+            portfolio_rows = list(self._feature_policy_cache.get("ALL", []) or [])
+
+            # Prefer product-specific feature policy.
+            # Use portfolio policy only as fallback so the same evidence is not double-counted.
+            if len(product_rows) >= int(COVARIANCE_MIN_ACTIVE_FEATURES):
+                rows = product_rows
+                feature_policy_scope = "product_specific"
+            else:
+                rows = portfolio_rows
+                feature_policy_scope = "portfolio_fallback"
             if not rows: return {"available": False, "allowed": True, "size_multiplier": 0.75, "reason": "covariance_correlation_policy_missing_size_down"}
             contributions: List[float] = []; reasons: List[str] = []; total_sample = 0
             for row in rows:
@@ -14587,15 +14631,17 @@ class TradingBot:
                 feature_mean = float(row.get("feature_mean", 0.0) or 0.0); feature_std = abs(float(row.get("feature_std", 0.0) or 0.0))
                 if feature_std <= 1e-12: continue
                 z_score = clamp_float((float(value) - feature_mean) / feature_std, -3.0, 3.0); feature_weight = float(row.get("feature_weight", 0.0) or 0.0); reliability = float(row.get("reliability", 0.0) or 0.0); sample_count = int(float(row.get("sample_count", 0) or 0))
-                contribution = float(z_score) * float(feature_weight); contributions.append(contribution); total_sample += sample_count
+                contribution = float(z_score) * float(feature_weight)
+                contributions.append(contribution)
+                total_sample = max(total_sample, sample_count)
                 if abs(contribution) >= 0.02: reasons.append(f"{feature_name}:value={float(value):.4f};z={z_score:.2f};weight={feature_weight:.4f};contrib={contribution:.4f};rel={reliability:.3f}")
             if len(contributions) < int(COVARIANCE_MIN_ACTIVE_FEATURES):
                 return {"available": True, "allowed": True, "size_multiplier": 0.85, "active_features": len(contributions), "reason": f"covariance_correlation_not_enough_live_features;active={len(contributions)};min={int(COVARIANCE_MIN_ACTIVE_FEATURES)}"}
             edge_score = float(np.mean(contributions)); size_multiplier = clamp_float(1.0 + edge_score * 1.75, float(COVARIANCE_SIZE_MULTIPLIER_MIN), float(COVARIANCE_SIZE_MULTIPLIER_MAX))
             if total_sample >= int(COVARIANCE_MIN_SAMPLE_COUNT_TO_BLOCK) and edge_score <= float(COVARIANCE_BLOCK_SCORE_BELOW):
-                return {"available": True, "allowed": False, "size_multiplier": 0.0, "edge_score": edge_score, "active_features": len(contributions), "reason": f"covariance_correlation_blocked;edge_score={edge_score:.4f};sample_count={total_sample};features={'|'.join(reasons[:8])}"}
+                return {"available": True, "allowed": False, "size_multiplier": 0.0, "edge_score": edge_score, "active_features": len(contributions), "reason": f"covariance_correlation_blocked;scope={feature_policy_scope};edge_score={edge_score:.4f};sample_count={total_sample};features={'|'.join(reasons[:8])}"}
             if edge_score <= float(COVARIANCE_SIZE_DOWN_SCORE_BELOW): size_multiplier = min(size_multiplier, 0.65)
-            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "edge_score": edge_score, "active_features": len(contributions), "sample_count": total_sample, "reason": f"covariance_correlation_allowed;edge_score={edge_score:.4f};size_multiplier={size_multiplier:.3f};features={'|'.join(reasons[:8])}"}
+            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "edge_score": edge_score, "active_features": len(contributions), "sample_count": total_sample, "reason": f"covariance_correlation_allowed;scope={feature_policy_scope};edge_score={edge_score:.4f};size_multiplier={size_multiplier:.3f};features={'|'.join(reasons[:8])}"}
         except Exception as exc:
             return {"available": False, "allowed": True, "size_multiplier": 0.85, "reason": f"covariance_correlation_gate_error:{exc}"}
 
@@ -14671,7 +14717,23 @@ class TradingBot:
             pp00 = p00 + dt_min * (p10 + p01) + (dt_min ** 2) * p11 + process_var; pp01 = p01 + dt_min * p11; pp10 = p10 + dt_min * p11; pp11 = p11 + process_var * 0.05
             residual = observed_price - predicted_price; smat = pp00 + measurement_var; kgp = pp00 / max(smat, 1e-12); kgv = pp10 / max(smat, 1e-12)
             updated_price = predicted_price + kgp * residual; updated_velocity = predicted_velocity + kgv * residual
-            self._kalman_state_by_product[product_id] = {"ts": current_ts, "price": updated_price, "velocity": updated_velocity, "p00": (1.0 - kgp) * pp00, "p01": (1.0 - kgp) * pp01, "p10": pp10 - kgv * pp00, "p11": pp11 - kgv * pp01}
+            new_p00 = max((1.0 - kgp) * pp00, measurement_var * 0.01)
+            new_p01 = (1.0 - kgp) * pp01
+            new_p10 = pp10 - kgv * pp00
+            new_p11 = max(pp11 - kgv * pp01, process_var * 0.01)
+
+            # Keep covariance symmetric enough for a stable 2-state filter.
+            off_diag = float((new_p01 + new_p10) / 2.0)
+
+            self._kalman_state_by_product[product_id] = {
+                "ts": current_ts,
+                "price": updated_price,
+                "velocity": updated_velocity,
+                "p00": float(new_p00),
+                "p01": off_diag,
+                "p10": off_diag,
+                "p11": float(new_p11),
+            }
             slope_bps_per_min = (updated_velocity / max(updated_price, 1e-9)) * 10000.0; residual_bps = (residual / max(observed_price, 1e-9)) * 10000.0
             live_allowed = True; size_multiplier = 1.0; reason_parts = []
             if slope_bps_per_min <= float(KALMAN_DOWNSLOPE_BLOCK_BPS_PER_MIN): live_allowed = False; size_multiplier = 0.0; reason_parts.append(f"kalman_downslope_block slope={slope_bps_per_min:.2f}")

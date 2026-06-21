@@ -164,18 +164,61 @@ def _infer_day_key(frame: pd.DataFrame) -> pd.Series:
 
 
 def _extract_outcome_bps(frame: pd.DataFrame, source_name: str) -> pd.Series:
-    for col in ["realized_or_proxy_net_bps", "binance_taker_taker_net_pnl_bps", "binance_maker_taker_net_pnl_bps", "net_pnl_bps", "buy_net_bps", "realized_net_pnl_bps", "primary_net_pnl_bps", "move_bps", "ev_at_entry"]:
+    """
+    Return the best available realized/proxy outcome in bps.
+
+    Important:
+    - move_bps / net_pnl fields are outcomes.
+    - ev_at_entry / expected_net_edge_bps are predictions.
+    - Predictions may be used only for explicit proxy/replay sources, never as proof
+      of realized live performance.
+    """
+    realized_cols = [
+        "realized_or_proxy_net_bps",
+        "binance_taker_taker_net_pnl_bps",
+        "binance_maker_taker_net_pnl_bps",
+        "net_pnl_bps",
+        "buy_net_bps",
+        "realized_net_pnl_bps",
+        "primary_net_pnl_bps",
+        "move_bps",
+        "outcome_bps",
+    ]
+
+    for col in realized_cols:
         if col in frame.columns:
             return _numeric(frame, col, 0.0)
+
     if "max_favorable_bps" in frame.columns and "max_adverse_bps" in frame.columns:
         max_fav = _numeric(frame, "max_favorable_bps", 0.0)
         max_adv = _numeric(frame, "max_adverse_bps", 0.0).abs()
         cost = _numeric(frame, "cost_bps", 0.0)
-        success = _bool_series(frame, "survived_to_profit") | _bool_series(frame, "reached_min_profit") | ((max_fav - cost) > 0.0)
-        return pd.Series(np.where(success, max_fav - cost, -(max_adv + cost * 0.25)), index=frame.index)
-    if "expected_net_edge_bps" in frame.columns:
-        return _numeric(frame, "expected_net_edge_bps", 0.0)
-    return pd.Series([0.0] * len(frame), index=frame.index)
+
+        success = (
+            _bool_series(frame, "survived_to_profit")
+            | _bool_series(frame, "reached_min_profit")
+            | ((max_fav - cost) > 0.0)
+        )
+
+        return pd.Series(
+            np.where(success, max_fav - cost, -(max_adv + cost * 0.25)),
+            index=frame.index,
+        )
+
+    proxy_allowed_sources = {
+        "candidate_replay_proxy",
+        "historical_shadow_replay",
+        "fifth_pass_live_style_replay",
+    }
+
+    if source_name in proxy_allowed_sources:
+        for col in ["expected_net_edge_bps", "ev_at_entry"]:
+            if col in frame.columns:
+                return _numeric(frame, col, 0.0)
+
+    # If no outcome exists, return NaN so the row is dropped instead of silently
+    # becoming a fake zero-outcome row.
+    return pd.Series([np.nan] * len(frame), index=frame.index)
 
 
 def _standardize_source_frame(frame: pd.DataFrame, source_name: str) -> pd.DataFrame:

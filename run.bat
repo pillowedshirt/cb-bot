@@ -70,6 +70,23 @@ if exist "requirements.txt" (
 )
 
 REM ------------------------------------------------------------
+REM Build C++ fast calibration core if available
+REM ------------------------------------------------------------
+
+if exist "setup_fast_calibration.py" (
+    echo [setup] Building C++ fast calibration core...
+    "%PYTHON_EXE%" setup_fast_calibration.py build_ext --inplace
+
+    if errorlevel 1 (
+        echo.
+        echo [warning] C++ fast calibration core failed to build.
+        echo The bot will still run using the Python fallback path.
+        echo To enable the speedup, install Microsoft C++ Build Tools and rerun this launcher.
+        echo.
+    )
+)
+
+REM ------------------------------------------------------------
 REM Check required files
 REM ------------------------------------------------------------
 

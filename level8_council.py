@@ -1671,7 +1671,7 @@ class Level8Council:
                 pct = float(influence.get("decision_weight_pct", 0.0) or 0.0)
                 if samples >= 20 and pct > 0.0 and ev > 0.0:
                     equal_pct = 100.0 / max(1.0, len(adjusted_votes))
-                    influence_multiplier = max(0.20, min(6.0, pct / max(1e-9, equal_pct)))
+                    influence_multiplier = max(0.15, min(8.0, pct / max(1e-9, equal_pct)))
                     raw_weight *= influence_multiplier
             if side == "BUY":
                 buy_rows = float(side_rating.get("buy_rows", 0.0) or 0.0)

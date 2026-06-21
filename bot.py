@@ -14804,7 +14804,19 @@ class TradingBot:
                     product_gate_ok, _product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
                     notional = float(info.get("recommended_position_pct", 0.0) or 0.0) * float(self._portfolio_value_usdt_estimate())
                     self._write_live_trade_blocker_row(product_id=product_id, block_reasons=[str(live_quality_reason)], action=str(action), product_gate_ok=product_gate_ok, top_of_book_age_sec=age, candidate_notional_usd=notional)
-                    self._write_approved_but_shadowed_row(product_id=product_id, council_action=str(action), block_reasons=[str(live_quality_reason)], expected_utility_bps=float(info.get("expected_utility_bps", 0.0) or 0.0), candidate_notional_usd=notional, top_of_book_age_sec=float(age or 0.0))
+                    gate_ok, _gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+                    block_reasons = [str(live_quality_reason)]
+                    if gate_ok and block_reasons:
+                        tob = self.tob.get(product_id)
+                        tob_age = now_ts() - float(tob.ts) if tob else 999999.0
+                        self._write_approved_but_shadowed_row(
+                            product_id=product_id,
+                            council_action=str(locals().get("action", "")),
+                            block_reasons=block_reasons,
+                            expected_utility_bps=float(locals().get("expected_utility_bps", info.get("expected_utility_bps", 0.0)) or 0.0),
+                            candidate_notional_usd=float(locals().get("candidate_notional_usd", notional) or 0.0),
+                            top_of_book_age_sec=tob_age,
+                        )
                 except Exception:
                     pass
             else:
@@ -16773,35 +16785,6 @@ class TradingBot:
     def _get_available_base_qty_live(self, product_id: str) -> float:
         adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_available_asset(rules.base_asset)
 
-
-    def _write_approved_but_shadowed_row(self, *, product_id: str, council_action: str, block_reasons: List[str], expected_utility_bps: float = 0.0, candidate_notional_usd: float = 0.0, top_of_book_age_sec: float = 0.0) -> None:
-        try:
-            path = APPROVED_BUT_SHADOWED_CSV_PATH
-            columns = ["ts", "dt_mst", "product_id", "symbol", "quote_asset", "product_gate_approved", "council_action", "expected_utility_bps", "candidate_notional_usd", "top_of_book_age_sec", "block_reasons", "next_best_action"]
-            self._ensure_csv_header(path, columns)
-            gate_ok, _gate_reason = self._four_pass_product_live_buy_allowed(product_id)
-            if not gate_ok:
-                return
-            adapter = self._active_adapter()
-            symbol = adapter.product_to_symbol(product_id)
-            quote_asset = adapter.quote_asset_for_product(product_id)
-            if any("expected_utility_too_low" in str(x) for x in block_reasons):
-                next_best_action = "lower_threshold_review_or_wait_for_higher_ev"
-            elif any("accepted_above_value_chase" in str(x) for x in block_reasons):
-                next_best_action = "wait_for_retest_not_market_chase"
-            elif any("low_volume_node" in str(x) for x in block_reasons):
-                next_best_action = "wait_for_acceptance_or_liquidity_confirmation"
-            elif any("top_of_book_stale" in str(x) for x in block_reasons):
-                next_best_action = "refresh_book_then_recheck"
-            else:
-                next_best_action = "review_final_gate_alignment"
-            ts_val = now_ts()
-            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
-            row = {"ts": ts_val, "dt_mst": dt_mst, "product_id": product_id, "symbol": symbol, "quote_asset": quote_asset, "product_gate_approved": 1, "council_action": council_action, "expected_utility_bps": float(expected_utility_bps or 0.0), "candidate_notional_usd": float(candidate_notional_usd or 0.0), "top_of_book_age_sec": float(top_of_book_age_sec or 0.0), "block_reasons": ";".join(str(x) for x in block_reasons), "next_best_action": next_best_action}
-            with open(path, "a", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=columns).writerow(row)
-        except Exception:
-            pass
 
     def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = False) -> ExchangeOrderResult:
         return self._active_adapter().place_market_buy(product_id, float(quote_usd))

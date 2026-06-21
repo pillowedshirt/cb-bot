@@ -205,19 +205,8 @@ def _extract_outcome_bps(frame: pd.DataFrame, source_name: str) -> pd.Series:
             index=frame.index,
         )
 
-    proxy_allowed_sources = {
-        "candidate_replay_proxy",
-        "historical_shadow_replay",
-        "fifth_pass_live_style_replay",
-    }
-
-    if source_name in proxy_allowed_sources:
-        for col in ["expected_net_edge_bps", "ev_at_entry"]:
-            if col in frame.columns:
-                return _numeric(frame, col, 0.0)
-
-    # If no outcome exists, return NaN so the row is dropped instead of silently
-    # becoming a fake zero-outcome row.
+    # Do not use prediction fields like expected_net_edge_bps or ev_at_entry
+    # as proof of outcome. If a row has no actual forward/result field, drop it.
     return pd.Series([np.nan] * len(frame), index=frame.index)
 
 

@@ -51,7 +51,7 @@ class BaseExchangeAdapter:
 import time, uuid
 from binance_us_client import BinanceUSClient
 from binance_symbol_filters import parse_symbol_rules, quantity_from_quote, format_price, format_quantity, order_meets_minimums
-from exchange_catalog import product_to_execution_symbol, execution_symbol_to_product, EXCHANGE_BINANCE_US
+from exchange_catalog import product_to_execution_symbol, execution_symbol_to_product, get_symbol_map, EXCHANGE_BINANCE_US
 try:
     from debug_tools import module_debug, module_exception
 except Exception:
@@ -65,11 +65,86 @@ load_dotenv(ENV_PATH, override=True)
 class BinanceUSAdapter(BaseExchangeAdapter):
     exchange_id=EXCHANGE_BINANCE_US
     def __init__(self, *, dry_run: Optional[bool]=None, allow_real_orders: Optional[bool]=None):
-        self.client = BinanceUSClient(); self.client.sync_time(); self.dry_run = False; self.allow_real_orders = True; self.symbol_rules_cache = {}; self.fee_cache = {}
+        self.client = BinanceUSClient()
+        self.client.sync_time()
+        self.dry_run = False
+        self.allow_real_orders = True
+        self.symbol_rules_cache = {}
+        self.fee_cache = {}
+        self.symbol_exists_cache = {}
+        self.product_symbol_cache = {}
+        self.preferred_quote_asset = os.getenv("BINANCE_US_PREFERRED_QUOTE_ASSET", "USD").strip().upper()
+        self.quote_asset_priority = [
+            x.strip().upper()
+            for x in os.getenv("BINANCE_US_QUOTE_ASSET_PRIORITY", "USD,USDT,USDC").split(",")
+            if x.strip()
+        ]
+
+    def _symbol_exists(self, symbol: str) -> bool:
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            return False
+        if symbol in self.symbol_exists_cache:
+            return bool(self.symbol_exists_cache[symbol])
+        try:
+            info = self.client.exchange_info(symbol=symbol)
+            exists = bool(info.get("symbols"))
+            self.symbol_exists_cache[symbol] = exists
+            return exists
+        except Exception:
+            self.symbol_exists_cache[symbol] = False
+            return False
+
+    def _quote_asset_from_symbol(self, symbol: str) -> str:
+        symbol = str(symbol or "").strip().upper()
+        if symbol.endswith("USDT"):
+            return "USDT"
+        if symbol.endswith("USDC"):
+            return "USDC"
+        if symbol.endswith("USD"):
+            return "USD"
+        return ""
+
+    def quote_asset_for_product(self, product_id: str) -> str:
+        symbol = self.product_to_symbol(product_id)
+        quote = self._quote_asset_from_symbol(symbol)
+        return quote or self.preferred_quote_asset or "USD"
+
+    def _candidate_symbols_for_product(self, product_id: str) -> List[str]:
+        product_id = str(product_id or "").strip().upper()
+        mapping = get_symbol_map(product_id)
+        if not mapping:
+            return []
+        candidates = []
+        by_quote = {
+            "USD": getattr(mapping, "binance_us_symbol_usd", None),
+            "USDT": getattr(mapping, "binance_us_symbol_usdt", None) or mapping.binance_us_symbol or mapping.binance_symbol,
+        }
+        for quote in self.quote_asset_priority:
+            symbol = by_quote.get(str(quote).upper())
+            if symbol and symbol not in candidates:
+                candidates.append(symbol)
+        for symbol in [getattr(mapping, "binance_us_symbol_usd", None), getattr(mapping, "binance_us_symbol_usdt", None), mapping.binance_us_symbol, mapping.binance_symbol]:
+            if symbol and symbol not in candidates:
+                candidates.append(symbol)
+        return [str(x).upper() for x in candidates if x]
+
     def product_to_symbol(self, product_id):
-        symbol=product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
-        if not symbol: raise RuntimeError(f"No Binance.US symbol mapping for {product_id}")
-        return symbol
+        product_id = str(product_id or "").strip().upper()
+        if product_id in self.product_symbol_cache:
+            return self.product_symbol_cache[product_id]
+        candidates = self._candidate_symbols_for_product(product_id)
+        for symbol in candidates:
+            if self._symbol_exists(symbol):
+                self.product_symbol_cache[product_id] = symbol
+                if module_debug:
+                    module_debug("exchange_adapters", "binance_symbol_selected", data={"product_id": product_id, "symbol": symbol, "quote_asset": self._quote_asset_from_symbol(symbol), "candidates": candidates}, level="INFO", also_overall=True)
+                return symbol
+        symbol = product_to_execution_symbol(product_id, exchange=EXCHANGE_BINANCE_US)
+        if not symbol:
+            raise RuntimeError(f"No Binance.US symbol mapping for {product_id}")
+        self.product_symbol_cache[product_id] = str(symbol).upper()
+        return self.product_symbol_cache[product_id]
     def symbol_to_product(self, symbol): return execution_symbol_to_product(symbol, exchange=EXCHANGE_BINANCE_US) or symbol
     def symbol_rules(self, symbol):
         symbol=str(symbol).upper()
@@ -80,13 +155,40 @@ class BinanceUSAdapter(BaseExchangeAdapter):
         return self.symbol_rules_cache[symbol]
     def get_account_snapshot(self): return self.client.account()
     def balances_by_asset(self):
-        out={}
-        for b in self.client.account().get("balances", []):
-            asset=str(b.get("asset") or ""); free=float(b.get("free") or 0.0); locked=float(b.get("locked") or 0.0)
-            if asset: out[asset]={"free":free,"locked":locked,"total":free+locked}
+        out = {}
+        account = self.client.account()
+        for b in account.get("balances", []):
+            asset = str(b.get("asset") or "").strip().upper()
+            try:
+                free = float(b.get("free") or 0.0)
+            except Exception:
+                free = 0.0
+            try:
+                locked = float(b.get("locked") or 0.0)
+            except Exception:
+                locked = 0.0
+            if asset:
+                out[asset] = {"free": free, "locked": locked, "total": free + locked}
+        if module_debug:
+            quote_debug = {asset: out.get(asset, {"free": 0.0, "locked": 0.0, "total": 0.0}) for asset in ["USD", "USDT", "USDC"]}
+            module_debug("exchange_adapters", "binance_quote_balance_snapshot", data=quote_debug, level="INFO", also_overall=True)
         return out
     def get_available_asset(self, asset): return float(self.balances_by_asset().get(str(asset).upper(), {}).get("free", 0.0))
     def get_total_asset(self, asset): return float(self.balances_by_asset().get(str(asset).upper(), {}).get("total", 0.0))
+    def get_available_quote_asset(self, quote_asset: str) -> float:
+        return self.get_available_asset(str(quote_asset).upper())
+    def get_total_quote_asset(self, quote_asset: str) -> float:
+        return self.get_total_asset(str(quote_asset).upper())
+    def get_available_quote_for_product(self, product_id: str) -> float:
+        return self.get_available_quote_asset(self.quote_asset_for_product(product_id))
+    def get_total_quote_for_product(self, product_id: str) -> float:
+        return self.get_total_quote_asset(self.quote_asset_for_product(product_id))
+    def get_total_tradable_quote_cash(self) -> float:
+        balances = self.balances_by_asset()
+        total = 0.0
+        for asset in self.quote_asset_priority:
+            total += float(balances.get(asset, {}).get("free", 0.0) or 0.0)
+        return float(total)
     def get_top_of_book(self, product_id):
         symbol=self.product_to_symbol(product_id); raw=self.client.book_ticker(symbol=symbol); bid=float(raw.get("bidPrice") or 0.0); ask=float(raw.get("askPrice") or 0.0); mid=(bid+ask)/2 if bid>0 and ask>0 else 0.0
         return {"exchange":self.exchange_id,"product_id":product_id,"symbol":symbol,"bid":bid,"ask":ask,"mid":mid,"spread_bps":((ask-bid)/mid*10000 if mid>0 else 0.0),"bid_qty":float(raw.get("bidQty") or 0.0),"ask_qty":float(raw.get("askQty") or 0.0),"ts":time.time(),"raw":raw}

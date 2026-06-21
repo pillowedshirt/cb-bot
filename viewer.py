@@ -489,6 +489,30 @@ div[data-testid="stButton"] button:focus {
     line-height: 1.35;
     opacity: 0.88;
 }
+.quant-panel-card {
+    border: 1px solid rgba(140, 180, 255, 0.22);
+    border-radius: 18px;
+    padding: 1rem;
+    background: linear-gradient(135deg, rgba(20, 30, 55, 0.70), rgba(10, 15, 30, 0.82));
+    box-shadow: 0 0 24px rgba(90, 130, 255, 0.08);
+}
+
+.quant-mini-title {
+    font-size: 0.88rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 0.76;
+    margin-bottom: 0.35rem;
+}
+
+.quant-callout {
+    border-left: 3px solid rgba(140, 180, 255, 0.55);
+    padding: 0.75rem 1rem;
+    border-radius: 12px;
+    background: rgba(140, 180, 255, 0.06);
+    margin: 0.75rem 0;
+}
+
 </style>
     """, unsafe_allow_html=True)
 
@@ -933,7 +957,7 @@ def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
             "micro_progress": float(micro_progress),
             "historical_candle_progress": float(historical_candle_progress),
             "historical_replay_progress": float(historical_replay_progress),
-            "calibration_verdict_progress": 0.0,
+            "calibration_verdict_progress": 0.0,  # filled after derived verdict progress is calculated
             "overall_product_progress": float(
                 (micro_progress * 0.15)
                 + (historical_candle_progress * 0.20)
@@ -943,12 +967,20 @@ def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
 
     product_count = max(1, len(product_ids))
 
+    derived_verdict_progress = _viewer_derived_verdict_progress(product_ids)
+
+    for row in product_status.values():
+        if bool(row.get("complete")):
+            row["calibration_verdict_progress"] = float(derived_verdict_progress)
+        else:
+            row["calibration_verdict_progress"] = 0.0
+
     phase_progress = {
         "live_data": 1.0 if ((snapshot or {}).get("updated_ts") or os.path.exists(MARKET_CSV_PATH)) else 0.0,
         "micro_backlog": sum(v["micro_progress"] for v in product_status.values()) / product_count,
         "historical_candle_backlog": sum(v["historical_candle_progress"] for v in product_status.values()) / product_count,
         "historical_replay": sum(v["historical_replay_progress"] for v in product_status.values()) / product_count,
-        "replay_calibration_verdicts": 0.0,
+        "replay_calibration_verdicts": float(derived_verdict_progress),
     }
 
     overall_progress = (
@@ -980,16 +1012,22 @@ def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
 
     worker_manifest = _viewer_manifest_progress(manifest)
 
+    synthesized_complete = bool(
+        len(product_ids) > 0
+        and all(bool(v.get("complete")) for v in product_status.values())
+        and float(derived_verdict_progress) >= 1.0
+    )
+
     return {
         "ts": now_value,
         "calculation_started_ts": float(calculation_started_ts),
         "calculation_elapsed_sec": float(elapsed_sec),
-        "full_viewer_unlocked": False,
-        "calculation_work_complete": False,
-        "calculation_complete_latched": False,
+        "full_viewer_unlocked": bool(synthesized_complete),
+        "calculation_work_complete": bool(synthesized_complete),
+        "calculation_complete_latched": bool(synthesized_complete),
         "overall_progress": float(max(0.0, min(1.0, overall_progress))),
         "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))),
-        "phase_label": phase_label,
+        "phase_label": "Complete" if synthesized_complete else phase_label,
         "phase_progress": phase_progress,
         "product_count": int(len(product_ids)),
         "complete_products": int(sum(1 for v in product_status.values() if v.get("complete"))),
@@ -1002,6 +1040,8 @@ def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
         "policy": (snapshot or {}).get("readiness", {}),
         "viewer_status_source": "synthesized_from_csvs_and_manifest",
         "viewer_status_reason": "calculation_status.json was missing or stale, so viewer calculated progress from existing runtime files",
+        "viewer_synthesized_complete": bool(synthesized_complete),
+        "viewer_derived_verdict_progress": float(derived_verdict_progress),
     }
 
 
@@ -1032,9 +1072,9 @@ def load_calculation_status(snapshot: dict | None = None) -> dict:
         try:
             status_ts = float(status.get("ts", 0.0) or 0.0)
             if status_ts > 0 and time.time() - status_ts <= 15.0:
-                return status
+                return _stabilize_calculation_status_for_viewer(status)
         except Exception:
-            return status
+            return _stabilize_calculation_status_for_viewer(status)
 
     # Only synthesize fallback progress when there is no completed latch/status.
     synthesized = _synthesize_calculation_status_for_viewer(snapshot or load_viewer_snapshot())
@@ -1048,7 +1088,7 @@ def load_calculation_status(snapshot: dict | None = None) -> dict:
     else:
         synthesized["bot_calculation_status_missing"] = True
 
-    return synthesized
+    return _stabilize_calculation_status_for_viewer(synthesized)
 
 
 def dataframe_latest_age_sec(frame: pd.DataFrame) -> float:
@@ -1059,6 +1099,95 @@ def dataframe_latest_age_sec(frame: pd.DataFrame) -> float:
     except Exception:
         return 999999.0
 
+
+
+def _as_numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if frame is None or frame.empty or column not in frame.columns:
+        return pd.Series([], dtype="float64")
+    return pd.to_numeric(frame[column], errors="coerce").fillna(default)
+
+
+def _safe_bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    if frame is None or frame.empty or column not in frame.columns:
+        return pd.Series([], dtype="bool")
+    return frame[column].astype(str).str.lower().isin({"true", "1", "yes", "y"})
+
+
+def _viewer_csv_has_meaningful_rows(path: str, min_rows: int = 1) -> bool:
+    try:
+        frame = load_csv_tail(path, max_lines=max(10, int(min_rows) + 5))
+        return bool(frame is not None and not frame.empty and len(frame) >= int(min_rows))
+    except Exception:
+        return False
+
+
+def _viewer_csv_product_coverage(path: str, product_ids: list[str]) -> float:
+    try:
+        if not product_ids:
+            return 0.0
+        frame = load_csv_tail(path, max_lines=20000)
+        if frame is None or frame.empty or "product_id" not in frame.columns:
+            return 0.0
+        products_seen = set(frame["product_id"].dropna().astype(str).tolist())
+        wanted = set(str(x) for x in product_ids if str(x))
+        if not wanted:
+            return 0.0
+        return len(products_seen & wanted) / max(1, len(wanted))
+    except Exception:
+        return 0.0
+
+
+def _viewer_derived_verdict_progress(product_ids: list[str]) -> float:
+    checks = [
+        _viewer_csv_has_meaningful_rows(FOUR_PASS_PRODUCT_LIVE_GATE_PATH, min_rows=1),
+        _viewer_csv_has_meaningful_rows(FIFTH_PASS_LIVE_STYLE_SUMMARY_PATH, min_rows=1),
+        _viewer_csv_has_meaningful_rows(RISK_LIVE_GATE_PATH, min_rows=1),
+        _viewer_csv_has_meaningful_rows(RISK_EV_CONFIDENCE_PATH, min_rows=1),
+    ]
+    quant_checks = [
+        _viewer_csv_has_meaningful_rows(FEATURE_OUTCOME_CORRELATION_PATH, min_rows=1),
+        _viewer_csv_has_meaningful_rows(MARKOV_REGIME_POLICY_PATH, min_rows=1),
+        _viewer_csv_has_meaningful_rows(KALMAN_FILTER_POLICY_PATH, min_rows=1),
+    ]
+    core_progress = sum(1.0 for x in checks if x) / max(1, len(checks))
+    quant_progress = sum(1.0 for x in quant_checks if x) / max(1, len(quant_checks))
+    return float(max(0.0, min(1.0, core_progress * 0.80 + quant_progress * 0.20)))
+
+
+def _stabilize_calculation_status_for_viewer(status: dict) -> dict:
+    if not isinstance(status, dict):
+        return {}
+    out = dict(status)
+    run_key = str(out.get("calculation_started_ts") or out.get("startup_run_id") or out.get("dt_mst") or "unknown_startup_run")
+    previous_key = st.session_state.get("_startup_progress_run_key")
+    if previous_key != run_key:
+        st.session_state["_startup_progress_run_key"] = run_key
+        st.session_state["_startup_progress_max"] = 0.0
+    try:
+        current_progress = float(out.get("overall_progress", 0.0) or 0.0)
+    except Exception:
+        current_progress = 0.0
+    current_progress = max(0.0, min(1.0, current_progress))
+    previous_max = float(st.session_state.get("_startup_progress_max", 0.0) or 0.0)
+    stabilized = max(previous_max, current_progress)
+    st.session_state["_startup_progress_max"] = stabilized
+    out["overall_progress"] = float(stabilized)
+    out["overall_progress_pct"] = float(stabilized * 100.0)
+    if stabilized > current_progress + 0.001:
+        out["viewer_progress_stabilized"] = True
+        out["viewer_progress_stabilized_reason"] = f"viewer kept progress from regressing during startup; raw={current_progress:.3f};stabilized={stabilized:.3f}"
+    if _status_is_startup_complete(out):
+        return _normalize_completed_calculation_status(out, source=str(out.get("viewer_status_source", "completed_status")))
+    return out
+
+
+def _quant_fig_layout(fig: go.Figure, title: str = "", height: int = 320) -> go.Figure:
+    fig.update_layout(title=title, height=height, margin=dict(l=20, r=20, t=55 if title else 25, b=25), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(size=12), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    return fig
+
+
+def _empty_quant_chart(message: str) -> None:
+    st.info(message)
 
 def format_age(age_sec: float) -> str:
     age_sec = max(0.0, float(age_sec or 0.0))
@@ -2473,6 +2602,17 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
         unsafe_allow_html=True,
     )
     st.progress(progress)
+    if calc_status.get("viewer_progress_stabilized"):
+        st.caption(str(calc_status.get("viewer_progress_stabilized_reason", "")))
+
+    if calc_status.get("viewer_derived_verdict_progress") is not None:
+        st.caption(
+            f"Derived verdict progress: "
+            f"{float(calc_status.get('viewer_derived_verdict_progress', 0.0) or 0.0) * 100.0:.1f}%"
+        )
+
+    if calc_status.get("viewer_synthesized_complete"):
+        st.success("Runtime files indicate startup calculations are complete. Viewer is unlocking from synthesized status.")
     status_ts = float(calc_status.get("ts", 0.0) or 0.0)
     age_sec = max(0.0, time.time() - status_ts) if status_ts > 0 else 0.0
     status_source = str(calc_status.get("viewer_status_source") or "calculation_status.json")
@@ -3116,24 +3256,99 @@ def render_risk_intelligence_panel(
     risk_context_df,
 ):
     st.markdown("### Risk Intelligence")
+
     if risk_live_gate_df is None or risk_live_gate_df.empty:
         st.info("Risk intelligence has not produced live-gate rows yet.")
         return
-    live_cols = [c for c in ["dt_utc", "product_id", "sample_count", "ev_mean_bps", "ev_ci_low_bps", "prob_ev_positive", "p95_max_drawdown_pct_30d", "prob_loss_7d", "prob_drawdown_gt_3pct_30d", "risk_grade", "live_allowed", "size_multiplier", "reason"] if c in risk_live_gate_df.columns]
-    st.markdown("#### Product Live Risk Gate")
-    st.dataframe(risk_live_gate_df.tail(50)[live_cols], width="stretch", hide_index=True)
+
+    latest_gate = risk_live_gate_df.copy()
+    if "ts" in latest_gate.columns:
+        latest_gate["ts"] = pd.to_numeric(latest_gate["ts"], errors="coerce").fillna(0.0)
+        latest_gate = latest_gate.sort_values("ts")
+    if "product_id" in latest_gate.columns:
+        latest_gate = latest_gate.groupby("product_id", as_index=False).tail(1)
+
+    latest_gate["live_allowed_bool"] = _safe_bool_series(latest_gate, "live_allowed")
+    latest_gate["size_multiplier_num"] = _as_numeric_series(latest_gate, "size_multiplier", 0.0)
+    latest_gate["ev_mean_num"] = _as_numeric_series(latest_gate, "ev_mean_bps", 0.0)
+    latest_gate["ev_ci_low_num"] = _as_numeric_series(latest_gate, "ev_ci_low_bps", 0.0)
+    latest_gate["prob_ev_positive_num"] = _as_numeric_series(latest_gate, "prob_ev_positive", 0.0)
+    latest_gate["p95_dd_num"] = _as_numeric_series(latest_gate, "p95_max_drawdown_pct_30d", 0.0)
+
+    allowed_count = int(latest_gate["live_allowed_bool"].sum())
+    blocked_count = int(len(latest_gate) - allowed_count)
+    avg_size = float(latest_gate["size_multiplier_num"].mean()) if len(latest_gate) else 0.0
+    avg_prob_ev = float(latest_gate["prob_ev_positive_num"].mean()) if len(latest_gate) else 0.0
+
+    cols = st.columns(4)
+    cols[0].metric("Risk-approved products", allowed_count)
+    cols[1].metric("Risk-blocked products", blocked_count)
+    cols[2].metric("Avg size multiplier", f"{avg_size:.2f}x")
+    cols[3].metric("Avg P(EV > 0)", f"{avg_prob_ev * 100.0:.1f}%")
+
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        if "product_id" in latest_gate.columns:
+            fig = go.Figure()
+            fig.add_bar(x=latest_gate["product_id"].astype(str), y=latest_gate["size_multiplier_num"], name="Size multiplier", text=latest_gate["risk_grade"].astype(str) if "risk_grade" in latest_gate.columns else None, hovertemplate="Product=%{x}<br>Size=%{y:.2f}x<extra></extra>")
+            fig.update_yaxes(title="Multiplier", range=[0, max(1.1, float(latest_gate["size_multiplier_num"].max() or 1.0) * 1.15)])
+            st.plotly_chart(_quant_fig_layout(fig, "Live Risk Gate Size Permission"), width="stretch")
+        else:
+            _empty_quant_chart("Risk live-gate rows do not include product_id.")
+    with chart_cols[1]:
+        if "product_id" in latest_gate.columns:
+            fig = go.Figure()
+            fig.add_bar(x=latest_gate["product_id"].astype(str), y=latest_gate["prob_ev_positive_num"] * 100.0, name="P(EV > 0)", hovertemplate="Product=%{x}<br>P(EV>0)=%{y:.1f}%<extra></extra>")
+            fig.add_scatter(x=latest_gate["product_id"].astype(str), y=latest_gate["p95_dd_num"], name="30D p95 drawdown %", mode="lines+markers", yaxis="y2", hovertemplate="Product=%{x}<br>p95 drawdown=%{y:.2f}%<extra></extra>")
+            fig.update_layout(yaxis=dict(title="P(EV > 0) %"), yaxis2=dict(title="p95 drawdown %", overlaying="y", side="right"))
+            st.plotly_chart(_quant_fig_layout(fig, "EV Confidence vs Drawdown Risk"), width="stretch")
+
     if risk_ev_confidence_df is not None and not risk_ev_confidence_df.empty:
-        ev_cols = [c for c in ["dt_utc", "scope", "product_id", "market_regime", "sample_count", "ev_mean_bps", "ev_ci_low_bps", "ev_ci_high_bps", "prob_ev_positive", "confidence_grade", "recommended_action", "size_multiplier"] if c in risk_ev_confidence_df.columns]
-        st.markdown("#### Bootstrapped EV Confidence")
-        st.dataframe(risk_ev_confidence_df.tail(80)[ev_cols], width="stretch", hide_index=True)
+        ev = risk_ev_confidence_df.copy()
+        ev = ev[ev.get("product_id", "").astype(str) != "ALL"] if "product_id" in ev.columns else ev
+        if "ts" in ev.columns:
+            ev["ts"] = pd.to_numeric(ev["ts"], errors="coerce").fillna(0.0); ev = ev.sort_values("ts")
+        if "product_id" in ev.columns:
+            ev = ev.groupby("product_id", as_index=False).tail(1)
+        for col in ["ev_mean_bps", "ev_ci_low_bps", "ev_ci_high_bps"]:
+            if col in ev.columns: ev[col] = pd.to_numeric(ev[col], errors="coerce").fillna(0.0)
+        if {"product_id", "ev_mean_bps", "ev_ci_low_bps", "ev_ci_high_bps"}.issubset(ev.columns):
+            fig = go.Figure()
+            fig.add_scatter(x=ev["product_id"].astype(str), y=ev["ev_mean_bps"], mode="markers", name="EV mean bps", error_y=dict(type="data", symmetric=False, array=(ev["ev_ci_high_bps"] - ev["ev_mean_bps"]).clip(lower=0.0), arrayminus=(ev["ev_mean_bps"] - ev["ev_ci_low_bps"]).clip(lower=0.0)), hovertemplate="Product=%{x}<br>EV=%{y:.2f} bps<extra></extra>")
+            fig.add_hline(y=0.0)
+            st.plotly_chart(_quant_fig_layout(fig, "Bootstrapped EV Confidence Intervals"), width="stretch")
+
     if risk_monte_carlo_df is not None and not risk_monte_carlo_df.empty:
-        mc_cols = [c for c in ["dt_utc", "scope", "product_id", "horizon_days", "trials", "median_return_pct", "p05_return_pct", "p95_return_pct", "prob_loss", "p95_max_drawdown_pct", "prob_drawdown_gt_3pct", "prob_drawdown_gt_5pct", "risk_grade"] if c in risk_monte_carlo_df.columns]
-        st.markdown("#### Monte Carlo Path Risk")
-        st.dataframe(risk_monte_carlo_df.tail(100)[mc_cols], width="stretch", hide_index=True)
+        mc = risk_monte_carlo_df.copy()
+        for col in ["horizon_days", "median_return_pct", "p05_return_pct", "p95_return_pct", "prob_loss", "p95_max_drawdown_pct"]:
+            if col in mc.columns: mc[col] = pd.to_numeric(mc[col], errors="coerce").fillna(0.0)
+        mc = mc[mc.get("product_id", "").astype(str) != "ALL"] if "product_id" in mc.columns else mc
+        if {"product_id", "horizon_days", "median_return_pct"}.issubset(mc.columns):
+            if "ts" in mc.columns:
+                mc["ts"] = pd.to_numeric(mc["ts"], errors="coerce").fillna(0.0); mc = mc.sort_values("ts")
+            mc_latest = mc.groupby(["product_id", "horizon_days"], as_index=False).tail(1)
+            fig = go.Figure()
+            for product_id, group in mc_latest.groupby("product_id"):
+                fig.add_scatter(x=group["horizon_days"], y=group["median_return_pct"], mode="lines+markers", name=str(product_id), hovertemplate="Horizon=%{x}d<br>Median return=%{y:.2f}%<extra></extra>")
+            st.plotly_chart(_quant_fig_layout(fig, "Monte Carlo Median Return by Horizon"), width="stretch")
+
     if risk_context_df is not None and not risk_context_df.empty:
-        ctx_cols = [c for c in ["dt_utc", "product_id", "market_regime", "context_key", "sample_count", "raw_win_rate", "ev_mean_bps", "ev_ci_low_bps", "prob_ev_positive", "context_grade", "context_live_allowed", "context_size_multiplier", "reason"] if c in risk_context_df.columns]
-        st.markdown("#### Context/Regime Risk")
-        st.dataframe(risk_context_df.tail(100)[ctx_cols], width="stretch", hide_index=True)
+        ctx = risk_context_df.copy()
+        for col in ["ev_mean_bps", "ev_ci_low_bps", "prob_ev_positive", "sample_count"]:
+            if col in ctx.columns: ctx[col] = pd.to_numeric(ctx[col], errors="coerce").fillna(0.0)
+        if {"product_id", "market_regime", "ev_mean_bps", "prob_ev_positive"}.issubset(ctx.columns):
+            ctx_tail = ctx.tail(300)
+            fig = go.Figure()
+            fig.add_scatter(x=ctx_tail["prob_ev_positive"] * 100.0, y=ctx_tail["ev_mean_bps"], mode="markers", text=ctx_tail["product_id"].astype(str) + " / " + ctx_tail["market_regime"].astype(str), marker=dict(size=(ctx_tail["sample_count"].clip(lower=1.0) ** 0.5) + 5), hovertemplate="%{text}<br>P(EV>0)=%{x:.1f}%<br>EV=%{y:.2f} bps<extra></extra>", name="Context edge")
+            fig.add_hline(y=0.0); fig.update_xaxes(title="P(EV > 0) %"); fig.update_yaxes(title="EV mean bps")
+            st.plotly_chart(_quant_fig_layout(fig, "Context / Regime Edge Map"), width="stretch")
+
+    with st.expander("Risk intelligence tables", expanded=False):
+        live_cols = [c for c in ["dt_utc", "product_id", "sample_count", "ev_mean_bps", "ev_ci_low_bps", "prob_ev_positive", "p95_max_drawdown_pct_30d", "prob_loss_7d", "prob_drawdown_gt_3pct_30d", "risk_grade", "live_allowed", "size_multiplier", "reason"] if c in risk_live_gate_df.columns]
+        st.markdown("#### Product Live Risk Gate"); st.dataframe(risk_live_gate_df.tail(50)[live_cols], width="stretch", hide_index=True)
+        for title, df in [("Bootstrapped EV Confidence", risk_ev_confidence_df), ("Monte Carlo Path Risk", risk_monte_carlo_df), ("Context/Regime Risk", risk_context_df)]:
+            if df is not None and not df.empty:
+                st.markdown(f"#### {title}"); st.dataframe(df.tail(100), width="stretch", hide_index=True)
 
 def render_active_quant_state_panel(
     feature_corr_df,
@@ -3145,33 +3360,122 @@ def render_active_quant_state_panel(
     quant_state_summary_df,
 ):
     st.markdown("### Active Quant State Engine")
-    if quant_state_summary_df is not None and not quant_state_summary_df.empty:
-        st.markdown("#### Quant State Summary")
-        st.dataframe(quant_state_summary_df.tail(50), width="stretch", hide_index=True)
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Feature rows", 0 if feature_corr_df is None else len(feature_corr_df))
+    summary_cols[1].metric("Markov policy rows", 0 if markov_policy_df is None else len(markov_policy_df))
+    summary_cols[2].metric("Kalman live rows", 0 if kalman_live_df is None else len(kalman_live_df))
+    summary_cols[3].metric("Quant summary rows", 0 if quant_state_summary_df is None else len(quant_state_summary_df))
+
     if feature_corr_df is not None and not feature_corr_df.empty:
-        cols = [c for c in ["dt_utc", "scope", "product_id", "feature_name", "sample_count", "feature_mean", "feature_std", "outcome_corr", "feature_weight", "reliability", "edge_direction", "live_enabled", "reason"] if c in feature_corr_df.columns]
-        st.markdown("#### Active Covariance / Correlation Feature Edge")
-        st.dataframe(feature_corr_df.tail(150)[cols], width="stretch", hide_index=True)
+        fc = feature_corr_df.copy()
+        for col in ["outcome_corr", "abs_corr", "feature_weight", "reliability", "sample_count"]:
+            if col in fc.columns: fc[col] = pd.to_numeric(fc[col], errors="coerce").fillna(0.0)
+        fc_live = fc[fc.get("live_enabled", True).astype(str).str.lower().isin({"true", "1", "yes", "y"})] if "live_enabled" in fc.columns else fc
+        fc_ranked = fc_live.sort_values("abs_corr", ascending=False).head(25) if "abs_corr" in fc_live.columns else fc_live.tail(25)
+        if {"feature_name", "outcome_corr"}.issubset(fc_ranked.columns):
+            fig = go.Figure(); fig.add_bar(x=fc_ranked["outcome_corr"], y=fc_ranked["product_id"].astype(str) + " · " + fc_ranked["feature_name"].astype(str), orientation="h", name="Outcome correlation", hovertemplate="%{y}<br>corr=%{x:.3f}<extra></extra>"); fig.add_vline(x=0.0); fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(_quant_fig_layout(fig, "Strongest Active Feature ↔ Outcome Correlations", height=520), width="stretch")
+
     if feature_matrix_df is not None and not feature_matrix_df.empty:
-        cols = [c for c in ["dt_utc", "scope", "product_id", "feature_a", "feature_b", "sample_count", "correlation", "redundant_pair", "reason"] if c in feature_matrix_df.columns]
-        st.markdown("#### Feature Correlation Matrix")
-        st.dataframe(feature_matrix_df.tail(150)[cols], width="stretch", hide_index=True)
+        fm = feature_matrix_df.copy()
+        if {"feature_a", "feature_b", "correlation"}.issubset(fm.columns):
+            fm["correlation"] = pd.to_numeric(fm["correlation"], errors="coerce").fillna(0.0)
+            pivot = fm.tail(500).pivot_table(index="feature_a", columns="feature_b", values="correlation", aggfunc="mean")
+            if not pivot.empty:
+                fig = go.Figure(data=go.Heatmap(z=pivot.values, x=[str(x) for x in pivot.columns], y=[str(y) for y in pivot.index], zmin=-1.0, zmax=1.0, colorbar=dict(title="corr"), hovertemplate="A=%{y}<br>B=%{x}<br>corr=%{z:.3f}<extra></extra>"))
+                st.plotly_chart(_quant_fig_layout(fig, "Feature Correlation Matrix Heatmap", height=580), width="stretch")
+
     if markov_policy_df is not None and not markov_policy_df.empty:
-        cols = [c for c in ["dt_utc", "scope", "product_id", "current_regime", "sample_count", "negative_next_probability", "high_vol_next_probability", "continuation_probability", "steady_state_negative_probability", "markov_grade", "live_allowed", "size_multiplier", "reason"] if c in markov_policy_df.columns]
-        st.markdown("#### Active Markov Regime Policy")
-        st.dataframe(markov_policy_df.tail(150)[cols], width="stretch", hide_index=True)
+        mp = markov_policy_df.copy()
+        for col in ["negative_next_probability", "high_vol_next_probability", "continuation_probability", "steady_state_negative_probability", "size_multiplier", "sample_count"]:
+            if col in mp.columns: mp[col] = pd.to_numeric(mp[col], errors="coerce").fillna(0.0)
+        if {"product_id", "current_regime", "negative_next_probability", "high_vol_next_probability"}.issubset(mp.columns):
+            if "ts" in mp.columns:
+                mp["ts"] = pd.to_numeric(mp["ts"], errors="coerce").fillna(0.0); mp = mp.sort_values("ts")
+            mp_latest = mp.groupby(["product_id", "current_regime"], as_index=False).tail(1)
+            fig = go.Figure(); fig.add_scatter(x=mp_latest["negative_next_probability"] * 100.0, y=mp_latest["high_vol_next_probability"] * 100.0, mode="markers+text", text=mp_latest["product_id"].astype(str), marker=dict(size=(mp_latest["sample_count"].clip(lower=1.0) ** 0.5) + 7), hovertemplate="Product=%{text}<br>Negative next=%{x:.1f}%<br>High-vol next=%{y:.1f}%<extra></extra>", name="Regime transition risk")
+            fig.update_xaxes(title="Negative next-regime probability %"); fig.update_yaxes(title="High-vol next-regime probability %")
+            st.plotly_chart(_quant_fig_layout(fig, "Markov Regime Transition Risk Map"), width="stretch")
+
     if markov_transitions_df is not None and not markov_transitions_df.empty:
-        cols = [c for c in ["dt_utc", "scope", "product_id", "from_regime", "to_regime", "transition_count", "transition_probability", "reason"] if c in markov_transitions_df.columns]
-        st.markdown("#### Markov Regime Transitions")
-        st.dataframe(markov_transitions_df.tail(150)[cols], width="stretch", hide_index=True)
-    if kalman_policy_df is not None and not kalman_policy_df.empty:
-        cols = [c for c in ["dt_utc", "scope", "product_id", "sample_count", "median_abs_return_bps", "measurement_noise_bps", "process_noise_bps", "kalman_enabled", "reason"] if c in kalman_policy_df.columns]
-        st.markdown("#### Kalman Filter Policy")
-        st.dataframe(kalman_policy_df.tail(100)[cols], width="stretch", hide_index=True)
+        mt = markov_transitions_df.copy()
+        if {"from_regime", "to_regime", "transition_probability"}.issubset(mt.columns):
+            mt["transition_probability"] = pd.to_numeric(mt["transition_probability"], errors="coerce").fillna(0.0)
+            pivot = mt.tail(500).pivot_table(index="from_regime", columns="to_regime", values="transition_probability", aggfunc="mean")
+            if not pivot.empty:
+                fig = go.Figure(data=go.Heatmap(z=pivot.values, x=[str(x) for x in pivot.columns], y=[str(y) for y in pivot.index], zmin=0.0, zmax=1.0, colorbar=dict(title="prob"), hovertemplate="From=%{y}<br>To=%{x}<br>prob=%{z:.3f}<extra></extra>"))
+                st.plotly_chart(_quant_fig_layout(fig, "Markov Transition Matrix"), width="stretch")
+
     if kalman_live_df is not None and not kalman_live_df.empty:
-        cols = [c for c in ["dt_mst", "product_id", "observed_price", "filtered_price", "velocity_price_per_min", "slope_bps_per_min", "residual_bps", "kalman_gain", "measurement_noise_bps", "process_noise_bps", "size_multiplier", "live_allowed", "reason"] if c in kalman_live_df.columns]
-        st.markdown("#### Live Kalman State")
-        st.dataframe(kalman_live_df.tail(150)[cols], width="stretch", hide_index=True)
+        kl = kalman_live_df.copy()
+        for col in ["observed_price", "filtered_price", "slope_bps_per_min", "residual_bps", "kalman_gain", "size_multiplier"]:
+            if col in kl.columns: kl[col] = pd.to_numeric(kl[col], errors="coerce").fillna(0.0)
+        if "ts" in kl.columns:
+            kl["ts"] = pd.to_numeric(kl["ts"], errors="coerce").fillna(0.0); kl = kl.sort_values("ts")
+        elif "dt_mst" in kl.columns: kl = kl.sort_values("dt_mst")
+        product_ids = kl["product_id"].dropna().astype(str).unique().tolist() if "product_id" in kl.columns else []
+        selected_kalman_product = st.selectbox("Kalman product view", product_ids, index=0, key="kalman_product_view") if product_ids else None
+        if selected_kalman_product:
+            kprod = kl[kl["product_id"].astype(str) == str(selected_kalman_product)].tail(300); x_axis = kprod["dt_mst"].astype(str) if "dt_mst" in kprod.columns else list(range(len(kprod)))
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Scatter(x=x_axis, y=kprod["observed_price"], mode="lines", name="Observed", hovertemplate="Observed=%{y:.8f}<extra></extra>"), secondary_y=False)
+            fig.add_trace(go.Scatter(x=x_axis, y=kprod["filtered_price"], mode="lines", name="Kalman filtered", hovertemplate="Filtered=%{y:.8f}<extra></extra>"), secondary_y=False)
+            fig.add_trace(go.Scatter(x=x_axis, y=kprod["slope_bps_per_min"], mode="lines", name="Slope bps/min", hovertemplate="Slope=%{y:.2f} bps/min<extra></extra>"), secondary_y=True)
+            fig.update_yaxes(title_text="Price", secondary_y=False); fig.update_yaxes(title_text="Slope bps/min", secondary_y=True)
+            st.plotly_chart(_quant_fig_layout(fig, f"Kalman Filter State · {selected_kalman_product}", height=460), width="stretch")
+            fig2 = go.Figure(); fig2.add_scatter(x=x_axis, y=kprod["residual_bps"], mode="lines", name="Residual bps", hovertemplate="Residual=%{y:.2f} bps<extra></extra>"); fig2.add_scatter(x=x_axis, y=kprod["size_multiplier"], mode="lines", name="Kalman size multiplier", yaxis="y2", hovertemplate="Multiplier=%{y:.2f}x<extra></extra>"); fig2.update_layout(yaxis=dict(title="Residual bps"), yaxis2=dict(title="Size multiplier", overlaying="y", side="right"))
+            st.plotly_chart(_quant_fig_layout(fig2, f"Kalman Residual + Sizing · {selected_kalman_product}", height=360), width="stretch")
+
+    if kalman_policy_df is not None and not kalman_policy_df.empty:
+        kp = kalman_policy_df.copy()
+        for col in ["measurement_noise_bps", "process_noise_bps", "median_abs_return_bps"]:
+            if col in kp.columns: kp[col] = pd.to_numeric(kp[col], errors="coerce").fillna(0.0)
+        if {"product_id", "measurement_noise_bps", "process_noise_bps"}.issubset(kp.columns):
+            if "ts" in kp.columns:
+                kp["ts"] = pd.to_numeric(kp["ts"], errors="coerce").fillna(0.0); kp = kp.sort_values("ts")
+            kp_latest = kp.groupby("product_id", as_index=False).tail(1)
+            fig = go.Figure(); fig.add_bar(x=kp_latest["product_id"].astype(str), y=kp_latest["measurement_noise_bps"], name="Measurement noise bps"); fig.add_bar(x=kp_latest["product_id"].astype(str), y=kp_latest["process_noise_bps"], name="Process noise bps"); fig.update_layout(barmode="group")
+            st.plotly_chart(_quant_fig_layout(fig, "Kalman Noise Policy by Product"), width="stretch")
+
+    with st.expander("Active quant state tables", expanded=False):
+        for title, df in [("Quant State Summary", quant_state_summary_df), ("Active Covariance / Correlation Feature Edge", feature_corr_df), ("Feature Correlation Matrix", feature_matrix_df), ("Active Markov Regime Policy", markov_policy_df), ("Markov Regime Transitions", markov_transitions_df), ("Kalman Filter Policy", kalman_policy_df), ("Live Kalman State", kalman_live_df)]:
+            if df is not None and not df.empty:
+                st.markdown(f"#### {title}"); st.dataframe(df.tail(150), width="stretch", hide_index=True)
+
+
+def render_live_gate_visual_summary(
+    live_trade_blockers_df,
+    risk_live_gate_df,
+    feature_corr_df,
+    markov_policy_df,
+    kalman_live_df,
+):
+    st.markdown("### Live Gate Visual Summary")
+    cols = st.columns(5)
+    cols[0].metric("Blocker rows", 0 if live_trade_blockers_df is None else len(live_trade_blockers_df))
+    cols[1].metric("Risk rows", 0 if risk_live_gate_df is None else len(risk_live_gate_df))
+    cols[2].metric("Feature edge rows", 0 if feature_corr_df is None else len(feature_corr_df))
+    cols[3].metric("Markov rows", 0 if markov_policy_df is None else len(markov_policy_df))
+    cols[4].metric("Kalman rows", 0 if kalman_live_df is None else len(kalman_live_df))
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        if live_trade_blockers_df is not None and not live_trade_blockers_df.empty and "block_reasons" in live_trade_blockers_df.columns:
+            reasons = live_trade_blockers_df["block_reasons"].astype(str).str.split(";").explode().str.strip(); reasons = reasons[reasons.astype(str).str.len() > 0]; reason_counts = reasons.value_counts().head(15)
+            if not reason_counts.empty:
+                fig = go.Figure(); fig.add_bar(x=reason_counts.values, y=reason_counts.index.astype(str), orientation="h", name="Block count", hovertemplate="%{y}<br>count=%{x}<extra></extra>"); fig.update_yaxes(autorange="reversed")
+                st.plotly_chart(_quant_fig_layout(fig, "Most Common Live Block Reasons", height=480), width="stretch")
+            else: _empty_quant_chart("No parsed live blocker reasons yet.")
+        else: _empty_quant_chart("No live_trade_blockers.csv rows yet.")
+    with chart_cols[1]:
+        if risk_live_gate_df is not None and not risk_live_gate_df.empty:
+            gate = risk_live_gate_df.copy()
+            if "ts" in gate.columns:
+                gate["ts"] = pd.to_numeric(gate["ts"], errors="coerce").fillna(0.0); gate = gate.sort_values("ts")
+            if "product_id" in gate.columns: gate = gate.groupby("product_id", as_index=False).tail(1)
+            gate["live_allowed_bool"] = _safe_bool_series(gate, "live_allowed"); allowed = int(gate["live_allowed_bool"].sum()); blocked = int(len(gate) - allowed)
+            fig = go.Figure(); fig.add_pie(labels=["Risk allowed", "Risk blocked"], values=[allowed, blocked], hole=0.45)
+            st.plotly_chart(_quant_fig_layout(fig, "Risk Gate Approval Split"), width="stretch")
+        else: _empty_quant_chart("No risk live-gate rows yet.")
 
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
@@ -3248,6 +3552,14 @@ def render_live_dashboard(selected, refresh_config):
             kalman_policy_df,
             kalman_live_df,
             quant_state_summary_df,
+        )
+    with st.expander("Live gate visual summary", expanded=True):
+        render_live_gate_visual_summary(
+            live_trade_blockers_df,
+            risk_live_gate_df,
+            feature_corr_df,
+            markov_policy_df,
+            kalman_live_df,
         )
     if account_balance_diagnostics_df is not None and not account_balance_diagnostics_df.empty:
         st.markdown("### Binance Quote Balance Diagnostics")

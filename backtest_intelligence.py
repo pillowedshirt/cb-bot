@@ -11,6 +11,20 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+try:
+    from risk_intelligence import (
+        run_risk_intelligence,
+        RISK_EV_CONFIDENCE_COLUMNS,
+        RISK_MONTE_CARLO_COLUMNS,
+        RISK_CONTEXT_PERFORMANCE_COLUMNS,
+        RISK_LIVE_GATE_COLUMNS,
+    )
+except Exception:
+    run_risk_intelligence = None
+    RISK_EV_CONFIDENCE_COLUMNS = []
+    RISK_MONTE_CARLO_COLUMNS = []
+    RISK_CONTEXT_PERFORMANCE_COLUMNS = []
+    RISK_LIVE_GATE_COLUMNS = []
 
 
 try:
@@ -2639,6 +2653,26 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     ablation_rows = _agent_ablation_rows(base_dir)
     four_pass = _four_pass_backtest_outputs(base_dir)
 
+    risk_intelligence_result: Dict[str, Any] = {}
+    if run_risk_intelligence is not None:
+        try:
+            risk_intelligence_result = run_risk_intelligence(
+                base_dir=base_dir,
+                log_fn=log,
+                bootstrap_trials=2000,
+                monte_carlo_trials=5000,
+                position_size_pct=0.10,
+            )
+        except Exception as exc:
+            risk_intelligence_result = {"error": str(exc)}
+            module_exception(
+                MODULE_NAME,
+                "risk_intelligence_failed",
+                exc,
+                data={"base_dir": base_dir},
+                also_overall=True,
+            )
+
     recommendations_path = os.path.join(base_dir, "backtest_recommendations.csv")
     sell_recommendations_path = os.path.join(base_dir, "backtest_sell_recommendations.csv")
     agent_priors_path = os.path.join(base_dir, "backtest_agent_priors.csv")
@@ -2664,6 +2698,10 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     fifth_pass_summary_path = os.path.join(base_dir, "fifth_pass_live_style_summary.csv")
     fifth_pass_product_contribution_path = os.path.join(base_dir, "fifth_pass_product_contribution.csv")
     fifth_pass_blockers_path = os.path.join(base_dir, "fifth_pass_blockers.csv")
+    risk_ev_confidence_path = os.path.join(base_dir, "risk_ev_confidence.csv")
+    risk_monte_carlo_summary_path = os.path.join(base_dir, "risk_monte_carlo_summary.csv")
+    risk_context_performance_path = os.path.join(base_dir, "risk_context_performance.csv")
+    risk_live_gate_path = os.path.join(base_dir, "risk_live_gate.csv")
     summary_path = os.path.join(base_dir, "backtest_summary.csv")
 
     _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
@@ -2718,6 +2756,10 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "fifth_pass_live_style_summary_rows", len(four_pass["fifth_pass_summary_rows"]), "final live-style profitability, win rate, and trades/day"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "fifth_pass_product_contribution_rows", len(four_pass["fifth_pass_product_contribution_rows"]), "per-product contribution from final live-style replay"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "fifth_pass_blocker_rows", len(four_pass["fifth_pass_blocker_rows"]), "why candidates were excluded from final live-style replay"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "risk_ev_confidence_rows", risk_intelligence_result.get("ev_rows", 0), "bootstrapped EV confidence by product/context"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "risk_monte_carlo_rows", risk_intelligence_result.get("monte_carlo_rows", 0), "Monte Carlo path-risk distribution"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "risk_context_performance_rows", risk_intelligence_result.get("context_rows", 0), "context/regime EV confidence rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "risk_live_gate_rows", risk_intelligence_result.get("live_gate_rows", 0), "live risk gate rows"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
     ]
     _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
@@ -2725,7 +2767,12 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     log(
         f"[backtest] completed buy_recs={len(buy_rows)} sell_recs={len(sell_rows)} "
         f"agent_priors={len(agent_rows)} setup_performance={len(setup_rows)} "
-        f"walk_forward={len(walk_forward_rows)} ablation={len(ablation_rows)} seconds={time.time() - started:.2f}"
+        f"walk_forward={len(walk_forward_rows)} ablation={len(ablation_rows)} "
+        f"risk_ev={risk_intelligence_result.get('ev_rows', 0)} "
+        f"risk_mc={risk_intelligence_result.get('monte_carlo_rows', 0)} "
+        f"risk_context={risk_intelligence_result.get('context_rows', 0)} "
+        f"risk_live_gate={risk_intelligence_result.get('live_gate_rows', 0)} "
+        f"seconds={time.time() - started:.2f}"
     )
     module_debug(
         MODULE_NAME,
@@ -2782,6 +2829,10 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
             "fifth_pass_live_style_summary": fifth_pass_summary_path,
             "fifth_pass_product_contribution": fifth_pass_product_contribution_path,
             "fifth_pass_blockers": fifth_pass_blockers_path,
+            "risk_ev_confidence": risk_ev_confidence_path,
+            "risk_monte_carlo_summary": risk_monte_carlo_summary_path,
+            "risk_context_performance": risk_context_performance_path,
+            "risk_live_gate": risk_live_gate_path,
             "backtest_summary": summary_path,
         },
         "recommendations": buy_recs,

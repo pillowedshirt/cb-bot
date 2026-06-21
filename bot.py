@@ -12707,41 +12707,38 @@ class TradingBot:
             return {}
 
     def _product_is_in_cooldown(self, product_id: str) -> Tuple[bool, str]:
-        try:
-            frame = self._read_csv_tail_for_bot(PRODUCT_COOLDOWNS_CSV_PATH, max_lines=10000)
-            if frame.empty or "product_id" not in frame.columns:
-                return False, ""
-            rows = frame[frame["product_id"].astype(str).eq(str(product_id))].copy()
-            if rows.empty:
-                return False, ""
-            rows["cooldown_until_ts_num"] = pd.to_numeric(rows.get("cooldown_until_ts", 0.0), errors="coerce").fillna(0.0)
-            rows = rows.sort_values("cooldown_until_ts_num")
-            latest = rows.tail(1).iloc[0].to_dict()
-            cooldown_until = float(latest.get("cooldown_until_ts", 0.0) or 0.0)
-            if cooldown_until <= now_ts():
-                return False, ""
-            cooldown_type = str(latest.get("cooldown_type", "") or "")
-            can_escape_early = str(latest.get("can_escape_early", "1")).strip() in {"1", "true", "True", "yes", "YES"}
-            if can_escape_early:
-                return True, f"soft_product_cooldown:{cooldown_type}:{latest.get('reason', '')}"
-            return True, f"hard_product_cooldown:{cooldown_type}:{latest.get('reason', '')}"
-        except Exception:
-            return False, ""
+        """
+        Timer-based product cooldowns are retired.
+
+        A product should not be blocked just because product_cooldowns.csv says
+        a timer is active. Product eligibility is now decided by the current
+        live market setup.
+
+        Keep this function for backwards compatibility with existing call sites,
+        but never allow it to block live buying.
+        """
+        return False, ""
 
     def _four_pass_product_live_buy_allowed(self, product_id: str) -> Tuple[bool, str]:
-        in_cooldown, cooldown_reason = self._product_is_in_cooldown(product_id)
-        if in_cooldown and cooldown_reason.startswith("hard_product_cooldown"):
-            return False, cooldown_reason
+        """
+        Product gate now means:
+        - Is this product structurally approved by the latest four-pass replay?
+        - It does NOT mean "is this product off a timer cooldown?"
+
+        A product that is not structurally approved can still become eligible
+        later through the current live market setup override.
+        """
         gate = self._latest_product_live_gate(product_id)
         if not gate:
             return False, "missing_four_pass_product_live_gate"
+
         approved = str(gate.get("approved_for_live_buy", "0")).strip()
         is_approved = approved in {"1", "true", "True", "yes", "YES"}
+
         if is_approved:
             return True, str(gate.get("gate_reason", "four_pass_product_gate_approved"))
-        if in_cooldown and cooldown_reason.startswith("soft_product_cooldown"):
-            return False, cooldown_reason
-        return False, str(gate.get("gate_reason", "four_pass_product_gate_blocked"))
+
+        return False, str(gate.get("gate_reason", "four_pass_product_gate_not_live_eligible"))
 
     def _infer_live_market_regime_from_signal(self, signal: Any = None, product_id: str = "") -> Dict[str, Any]:
         try:
@@ -13407,6 +13404,117 @@ class TradingBot:
             ),
         }
 
+    def _blocked_product_live_setup_is_favorable(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        level8_info: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Market-condition eligibility gate.
+
+        This replaces timer-based cooldown behavior.
+
+        If a product is not approved by the product-level replay gate, it can
+        still become live-eligible immediately when the current market setup is
+        exceptionally favorable.
+
+        This is intentionally stricter than normal approved-product buying.
+        """
+        try:
+            product_id = str(candidate.get("product_id") or candidate.get("symbol") or "")
+
+            def f(name: str, default: float = 0.0) -> float:
+                try:
+                    return float(candidate.get(name, default) or default)
+                except Exception:
+                    return float(default)
+
+            def lf(name: str, default: float) -> float:
+                try:
+                    return float(globals().get(name, default))
+                except Exception:
+                    return float(default)
+
+            spread_bps = f("spread_bps", 9999.0)
+            expected_utility_bps = f("expected_utility_bps", 0.0)
+            maker_adjusted_ev_bps = f("maker_adjusted_expected_value_bps", 0.0)
+            calibrated_p_win = f("calibrated_p_win", 0.50)
+            payoff_ratio = f("payoff_ratio", 0.0)
+            buy_vs_wait_edge_bps = f("buy_vs_wait_edge_bps", 0.0)
+            maker_fill_probability = f("maker_fill_probability", 0.0)
+
+            value_acceptance_state = str(candidate.get("value_acceptance_state", "") or "").lower()
+            volume_node_state = str(candidate.get("volume_node_state", "") or "").lower()
+            poc_distance_bps = f("poc_distance_bps", 9999.0)
+            volume_profile_wait_score = f("volume_profile_leader_wait_score", 0.50)
+
+            final_buy = float(level8_info.get("final_buy_score", 0.0) or 0.0)
+            threshold = float(level8_info.get("buy_threshold", 0.0) or 0.0)
+            truth = float(level8_info.get("truth_score", 0.0) or 0.0)
+            margin = final_buy - threshold
+
+            max_spread = min(lf("PROFITABILITY_MAX_STRICT_SPREAD_BPS", 25.0), 18.0)
+            min_expected_utility = max(
+                lf("PROFIT_FIRST_MIN_EXPECTED_UTILITY_BPS", 60.0),
+                lf("PROFITABILITY_MIN_EXPECTED_UTILITY_BPS", 60.0),
+                85.0,
+            )
+            min_maker_ev = max(lf("PROFIT_FIRST_MIN_MAKER_ADJUSTED_EV_BPS", 10.0), 18.0)
+            min_p_win = max(lf("PROFIT_FIRST_MIN_CALIBRATED_P_WIN", 0.58), 0.64)
+            min_payoff = max(lf("PROFIT_FIRST_MIN_PAYOFF_RATIO", 0.85), 0.95)
+            min_buy_vs_wait = max(
+                lf("PROFIT_FIRST_BUY_MUST_BEAT_WAIT_BY_BPS", 10.0),
+                lf("PROFITABILITY_MIN_BUY_VS_WAIT_EDGE_BPS", 10.0),
+                18.0,
+            )
+            min_truth = max(lf("PROFITABILITY_MIN_TRUTH_FOR_LIVE_BUY", 0.60), 0.68)
+            min_margin = max(lf("PROFITABILITY_MIN_MARGIN_FOR_LIVE_BUY", 0.02), 0.04)
+            min_maker_fill = lf("UTILITY_MIN_MAKER_FILL_PROBABILITY", 0.15)
+
+            if spread_bps > max_spread:
+                return False, f"market_not_favorable:spread_too_wide spread={spread_bps:.2f};max={max_spread:.2f}"
+            if calibrated_p_win < min_p_win:
+                return False, f"market_not_favorable:p_win_too_low p_win={calibrated_p_win:.3f};min={min_p_win:.3f}"
+            if payoff_ratio < min_payoff:
+                return False, f"market_not_favorable:payoff_too_low payoff={payoff_ratio:.3f};min={min_payoff:.3f}"
+            if expected_utility_bps < min_expected_utility:
+                return False, f"market_not_favorable:expected_utility_too_low utility={expected_utility_bps:.2f};min={min_expected_utility:.2f}"
+            if maker_adjusted_ev_bps < min_maker_ev:
+                return False, f"market_not_favorable:maker_ev_too_low maker_ev={maker_adjusted_ev_bps:.2f};min={min_maker_ev:.2f}"
+            if buy_vs_wait_edge_bps < min_buy_vs_wait:
+                return False, f"market_not_favorable:buy_does_not_beat_wait buy_vs_wait={buy_vs_wait_edge_bps:.2f};min={min_buy_vs_wait:.2f}"
+            if maker_fill_probability < min_maker_fill:
+                return False, f"market_not_favorable:maker_fill_probability_too_low fill={maker_fill_probability:.3f};min={min_maker_fill:.3f}"
+            if truth < min_truth:
+                return False, f"market_not_favorable:council_truth_too_low truth={truth:.3f};min={min_truth:.3f}"
+            if margin < min_margin:
+                return False, f"market_not_favorable:council_margin_too_low margin={margin:.3f};min={min_margin:.3f}"
+            if volume_node_state == "low_volume_node":
+                return False, f"market_not_favorable:low_volume_node product={product_id}"
+            if value_acceptance_state == "accepted_above_value":
+                return False, f"market_not_favorable:accepted_above_value_chase product={product_id}"
+            if (
+                value_acceptance_state in {"inside_fair_value", "inside_value_near_poc"}
+                and poc_distance_bps <= 20.0
+                and volume_profile_wait_score >= 0.58
+            ):
+                return False, (
+                    f"market_not_favorable:inside_value_or_poc_chop "
+                    f"product={product_id};poc_distance={poc_distance_bps:.2f};"
+                    f"wait_score={volume_profile_wait_score:.3f}"
+                )
+
+            return True, (
+                f"market_favorable_override "
+                f"product={product_id};spread={spread_bps:.2f};"
+                f"p_win={calibrated_p_win:.3f};payoff={payoff_ratio:.3f};"
+                f"utility={expected_utility_bps:.2f};maker_ev={maker_adjusted_ev_bps:.2f};"
+                f"buy_vs_wait={buy_vs_wait_edge_bps:.2f};truth={truth:.3f};margin={margin:.3f}"
+            )
+        except Exception as exc:
+            return False, f"market_not_favorable:error={exc}"
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -13450,28 +13558,18 @@ class TradingBot:
                     return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age:.2f}")
             product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
             if not product_gate_ok:
-                near_miss_allowed = False
-                try:
-                    gate = self._latest_product_live_gate(product_id)
-                    if gate:
-                        win_rate = float(gate.get("buy_win_rate", 0.0) or 0.0)
-                        avg_net = float(gate.get("buy_avg_net_bps", 0.0) or 0.0)
-                        median_net = float(gate.get("buy_median_net_bps", 0.0) or 0.0)
-                        selected_count = float(gate.get("buy_selected_count", 0.0) or 0.0)
-                        near_miss_allowed = (
-                            bool(NEAR_MISS_EXPLORATION_ENABLED)
-                            and selected_count >= 15
-                            and win_rate >= 0.58
-                            and avg_net > 0.0
-                            and median_net > 0.0
-                            and float(candidate.get("expected_utility_bps", 0.0) or 0.0) >= float(NEAR_MISS_MIN_EXPECTED_UTILITY_BPS)
-                        )
-                except Exception:
-                    near_miss_allowed = False
-                if near_miss_allowed:
+                live_setup_ok, live_setup_reason = self._blocked_product_live_setup_is_favorable(
+                    candidate=candidate,
+                    level8_info=level8_info,
+                )
+
+                candidate["market_eligibility_reason"] = live_setup_reason
+
+                if live_setup_ok:
+                    candidate["market_eligibility_override"] = True
                     candidate["near_miss_exploratory_size"] = True
                 else:
-                    return False, f"live_buy_blocked:{product_gate_reason}"
+                    return False, f"live_buy_blocked:product_not_currently_favorable {product_gate_reason};{live_setup_reason}"
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
@@ -13513,13 +13611,19 @@ class TradingBot:
                                     if four_pass_ok:
                                         product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
                                         if not product_gate_ok:
-                                            four_pass_ok = False
+                                            live_setup_ok, live_setup_reason = self._blocked_product_live_setup_is_favorable(
+                                                candidate=candidate,
+                                                level8_info=level8_info,
+                                            )
+                                            candidate["market_eligibility_reason"] = live_setup_reason
+                                            candidate["market_eligibility_override"] = bool(live_setup_ok)
+                                            four_pass_ok = bool(live_setup_ok)
                     except Exception:
                         four_pass_ok = False
                     if not four_pass_ok:
                         return False, (
-                            f"live_buy_blocked:no_weighted_all_agent_council_profitability_approval "
-                            f"{replay_gate.get('reason', '')}"
+                            f"live_buy_blocked:product_not_currently_favorable "
+                            f"{candidate.get('market_eligibility_reason', replay_gate.get('reason', ''))}"
                         )
             if bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY):
                 calc_status = self._calculation_status()

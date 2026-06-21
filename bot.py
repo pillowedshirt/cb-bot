@@ -618,6 +618,7 @@ ORDER_BOOK_SNAPSHOTS_CSV_PATH: str = os.path.join(BASE_DIR, "order_book_snapshot
 ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
 ACCOUNT_BALANCE_DIAGNOSTICS_CSV_PATH: str = os.path.join(BASE_DIR, "account_balance_diagnostics.csv")
 LIVE_TRADE_BLOCKERS_CSV_PATH: str = os.path.join(BASE_DIR, "live_trade_blockers.csv")
+APPROVED_BUT_SHADOWED_CSV_PATH: str = os.path.join(BASE_DIR, "approved_but_shadowed.csv")
 
 RUNTIME_CSV_ROW_LIMITS = {
     "market.csv": 15000,
@@ -640,6 +641,7 @@ RUNTIME_CSV_ROW_LIMITS = {
     "product_cooldowns.csv": 10000,
     "account_balance_diagnostics.csv": 10000,
     "live_trade_blockers.csv": 50000,
+    "approved_but_shadowed.csv": 50000,
 }
 
 SHADOW_SELL_REPLAY_COLUMNS: List[str] = [
@@ -1121,6 +1123,9 @@ LEVEL5_DISABLE_INVERTED_CYCLE: bool = False
 LEVEL5_MODE: str = "DISABLED"
 LEVEL5_MIN_POSITION_PCT: float = 0.0
 LEVEL5_MAX_POSITION_PCT: float = 1.0
+NEAR_MISS_EXPLORATION_ENABLED: bool = env_bool("NEAR_MISS_EXPLORATION_ENABLED", True)
+NEAR_MISS_MAX_POSITION_PCT: float = env_float("NEAR_MISS_MAX_POSITION_PCT", 5.0)
+NEAR_MISS_MIN_EXPECTED_UTILITY_BPS: float = env_float("NEAR_MISS_MIN_EXPECTED_UTILITY_BPS", 20.0)
 
 # ============================================================
 # LEVEL 8 EVIDENCE-WEIGHTED COUNCIL
@@ -1181,6 +1186,7 @@ BACKTEST_INTELLIGENCE_FORCE_AFTER_STARTUP_COMPLETE: bool = env_bool("BACKTEST_IN
 FOUR_PASS_CACHE_WARMUP_ENABLED: bool = env_bool("FOUR_PASS_CACHE_WARMUP_ENABLED", True)
 CALCULATION_PARALLEL_PHASES_ENABLED: bool = env_bool("CALCULATION_PARALLEL_PHASES_ENABLED", True)
 STARTUP_STATUS_MIN_UPDATE_SECONDS: float = env_float("STARTUP_STATUS_MIN_UPDATE_SECONDS", 2.0)
+BACKTEST_RELOAD_MIN_SECONDS: float = env_float("BACKTEST_RELOAD_MIN_SECONDS", 60.0)
 BACKTEST_USE_PRODUCT_BUY_RECOMMENDATIONS: bool = True
 BACKTEST_USE_PRODUCT_SELL_RECOMMENDATIONS: bool = True
 
@@ -7282,6 +7288,36 @@ class TradingBot:
         except Exception:
             pass
 
+
+    def _write_approved_but_shadowed_row(self, *, product_id: str, council_action: str, block_reasons: List[str], expected_utility_bps: float = 0.0, candidate_notional_usd: float = 0.0, top_of_book_age_sec: float = 0.0) -> None:
+        try:
+            path = APPROVED_BUT_SHADOWED_CSV_PATH
+            columns = ["ts", "dt_mst", "product_id", "symbol", "quote_asset", "product_gate_approved", "council_action", "expected_utility_bps", "candidate_notional_usd", "top_of_book_age_sec", "block_reasons", "next_best_action"]
+            self._ensure_csv_header(path, columns)
+            gate_ok, _gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+            if not gate_ok:
+                return
+            adapter = self._active_adapter()
+            symbol = adapter.product_to_symbol(product_id)
+            quote_asset = adapter.quote_asset_for_product(product_id)
+            if any("expected_utility_too_low" in str(x) for x in block_reasons):
+                next_best_action = "lower_threshold_review_or_wait_for_higher_ev"
+            elif any("accepted_above_value_chase" in str(x) for x in block_reasons):
+                next_best_action = "wait_for_retest_not_market_chase"
+            elif any("low_volume_node" in str(x) for x in block_reasons):
+                next_best_action = "wait_for_acceptance_or_liquidity_confirmation"
+            elif any("top_of_book_stale" in str(x) for x in block_reasons):
+                next_best_action = "refresh_book_then_recheck"
+            else:
+                next_best_action = "review_final_gate_alignment"
+            ts_val = now_ts()
+            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            row = {"ts": ts_val, "dt_mst": dt_mst, "product_id": product_id, "symbol": symbol, "quote_asset": quote_asset, "product_gate_approved": 1, "council_action": council_action, "expected_utility_bps": float(expected_utility_bps or 0.0), "candidate_notional_usd": float(candidate_notional_usd or 0.0), "top_of_book_age_sec": float(top_of_book_age_sec or 0.0), "block_reasons": ";".join(str(x) for x in block_reasons), "next_best_action": next_best_action}
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=columns).writerow(row)
+        except Exception:
+            pass
+
     def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = False) -> ExchangeOrderResult:
         return self._active_adapter().place_market_buy(product_id, float(quote_usd))
 
@@ -11614,6 +11650,17 @@ class TradingBot:
         except Exception as exc:
             log(f"[ai] background scheduling failed: {exc}")
 
+    def _maybe_reload_backtest_background_debounced(self) -> None:
+        try:
+            now_value = now_ts()
+            last = float(getattr(self, "_last_backtest_reload_ts", 0.0) or 0.0)
+            if now_value - last < float(BACKTEST_RELOAD_MIN_SECONDS):
+                return
+            self._last_backtest_reload_ts = now_value
+            self._maybe_reload_backtest_background()
+        except Exception:
+            pass
+
     def _maybe_reload_backtest_background(self) -> None:
         try:
             ts_now = now_ts()
@@ -12671,23 +12718,30 @@ class TradingBot:
             rows = rows.sort_values("cooldown_until_ts_num")
             latest = rows.tail(1).iloc[0].to_dict()
             cooldown_until = float(latest.get("cooldown_until_ts", 0.0) or 0.0)
-            if cooldown_until > now_ts():
-                return True, str(latest.get("reason", "product_cooldown"))
-            return False, ""
+            if cooldown_until <= now_ts():
+                return False, ""
+            cooldown_type = str(latest.get("cooldown_type", "") or "")
+            can_escape_early = str(latest.get("can_escape_early", "1")).strip() in {"1", "true", "True", "yes", "YES"}
+            if can_escape_early:
+                return True, f"soft_product_cooldown:{cooldown_type}:{latest.get('reason', '')}"
+            return True, f"hard_product_cooldown:{cooldown_type}:{latest.get('reason', '')}"
         except Exception:
             return False, ""
 
     def _four_pass_product_live_buy_allowed(self, product_id: str) -> Tuple[bool, str]:
         in_cooldown, cooldown_reason = self._product_is_in_cooldown(product_id)
-        if in_cooldown:
-            return False, f"product_cooldown:{cooldown_reason}"
+        if in_cooldown and cooldown_reason.startswith("hard_product_cooldown"):
+            return False, cooldown_reason
         gate = self._latest_product_live_gate(product_id)
         if not gate:
             return False, "missing_four_pass_product_live_gate"
         approved = str(gate.get("approved_for_live_buy", "0")).strip()
-        if approved not in {"1", "true", "True", "yes", "YES"}:
-            return False, str(gate.get("gate_reason", "four_pass_product_gate_blocked"))
-        return True, str(gate.get("gate_reason", "four_pass_product_gate_approved"))
+        is_approved = approved in {"1", "true", "True", "yes", "YES"}
+        if is_approved:
+            return True, str(gate.get("gate_reason", "four_pass_product_gate_approved"))
+        if in_cooldown and cooldown_reason.startswith("soft_product_cooldown"):
+            return False, cooldown_reason
+        return False, str(gate.get("gate_reason", "four_pass_product_gate_blocked"))
 
     def _infer_live_market_regime_from_signal(self, signal: Any = None, product_id: str = "") -> Dict[str, Any]:
         try:
@@ -13396,7 +13450,28 @@ class TradingBot:
                     return False, ("live_buy_blocked:product_top_of_book_stale " f"product_id={product_id};age_sec={tob_age:.2f}")
             product_gate_ok, product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
             if not product_gate_ok:
-                return False, f"live_buy_blocked:{product_gate_reason}"
+                near_miss_allowed = False
+                try:
+                    gate = self._latest_product_live_gate(product_id)
+                    if gate:
+                        win_rate = float(gate.get("buy_win_rate", 0.0) or 0.0)
+                        avg_net = float(gate.get("buy_avg_net_bps", 0.0) or 0.0)
+                        median_net = float(gate.get("buy_median_net_bps", 0.0) or 0.0)
+                        selected_count = float(gate.get("buy_selected_count", 0.0) or 0.0)
+                        near_miss_allowed = (
+                            bool(NEAR_MISS_EXPLORATION_ENABLED)
+                            and selected_count >= 15
+                            and win_rate >= 0.58
+                            and avg_net > 0.0
+                            and median_net > 0.0
+                            and float(candidate.get("expected_utility_bps", 0.0) or 0.0) >= float(NEAR_MISS_MIN_EXPECTED_UTILITY_BPS)
+                        )
+                except Exception:
+                    near_miss_allowed = False
+                if near_miss_allowed:
+                    candidate["near_miss_exploratory_size"] = True
+                else:
+                    return False, f"live_buy_blocked:{product_gate_reason}"
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
@@ -14652,6 +14727,15 @@ class TradingBot:
         except Exception as exc:
             log(f"[level8] malformed decision for {product_id}: {exc}")
             return False, {**fallback, "reason": f"level8_malformed_decision_fail_closed:{exc}"}
+        if bool(candidate.get("near_miss_exploratory_size", False)):
+            try:
+                info["recommended_position_pct"] = min(
+                    float(info.get("recommended_position_pct", 0.0) or 0.0),
+                    float(NEAR_MISS_MAX_POSITION_PCT) / 100.0,
+                )
+                info["reason"] = f"{info.get('reason', '')};near_miss_exploratory_size"
+            except Exception:
+                pass
         self._append_level8_vote_snapshots(
             product_id=product_id,
             decision_id=info["decision_id"],
@@ -14718,7 +14802,9 @@ class TradingBot:
                     tob = self.tob.get(product_id)
                     age = None if not tob else now_ts() - float(tob.ts)
                     product_gate_ok, _product_gate_reason = self._four_pass_product_live_buy_allowed(product_id)
-                    self._write_live_trade_blocker_row(product_id=product_id, block_reasons=[str(live_quality_reason)], action=str(action), product_gate_ok=product_gate_ok, top_of_book_age_sec=age, candidate_notional_usd=float(info.get("recommended_position_pct", 0.0) or 0.0) * float(self._portfolio_value_usdt_estimate()))
+                    notional = float(info.get("recommended_position_pct", 0.0) or 0.0) * float(self._portfolio_value_usdt_estimate())
+                    self._write_live_trade_blocker_row(product_id=product_id, block_reasons=[str(live_quality_reason)], action=str(action), product_gate_ok=product_gate_ok, top_of_book_age_sec=age, candidate_notional_usd=notional)
+                    self._write_approved_but_shadowed_row(product_id=product_id, council_action=str(action), block_reasons=[str(live_quality_reason)], expected_utility_bps=float(info.get("expected_utility_bps", 0.0) or 0.0), candidate_notional_usd=notional, top_of_book_age_sec=float(age or 0.0))
                 except Exception:
                     pass
             else:
@@ -16686,6 +16772,36 @@ class TradingBot:
 
     def _get_available_base_qty_live(self, product_id: str) -> float:
         adapter = self._active_adapter(); rules = adapter.symbol_rules(adapter.product_to_symbol(product_id)); return adapter.get_available_asset(rules.base_asset)
+
+
+    def _write_approved_but_shadowed_row(self, *, product_id: str, council_action: str, block_reasons: List[str], expected_utility_bps: float = 0.0, candidate_notional_usd: float = 0.0, top_of_book_age_sec: float = 0.0) -> None:
+        try:
+            path = APPROVED_BUT_SHADOWED_CSV_PATH
+            columns = ["ts", "dt_mst", "product_id", "symbol", "quote_asset", "product_gate_approved", "council_action", "expected_utility_bps", "candidate_notional_usd", "top_of_book_age_sec", "block_reasons", "next_best_action"]
+            self._ensure_csv_header(path, columns)
+            gate_ok, _gate_reason = self._four_pass_product_live_buy_allowed(product_id)
+            if not gate_ok:
+                return
+            adapter = self._active_adapter()
+            symbol = adapter.product_to_symbol(product_id)
+            quote_asset = adapter.quote_asset_for_product(product_id)
+            if any("expected_utility_too_low" in str(x) for x in block_reasons):
+                next_best_action = "lower_threshold_review_or_wait_for_higher_ev"
+            elif any("accepted_above_value_chase" in str(x) for x in block_reasons):
+                next_best_action = "wait_for_retest_not_market_chase"
+            elif any("low_volume_node" in str(x) for x in block_reasons):
+                next_best_action = "wait_for_acceptance_or_liquidity_confirmation"
+            elif any("top_of_book_stale" in str(x) for x in block_reasons):
+                next_best_action = "refresh_book_then_recheck"
+            else:
+                next_best_action = "review_final_gate_alignment"
+            ts_val = now_ts()
+            dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            row = {"ts": ts_val, "dt_mst": dt_mst, "product_id": product_id, "symbol": symbol, "quote_asset": quote_asset, "product_gate_approved": 1, "council_action": council_action, "expected_utility_bps": float(expected_utility_bps or 0.0), "candidate_notional_usd": float(candidate_notional_usd or 0.0), "top_of_book_age_sec": float(top_of_book_age_sec or 0.0), "block_reasons": ";".join(str(x) for x in block_reasons), "next_best_action": next_best_action}
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=columns).writerow(row)
+        except Exception:
+            pass
 
     def _place_live_buy(self, product_id: str, quote_usd: float, *, maker_first: bool = False) -> ExchangeOrderResult:
         return self._active_adapter().place_market_buy(product_id, float(quote_usd))
@@ -22526,7 +22642,7 @@ class TradingBot:
             ):
                 self.last_agent_performance_update_ts = ts_now
 
-                _t = time.perf_counter(); self._maybe_reload_backtest_background(); self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["backtest_reload_scheduling"] = round(_e, 4); self._log_hot_loop_timing("backtest_reload_scheduling", _e)
+                _t = time.perf_counter(); self._maybe_reload_backtest_background_debounced(); self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["backtest_reload_scheduling"] = round(_e, 4); self._log_hot_loop_timing("backtest_reload_scheduling", _e)
 
                 try:
                     _t = time.perf_counter(); self._schedule_background_work("sell_outcome_classification", "_sell_outcome_classification_running", self._classify_level8_sell_outcomes); _e = time.perf_counter() - _t; self._last_eval_loop_section_timings["sell_outcome_classification"] = round(_e, 4); self._log_hot_loop_timing("sell_outcome_classification", _e)

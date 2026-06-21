@@ -209,7 +209,66 @@ FOUR_PASS_PRODUCT_LIVE_GATE_COLUMNS = [
 PRODUCT_COOLDOWN_COLUMNS = [
     "ts", "dt_utc",
     "product_id", "cooldown_until_ts", "cooldown_minutes",
+    "cooldown_type",
+    "can_escape_early",
     "reason",
+]
+
+AGENT_DECISION_INFLUENCE_COLUMNS = [
+    "ts", "dt_utc",
+    "agent", "side",
+    "sample_count", "selected_count",
+    "frequency_per_day",
+    "raw_win_rate", "smoothed_win_rate",
+    "avg_win_bps", "avg_loss_bps",
+    "avg_net_bps", "median_net_bps",
+    "ev_bps", "avg_adverse_bps",
+    "reliability_score", "frequency_score",
+    "edge_score", "decision_influence_score",
+    "decision_weight_pct",
+    "role",
+    "reason",
+]
+
+PRODUCT_AGENT_INFLUENCE_COLUMNS = [
+    "ts", "dt_utc",
+    "product_id", "market_regime",
+    "agent", "side",
+    "selected_count", "frequency_per_day",
+    "smoothed_win_rate", "ev_bps",
+    "avg_net_bps", "median_net_bps",
+    "decision_influence_score",
+    "decision_weight_pct",
+    "role",
+    "reason",
+]
+
+TRADE_FREQUENCY_ESTIMATE_COLUMNS = [
+    "ts", "dt_utc",
+    "scope", "product_id",
+    "dedupe_minutes",
+    "candidate_days",
+    "raw_selected_count",
+    "deduped_trade_count",
+    "estimated_trades_per_day",
+    "win_rate",
+    "avg_net_bps", "median_net_bps",
+    "avg_win_bps", "avg_loss_bps",
+    "expected_net_per_trade_bps",
+    "expected_daily_net_bps_if_all_traded",
+    "reason",
+]
+
+APPROVED_BUT_SHADOWED_COLUMNS = [
+    "ts", "dt_mst",
+    "product_id", "symbol", "quote_asset",
+    "product_gate_approved",
+    "council_action",
+    "expected_utility_bps",
+    "candidate_notional_usd",
+    "top_of_book_age_sec",
+    "block_reasons",
+    "next_best_action",
 ]
 
 FEATURE_STORE_SUMMARY_COLUMNS = [
@@ -1018,6 +1077,78 @@ def _ev_stats(values: pd.Series) -> Dict[str, float]:
     }
 
 
+
+
+def _training_days_from_frame(frame: pd.DataFrame) -> float:
+    if frame is None or frame.empty:
+        return 1.0
+    time_col = None
+    for col in ["replay_ts", "entry_ts", "ts"]:
+        if col in frame.columns:
+            time_col = col
+            break
+    if not time_col:
+        return 1.0
+    times = pd.to_numeric(frame[time_col], errors="coerce").dropna()
+    if times.empty:
+        return 1.0
+    days = float((times.max() - times.min()) / 86400.0)
+    return max(1.0, days)
+
+
+def _frequency_score(frequency_per_day: float, *, target_per_day: float = 8.0) -> float:
+    try:
+        freq = max(0.0, float(frequency_per_day))
+        target = max(1.0, float(target_per_day))
+        return max(0.05, min(1.0, math.log1p(freq) / math.log1p(target)))
+    except Exception:
+        return 0.05
+
+
+def _sample_reliability(selected_count: int, *, half_confidence_count: int = 80) -> float:
+    try:
+        n = max(0.0, float(selected_count))
+        h = max(1.0, float(half_confidence_count))
+        return max(0.05, min(1.0, 1.0 - math.exp(-n / h)))
+    except Exception:
+        return 0.05
+
+
+def _edge_score_from_stats(*, smoothed_win_rate: float, ev_bps: float, avg_net_bps: float, median_net_bps: float, avg_loss_bps: float) -> float:
+    score = (
+        0.50
+        + (float(smoothed_win_rate) - 0.50) * 0.70
+        + max(-200.0, min(300.0, float(ev_bps))) / 600.0
+        + max(-150.0, min(250.0, float(avg_net_bps))) / 900.0
+        + max(-150.0, min(250.0, float(median_net_bps))) / 1100.0
+        - max(0.0, float(avg_loss_bps) - 45.0) / 500.0
+    )
+    return max(0.03, min(0.97, float(score)))
+
+
+def _decision_influence_score(*, selected_count: int, frequency_per_day: float, smoothed_win_rate: float, ev_bps: float, avg_net_bps: float, median_net_bps: float, avg_loss_bps: float) -> Dict[str, float]:
+    reliability = _sample_reliability(selected_count)
+    frequency = _frequency_score(frequency_per_day)
+    edge = _edge_score_from_stats(smoothed_win_rate=smoothed_win_rate, ev_bps=ev_bps, avg_net_bps=avg_net_bps, median_net_bps=median_net_bps, avg_loss_bps=avg_loss_bps)
+    influence = max(0.0, edge) * (0.60 + 0.40 * reliability) * (0.45 + 0.55 * frequency)
+    return {"reliability_score": float(reliability), "frequency_score": float(frequency), "edge_score": float(edge), "decision_influence_score": float(influence)}
+
+
+def _normalize_influence_rows(rows: List[Dict[str, Any]], *, group_keys: List[str], score_key: str = "decision_influence_score", weight_key: str = "decision_weight_pct") -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = tuple(row.get(k, "") for k in group_keys)
+        grouped.setdefault(key, []).append(row)
+    out: List[Dict[str, Any]] = []
+    for group_rows in grouped.values():
+        total = max(sum(max(0.0, float(r.get(score_key, 0.0) or 0.0)) for r in group_rows), 1e-9)
+        for row in group_rows:
+            row[weight_key] = max(0.0, float(row.get(score_key, 0.0) or 0.0)) / total * 100.0
+            out.append(row)
+    return out
+
 def _infer_market_regime(frame: pd.DataFrame) -> pd.Series:
     """Creates a stable regime label using whatever columns are available."""
     if frame is None or frame.empty:
@@ -1762,7 +1893,9 @@ def _four_pass_product_live_gate_rows(
                     cooldown_minutes = 360
                 reason = f"blocked;buy_ok={buy_ok};walk_forward_ok={walk_forward_ok};sell_path_ok={sell_path_ok};selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
                 cooldown_until = float(ts_value) + float(cooldown_minutes * 60)
-                cooldown_rows.append([f"{ts_value:.6f}", dt_value, product_id, f"{cooldown_until:.6f}", int(cooldown_minutes), reason])
+                cooldown_type = "negative_ev_watch_only" if (avg_net < 0 or median_net < 0) else ("validation_wait" if not walk_forward_ok else "near_miss")
+                can_escape_early = 1
+                cooldown_rows.append([f"{ts_value:.6f}", dt_value, product_id, f"{cooldown_until:.6f}", int(cooldown_minutes), cooldown_type, int(can_escape_early), reason])
             gate_rows.append([f"{ts_value:.6f}", dt_value, product_id, int(selected_count), f"{win_rate:.6f}", f"{avg_net:.6f}", f"{median_net:.6f}", f"{score:.6f}", profitability_mode, int(wf_folds), int(positive_buy_folds), f"{wf_avg_net:.6f}", f"{wf_avg_return:.6f}", int(sell_path_rows), f"{sell_path_avg:.6f}", f"{sell_path_return:.6f}", int(1 if approved else 0), int(cooldown_minutes), reason])
         except Exception:
             continue
@@ -1891,6 +2024,71 @@ def _purged_walk_forward_rows(base_dir: str, frame: pd.DataFrame, *, side: str =
         ])
     return rows
 
+
+def _agent_decision_influence_rows(buy_agent_rows: List[List[Any]], sell_agent_rows: List[List[Any]], buy_frame: pd.DataFrame, sell_frame: pd.DataFrame) -> List[List[Any]]:
+    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); rows: List[Dict[str, Any]] = []
+    for source_rows, side, days in [(buy_agent_rows or [], "BUY", _training_days_from_frame(buy_frame)), (sell_agent_rows or [], "SELL", _training_days_from_frame(sell_frame))]:
+        for row in source_rows:
+            try:
+                agent = str(row[3]); selected_count = int(float(row[6])); frequency_per_day = float(selected_count) / max(1.0, days)
+                if side == "BUY":
+                    smoothed = float(row[8]); avg_net = float(row[9]); median_net = float(row[10]); avg_adv = float(row[11]); reason = str(row[15]); raw = smoothed; ev = avg_net; role_prefix = "buy"
+                else:
+                    smoothed = float(row[8]); avg_net = float(row[11]); median_net = avg_net; avg_adv = 0.0; reason = str(row[15]); raw = smoothed; ev = avg_net; role_prefix = "sell"
+                stats = _decision_influence_score(selected_count=selected_count, frequency_per_day=frequency_per_day, smoothed_win_rate=smoothed, ev_bps=ev, avg_net_bps=avg_net, median_net_bps=median_net, avg_loss_bps=0.0)
+                role = f"{role_prefix}_leader" if stats["decision_influence_score"] >= 0.75 else (f"{role_prefix}_support" if stats["decision_influence_score"] >= 0.55 else f"{role_prefix}_context")
+                rows.append({"agent": agent, "side": side, "sample_count": int(float(row[5])), "selected_count": selected_count, "frequency_per_day": frequency_per_day, "raw_win_rate": raw, "smoothed_win_rate": smoothed, "avg_win_bps": 0.0, "avg_loss_bps": 0.0, "avg_net_bps": avg_net, "median_net_bps": median_net, "ev_bps": ev, "avg_adverse_bps": avg_adv, "role": role, "reason": f"global_{role_prefix}_influence;{reason}", **stats})
+            except Exception:
+                continue
+    rows = _normalize_influence_rows(rows, group_keys=["side"])
+    return [[f"{ts_value:.6f}", dt_value, r["agent"], r["side"], int(r["sample_count"]), int(r["selected_count"]), f"{float(r['frequency_per_day']):.6f}", f"{float(r['raw_win_rate']):.6f}", f"{float(r['smoothed_win_rate']):.6f}", f"{float(r['avg_win_bps']):.6f}", f"{float(r['avg_loss_bps']):.6f}", f"{float(r['avg_net_bps']):.6f}", f"{float(r['median_net_bps']):.6f}", f"{float(r['ev_bps']):.6f}", f"{float(r['avg_adverse_bps']):.6f}", f"{float(r['reliability_score']):.6f}", f"{float(r['frequency_score']):.6f}", f"{float(r['edge_score']):.6f}", f"{float(r['decision_influence_score']):.6f}", f"{float(r['decision_weight_pct']):.6f}", r["role"], r["reason"]] for r in rows]
+
+
+def _product_agent_influence_rows(context_rows: List[List[Any]], buy_frame: pd.DataFrame) -> List[List[Any]]:
+    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); days = _training_days_from_frame(buy_frame); rows: List[Dict[str, Any]] = []
+    for row in context_rows or []:
+        try:
+            agent, side, product_id, market_regime = str(row[2]), str(row[3]), str(row[4]), str(row[5])
+            selected_count = int(float(row[8])); freq = float(selected_count) / max(1.0, days); smoothed = float(row[11]); ev = float(row[14]); avg_net = float(row[15]); median_net = float(row[16])
+            stats = _decision_influence_score(selected_count=selected_count, frequency_per_day=freq, smoothed_win_rate=smoothed, ev_bps=ev, avg_net_bps=avg_net, median_net_bps=median_net, avg_loss_bps=0.0)
+            role = "product_leader" if stats["decision_influence_score"] >= 0.75 else ("product_support" if stats["decision_influence_score"] >= 0.55 else "product_context")
+            rows.append({"product_id": product_id, "market_regime": market_regime, "agent": agent, "side": side, "selected_count": selected_count, "frequency_per_day": freq, "smoothed_win_rate": smoothed, "ev_bps": ev, "avg_net_bps": avg_net, "median_net_bps": median_net, "role": role, "reason": "product_context_influence;frequency_weighted", **stats})
+        except Exception:
+            continue
+    rows = _normalize_influence_rows(rows, group_keys=["side", "product_id", "market_regime"])
+    return [[f"{ts_value:.6f}", dt_value, r["product_id"], r["market_regime"], r["agent"], r["side"], int(r["selected_count"]), f"{float(r['frequency_per_day']):.6f}", f"{float(r['smoothed_win_rate']):.6f}", f"{float(r['ev_bps']):.6f}", f"{float(r['avg_net_bps']):.6f}", f"{float(r['median_net_bps']):.6f}", f"{float(r['decision_influence_score']):.6f}", f"{float(r['decision_weight_pct']):.6f}", r["role"], r["reason"]] for r in rows]
+
+
+def _estimate_trade_frequency_rows(buy_frame: pd.DataFrame, council_buy_rows: List[List[Any]]) -> List[List[Any]]:
+    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
+    if buy_frame is None or buy_frame.empty or not council_buy_rows or "product_id" not in buy_frame.columns or "buy_net_bps" not in buy_frame.columns or "four_pass_buy_council_score" not in buy_frame.columns:
+        return []
+    frame = buy_frame.copy(); time_col = next((c for c in ["replay_ts", "entry_ts", "ts"] if c in frame.columns), "ts")
+    frame["_time"] = pd.to_numeric(frame[time_col], errors="coerce"); frame["_net"] = pd.to_numeric(frame["buy_net_bps"], errors="coerce").fillna(0.0); frame = frame.dropna(subset=["_time"]).copy(); days = _training_days_from_frame(frame)
+    selected_parts = []
+    for row in council_buy_rows:
+        try:
+            pid, threshold = str(row[3]), float(row[6])
+            selected_parts.append(frame[frame["product_id"].astype(str).eq(pid) & (pd.to_numeric(frame["four_pass_buy_council_score"], errors="coerce").fillna(0.0) >= threshold)].copy())
+        except Exception:
+            pass
+    if not selected_parts: return []
+    selected_all = pd.concat(selected_parts, ignore_index=True, sort=False); rows=[]
+    def build(scope, pid, selected, dedupe):
+        if selected.empty: return
+        vals=[]; last=-1e30; gap=float(dedupe)*60.0
+        for _, rr in selected.sort_values("_time").iterrows():
+            t=float(rr["_time"])
+            if t-last >= gap: vals.append(float(rr["_net"])); last=t
+        if not vals: return
+        ser=pd.Series(vals); wins=ser[ser>0]; losses=ser[ser<=0]; avg=float(ser.mean()); trades=float(len(ser))/max(1.0,days)
+        rows.append([f"{ts_value:.6f}", dt_value, scope, pid, int(dedupe), f"{days:.6f}", int(len(selected)), int(len(ser)), f"{trades:.6f}", f"{float((ser>0).mean()):.6f}", f"{avg:.6f}", f"{float(ser.median()):.6f}", f"{float(wins.mean()) if not wins.empty else 0.0:.6f}", f"{float(abs(losses.mean())) if not losses.empty else 0.0:.6f}", f"{avg:.6f}", f"{trades*avg:.6f}", f"deduped_frequency_estimate;dedupe_minutes={dedupe}"])
+    for dedupe in [15,30,60,120]:
+        build("all_products", "ALL", selected_all, dedupe)
+        for pid, group in selected_all.groupby(selected_all["product_id"].astype(str)):
+            build("product", str(pid), group, dedupe)
+    return rows
+
 def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     buy_agent_rows, buy_weights, buy_frame, buy_context_rows = _four_pass_buy_agent_rows(base_dir)
     walk_forward_buy_rows = _purged_walk_forward_rows(base_dir, buy_frame, side="BUY")
@@ -1905,9 +2103,12 @@ def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
         sell_path_replay_rows,
     )
     final_rating_rows = _four_pass_final_agent_rating_rows(buy_agent_rows, sell_agent_rows)
+    agent_decision_influence_rows = _agent_decision_influence_rows(buy_agent_rows, sell_agent_rows, buy_frame, sell_frame)
+    product_agent_influence_rows = _product_agent_influence_rows(buy_context_rows, buy_frame)
+    trade_frequency_estimate_rows = _estimate_trade_frequency_rows(council_buy_entries, council_buy_rows)
     profitability_summary_rows = _four_pass_profitability_summary_rows(buy_agent_rows, council_buy_rows, sell_agent_rows, council_sell_rows, sell_path_replay_rows)
     feature_store_summary_rows = _feature_store_summary_rows(base_dir)
-    return {"buy_agent_rows": buy_agent_rows, "buy_weights": buy_weights, "council_buy_rows": council_buy_rows, "council_buy_entries": council_buy_entries, "sell_agent_rows": sell_agent_rows, "sell_weights": sell_weights, "council_sell_rows": council_sell_rows, "sell_path_replay_rows": sell_path_replay_rows, "purged_walk_forward_rows": walk_forward_buy_rows + walk_forward_sell_rows, "final_rating_rows": final_rating_rows, "profitability_summary_rows": profitability_summary_rows, "context_rating_rows": buy_context_rows, "feature_store_summary_rows": feature_store_summary_rows, "product_live_gate_rows": product_live_gate_rows, "product_cooldown_rows": product_cooldown_rows}
+    return {"buy_agent_rows": buy_agent_rows, "buy_weights": buy_weights, "council_buy_rows": council_buy_rows, "council_buy_entries": council_buy_entries, "sell_agent_rows": sell_agent_rows, "sell_weights": sell_weights, "council_sell_rows": council_sell_rows, "sell_path_replay_rows": sell_path_replay_rows, "purged_walk_forward_rows": walk_forward_buy_rows + walk_forward_sell_rows, "final_rating_rows": final_rating_rows, "profitability_summary_rows": profitability_summary_rows, "context_rating_rows": buy_context_rows, "feature_store_summary_rows": feature_store_summary_rows, "product_live_gate_rows": product_live_gate_rows, "product_cooldown_rows": product_cooldown_rows, "agent_decision_influence_rows": agent_decision_influence_rows, "product_agent_influence_rows": product_agent_influence_rows, "trade_frequency_estimate_rows": trade_frequency_estimate_rows}
 
 
 def _agent_ablation_rows(base_dir: str) -> List[List[Any]]:
@@ -2024,6 +2225,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     four_pass_product_live_gate_path = os.path.join(base_dir, "four_pass_product_live_gate.csv")
     product_cooldowns_path = os.path.join(base_dir, "product_cooldowns.csv")
     feature_store_summary_path = os.path.join(base_dir, "feature_store_summary.csv")
+    agent_decision_influence_path = os.path.join(base_dir, "agent_decision_influence.csv")
+    product_agent_influence_path = os.path.join(base_dir, "product_agent_influence.csv")
+    trade_frequency_estimate_path = os.path.join(base_dir, "trade_frequency_estimate.csv")
     summary_path = os.path.join(base_dir, "backtest_summary.csv")
 
     _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
@@ -2044,6 +2248,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     _write_rows(four_pass_product_live_gate_path, FOUR_PASS_PRODUCT_LIVE_GATE_COLUMNS, four_pass["product_live_gate_rows"])
     _write_rows(product_cooldowns_path, PRODUCT_COOLDOWN_COLUMNS, four_pass["product_cooldown_rows"])
     _write_rows(feature_store_summary_path, FEATURE_STORE_SUMMARY_COLUMNS, four_pass["feature_store_summary_rows"])
+    _write_rows(agent_decision_influence_path, AGENT_DECISION_INFLUENCE_COLUMNS, four_pass["agent_decision_influence_rows"])
+    _write_rows(product_agent_influence_path, PRODUCT_AGENT_INFLUENCE_COLUMNS, four_pass["product_agent_influence_rows"])
+    _write_rows(trade_frequency_estimate_path, TRADE_FREQUENCY_ESTIMATE_COLUMNS, four_pass["trade_frequency_estimate_rows"])
 
     ts_value = _utc_ts()
     summary_rows = [
@@ -2063,6 +2270,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_purged_walk_forward_rows", len(four_pass["purged_walk_forward_rows"]), "purged walk-forward validation rows"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "four_pass_product_live_gate_rows", len(four_pass["product_live_gate_rows"]), "product-level live buy approval rows"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "product_cooldown_rows", len(four_pass["product_cooldown_rows"]), "product-level cooldown rows"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "agent_decision_influence_rows", len(four_pass["agent_decision_influence_rows"]), "frequency weighted global agent decision influence"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "product_agent_influence_rows", len(four_pass["product_agent_influence_rows"]), "frequency weighted product agent decision influence"],
+        [f"{ts_value:.6f}", _utc_dt(ts_value), "trade_frequency_estimate_rows", len(four_pass["trade_frequency_estimate_rows"]), "deduped trade frequency and avg win/loss estimates"],
         [f"{ts_value:.6f}", _utc_dt(ts_value), "runtime_seconds", f"{time.time() - started:.3f}", "backtest intelligence runtime"],
     ]
     _write_rows(summary_path, BACKTEST_SUMMARY_COLUMNS, summary_rows)
@@ -2120,6 +2330,9 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
             "four_pass_product_live_gate": four_pass_product_live_gate_path,
             "product_cooldowns": product_cooldowns_path,
             "feature_store_summary": feature_store_summary_path,
+            "agent_decision_influence": agent_decision_influence_path,
+            "product_agent_influence": product_agent_influence_path,
+            "trade_frequency_estimate": trade_frequency_estimate_path,
             "backtest_summary": summary_path,
         },
         "recommendations": buy_recs,

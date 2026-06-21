@@ -1335,15 +1335,15 @@ REENTRY_REARM_BPS: float = 15.0
 FIRST_BUY_DELAY_SEC: float = 60.0
 BUY_COOLDOWN_SEC: float = 300.0
 POST_EXIT_COOLDOWN_SEC: float = 600.0
-MAX_NEW_ENTRIES_PER_EVAL: int = 1
+MAX_NEW_ENTRIES_PER_EVAL: int = 2
 EVAL_TICK_SEC: float = 5.0
 
 # Bound aggregate deployment when several candidates pass in the same cycle.
-MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY: float = 0.40
-ENABLE_MULTI_CANDIDATE_BUYS: bool = False
+MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY: float = 1.00
+ENABLE_MULTI_CANDIDATE_BUYS: bool = True
 
 # Allocation / exposure
-MAX_OPEN_POSITIONS: int = 20
+MAX_OPEN_POSITIONS: int = 3
 
 # Minimum Coinbase order size guard.
 # This is a bot-side minimum. Coinbase may still enforce product-specific minimums.
@@ -1359,8 +1359,8 @@ USE_EQUITY_PERCENT_POSITION_SIZING: bool = True
 
 # A single new buy can be 5%–20% of total account equity.
 # Total equity means cash + positions valued using live mids.
-MIN_POSITION_PCT_OF_EQUITY: float = 0.05
-MAX_SINGLE_BUY_PCT_OF_EQUITY: float = 0.20
+MIN_POSITION_PCT_OF_EQUITY: float = 0.50
+MAX_SINGLE_BUY_PCT_OF_EQUITY: float = 1.00
 
 # ============================================================
 # LEVEL 5 TRADING MANAGER — REMOVED FROM DECISION CHAIN
@@ -1580,7 +1580,7 @@ LEVEL8_MIN_NET_AFTER_EXIT_BPS_TO_SELL: float = 8.0
 PROFIT_LOCK_ARM_NET_AFTER_EXIT_BPS: float = 5.0
 PROFIT_LOCK_MIN_PEAK_UNREALIZED_BPS: float = 10.0
 PROFIT_LOCK_PULLBACK_FROM_PEAK_BPS: float = 4.0
-PROFIT_LOCK_SELL_FRACTION: float = 1.0
+PROFIT_LOCK_SELL_FRACTION: float = 0.25
 
 # Strong green giveback protection.
 PROFIT_GIVEBACK_EXIT_MIN_NET_BPS: float = 3.0
@@ -1608,30 +1608,53 @@ LEVEL8_PEAK_CAPTURE_FULL_EXIT_PULLBACK_BPS: float = 240.0
 LEVEL8_STRONG_CONTINUATION_MOM3_BPS: float = 10.0
 LEVEL8_STRONG_CONTINUATION_PULLBACK_MAX_BPS: float = 35.0
 
+# ============================================================
+# ADAPTIVE WAVE-RIDING / SELL CAPTURE SYSTEM
+# ============================================================
+
+ENABLE_ADAPTIVE_WAVE_EXIT: bool = True
+ADAPTIVE_BREAKEVEN_MIN_HOLD_SEC: float = 60.0
+ADAPTIVE_BREAKEVEN_MIN_PEAK_FLOOR_BPS: float = 18.0
+ADAPTIVE_BREAKEVEN_EXPECTED_MOVE_FRACTION: float = 0.22
+ADAPTIVE_BREAKEVEN_NOISE_MULT: float = 0.75
+ADAPTIVE_BREAKEVEN_SPREAD_MULT: float = 2.0
+ADAPTIVE_FLOOR_CONFIRMATION_TICKS: int = 2
+ADAPTIVE_FLOOR_MIN_BREACH_BPS: float = 2.0
+ADAPTIVE_TRAIL_EARLY_CAPTURE_FRACTION: float = 0.25
+ADAPTIVE_TRAIL_MID_CAPTURE_FRACTION: float = 0.45
+ADAPTIVE_TRAIL_LATE_CAPTURE_FRACTION: float = 0.65
+ADAPTIVE_PARTIAL_HARVEST_MIN_FRACTION: float = 0.25
+ADAPTIVE_PARTIAL_HARVEST_MID_FRACTION: float = 0.35
+ADAPTIVE_PARTIAL_HARVEST_HIGH_FRACTION: float = 0.50
+ADAPTIVE_MIN_EXPECTED_FAVORABLE_BPS: float = 35.0
+ADAPTIVE_DEFAULT_EXPECTED_FAVORABLE_BPS: float = 75.0
+ADAPTIVE_MAX_EXPECTED_FAVORABLE_BPS: float = 250.0
+ADAPTIVE_SELL_QUALITY_MIN_ACCEPTABLE_CAPTURE: float = 0.35
+
 # Small-account protection:
 # If a partial sell is below Coinbase's minimum order value, bot.py raises the
 # fraction enough to create a valid sell order, or sells the whole position if needed.
 LEVEL8_MIN_SELL_NOTIONAL_USD: float = MIN_LIVE_ORDER_USD
 
 # Only hard spending ceiling: max 80% deployed, 20% reserve.
-LEVEL8_RESERVE_CASH_PCT: float = 0.20
-LEVEL8_MAX_SINGLE_TRADE_PCT: float = 0.20
-LEVEL8_MAX_PRODUCT_EXPOSURE_PCT: float = 0.35
-LEVEL8_MAX_TOTAL_EXPOSURE_PCT: float = 0.65
+LEVEL8_RESERVE_CASH_PCT: float = 0.00
+LEVEL8_MAX_SINGLE_TRADE_PCT: float = 1.00
+LEVEL8_MAX_PRODUCT_EXPOSURE_PCT: float = 1.00
+LEVEL8_MAX_TOTAL_EXPOSURE_PCT: float = 1.00
 
 # Graduated live sizing:
 # Level 8 may recommend large allocations, but bot.py caps live size until
 # completed SELL outcomes prove the product and the whole bot have enough history.
-LEVEL8_GRADUATED_LIVE_SIZING: bool = True
+LEVEL8_GRADUATED_LIVE_SIZING: bool = False
 LEVEL8_PRODUCT_YOUNG_HISTORY_SELLS: int = 3
 LEVEL8_PRODUCT_MODERATE_HISTORY_SELLS: int = 10
 LEVEL8_GLOBAL_EARLY_HISTORY_SELLS: int = 10
 LEVEL8_GLOBAL_MODERATE_HISTORY_SELLS: int = 30
-LEVEL8_YOUNG_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.06
-LEVEL8_MODERATE_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.12
-LEVEL8_PROVEN_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.20
-LEVEL8_GLOBAL_EARLY_LIVE_SIZE_CAP_PCT: float = 0.08
-LEVEL8_GLOBAL_MODERATE_LIVE_SIZE_CAP_PCT: float = 0.16
+LEVEL8_YOUNG_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.50
+LEVEL8_MODERATE_PRODUCT_LIVE_SIZE_CAP_PCT: float = 0.75
+LEVEL8_PROVEN_PRODUCT_LIVE_SIZE_CAP_PCT: float = 1.00
+LEVEL8_GLOBAL_EARLY_LIVE_SIZE_CAP_PCT: float = 0.50
+LEVEL8_GLOBAL_MODERATE_LIVE_SIZE_CAP_PCT: float = 0.75
 
 LEVEL8_MIN_TEST_TRADE_USD: float = MIN_LIVE_ORDER_USD
 LEVEL8_SUPERSEDES_LEVEL5: bool = True
@@ -1776,7 +1799,7 @@ HIST_REPLAY_MIN_EXPECTED_EDGE_BPS_FOR_CALIBRATION: float = -25.0
 HIST_REPLAY_BLOCK_NEAR_POC_CHOP: bool = True
 HIST_REPLAY_MAX_POC_DISTANCE_FOR_CHOP_BPS: float = 18.0
 REQUIRE_HISTORICAL_REPLAY_CALIBRATION_FOR_LIVE_BUY: bool = False
-ENABLE_REPLAY_SUPPORT_LIVE_BUY_GATE: bool = True
+ENABLE_REPLAY_SUPPORT_LIVE_BUY_GATE: bool = False
 REPLAY_SUPPORT_MIN_ROWS: int = 50
 REPLAY_SUPPORT_MIN_AVG_NET_BPS: float = 10.0
 REPLAY_SUPPORT_MIN_WIN_RATE: float = 0.35
@@ -1797,7 +1820,7 @@ STRONG_UTILITY_OVERRIDE_MIN_BPS: float = 175.0
 HIST_REPLAY_RECENCY_HALFLIFE_DAYS: float = 30.0
 
 # Max total exposure per product can reach 80% of total equity through scale-ins.
-MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 0.80
+MAX_EXPOSURE_PER_PRODUCT_PCT_OF_EQUITY: float = 1.00
 
 # Probability mapping for aggressive Level 8 learning-mode sizing.
 PROB_FOR_MIN_SIZE: float = 0.25
@@ -2329,7 +2352,7 @@ BUY_ARMED_SIGNAL_STALE_SEC: float = 300.0
 # Profit lock and stale-position review.
 ENABLE_PROFIT_LOCK: bool = True
 PROFIT_LOCK_BUFFER_BPS: float = 2.0
-PROFIT_LOCK_SELL_FRACTION: float = 1.0
+PROFIT_LOCK_SELL_FRACTION: float = 0.25
 ENABLE_STALE_POSITION_REVIEW: bool = True
 STALE_POSITION_MIN_SCORE_TO_KEEP: float = 35.0
 STALE_POSITION_MIN_PROB_TO_KEEP: float = 0.45
@@ -4846,6 +4869,15 @@ class PositionTargetsLogger:
         "inverted_target_sell_price",
         "inverted_next_loss_trigger_price",
         "inverted_rebuy_count",
+        "adaptive_expected_favorable_bps",
+        "adaptive_progress_to_expected",
+        "adaptive_protection_armed",
+        "adaptive_floor_unrealized_bps",
+        "adaptive_floor_breached",
+        "adaptive_floor_exit_confirmed",
+        "adaptive_dynamic_pullback_bps",
+        "adaptive_strong_continuation",
+        "adaptive_harvest_fraction",
         "exit_plan_note",
     ]
 
@@ -4894,6 +4926,15 @@ class PositionTargetsLogger:
                     "" if r.get("inverted_target_sell_price") is None else f"{float(r.get('inverted_target_sell_price')):.10f}",
                     "" if r.get("inverted_next_loss_trigger_price") is None else f"{float(r.get('inverted_next_loss_trigger_price')):.10f}",
                     int(r.get("inverted_rebuy_count", 0) or 0),
+                    f"{float(r.get('adaptive_expected_favorable_bps', 0.0) or 0.0):.6f}",
+                    f"{float(r.get('adaptive_progress_to_expected', 0.0) or 0.0):.6f}",
+                    bool(r.get("adaptive_protection_armed", False)),
+                    f"{float(r.get('adaptive_floor_unrealized_bps', 0.0) or 0.0):.6f}",
+                    bool(r.get("adaptive_floor_breached", False)),
+                    bool(r.get("adaptive_floor_exit_confirmed", False)),
+                    f"{float(r.get('adaptive_dynamic_pullback_bps', 0.0) or 0.0):.6f}",
+                    bool(r.get("adaptive_strong_continuation", False)),
+                    f"{float(r.get('adaptive_harvest_fraction', 0.0) or 0.0):.6f}",
                     r.get("exit_plan_note", ""),
                 ])
         for attempt in range(5):
@@ -10769,23 +10810,19 @@ class TradingBot:
         )
 
     def _position_pct_from_probability(self, estimated_prob_up: float) -> float:
-        """Convert a positive, buy-ready probability into an equity allocation."""
+        """Convert an approved buy probability into a high-conviction allocation."""
         p = clamp_float(float(estimated_prob_up), 0.0, 1.0)
-
         if p <= 0.0:
             return 0.0
-
-        # The entry gate decides whether a signal is tradable. A passing signal
-        # below the preferred sizing range still receives the minimum allocation.
-        if p <= float(PROB_FOR_MIN_SIZE):
-            return float(MIN_POSITION_PCT_OF_EQUITY)
-
-        span = max(1e-9, float(PROB_FOR_MAX_SIZE) - float(PROB_FOR_MIN_SIZE))
-        t = clamp_float((p - float(PROB_FOR_MIN_SIZE)) / span, 0.0, 1.0)
-        return float(MIN_POSITION_PCT_OF_EQUITY) + t * (
-            float(MAX_SINGLE_BUY_PCT_OF_EQUITY)
-            - float(MIN_POSITION_PCT_OF_EQUITY)
-        )
+        min_pct = float(MIN_POSITION_PCT_OF_EQUITY)
+        max_pct = float(MAX_SINGLE_BUY_PCT_OF_EQUITY)
+        p_min = 0.52
+        p_max = 0.82
+        if p <= p_min:
+            return min_pct
+        span = max(1e-9, p_max - p_min)
+        t = clamp_float((p - p_min) / span, 0.0, 1.0)
+        return clamp_float(min_pct + t * (max_pct - min_pct), min_pct, max_pct)
 
     def _micro_trending_down(self, product_id: str) -> Tuple[bool, str]:
         series = self.live_1m.get(product_id)
@@ -15994,7 +16031,7 @@ class TradingBot:
         except Exception:
             green_count = 0
 
-        return {
+        base_state = {
             "now_ts": now_value,
             "entry_ts": entry_ts_min,
             "hold_seconds": max(0.0, now_value - entry_ts_min),
@@ -16016,18 +16053,173 @@ class TradingBot:
             "momentum_5_bps": float(momentum_snapshot.get("mom5", 0.0) or 0.0),
             "momentum_15_bps": float(momentum_snapshot.get("mom15", 0.0) or 0.0),
             "green_candles": int(green_count),
+            "unrealized_bps": float(unrealized_bps),
         }
+
+        base_state["continuation_quality"] = float(
+            clamp_float(
+                0.48
+                + max(-80.0, min(120.0, float(base_state["momentum_3_bps"]))) / 180.0
+                + max(-120.0, min(180.0, float(base_state["momentum_5_bps"]))) / 320.0
+                + min(3, max(0, int(green_count))) * 0.035
+                + max(0.0, float(net_after_exit_bps)) / 850.0
+                - float(pullback_from_peak_bps) / 150.0,
+                0.0,
+                1.0,
+            )
+        )
+        try:
+            adaptive_exit_profile = self._adaptive_wave_exit_profile(
+                product_id=product_id,
+                hold_state=base_state,
+                current_price=float(current_px),
+                spread_bps=float(self.tob[product_id].spread_bps) if product_id in self.tob else 0.0,
+                cost_bps=float(exit_cost_bps),
+            )
+        except Exception as exc:
+            adaptive_exit_profile = {"enabled": True, "reason": f"adaptive_exit_profile_failed:{exc}"}
+        base_state["adaptive_exit_profile"] = adaptive_exit_profile
+        for key, value in adaptive_exit_profile.items():
+            if isinstance(value, (int, float, bool, str)):
+                base_state[f"adaptive_{key}"] = value
+        return base_state
+
+    def _adaptive_recent_chart_noise_bps(self, product_id: str, lookback: int = 20) -> Dict[str, float]:
+        """Estimate normal short-term chart noise for anti-whipsaw sell protection."""
+        try:
+            series = self.live_1m.get(product_id)
+            candles = list(series.candles) if series is not None else []
+            candles = candles[-max(5, int(lookback)):]
+            if len(candles) < 5:
+                return {"range_noise_bps": 8.0, "close_noise_bps": 5.0, "reason": "adaptive_noise_default_not_enough_candles"}
+            ranges, close_moves, prev_close = [], [], 0.0
+            for candle in candles:
+                high = float(getattr(candle, "high", 0.0) or 0.0)
+                low = float(getattr(candle, "low", 0.0) or 0.0)
+                close = float(getattr(candle, "close", 0.0) or 0.0)
+                if high > 0 and low > 0 and close > 0:
+                    ranges.append(abs((high / max(low, 1e-12) - 1.0) * 10000.0))
+                if prev_close > 0 and close > 0:
+                    close_moves.append(abs((close / prev_close - 1.0) * 10000.0))
+                if close > 0:
+                    prev_close = close
+            def median(values: List[float], fallback: float) -> float:
+                values = sorted(values)
+                if not values:
+                    return fallback
+                mid = len(values) // 2
+                return float(values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2.0)
+            return {"range_noise_bps": median(ranges, 8.0), "close_noise_bps": median(close_moves, 5.0), "reason": f"adaptive_noise_from_1m_candles;rows={len(candles)}"}
+        except Exception as exc:
+            return {"range_noise_bps": 8.0, "close_noise_bps": 5.0, "reason": f"adaptive_noise_error:{exc}"}
+
+    def _adaptive_backlog_move_profile(self, product_id: str) -> Dict[str, Any]:
+        """Build product-specific expected favorable movement from existing backlog/replay outputs."""
+        cache = getattr(self, "_adaptive_backlog_profile_cache", {})
+        cache_ts = float(getattr(self, "_adaptive_backlog_profile_cache_ts", 0.0) or 0.0)
+        if cache and now_ts() - cache_ts < 60.0:
+            return dict(cache.get(product_id, cache.get("DEFAULT", {})))
+        profiles: Dict[str, Dict[str, Any]] = {}
+        paths = [
+            (FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH, "gate"),
+            (os.path.join(BASE_DIR, "trade_frequency_estimate.csv"), "freq"),
+            (os.path.join(BASE_DIR, "four_pass_sell_path_replay.csv"), "sell_path"),
+        ]
+        for path, kind in paths:
+            try:
+                if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                    continue
+                frame = pd.read_csv(path)
+                if "product_id" not in frame.columns:
+                    continue
+                if kind == "freq" and "scope" in frame.columns:
+                    frame = frame[frame["scope"].astype(str).eq("product")]
+                for pid, group in frame.groupby(frame["product_id"].astype(str)):
+                    profile = profiles.setdefault(pid, {})
+                    for col in ("buy_avg_net_bps", "buy_median_net_bps", "sell_path_avg_realized_net_bps", "avg_net_bps", "median_net_bps", "realized_net_bps", "max_favorable_bps"):
+                        if col in group.columns:
+                            vals = pd.to_numeric(group[col], errors="coerce").dropna()
+                            if not vals.empty:
+                                profile[f"{kind}_{col}"] = float(vals.median() if col in {"median_net_bps", "max_favorable_bps"} else vals.mean())
+            except Exception as exc:
+                log(f"[adaptive-exit] failed reading {path}: {exc}")
+        for pid, profile in profiles.items():
+            candidates = [safe_float(v, 0.0) for k, v in profile.items() if k.endswith(("net_bps", "realized_net_bps", "max_favorable_bps"))]
+            positive = [x for x in candidates if x > 0]
+            expected = max(positive) if positive else float(ADAPTIVE_DEFAULT_EXPECTED_FAVORABLE_BPS)
+            profile["expected_favorable_bps"] = clamp_float(expected, float(ADAPTIVE_MIN_EXPECTED_FAVORABLE_BPS), float(ADAPTIVE_MAX_EXPECTED_FAVORABLE_BPS))
+            profile["reason"] = f"adaptive_backlog_profile;expected_favorable_bps={profile['expected_favorable_bps']:.2f}"
+        profiles["DEFAULT"] = {"expected_favorable_bps": float(ADAPTIVE_DEFAULT_EXPECTED_FAVORABLE_BPS), "reason": "adaptive_backlog_default"}
+        self._adaptive_backlog_profile_cache = profiles
+        self._adaptive_backlog_profile_cache_ts = now_ts()
+        return dict(profiles.get(product_id, profiles["DEFAULT"]))
+
+    def _adaptive_wave_exit_profile(self, *, product_id: str, hold_state: Dict[str, Any], current_price: float, spread_bps: float, cost_bps: float) -> Dict[str, Any]:
+        """Adaptive fee-adjusted breakeven/trailing/harvest sell-capture profile."""
+        if not bool(ENABLE_ADAPTIVE_WAVE_EXIT):
+            return {"enabled": False, "reason": "adaptive_wave_exit_disabled"}
+        try:
+            backlog = self._adaptive_backlog_move_profile(product_id)
+            noise = self._adaptive_recent_chart_noise_bps(product_id)
+            expected = clamp_float(safe_float(backlog.get("expected_favorable_bps"), ADAPTIVE_DEFAULT_EXPECTED_FAVORABLE_BPS), ADAPTIVE_MIN_EXPECTED_FAVORABLE_BPS, ADAPTIVE_MAX_EXPECTED_FAVORABLE_BPS)
+            normal_noise = max(1.0, safe_float(noise.get("range_noise_bps"), 8.0), safe_float(noise.get("close_noise_bps"), 5.0))
+            unreal = safe_float(hold_state.get("unrealized_bps"), 0.0)
+            net = safe_float(hold_state.get("net_after_exit_bps"), 0.0)
+            exit_cost = safe_float(hold_state.get("exit_cost_bps"), cost_bps)
+            peak = safe_float(hold_state.get("peak_unrealized_bps"), max(0.0, unreal))
+            pullback = safe_float(hold_state.get("pullback_from_peak_bps"), 0.0)
+            hold_seconds = safe_float(hold_state.get("hold_seconds"), 0.0)
+            mom1, mom3, mom5 = (safe_float(hold_state.get(k), 0.0) for k in ("momentum_1_bps", "momentum_3_bps", "momentum_5_bps"))
+            momentum_positive = mom1 >= 0 and mom3 >= 0
+            momentum_fading = mom1 < 0 or mom3 < 0 or mom5 < 0
+            momentum_breakdown = mom1 < -normal_noise * 0.35 and mom3 < -normal_noise * 0.50
+            activation_buffer = max(ADAPTIVE_BREAKEVEN_MIN_PEAK_FLOOR_BPS, spread_bps * ADAPTIVE_BREAKEVEN_SPREAD_MULT, normal_noise * ADAPTIVE_BREAKEVEN_NOISE_MULT, expected * ADAPTIVE_BREAKEVEN_EXPECTED_MOVE_FRACTION)
+            activation_peak = max(exit_cost + activation_buffer, ADAPTIVE_BREAKEVEN_MIN_PEAK_FLOOR_BPS)
+            armed = hold_seconds >= ADAPTIVE_BREAKEVEN_MIN_HOLD_SEC and peak >= activation_peak and net > 0
+            progress = clamp_float(peak / max(expected, 1e-9), 0.0, 3.0)
+            locked = peak * (ADAPTIVE_TRAIL_LATE_CAPTURE_FRACTION if progress >= 1.20 else ADAPTIVE_TRAIL_MID_CAPTURE_FRACTION if progress >= 0.70 else ADAPTIVE_TRAIL_EARLY_CAPTURE_FRACTION if progress >= 0.35 else 0.0)
+            floor = exit_cost + max(0.0, locked)
+            buffer = max(ADAPTIVE_FLOOR_MIN_BREACH_BPS, spread_bps * 1.5, normal_noise * 0.35)
+            breached = bool(armed and unreal <= floor - buffer)
+            if not hasattr(self, "_adaptive_floor_breach_counts"):
+                self._adaptive_floor_breach_counts = {}
+            breach_count = int(self._adaptive_floor_breach_counts.get(product_id, 0) or 0) + 1 if breached else 0
+            self._adaptive_floor_breach_counts[product_id] = breach_count
+            floor_exit = bool(armed and breached and (breach_count >= ADAPTIVE_FLOOR_CONFIRMATION_TICKS or momentum_breakdown) and not momentum_positive)
+            dyn = max(normal_noise * 1.25, expected * 0.18, spread_bps * 3.0)
+            dyn_strong = max(dyn * 1.65, expected * 0.35)
+            dyn_full = max(dyn_strong * 1.60, expected * 0.60)
+            strong_cont = bool(momentum_positive and pullback <= dyn and progress < 1.35)
+            partial = full = False; frac = 0.0
+            if armed and not strong_cont:
+                if progress >= 0.50 and pullback >= dyn and momentum_fading:
+                    partial, frac = True, max(frac, ADAPTIVE_PARTIAL_HARVEST_MIN_FRACTION)
+                if progress >= 0.85 and pullback >= dyn_strong:
+                    partial, frac = True, max(frac, ADAPTIVE_PARTIAL_HARVEST_MID_FRACTION)
+                if progress >= 1.15 and momentum_fading:
+                    partial, frac = True, max(frac, ADAPTIVE_PARTIAL_HARVEST_HIGH_FRACTION)
+                if pullback >= dyn_full and momentum_breakdown:
+                    full, frac = True, 1.0
+            reason = f"adaptive_wave_exit;expected={expected:.2f};noise={normal_noise:.2f};activation_peak={activation_peak:.2f};armed={armed};floor={floor:.2f};buffer={buffer:.2f};breached={breached};breach_count={breach_count};floor_exit={floor_exit};progress={progress:.3f};pullback={pullback:.2f};dynamic_pullback={dyn:.2f};strong_continuation={strong_cont};partial={partial};full={full};fraction={frac:.3f};backlog={backlog.get('reason','')};noise_reason={noise.get('reason','')}"
+            return {"enabled": True, "expected_favorable_bps": float(expected), "normal_noise_bps": float(normal_noise), "activation_buffer_bps": float(activation_buffer), "breakeven_activation_peak_bps": float(activation_peak), "protection_armed": bool(armed), "floor_unrealized_bps": float(floor), "floor_buffer_bps": float(buffer), "floor_breached": bool(breached), "floor_breach_count": int(breach_count), "floor_exit_confirmed": bool(floor_exit), "progress_to_expected": float(progress), "locked_net_bps": float(locked), "dynamic_pullback_bps": float(dyn), "dynamic_strong_pullback_bps": float(dyn_strong), "dynamic_full_exit_pullback_bps": float(dyn_full), "strong_continuation": bool(strong_cont), "momentum_positive": bool(momentum_positive), "momentum_fading": bool(momentum_fading), "momentum_breakdown": bool(momentum_breakdown), "adaptive_partial_harvest": bool(partial), "adaptive_full_exit": bool(full), "adaptive_harvest_fraction": float(clamp_float(frac, 0.0, 1.0)), "reason": reason}
+        except Exception as exc:
+            return {"enabled": True, "expected_favorable_bps": float(ADAPTIVE_DEFAULT_EXPECTED_FAVORABLE_BPS), "protection_armed": False, "floor_exit_confirmed": False, "adaptive_partial_harvest": False, "adaptive_full_exit": False, "adaptive_harvest_fraction": 0.0, "reason": f"adaptive_wave_exit_error:{exc}"}
 
     def _sell_quality_columns(self) -> List[str]:
         return [
             "ts", "dt_mst", "product_id", "trade_id", "sell_price",
             "review_price", "review_minutes", "move_after_sell_bps",
             "peak_before_sell_bps", "net_after_exit_bps", "executed_sell_fraction",
+            "max_favorable_bps", "capture_ratio",
+            "adaptive_expected_favorable_bps", "adaptive_progress_to_expected",
+            "adaptive_protection_armed", "adaptive_floor_unrealized_bps",
+            "adaptive_exit_reason",
             "capture_quality_score", "sell_quality_kind", "reason",
         ]
 
     def _append_sell_quality_seed(self, *, product_id: str, trade_id: str, sell_price: float, hold_state: Dict[str, Any], sell_fraction: float, reason: str) -> None:
         try:
+            adaptive_exit = dict(hold_state.get("adaptive_exit_profile", {}) or {})
             self._append_csv_dict_row(
                 path=SELL_QUALITY_REVIEWS_CSV_PATH,
                 columns=self._sell_quality_columns(),
@@ -16043,6 +16235,13 @@ class TradingBot:
                     "peak_before_sell_bps": f"{float(hold_state.get('peak_unrealized_bps', 0.0) or 0.0):.6f}",
                     "net_after_exit_bps": f"{float(hold_state.get('net_after_exit_bps', 0.0) or 0.0):.6f}",
                     "executed_sell_fraction": f"{float(sell_fraction):.6f}",
+                    "max_favorable_bps": f"{float(hold_state.get('peak_unrealized_bps', 0.0) or 0.0):.6f}",
+                    "capture_ratio": "",
+                    "adaptive_expected_favorable_bps": f"{safe_float(adaptive_exit.get('expected_favorable_bps'), 0.0):.6f}",
+                    "adaptive_progress_to_expected": f"{safe_float(adaptive_exit.get('progress_to_expected'), 0.0):.6f}",
+                    "adaptive_protection_armed": bool(adaptive_exit.get("protection_armed", False)),
+                    "adaptive_floor_unrealized_bps": f"{safe_float(adaptive_exit.get('floor_unrealized_bps'), 0.0):.6f}",
+                    "adaptive_exit_reason": str(adaptive_exit.get("reason", ""))[:900],
                     "capture_quality_score": "",
                     "sell_quality_kind": "seed",
                     "reason": str(reason or "")[:900],
@@ -16084,7 +16283,13 @@ class TradingBot:
                     future_high = max(float(getattr(c, "high", 0.0) or 0.0) for c in future)
                     move_after_sell_bps = ((review_price / sell_price) - 1.0) * 10000.0
                     missed_upside_bps = max(0.0, ((future_high / sell_price) - 1.0) * 10000.0)
-                    if missed_upside_bps >= 120:
+                    peak_before_sell_bps = safe_float(row.get("peak_before_sell_bps"), 0.0)
+                    max_favorable_bps = max(float(peak_before_sell_bps), float(missed_upside_bps))
+                    captured_bps = max(0.0, safe_float(row.get("net_after_exit_bps"), 0.0))
+                    capture_ratio = captured_bps / max(max_favorable_bps, 1e-9)
+                    if capture_ratio >= 0.65:
+                        kind, quality = "good_capture_ratio", 0.85
+                    elif missed_upside_bps >= 120:
                         kind, quality = "sold_too_early_big_missed_upside", 0.20
                     elif move_after_sell_bps <= -45:
                         kind, quality = "good_exit_price_fell_after_sell", 0.85
@@ -16100,12 +16305,18 @@ class TradingBot:
                         "peak_before_sell_bps": row.get("peak_before_sell_bps", ""),
                         "net_after_exit_bps": row.get("net_after_exit_bps", ""),
                         "executed_sell_fraction": row.get("executed_sell_fraction", ""),
+                        "max_favorable_bps": f"{max_favorable_bps:.6f}",
+                        "capture_ratio": f"{capture_ratio:.6f}",
+                        "adaptive_expected_favorable_bps": row.get("adaptive_expected_favorable_bps", ""),
+                        "adaptive_progress_to_expected": row.get("adaptive_progress_to_expected", ""),
+                        "adaptive_protection_armed": row.get("adaptive_protection_armed", ""),
+                        "adaptive_floor_unrealized_bps": row.get("adaptive_floor_unrealized_bps", ""),
+                        "adaptive_exit_reason": row.get("adaptive_exit_reason", ""),
                         "capture_quality_score": f"{quality:.6f}", "sell_quality_kind": "review",
-                        "reason": f"sell_quality_review;kind={kind};missed_upside_bps={missed_upside_bps:.2f}",
+                        "reason": f"sell_quality_review;kind={kind};missed_upside_bps={missed_upside_bps:.2f};capture_ratio={capture_ratio:.3f}",
                     })
         except Exception as exc:
             log(f"[sell-quality] review failed: {exc}")
-
 
     def _sell_quality_recent_context(self, product_id: str) -> Dict[str, Any]:
         try:
@@ -16548,6 +16759,24 @@ class TradingBot:
         pullback_for_profit_lock = float(
             hold_state.get("pullback_from_peak_bps", 0.0) or 0.0
         )
+        adaptive_exit_profile = dict(hold_state.get("adaptive_exit_profile", {}) or {})
+        adaptive_reason = str(adaptive_exit_profile.get("reason", "no_adaptive_exit_profile"))
+        adaptive_floor_exit_confirmed = bool(adaptive_exit_profile.get("floor_exit_confirmed", False))
+        adaptive_partial_harvest = bool(adaptive_exit_profile.get("adaptive_partial_harvest", False))
+        adaptive_full_exit = bool(adaptive_exit_profile.get("adaptive_full_exit", False))
+        adaptive_strong_continuation = bool(adaptive_exit_profile.get("strong_continuation", False))
+        adaptive_harvest_fraction = clamp_float(
+            safe_float(adaptive_exit_profile.get("adaptive_harvest_fraction"), 0.0),
+            0.0,
+            1.0,
+        )
+
+        if adaptive_floor_exit_confirmed:
+            return True, f"adaptive_fee_adjusted_floor_exit;{adaptive_reason};{default_exit_reason}", 1.0
+        if adaptive_full_exit:
+            return True, f"adaptive_wave_full_exit;{adaptive_reason};{default_exit_reason}", 1.0
+        if adaptive_partial_harvest and adaptive_harvest_fraction > 0.0:
+            return True, f"adaptive_wave_partial_harvest;fraction={adaptive_harvest_fraction:.3f};{adaptive_reason};{default_exit_reason}", float(adaptive_harvest_fraction)
 
         big_peak_dynamic_pullback_bps = max(
             float(PROFIT_GIVEBACK_STRONG_PULLBACK_BPS),
@@ -16585,13 +16814,27 @@ class TradingBot:
         )
 
         if profit_lock_hit:
+            if adaptive_strong_continuation:
+                return False, (
+                    f"adaptive_hold_over_static_profit_lock;"
+                    f"net_after_exit_bps={net_after_exit_for_hard_check:.2f};"
+                    f"peak_unrealized_bps={peak_unrealized_for_profit_lock:.2f};"
+                    f"pullback_from_peak_bps={pullback_for_profit_lock:.2f};"
+                    f"{adaptive_reason};{default_exit_reason}"
+                ), 0.0
+            static_fraction = clamp_float(float(PROFIT_LOCK_SELL_FRACTION), 0.0, 1.0)
+            dynamic_fraction = clamp_float(
+                max(static_fraction, adaptive_harvest_fraction),
+                float(ADAPTIVE_PARTIAL_HARVEST_MIN_FRACTION),
+                float(ADAPTIVE_PARTIAL_HARVEST_HIGH_FRACTION),
+            )
             return True, (
-                f"level8_profit_lock_exit;"
+                f"level8_profit_lock_partial_harvest;"
                 f"net_after_exit_bps={net_after_exit_for_hard_check:.2f};"
                 f"peak_unrealized_bps={peak_unrealized_for_profit_lock:.2f};"
                 f"pullback_from_peak_bps={pullback_for_profit_lock:.2f};"
-                f"{default_exit_reason}"
-            ), float(PROFIT_LOCK_SELL_FRACTION)
+                f"fraction={dynamic_fraction:.3f};{adaptive_reason};{default_exit_reason}"
+            ), float(dynamic_fraction)
 
         if hard_exit:
             if hard_stop_for_hard_check:
@@ -16700,6 +16943,19 @@ class TradingBot:
                     hold_state=hold_state,
                 ),
                 "sell_quality_context": self._sell_quality_recent_context(product_id),
+                "adaptive_exit_profile": adaptive_exit_profile,
+                "adaptive_expected_favorable_bps": safe_float(adaptive_exit_profile.get("expected_favorable_bps"), 0.0),
+                "adaptive_progress_to_expected": safe_float(adaptive_exit_profile.get("progress_to_expected"), 0.0),
+                "adaptive_protection_armed": bool(adaptive_exit_profile.get("protection_armed", False)),
+                "adaptive_floor_unrealized_bps": safe_float(adaptive_exit_profile.get("floor_unrealized_bps"), 0.0),
+                "adaptive_floor_breached": bool(adaptive_exit_profile.get("floor_breached", False)),
+                "adaptive_floor_exit_confirmed": bool(adaptive_exit_profile.get("floor_exit_confirmed", False)),
+                "adaptive_dynamic_pullback_bps": safe_float(adaptive_exit_profile.get("dynamic_pullback_bps"), 0.0),
+                "adaptive_dynamic_strong_pullback_bps": safe_float(adaptive_exit_profile.get("dynamic_strong_pullback_bps"), 0.0),
+                "adaptive_dynamic_full_exit_pullback_bps": safe_float(adaptive_exit_profile.get("dynamic_full_exit_pullback_bps"), 0.0),
+                "adaptive_strong_continuation": bool(adaptive_exit_profile.get("strong_continuation", False)),
+                "adaptive_harvest_fraction": safe_float(adaptive_exit_profile.get("adaptive_harvest_fraction"), 0.0),
+                "adaptive_exit_reason": str(adaptive_exit_profile.get("reason", "")),
             }
 
             if hasattr(self.level8_council, "decide_exit"):
@@ -17208,49 +17464,37 @@ class TradingBot:
         product_id: str,
         requested_pct: float,
     ) -> Tuple[float, str]:
-        """
-        Cap Level 8 live size until completed outcomes justify larger allocations.
-        """
+        """High-conviction live sizing for approved Level 8 setups."""
         requested_pct = clamp_float(float(requested_pct), 0.0, float(LEVEL8_MAX_SINGLE_TRADE_PCT))
-
+        if requested_pct <= 0.0:
+            return 0.0, "high_conviction_sizing_no_requested_pct"
         if not bool(LEVEL8_GRADUATED_LIVE_SIZING):
-            return requested_pct, "graduated_sizing_disabled"
-
+            final_pct = clamp_float(max(float(MIN_POSITION_PCT_OF_EQUITY), requested_pct), 0.0, float(LEVEL8_MAX_SINGLE_TRADE_PCT))
+            return final_pct, (
+                f"high_conviction_sizing;requested_pct={requested_pct:.3f};"
+                f"final_pct={final_pct:.3f};min_approved_pct={float(MIN_POSITION_PCT_OF_EQUITY):.3f};"
+                f"max_single_pct={float(LEVEL8_MAX_SINGLE_TRADE_PCT):.3f};graduated_sizing_disabled"
+            )
         product_sells, global_sells = self._completed_sell_history_counts(product_id)
-
         if product_sells < int(LEVEL8_PRODUCT_YOUNG_HISTORY_SELLS):
-            product_cap = float(LEVEL8_YOUNG_PRODUCT_LIVE_SIZE_CAP_PCT)
-            product_stage = "young_product_history"
+            product_cap, product_stage = float(LEVEL8_YOUNG_PRODUCT_LIVE_SIZE_CAP_PCT), "young_product_history"
         elif product_sells < int(LEVEL8_PRODUCT_MODERATE_HISTORY_SELLS):
-            product_cap = float(LEVEL8_MODERATE_PRODUCT_LIVE_SIZE_CAP_PCT)
-            product_stage = "moderate_product_history"
+            product_cap, product_stage = float(LEVEL8_MODERATE_PRODUCT_LIVE_SIZE_CAP_PCT), "moderate_product_history"
         else:
-            product_cap = float(LEVEL8_PROVEN_PRODUCT_LIVE_SIZE_CAP_PCT)
-            product_stage = "proven_product_history"
-
+            product_cap, product_stage = float(LEVEL8_PROVEN_PRODUCT_LIVE_SIZE_CAP_PCT), "proven_product_history"
         if global_sells < int(LEVEL8_GLOBAL_EARLY_HISTORY_SELLS):
-            global_cap = float(LEVEL8_GLOBAL_EARLY_LIVE_SIZE_CAP_PCT)
-            global_stage = "early_global_history"
+            global_cap, global_stage = float(LEVEL8_GLOBAL_EARLY_LIVE_SIZE_CAP_PCT), "early_global_history"
         elif global_sells < int(LEVEL8_GLOBAL_MODERATE_HISTORY_SELLS):
-            global_cap = float(LEVEL8_GLOBAL_MODERATE_LIVE_SIZE_CAP_PCT)
-            global_stage = "moderate_global_history"
+            global_cap, global_stage = float(LEVEL8_GLOBAL_MODERATE_LIVE_SIZE_CAP_PCT), "moderate_global_history"
         else:
-            global_cap = float(LEVEL8_MAX_SINGLE_TRADE_PCT)
-            global_stage = "proven_global_history"
-
-        final_cap = min(
-            float(product_cap),
-            float(global_cap),
-            float(LEVEL8_MAX_SINGLE_TRADE_PCT),
-        )
-        final_pct = min(float(requested_pct), float(final_cap))
-
+            global_cap, global_stage = float(LEVEL8_MAX_SINGLE_TRADE_PCT), "proven_global_history"
+        final_cap = min(product_cap, global_cap, float(LEVEL8_MAX_SINGLE_TRADE_PCT))
+        final_pct = clamp_float(max(float(MIN_POSITION_PCT_OF_EQUITY), requested_pct), 0.0, final_cap)
         return final_pct, (
-            f"graduated_sizing requested_pct={requested_pct:.3f};"
-            f"final_pct={final_pct:.3f};"
-            f"product_sells={product_sells};global_sells={global_sells};"
-            f"product_stage={product_stage};global_stage={global_stage};"
-            f"product_cap={product_cap:.3f};global_cap={global_cap:.3f}"
+            f"graduated_high_conviction_sizing requested_pct={requested_pct:.3f};final_pct={final_pct:.3f};"
+            f"product_sells={product_sells};global_sells={global_sells};product_stage={product_stage};"
+            f"global_stage={global_stage};product_cap={product_cap:.3f};global_cap={global_cap:.3f};"
+            f"min_approved_pct={float(MIN_POSITION_PCT_OF_EQUITY):.3f}"
         )
 
     def _entry_gate_bottoming(
@@ -24938,6 +25182,15 @@ class TradingBot:
                 "inverted_target_sell_price": None,
                 "inverted_next_loss_trigger_price": None,
                 "inverted_rebuy_count": 0,
+                "adaptive_expected_favorable_bps": 0.0,
+                "adaptive_progress_to_expected": 0.0,
+                "adaptive_protection_armed": False,
+                "adaptive_floor_unrealized_bps": 0.0,
+                "adaptive_floor_breached": False,
+                "adaptive_floor_exit_confirmed": False,
+                "adaptive_dynamic_pullback_bps": 0.0,
+                "adaptive_strong_continuation": False,
+                "adaptive_harvest_fraction": 0.0,
                 "exit_plan_note": "no open position",
             }
 
@@ -24995,7 +25248,14 @@ class TradingBot:
                     return ((float(target_px) / bid) - 1.0) * 10000.0
 
                 scalp_armed = bool(lot_meta.get("scalp_armed", False))
-                core_armed = bool(lot_meta.get("core_armed", False))
+                hold_state_for_targets = self._level8_position_hold_state(
+                    product_id=product_id,
+                    lots=lots,
+                    unrealized_bps=((float(bid) / float(avg_entry_price)) - 1.0) * 10000.0 if bid and avg_entry_price > 0 else 0.0,
+                    entry_price=float(avg_entry_price),
+                    current_price=float(bid or 0.0),
+                )
+                adaptive_exit = dict(hold_state_for_targets.get("adaptive_exit_profile", {}) or {})
                 row.update({
                     "avg_entry_price": avg_entry_price,
                     "min_profitable_exit_price": min_exit_px,
@@ -25017,10 +25277,28 @@ class TradingBot:
                     "min_profitable_exit_price_from_lot": lot_meta.get("min_profitable_exit_price"),
                     "calibrated_forward_window_minutes": lot_meta.get("calibrated_forward_window_minutes"),
                     "calibrated_post_profit_breathing_minutes": lot_meta.get("calibrated_post_profit_breathing_minutes"),
+                    "adaptive_expected_favorable_bps": safe_float(adaptive_exit.get("expected_favorable_bps"), 0.0),
+                    "adaptive_progress_to_expected": safe_float(adaptive_exit.get("progress_to_expected"), 0.0),
+                    "adaptive_protection_armed": bool(adaptive_exit.get("protection_armed", False)),
+                    "adaptive_floor_unrealized_bps": safe_float(adaptive_exit.get("floor_unrealized_bps"), 0.0),
+                    "adaptive_floor_breached": bool(adaptive_exit.get("floor_breached", False)),
+                    "adaptive_floor_exit_confirmed": bool(adaptive_exit.get("floor_exit_confirmed", False)),
+                    "adaptive_dynamic_pullback_bps": safe_float(adaptive_exit.get("dynamic_pullback_bps"), 0.0),
+                    "adaptive_strong_continuation": bool(adaptive_exit.get("strong_continuation", False)),
+                    "adaptive_harvest_fraction": safe_float(adaptive_exit.get("adaptive_harvest_fraction"), 0.0),
                     "exit_plan_note": (
-                        "scalp/core armed trailing active"
-                        if scalp_armed or core_armed
-                        else "waiting for min-profit/scalp/core target"
+                        (
+                            "scalp/core armed trailing active"
+                            if scalp_armed or core_armed
+                            else "waiting for min-profit/scalp/core target"
+                        )
+                        + (
+                            f"; adaptive_expected={safe_float(adaptive_exit.get('expected_favorable_bps'), 0.0):.2f}bps "
+                            f"adaptive_progress={safe_float(adaptive_exit.get('progress_to_expected'), 0.0):.3f} "
+                            f"adaptive_protected={bool(adaptive_exit.get('protection_armed', False))} "
+                            f"adaptive_floor={safe_float(adaptive_exit.get('floor_unrealized_bps'), 0.0):.2f}bps "
+                            f"adaptive_harvest_fraction={safe_float(adaptive_exit.get('adaptive_harvest_fraction'), 0.0):.3f}"
+                        )
                     ),
                 })
                 log(

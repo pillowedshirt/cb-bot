@@ -53,13 +53,28 @@ FEATURE_CANDIDATES = [
     "expected_net_edge_bps",
     "ev_at_entry",
     "spread_at_entry",
-    "move_bps", "projected_forward_gain_bps", "expected_utility_bps",
-    "buy_vs_wait_edge_bps", "maker_adjusted_expected_value_bps", "payoff_ratio",
-    "cost_bps", "spread_bps", "walk_forward_penalty_bps", "uncertainty_penalty_bps",
-    "momentum_1_bps", "momentum_3_bps", "momentum_5_bps", "momentum_15_bps",
-    "order_book_imbalance", "order_book_top_depth_usd", "spread_instability_bps",
-    "liquidity_risk_score", "quant_forecast_return_bps", "quant_conditional_volatility_bps",
-    "relative_volume", "atr_bps", "rsi", "max_favorable_bps", "max_adverse_bps",
+    "projected_forward_gain_bps",
+    "expected_utility_bps",
+    "buy_vs_wait_edge_bps",
+    "maker_adjusted_expected_value_bps",
+    "payoff_ratio",
+    "cost_bps",
+    "spread_bps",
+    "walk_forward_penalty_bps",
+    "uncertainty_penalty_bps",
+    "momentum_1_bps",
+    "momentum_3_bps",
+    "momentum_5_bps",
+    "momentum_15_bps",
+    "order_book_imbalance",
+    "order_book_top_depth_usd",
+    "spread_instability_bps",
+    "liquidity_risk_score",
+    "quant_forecast_return_bps",
+    "quant_conditional_volatility_bps",
+    "relative_volume",
+    "atr_bps",
+    "rsi",
 ]
 
 NEGATIVE_REGIME_TERMS = ("down", "bear", "risk_off", "sell", "negative", "breakdown")
@@ -128,18 +143,8 @@ def _extract_outcome_bps(frame: pd.DataFrame, source_name: str) -> pd.Series:
         cost = _num(frame, "cost_bps", 0.0)
         return fav - adv * 0.35 - cost
 
-    proxy_allowed_sources = {
-        "candidate_proxy",
-        "historical_shadow",
-        "fifth_pass",
-        "council_observed",
-    }
-
-    if source_name in proxy_allowed_sources:
-        for col in ["expected_net_edge_bps", "ev_at_entry"]:
-            if col in frame.columns:
-                return _num(frame, col, 0.0)
-
+    # Active quant-state policies must learn from actual observed/proxy-forward outcomes,
+    # not from the bot's own predicted EV.
     return pd.Series([np.nan] * len(frame), index=frame.index)
 
 
@@ -167,7 +172,9 @@ def _infer_ts(frame: pd.DataFrame) -> pd.Series:
     for col in ["entry_ts", "replay_ts", "ts"]:
         if col in frame.columns:
             return pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
-    return pd.Series(np.arange(len(frame)), index=frame.index, dtype="float64")
+
+    # No real timestamp means this source cannot safely create Markov transitions.
+    return pd.Series([0.0] * len(frame), index=frame.index, dtype="float64")
 
 
 def _source_frames(base_dir: str) -> pd.DataFrame:
@@ -373,16 +380,22 @@ def _steady_state(matrix: np.ndarray) -> np.ndarray:
 
 
 def _markov_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[List[List[Any]], List[List[Any]]]:
-    transition_rows: List[List[Any]] = []; policy_rows: List[List[Any]] = []
-    # Markov transitions must be built from one product's time series at a time.
-    # Do not build portfolio-level transitions by sorting interleaved products,
-    # because that creates fake transitions from one product's regime into another product's regime.
+    transition_rows: List[List[Any]] = []
+    policy_rows: List[List[Any]] = []
+
+    # Markov transitions must be product-specific.
     groups: List[Tuple[str, str, pd.DataFrame]] = [
         ("product", str(pid), group.copy())
         for pid, group in frame.groupby("product_id")
     ]
+
     for scope, product_id, group in groups:
+        if "source_weight" not in group.columns:
+            group = group.copy()
+            group["source_weight"] = 0.50
+
         local = group[["market_regime", "row_ts", "source_weight"]].copy().dropna()
+
         local["market_regime"] = (
             local["market_regime"]
             .astype(str)
@@ -391,7 +404,11 @@ def _markov_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[L
             .str.replace(" ", "_", regex=False)
         )
         local["row_ts"] = pd.to_numeric(local["row_ts"], errors="coerce").fillna(0.0)
-        local["source_weight"] = pd.to_numeric(local["source_weight"], errors="coerce").fillna(0.50).clip(lower=0.05)
+        local["source_weight"] = (
+            pd.to_numeric(local["source_weight"], errors="coerce")
+            .fillna(0.50)
+            .clip(lower=0.05)
+        )
 
         local = local[
             (local["market_regime"] != "")
@@ -400,39 +417,129 @@ def _markov_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> Tuple[L
             & (local["row_ts"] > 0.0)
         ].copy()
 
-        local = local.sort_values("row_ts")
+        if local.empty:
+            continue
+
+        # Collapse duplicate rows at the same timestamp.
+        # This prevents same-minute duplicate candidate rows from creating fake transitions.
+        collapsed_rows = []
+        for row_ts, ts_group in local.groupby("row_ts"):
+            regime_mode = (
+                ts_group["market_regime"]
+                .mode()
+                .iloc[0]
+                if not ts_group["market_regime"].mode().empty
+                else str(ts_group["market_regime"].iloc[-1])
+            )
+            collapsed_rows.append({
+                "row_ts": float(row_ts),
+                "market_regime": str(regime_mode),
+                "source_weight": float(ts_group["source_weight"].mean()),
+            })
+
+        local = pd.DataFrame(collapsed_rows).sort_values("row_ts")
 
         regimes = sorted([str(x) for x in local["market_regime"].dropna().unique()])
-        if len(local) < 20 or len(regimes) < 2: continue
-        idx = {regime: i for i, regime in enumerate(regimes)}; counts = np.zeros((len(regimes), len(regimes)), dtype=float); values = list(local["market_regime"].astype(str).values)
+
+        if len(local) < 20 or len(regimes) < 2:
+            continue
+
+        idx = {regime: i for i, regime in enumerate(regimes)}
+        counts = np.zeros((len(regimes), len(regimes)), dtype=float)
+
+        values = list(local["market_regime"].astype(str).values)
         weights = list(local["source_weight"].astype(float).values)
+
         for k, (current_regime, next_regime) in enumerate(zip(values[:-1], values[1:])):
             transition_weight = float((weights[k] + weights[k + 1]) / 2.0)
             counts[idx[current_regime], idx[next_regime]] += transition_weight
-        row_sums = counts.sum(axis=1); probs = np.zeros_like(counts)
+
+        row_sums = counts.sum(axis=1)
+        probs = np.zeros_like(counts)
+
         for i in range(len(regimes)):
-            if row_sums[i] > 0: probs[i, :] = counts[i, :] / row_sums[i]
-            else: probs[i, i] = 1.0
+            if row_sums[i] > 0:
+                probs[i, :] = counts[i, :] / row_sums[i]
+            else:
+                probs[i, i] = 1.0
+
         steady = _steady_state(probs)
+
         for from_regime in regimes:
             i = idx[from_regime]
+
             for to_regime in regimes:
                 j = idx[to_regime]
-                if counts[i, j] <= 0: continue
-                transition_rows.append([f"{ts_value:.6f}", dt_value, scope, product_id, from_regime, to_regime, int(counts[i, j]), f"{probs[i, j]:.8f}", f"markov_transition;from={from_regime};to={to_regime};p={probs[i, j]:.4f}"])
+
+                if counts[i, j] <= 0:
+                    continue
+
+                transition_rows.append([
+                    f"{ts_value:.6f}",
+                    dt_value,
+                    scope,
+                    product_id,
+                    from_regime,
+                    to_regime,
+                    f"{counts[i, j]:.6f}",
+                    f"{probs[i, j]:.8f}",
+                    (
+                        f"markov_transition;"
+                        f"from={from_regime};to={to_regime};"
+                        f"weighted_count={counts[i, j]:.3f};"
+                        f"p={probs[i, j]:.4f}"
+                    ),
+                ])
+
         for regime in regimes:
             i = idx[regime]
+
             neg = float(sum(probs[i, j] for j, r in enumerate(regimes) if _is_negative_regime(r)))
             high = float(sum(probs[i, j] for j, r in enumerate(regimes) if _is_high_vol_regime(r)))
-            cont = float(probs[i, i]); steady_neg = float(sum(steady[j] for j, r in enumerate(regimes) if _is_negative_regime(r))) if steady.size else 0.0; sample_count = int(row_sums[i])
-            if sample_count < 10: grade, live_allowed, size_multiplier = "INSUFFICIENT_REGIME_TRANSITIONS", True, 0.75
-            elif neg >= 0.60 or (neg >= 0.45 and high >= 0.45): grade, live_allowed, size_multiplier = "NEGATIVE_TRANSITION_RISK", False, 0.0
-            elif neg >= 0.35 or high >= 0.55: grade, live_allowed, size_multiplier = "ELEVATED_TRANSITION_RISK", True, 0.60
-            elif steady_neg >= 0.45: grade, live_allowed, size_multiplier = "LONG_RUN_REGIME_RISK", True, 0.75
-            else: grade, live_allowed, size_multiplier = "REGIME_TRANSITION_OK", True, 1.0
-            policy_rows.append([f"{ts_value:.6f}", dt_value, scope, product_id, regime, sample_count, f"{neg:.8f}", f"{high:.8f}", f"{cont:.8f}", f"{steady_neg:.8f}", grade, live_allowed, f"{size_multiplier:.8f}", f"markov_policy;regime={regime};neg_next={neg:.3f};high_next={high:.3f};steady_neg={steady_neg:.3f};n={sample_count}"])
-    return transition_rows, policy_rows
+            cont = float(probs[i, i])
+            steady_neg = (
+                float(sum(steady[j] for j, r in enumerate(regimes) if _is_negative_regime(r)))
+                if steady.size
+                else 0.0
+            )
+            sample_count = float(row_sums[i])
 
+            if sample_count < 10:
+                grade, live_allowed, size_multiplier = "INSUFFICIENT_REGIME_TRANSITIONS", True, 0.75
+            elif neg >= 0.60 or (neg >= 0.45 and high >= 0.45):
+                grade, live_allowed, size_multiplier = "NEGATIVE_TRANSITION_RISK", False, 0.0
+            elif neg >= 0.35 or high >= 0.55:
+                grade, live_allowed, size_multiplier = "ELEVATED_TRANSITION_RISK", True, 0.60
+            elif steady_neg >= 0.45:
+                grade, live_allowed, size_multiplier = "LONG_RUN_REGIME_RISK", True, 0.75
+            else:
+                grade, live_allowed, size_multiplier = "REGIME_TRANSITION_OK", True, 1.0
+
+            policy_rows.append([
+                f"{ts_value:.6f}",
+                dt_value,
+                scope,
+                product_id,
+                regime,
+                f"{sample_count:.6f}",
+                f"{neg:.8f}",
+                f"{high:.8f}",
+                f"{cont:.8f}",
+                f"{steady_neg:.8f}",
+                grade,
+                live_allowed,
+                f"{size_multiplier:.8f}",
+                (
+                    f"markov_policy;"
+                    f"regime={regime};"
+                    f"weighted_n={sample_count:.3f};"
+                    f"neg_next={neg:.3f};"
+                    f"high_next={high:.3f};"
+                    f"steady_neg={steady_neg:.3f}"
+                ),
+            ])
+
+    return transition_rows, policy_rows
 
 def _kalman_policy_rows(frame: pd.DataFrame, ts_value: float, dt_value: str) -> List[List[Any]]:
     rows: List[List[Any]] = []

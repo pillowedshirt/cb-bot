@@ -2414,7 +2414,7 @@ COVARIANCE_MIN_SAMPLE_COUNT_TO_BLOCK: int = 60
 COVARIANCE_BLOCK_SCORE_BELOW: float = -0.28
 COVARIANCE_SIZE_DOWN_SCORE_BELOW: float = -0.08
 COVARIANCE_SIZE_MULTIPLIER_MIN: float = 0.35
-COVARIANCE_SIZE_MULTIPLIER_MAX: float = 1.10
+COVARIANCE_SIZE_MULTIPLIER_MAX: float = 1.00
 MARKOV_MIN_SAMPLE_COUNT_TO_BLOCK: int = 10
 MARKOV_MISSING_POLICY_SIZE_MULTIPLIER: float = 0.85
 KALMAN_DOWNSLOPE_BLOCK_BPS_PER_MIN: float = -8.0
@@ -14604,46 +14604,172 @@ class TradingBot:
 
     def _feature_correlation_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         if not bool(ENABLE_COVARIANCE_CORRELATION_LIVE_GATE):
-            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "covariance_correlation_gate_disabled"}
+            return {
+                "available": False,
+                "allowed": True,
+                "size_multiplier": 1.0,
+                "reason": "covariance_correlation_gate_disabled",
+            }
+
         if load_feature_policy_map is None or candidate_feature_value is None:
-            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "covariance_correlation_module_unavailable"}
+            return {
+                "available": False,
+                "allowed": True,
+                "size_multiplier": 0.75,
+                "reason": "covariance_correlation_module_unavailable_size_down",
+            }
+
+        def evaluate_rows(rows: List[Dict[str, Any]], scope: str) -> Dict[str, Any]:
+            contributions: List[float] = []
+            reasons: List[str] = []
+            total_sample = 0
+
+            for row in rows:
+                feature_name = str(row.get("feature_name", ""))
+                value = candidate_feature_value(candidate, feature_name)
+
+                if value is None:
+                    continue
+
+                feature_mean = float(row.get("feature_mean", 0.0) or 0.0)
+                feature_std = abs(float(row.get("feature_std", 0.0) or 0.0))
+
+                if feature_std <= 1e-12:
+                    continue
+
+                z_score = clamp_float((float(value) - feature_mean) / feature_std, -3.0, 3.0)
+                feature_weight = float(row.get("feature_weight", 0.0) or 0.0)
+                reliability = float(row.get("reliability", 0.0) or 0.0)
+                sample_count = int(float(row.get("sample_count", 0) or 0))
+
+                contribution = float(z_score) * float(feature_weight)
+                contributions.append(contribution)
+                total_sample = max(total_sample, sample_count)
+
+                if abs(contribution) >= 0.02:
+                    reasons.append(
+                        f"{feature_name}:value={float(value):.4f};"
+                        f"z={z_score:.2f};weight={feature_weight:.4f};"
+                        f"contrib={contribution:.4f};rel={reliability:.3f}"
+                    )
+
+            if len(contributions) < int(COVARIANCE_MIN_ACTIVE_FEATURES):
+                return {
+                    "available": True,
+                    "usable": False,
+                    "allowed": True,
+                    "size_multiplier": 0.85,
+                    "active_features": len(contributions),
+                    "sample_count": total_sample,
+                    "reason": (
+                        f"covariance_correlation_not_enough_live_features;"
+                        f"scope={scope};"
+                        f"active={len(contributions)};"
+                        f"min={int(COVARIANCE_MIN_ACTIVE_FEATURES)}"
+                    ),
+                }
+
+            edge_score = float(np.mean(contributions))
+            size_multiplier = clamp_float(
+                1.0 + edge_score * 1.75,
+                float(COVARIANCE_SIZE_MULTIPLIER_MIN),
+                float(COVARIANCE_SIZE_MULTIPLIER_MAX),
+            )
+
+            if edge_score <= float(COVARIANCE_SIZE_DOWN_SCORE_BELOW):
+                size_multiplier = min(size_multiplier, 0.65)
+
+            if (
+                total_sample >= int(COVARIANCE_MIN_SAMPLE_COUNT_TO_BLOCK)
+                and edge_score <= float(COVARIANCE_BLOCK_SCORE_BELOW)
+            ):
+                return {
+                    "available": True,
+                    "usable": True,
+                    "allowed": False,
+                    "size_multiplier": 0.0,
+                    "edge_score": edge_score,
+                    "active_features": len(contributions),
+                    "sample_count": total_sample,
+                    "reason": (
+                        f"covariance_correlation_blocked;"
+                        f"scope={scope};edge_score={edge_score:.4f};"
+                        f"sample_count={total_sample};"
+                        f"features={'|'.join(reasons[:8])}"
+                    ),
+                }
+
+            return {
+                "available": True,
+                "usable": True,
+                "allowed": True,
+                "size_multiplier": size_multiplier,
+                "edge_score": edge_score,
+                "active_features": len(contributions),
+                "sample_count": total_sample,
+                "reason": (
+                    f"covariance_correlation_allowed;"
+                    f"scope={scope};edge_score={edge_score:.4f};"
+                    f"size_multiplier={size_multiplier:.3f};"
+                    f"features={'|'.join(reasons[:8])}"
+                ),
+            }
+
         try:
             now_value = now_ts()
-            if not self._feature_policy_cache or now_value - float(self._feature_policy_cache_ts or 0.0) > 15.0:
-                self._feature_policy_cache = load_feature_policy_map(BASE_DIR); self._feature_policy_cache_ts = now_value
+
+            if (
+                not self._feature_policy_cache
+                or now_value - float(self._feature_policy_cache_ts or 0.0) > 15.0
+            ):
+                self._feature_policy_cache = load_feature_policy_map(BASE_DIR)
+                self._feature_policy_cache_ts = now_value
+
             product_id = str(candidate.get("product_id", ""))
             product_rows = list(self._feature_policy_cache.get(product_id, []) or [])
             portfolio_rows = list(self._feature_policy_cache.get("ALL", []) or [])
 
-            # Prefer product-specific feature policy.
-            # Use portfolio policy only as fallback so the same evidence is not double-counted.
-            if len(product_rows) >= int(COVARIANCE_MIN_ACTIVE_FEATURES):
-                rows = product_rows
-                feature_policy_scope = "product_specific"
-            else:
-                rows = portfolio_rows
-                feature_policy_scope = "portfolio_fallback"
-            if not rows: return {"available": False, "allowed": True, "size_multiplier": 0.75, "reason": "covariance_correlation_policy_missing_size_down"}
-            contributions: List[float] = []; reasons: List[str] = []; total_sample = 0
-            for row in rows:
-                feature_name = str(row.get("feature_name", "")); value = candidate_feature_value(candidate, feature_name)
-                if value is None: continue
-                feature_mean = float(row.get("feature_mean", 0.0) or 0.0); feature_std = abs(float(row.get("feature_std", 0.0) or 0.0))
-                if feature_std <= 1e-12: continue
-                z_score = clamp_float((float(value) - feature_mean) / feature_std, -3.0, 3.0); feature_weight = float(row.get("feature_weight", 0.0) or 0.0); reliability = float(row.get("reliability", 0.0) or 0.0); sample_count = int(float(row.get("sample_count", 0) or 0))
-                contribution = float(z_score) * float(feature_weight)
-                contributions.append(contribution)
-                total_sample = max(total_sample, sample_count)
-                if abs(contribution) >= 0.02: reasons.append(f"{feature_name}:value={float(value):.4f};z={z_score:.2f};weight={feature_weight:.4f};contrib={contribution:.4f};rel={reliability:.3f}")
-            if len(contributions) < int(COVARIANCE_MIN_ACTIVE_FEATURES):
-                return {"available": True, "allowed": True, "size_multiplier": 0.85, "active_features": len(contributions), "reason": f"covariance_correlation_not_enough_live_features;active={len(contributions)};min={int(COVARIANCE_MIN_ACTIVE_FEATURES)}"}
-            edge_score = float(np.mean(contributions)); size_multiplier = clamp_float(1.0 + edge_score * 1.75, float(COVARIANCE_SIZE_MULTIPLIER_MIN), float(COVARIANCE_SIZE_MULTIPLIER_MAX))
-            if total_sample >= int(COVARIANCE_MIN_SAMPLE_COUNT_TO_BLOCK) and edge_score <= float(COVARIANCE_BLOCK_SCORE_BELOW):
-                return {"available": True, "allowed": False, "size_multiplier": 0.0, "edge_score": edge_score, "active_features": len(contributions), "reason": f"covariance_correlation_blocked;scope={feature_policy_scope};edge_score={edge_score:.4f};sample_count={total_sample};features={'|'.join(reasons[:8])}"}
-            if edge_score <= float(COVARIANCE_SIZE_DOWN_SCORE_BELOW): size_multiplier = min(size_multiplier, 0.65)
-            return {"available": True, "allowed": True, "size_multiplier": size_multiplier, "edge_score": edge_score, "active_features": len(contributions), "sample_count": total_sample, "reason": f"covariance_correlation_allowed;scope={feature_policy_scope};edge_score={edge_score:.4f};size_multiplier={size_multiplier:.3f};features={'|'.join(reasons[:8])}"}
+            product_result = evaluate_rows(product_rows, "product_specific") if product_rows else {
+                "usable": False,
+                "reason": "no_product_specific_feature_policy",
+            }
+
+            if bool(product_result.get("usable", False)):
+                return product_result
+
+            portfolio_result = evaluate_rows(portfolio_rows, "portfolio_fallback") if portfolio_rows else {
+                "available": False,
+                "usable": False,
+                "allowed": True,
+                "size_multiplier": 0.75,
+                "reason": "covariance_correlation_policy_missing_size_down",
+            }
+
+            if bool(portfolio_result.get("usable", False)):
+                return portfolio_result
+
+            return {
+                "available": bool(product_rows or portfolio_rows),
+                "allowed": True,
+                "size_multiplier": 0.75,
+                "active_features": int(max(
+                    float(product_result.get("active_features", 0) or 0),
+                    float(portfolio_result.get("active_features", 0) or 0),
+                )),
+                "reason": (
+                    f"covariance_correlation_no_usable_policy_size_down;"
+                    f"product_reason={product_result.get('reason', '')};"
+                    f"portfolio_reason={portfolio_result.get('reason', '')}"
+                ),
+            }
+
         except Exception as exc:
-            return {"available": False, "allowed": True, "size_multiplier": 0.85, "reason": f"covariance_correlation_gate_error:{exc}"}
+            return {
+                "available": False,
+                "allowed": True,
+                "size_multiplier": 0.75,
+                "reason": f"covariance_correlation_gate_error_size_down:{exc}",
+            }
 
     def _markov_regime_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         if not bool(ENABLE_MARKOV_REGIME_LIVE_GATE): return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "markov_regime_gate_disabled"}
@@ -14698,6 +14824,8 @@ class TradingBot:
             if not product_id or observed_price <= 0:
                 candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 0.85, "kalman_reason": "kalman_missing_product_or_price"}); return candidate
             policy = self._kalman_policy_for_product(product_id)
+            kalman_policy_missing = not bool(policy)
+
             measurement_noise_bps = float(policy.get("measurement_noise_bps", 12.0) or 12.0)
             process_noise_bps = float(policy.get("process_noise_bps", 2.0) or 2.0)
 
@@ -14741,7 +14869,19 @@ class TradingBot:
             if residual_bps <= float(KALMAN_NEGATIVE_RESIDUAL_BLOCK_BPS): live_allowed = False; size_multiplier = 0.0; reason_parts.append(f"kalman_negative_residual_block residual={residual_bps:.2f}")
             if live_allowed:
                 size_multiplier = 0.65 if slope_bps_per_min < 0.0 else 0.75 if residual_bps > 60.0 else 1.05 if slope_bps_per_min > 4.0 and abs(residual_bps) < 80.0 else 0.90
-                size_multiplier = clamp_float(size_multiplier, float(KALMAN_SIZE_MULTIPLIER_MIN), float(KALMAN_SIZE_MULTIPLIER_MAX)); reason_parts.append(f"kalman_allowed slope={slope_bps_per_min:.2f};residual={residual_bps:.2f}")
+                if kalman_policy_missing:
+                    size_multiplier = min(size_multiplier, 0.75)
+                    reason_parts.append("kalman_policy_missing_using_default_noise_size_down")
+
+                size_multiplier = clamp_float(
+                    size_multiplier,
+                    float(KALMAN_SIZE_MULTIPLIER_MIN),
+                    float(KALMAN_SIZE_MULTIPLIER_MAX),
+                )
+                reason_parts.append(
+                    f"kalman_allowed slope={slope_bps_per_min:.2f};"
+                    f"residual={residual_bps:.2f}"
+                )
             data = {"observed_price": observed_price, "filtered_price": updated_price, "velocity_price_per_min": updated_velocity, "slope_bps_per_min": slope_bps_per_min, "residual_bps": residual_bps, "kalman_gain": kgp, "measurement_noise_bps": measurement_noise_bps, "process_noise_bps": process_noise_bps, "size_multiplier": size_multiplier, "live_allowed": live_allowed, "reason": ";".join(reason_parts)}
             candidate.update({"kalman_available": True, "kalman_filtered_price": float(updated_price), "kalman_velocity_price_per_min": float(updated_velocity), "kalman_slope_bps_per_min": float(slope_bps_per_min), "kalman_residual_bps": float(residual_bps), "kalman_gain": float(kgp), "kalman_measurement_noise_bps": float(measurement_noise_bps), "kalman_process_noise_bps": float(process_noise_bps), "kalman_live_allowed": bool(live_allowed), "kalman_size_multiplier": float(size_multiplier), "kalman_reason": str(data["reason"])})
             self._append_kalman_live_state_row(product_id, data); return candidate

@@ -203,15 +203,87 @@ class BinanceUSAdapter(BaseExchangeAdapter):
         symbol=self.product_to_symbol(product_id); return self.client.get_order(symbol=symbol, order_id=str(order_id))
     def cancel_product_order(self, product_id: str, order_id: str) -> bool:
         symbol=self.product_to_symbol(product_id); raw=self.client.cancel_order(symbol=symbol, order_id=str(order_id)); return bool(raw)
+    def _parse_fee_row_to_bps(self, row: Dict[str, Any]) -> Dict[str, float]:
+        maker_raw = (
+            row.get("makerCommission")
+            or row.get("maker")
+            or row.get("makerFee")
+            or row.get("maker_fee")
+            or row.get("makerCommissionRate")
+            or 0.0
+        )
+        taker_raw = (
+            row.get("takerCommission")
+            or row.get("taker")
+            or row.get("takerFee")
+            or row.get("taker_fee")
+            or row.get("takerCommissionRate")
+            or 0.0
+        )
+
+        maker = float(maker_raw or 0.0)
+        taker = float(taker_raw or 0.0)
+
+        if abs(maker) <= 1.0:
+            maker *= 10000.0
+
+        if abs(taker) <= 1.0:
+            taker *= 10000.0
+
+        return {"maker_bps": float(maker), "taker_bps": float(taker)}
+
     def fee_bps_for_symbol(self, symbol):
-        symbol=str(symbol).upper()
+        symbol = str(symbol).upper().strip()
+
         if symbol not in self.fee_cache:
             try:
-                row=self.client.trading_fee(symbol=symbol); row=row[0] if isinstance(row, list) else row; maker=float(row.get("makerCommission") or 0.0)*10000; taker=float(row.get("takerCommission") or 0.0)*10000
-                self.fee_cache[symbol]={"maker_bps":maker,"taker_bps":taker,"source":"api"}
-            except Exception as exc:
-                maker=float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS","0.0")); taker=float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS","2.0"))
-                self.fee_cache[symbol]={"maker_bps":maker,"taker_bps":taker,"source":"fallback","error":str(exc)}
+                row = self.client.trading_fee(symbol=symbol)
+                row = row[0] if isinstance(row, list) and row else row
+
+                if not isinstance(row, dict):
+                    raise RuntimeError(f"Unexpected trading fee response for {symbol}: {row}")
+
+                parsed = self._parse_fee_row_to_bps(row)
+                self.fee_cache[symbol] = {
+                    "maker_bps": float(parsed["maker_bps"]),
+                    "taker_bps": float(parsed["taker_bps"]),
+                    "source": "api_symbol",
+                }
+
+            except Exception as symbol_exc:
+                try:
+                    rows = self.client.trading_fee()
+                    match = None
+
+                    if isinstance(rows, list):
+                        for candidate in rows:
+                            if str(candidate.get("symbol", "")).upper() == symbol:
+                                match = candidate
+                                break
+                    elif isinstance(rows, dict):
+                        if str(rows.get("symbol", "")).upper() == symbol:
+                            match = rows
+
+                    if not isinstance(match, dict):
+                        raise RuntimeError(f"No trading-fee row found for {symbol}")
+
+                    parsed = self._parse_fee_row_to_bps(match)
+                    self.fee_cache[symbol] = {
+                        "maker_bps": float(parsed["maker_bps"]),
+                        "taker_bps": float(parsed["taker_bps"]),
+                        "source": "api_all_symbols",
+                    }
+
+                except Exception as all_exc:
+                    maker = float(os.getenv("BINANCE_US_FALLBACK_MAKER_FEE_BPS", "0.0"))
+                    taker = float(os.getenv("BINANCE_US_FALLBACK_TAKER_FEE_BPS", "2.0"))
+                    self.fee_cache[symbol] = {
+                        "maker_bps": maker,
+                        "taker_bps": taker,
+                        "source": "fallback",
+                        "error": f"symbol_fee_error={symbol_exc};all_fee_error={all_exc}",
+                    }
+
         return self.fee_cache[symbol]
     def _result_from_order(
         self,

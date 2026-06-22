@@ -43,9 +43,22 @@ def _month_iter(start_ts: int, end_ts: int) -> List[Tuple[int, int]]:
 
 def _binance_interval_for_timeframe(timeframe: str) -> str:
     tf = str(timeframe or "").lower().strip()
-    if tf == "primary_15m_90d": return "15m"
-    if tf == "regime_1h_365d": return "1h"
-    if tf == "daily_1d_2y": return "1d"
+
+    if tf in {"startup_1m_60d", "chart_1m_60d", "historical_1m_60d"}:
+        return "1m"
+
+    if tf in {"startup_5m_180d", "chart_5m_180d", "historical_5m_180d"}:
+        return "5m"
+
+    if tf in {"startup_15m_365d", "primary_15m_90d", "chart_15m_365d"}:
+        return "15m"
+
+    if tf in {"startup_1h_3y", "regime_1h_365d", "chart_1h_3y"}:
+        return "1h"
+
+    if tf in {"daily_1d_2y"}:
+        return "1d"
+
     raise ValueError(f"Unsupported Binance historical timeframe: {timeframe}")
 
 def _safe_ts_from_binance(raw_value: str) -> int:
@@ -168,7 +181,13 @@ class BinanceBulkHistoricalProvider:
             for candle in self._read_monthly_zip(zip_path=local_path, product_id=product_id, symbol=symbol, interval=interval, start_ts=start_ts, end_ts=end_ts):
                 candles_by_ts[int(candle.ts)] = candle
         daily_attempted = daily_downloaded = daily_missing = 0
-        expected_interval_sec = {"15m": 15 * 60, "1h": 60 * 60, "1d": 24 * 60 * 60}.get(interval, 60 * 60)
+        expected_interval_sec = {
+                "1m": 60,
+                "5m": 5 * 60,
+                "15m": 15 * 60,
+                "1h": 60 * 60,
+                "1d": 24 * 60 * 60,
+            }.get(interval, 60 * 60)
         existing_ts = set(candles_by_ts.keys())
         for year, month, day in self._day_iter(start_ts, end_ts):
             day_start = int(datetime(year, month, day, tzinfo=timezone.utc).timestamp())

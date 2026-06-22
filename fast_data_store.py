@@ -87,17 +87,65 @@ def scan_table(csv_path: str):
         return None
 
 
-def write_table(csv_path: str, frame: pd.DataFrame, *, write_csv: bool = True, write_parquet: bool = True, compression: Optional[str] = None) -> None:
+def write_table(
+    csv_path: str,
+    frame: pd.DataFrame,
+    *,
+    write_csv: bool = True,
+    write_parquet: bool = True,
+    compression: Optional[str] = None,
+) -> None:
+    """
+    Atomic table writer.
+
+    Large research/backtest files should write Parquet sidecars when possible.
+    If Parquet is unavailable, never break the bot; fall back to CSV.
+    """
     csv_path = str(csv_path)
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+
     if frame is None:
         frame = pd.DataFrame()
-    if write_parquet:
+
+    parquet_written = False
+
+    if write_parquet and pa is not None:
         pq_path = parquet_path_for(csv_path)
         tmp_pq = pq_path + ".tmp"
-        frame.to_parquet(tmp_pq, index=False, compression=compression or PARQUET_COMPRESSION)
-        os.replace(tmp_pq, pq_path)
-    if write_csv:
+
+        try:
+            frame.to_parquet(
+                tmp_pq,
+                index=False,
+                compression=compression or PARQUET_COMPRESSION,
+            )
+            os.replace(tmp_pq, pq_path)
+            parquet_written = True
+        except Exception:
+            try:
+                if os.path.exists(tmp_pq):
+                    os.remove(tmp_pq)
+            except Exception:
+                pass
+
+            # Retry with snappy because it is usually the safest pyarrow compression.
+            try:
+                frame.to_parquet(
+                    tmp_pq,
+                    index=False,
+                    compression="snappy",
+                )
+                os.replace(tmp_pq, pq_path)
+                parquet_written = True
+            except Exception:
+                try:
+                    if os.path.exists(tmp_pq):
+                        os.remove(tmp_pq)
+                except Exception:
+                    pass
+                parquet_written = False
+
+    if write_csv or not parquet_written:
         tmp_csv = csv_path + ".tmp"
         frame.to_csv(tmp_csv, index=False)
         os.replace(tmp_csv, csv_path)

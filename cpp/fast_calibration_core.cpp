@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -35,7 +37,7 @@ static double median_from_indices(const std::vector<int>& indices, Getter getter
 static py::dict evaluate_outcome_arrays(double entry_price, py::array_t<double, py::array::c_style | py::array::forcecast> highs, py::array_t<double, py::array::c_style | py::array::forcecast> lows, double target_bps, double cost_bps, double min_net_gain_bps, double bar_minutes, double max_adverse_before_profit_bps) {
     auto h = highs.unchecked<1>();
     auto l = lows.unchecked<1>();
-    const ssize_t n = h.shape(0);
+    const py::ssize_t n = h.shape(0);
     if (entry_price <= 0.0 || n <= 0 || l.shape(0) != n) {
         py::dict out;
         out["max_favorable_bps"] = 0.0; out["max_adverse_bps"] = 0.0; out["reached_min_profit"] = false; out["reached_target"] = false; out["win_bps"] = 0.0; out["loss_bps"] = 0.0; out["time_to_min_profit_bars"] = -1; out["time_to_min_profit_minutes"] = 0.0; out["forward_window_minutes"] = 0.0; out["post_profit_max_favorable_bps"] = 0.0; out["post_profit_extra_gain_bps"] = 0.0; out["adverse_before_profit_bps"] = 0.0; out["survived_to_profit"] = false;
@@ -45,7 +47,7 @@ static py::dict evaluate_outcome_arrays(double entry_price, py::array_t<double, 
     double max_high = 0.0, min_low = std::numeric_limits<double>::infinity(), max_favorable_bps = 0.0, max_adverse_bps = 0.0;
     int time_to_min_profit_bars = -1, profit_hit_index = -1;
     double time_to_min_profit_minutes = 0.0, adverse_before_profit_bps = 0.0, low_before_profit = entry_price;
-    for (ssize_t idx = 0; idx < n; ++idx) {
+    for (py::ssize_t idx = 0; idx < n; ++idx) {
         const double high = h(idx), low = l(idx);
         if (high <= 0.0 || low <= 0.0 || !std::isfinite(high) || !std::isfinite(low)) continue;
         max_high = std::max(max_high, high); min_low = std::min(min_low, low);
@@ -62,7 +64,7 @@ static py::dict evaluate_outcome_arrays(double entry_price, py::array_t<double, 
     double post_profit_max_favorable_bps = 0.0, post_profit_extra_gain_bps = 0.0;
     if (reached_min_profit && profit_hit_index >= 0) {
         double post_profit_high = 0.0;
-        for (ssize_t idx = profit_hit_index; idx < n; ++idx) { const double high = h(idx); if (high > 0.0 && std::isfinite(high)) post_profit_high = std::max(post_profit_high, high); }
+        for (py::ssize_t idx = profit_hit_index; idx < n; ++idx) { const double high = h(idx); if (high > 0.0 && std::isfinite(high)) post_profit_high = std::max(post_profit_high, high); }
         if (post_profit_high > 0.0) { post_profit_max_favorable_bps = ((post_profit_high / entry_price) - 1.0) * 10000.0; post_profit_extra_gain_bps = std::max(0.0, post_profit_max_favorable_bps - required_profit_bps); }
     }
     py::dict out;
@@ -71,11 +73,11 @@ static py::dict evaluate_outcome_arrays(double entry_price, py::array_t<double, 
 }
 
 static py::object simulate_armed_exit_net_bps(double entry_price, py::array_t<double, py::array::c_style | py::array::forcecast> highs, py::array_t<double, py::array::c_style | py::array::forcecast> lows, py::array_t<double, py::array::c_style | py::array::forcecast> closes, double target_bps, double cost_bps, double pullback_pct) {
-    auto h = highs.unchecked<1>(); auto l = lows.unchecked<1>(); auto c = closes.unchecked<1>(); const ssize_t n = h.shape(0);
+    auto h = highs.unchecked<1>(); auto l = lows.unchecked<1>(); auto c = closes.unchecked<1>(); const py::ssize_t n = h.shape(0);
     if (entry_price <= 0.0 || n <= 0 || l.shape(0) != n || c.shape(0) != n) return py::none();
     const double target_price = entry_price * (1.0 + target_bps / 10000.0);
     bool armed = false; double peak = 0.0;
-    for (ssize_t idx = 0; idx < n; ++idx) {
+    for (py::ssize_t idx = 0; idx < n; ++idx) {
         const double high = h(idx), low = l(idx), close = c(idx);
         if (!std::isfinite(high) || !std::isfinite(low) || !std::isfinite(close)) continue;
         if (!armed) { if (high >= target_price) { armed = true; peak = std::max(high, target_price); } continue; }
@@ -92,11 +94,11 @@ static py::dict find_best_threshold_profile(py::array_t<double, py::array::c_sty
     auto score=scores.unchecked<1>(), prob=probabilities.unchecked<1>(), evs=expected_values.unchecked<1>(), cost=costs.unchecked<1>(), spread=spreads.unchecked<1>();
     auto reached=reached_min_profit.unchecked<1>(), survived=survived_to_profit.unchecked<1>();
     auto favorable=max_favorable_bps.unchecked<1>(), ttmin=time_to_min_profit_minutes.unchecked<1>(), fwin=forward_window_minutes.unchecked<1>(), swin=selected_forward_window_minutes.unchecked<1>(), extra=post_profit_extra_gain_bps.unchecked<1>(), adverse=adverse_before_profit_bps.unchecked<1>();
-    auto score_cands=score_candidates.unchecked<1>(), prob_cands=probability_candidates.unchecked<1>(); const ssize_t n=score.shape(0);
+    auto score_cands=score_candidates.unchecked<1>(), prob_cands=probability_candidates.unchecked<1>(); const py::ssize_t n=score.shape(0);
     if (prob.shape(0)!=n||evs.shape(0)!=n||cost.shape(0)!=n||spread.shape(0)!=n||reached.shape(0)!=n||survived.shape(0)!=n||favorable.shape(0)!=n||ttmin.shape(0)!=n||fwin.shape(0)!=n||swin.shape(0)!=n||extra.shape(0)!=n||adverse.shape(0)!=n) throw std::runtime_error("find_best_threshold_profile received arrays with mismatched lengths");
     bool found=false; double best_quality=-std::numeric_limits<double>::infinity(), best_score_threshold=0.0, best_probability_threshold=0.0, best_win_rate=0.0, best_avg_win=0.0, best_avg_loss=0.0, best_ev=0.0, best_projected_gross_bps=0.0, best_median_time_to_min_profit=0.0, best_median_forward_window=0.0, best_median_selected_window=0.0, best_median_post_profit_extra_gain=0.0, best_median_adverse_before_profit=0.0; int best_sample_count=0; std::vector<int> best_indices;
-    for (ssize_t si=0; si<score_cands.shape(0); ++si) { const double score_threshold=score_cands(si); if (!std::isfinite(score_threshold)) continue; for (ssize_t pi=0; pi<prob_cands.shape(0); ++pi) { const double probability_threshold=prob_cands(pi); if (!std::isfinite(probability_threshold)) continue; std::vector<int> selected; selected.reserve(static_cast<size_t>(n));
-        for (ssize_t i=0; i<n; ++i) if (std::isfinite(score(i))&&std::isfinite(prob(i))&&score(i)>=score_threshold&&prob(i)>=probability_threshold) selected.push_back(static_cast<int>(i));
+    for (py::ssize_t si=0; si<score_cands.shape(0); ++si) { const double score_threshold=score_cands(si); if (!std::isfinite(score_threshold)) continue; for (py::ssize_t pi=0; pi<prob_cands.shape(0); ++pi) { const double probability_threshold=prob_cands(pi); if (!std::isfinite(probability_threshold)) continue; std::vector<int> selected; selected.reserve(static_cast<size_t>(n));
+        for (py::ssize_t i=0; i<n; ++i) if (std::isfinite(score(i))&&std::isfinite(prob(i))&&score(i)>=score_threshold&&prob(i)>=probability_threshold) selected.push_back(static_cast<int>(i));
         if (!selected.empty()) { const double reference_cost=median_from_indices(selected,[&](int idx){return cost(idx);}); const double reference_spread=median_from_indices(selected,[&](int idx){return spread(idx);}); std::vector<int> similar_selected; similar_selected.reserve(selected.size()); for (int idx:selected) if (std::abs(score(idx)-score_threshold)<=similar_score_band&&std::abs(prob(idx)-probability_threshold)<=similar_prob_band&&std::abs(cost(idx)-reference_cost)<=similar_cost_band_bps&&std::abs(spread(idx)-reference_spread)<=similar_spread_band_bps) similar_selected.push_back(idx); if (static_cast<int>(similar_selected.size())>=calib_exact_min_samples) selected.swap(similar_selected); }
         std::vector<int> selected_for_stats; for (int idx:selected) if ((reached(idx)==0)||survived(idx)!=0) selected_for_stats.push_back(idx); const int sample_count=static_cast<int>(selected_for_stats.size()); if (sample_count<calib_exact_min_samples) continue;
         int win_count=0, loss_count=0; double win_sum=0.0, loss_sum=0.0; for (int idx:selected_for_stats) { const double ev=evs(idx); if (!std::isfinite(ev)) continue; if (ev>0.0) { win_count++; win_sum+=std::max(0.0,ev); } else { loss_count++; loss_sum+=std::abs(std::min(0.0,ev)); } }
@@ -127,7 +129,7 @@ static py::dict evaluate_best_window_from_arrays(
     auto l = lows.unchecked<1>();
     auto windows = forward_windows.unchecked<1>();
 
-    const ssize_t n = h.shape(0);
+    const py::ssize_t n = h.shape(0);
 
     py::dict out;
     out["found"] = false;
@@ -163,7 +165,7 @@ static py::dict evaluate_best_window_from_arrays(
     bool best_survived_to_profit = false;
     double best_expected_value_bps = 0.0;
 
-    for (ssize_t wi = 0; wi < windows.shape(0); ++wi) {
+    for (py::ssize_t wi = 0; wi < windows.shape(0); ++wi) {
         const int forward_bars = windows(wi);
 
         if (forward_bars <= 0) {
@@ -350,7 +352,7 @@ static py::dict evaluate_best_windows_batch_from_arrays(
     auto targets = target_bps_values.unchecked<1>();
     auto costs = cost_bps_values.unchecked<1>();
 
-    const ssize_t n = entries.shape(0);
+    const py::ssize_t n = entries.shape(0);
 
     if (
         starts.shape(0) != n ||
@@ -379,7 +381,7 @@ static py::dict evaluate_best_windows_batch_from_arrays(
     py::list survived_to_profit_values;
     py::list expected_value_bps_values;
 
-    for (ssize_t row = 0; row < n; ++row) {
+    for (py::ssize_t row = 0; row < n; ++row) {
         const double entry_price = entries(row);
         const int start_index = starts(row);
         const double target_bps = targets(row);

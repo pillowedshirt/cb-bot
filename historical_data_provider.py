@@ -72,10 +72,18 @@ def _dt_mst(ts: int) -> str:
 
 class BinanceBulkHistoricalProvider:
     """Public historical Binance spot kline provider for replay/backlog only."""
-    def __init__(self, *, base_dir: str, timeout_sec: float = 30.0, prefer_binance_us: bool = False):
+    def __init__(
+        self,
+        *,
+        base_dir: str,
+        timeout_sec: float = 12.0,
+        prefer_binance_us: bool = False,
+        daily_fallback_max_days: int = 35,
+    ):
         self.base_dir = base_dir
         self.timeout_sec = float(timeout_sec)
         self.prefer_binance_us = bool(prefer_binance_us)
+        self.daily_fallback_max_days = int(daily_fallback_max_days)
         self.cache_dir = os.path.join(base_dir, BINANCE_BULK_CACHE_DIR_NAME)
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -117,7 +125,12 @@ class BinanceBulkHistoricalProvider:
             return True
         tmp_path = local_path + ".tmp"
         try:
-            response = requests.get(url, timeout=self.timeout_sec, stream=True)
+            response = requests.get(
+                url,
+                timeout=(5.0, float(self.timeout_sec)),
+                stream=True,
+                headers={"User-Agent": "cb-alt-scalper-historical-backfill/1.0"},
+            )
             if response.status_code == 404:
                 return False
             response.raise_for_status()
@@ -189,11 +202,24 @@ class BinanceBulkHistoricalProvider:
                 "1d": 24 * 60 * 60,
             }.get(interval, 60 * 60)
         existing_ts = set(candles_by_ts.keys())
+
+        # Daily fallback is only for recent monthly-file gaps.
+        # Do not try hundreds/thousands of daily files for older missing periods.
+        daily_cutoff_ts = max(
+            int(start_ts),
+            int(end_ts) - int(self.daily_fallback_max_days) * 86400,
+        )
+
         for year, month, day in self._day_iter(start_ts, end_ts):
             day_start = int(datetime(year, month, day, tzinfo=timezone.utc).timestamp())
             day_end = day_start + 86400 - 1
+
             if day_end < int(start_ts) or day_start > int(end_ts):
                 continue
+
+            if day_end < int(daily_cutoff_ts):
+                continue
+
             expected_points = max(1, int(86400 / max(1, expected_interval_sec)))
             covered_points = sum(1 for ts in existing_ts if day_start <= int(ts) <= day_end)
             if covered_points >= max(1, int(expected_points * 0.80)):

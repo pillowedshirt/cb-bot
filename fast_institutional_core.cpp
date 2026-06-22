@@ -5,20 +5,22 @@
 #include <cmath>
 #include <numeric>
 #include <vector>
+#include <cstddef>
+#include <cstdint>
 namespace py = pybind11;
 
 static std::vector<double> finite_values(py::array_t<double, py::array::c_style | py::array::forcecast> a) {
     auto r = a.unchecked<1>(); std::vector<double> v; v.reserve(r.shape(0));
-    for (ssize_t i=0;i<r.shape(0);++i) if (std::isfinite(r(i))) v.push_back(r(i));
+    for (py::ssize_t i=0;i<r.shape(0);++i) if (std::isfinite(r(i))) v.push_back(r(i));
     return v;
 }
 
 py::dict evaluate_agent_thresholds(py::array_t<double, py::array::c_style | py::array::forcecast> scores, py::array_t<double, py::array::c_style | py::array::forcecast> outcomes, py::array_t<double, py::array::c_style | py::array::forcecast> adverse, py::array_t<double, py::array::c_style | py::array::forcecast> thresholds) {
     auto s=scores.unchecked<1>(), o=outcomes.unchecked<1>(), a=adverse.unchecked<1>(), t=thresholds.unchecked<1>();
-    py::list rows; ssize_t n = std::min(s.shape(0), o.shape(0));
-    for (ssize_t j=0;j<t.shape(0);++j) {
+    py::list rows; py::ssize_t n = std::min(s.shape(0), o.shape(0));
+    for (py::ssize_t j=0;j<t.shape(0);++j) {
         double th=t(j), sum=0.0, advsum=0.0; int count=0, wins=0; std::vector<double> vals;
-        for (ssize_t i=0;i<n;++i) if (std::isfinite(s(i)) && s(i) >= th && std::isfinite(o(i))) { double v=o(i); vals.push_back(v); sum += v; wins += v > 0.0; if (i < a.shape(0) && std::isfinite(a(i))) advsum += std::abs(a(i)); count++; }
+        for (py::ssize_t i=0;i<n;++i) if (std::isfinite(s(i)) && s(i) >= th && std::isfinite(o(i))) { double v=o(i); vals.push_back(v); sum += v; wins += v > 0.0; if (i < a.shape(0) && std::isfinite(a(i))) advsum += std::abs(a(i)); count++; }
         py::dict row; row["threshold"]=th; row["selected"]=count;
         if (!count) { row["win_rate"]=0.0; row["avg_net"]=0.0; row["median"]=0.0; row["avg_adverse"]=0.0; }
         else { std::sort(vals.begin(), vals.end()); double med = vals[count/2]; if (count % 2 == 0) med = (vals[count/2-1] + vals[count/2]) / 2.0; row["win_rate"]=(double)wins/count; row["avg_net"]=sum/count; row["median"]=med; row["avg_adverse"]=advsum/count; }

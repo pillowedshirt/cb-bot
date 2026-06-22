@@ -617,6 +617,8 @@ FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH: str = runtime_path("fixed_inter
 FIXED_INTERSECTION_TRADE_LOG_CSV_PATH: str = runtime_path("fixed_intersection_trade_log.csv")
 FIXED_INTERSECTION_AGENT_SNAPSHOTS_CSV_PATH: str = runtime_path("fixed_intersection_agent_snapshots.csv")
 FIXED_INTERSECTION_PRODUCT_SUMMARY_CSV_PATH: str = runtime_path("fixed_intersection_product_summary.csv")
+FIXED_INTERSECTION_BACKLOG_STATUS_JSON_PATH: str = runtime_path("fixed_intersection_backlog_status.json")
+FIXED_INTERSECTION_BACKLOG_PROGRESS_CSV_PATH: str = runtime_path("fixed_intersection_backlog_progress.csv")
 
 # Compatibility aliases used by the historical replay process-worker path.
 # Keep both names because older helper functions still reference HISTORICAL_REPLAY_*.
@@ -22213,12 +22215,45 @@ class TradingBot:
             return {"available": False, "allowed": False, "confidence": 0.0, "reason": f"clean_profit_path_gate_error_fail_closed:{exc}"}
 
 
+    def _write_fixed_intersection_backlog_status(
+        self,
+        *,
+        stage: str,
+        product_id: str = "",
+        timeframe: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            payload = {
+                "ts": now_ts(),
+                "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                "stage": str(stage),
+                "product_id": str(product_id or ""),
+                "timeframe": str(timeframe or ""),
+                "detail": dict(detail or {}),
+            }
+
+            os.makedirs(os.path.dirname(FIXED_INTERSECTION_BACKLOG_STATUS_JSON_PATH), exist_ok=True)
+            tmp_path = FIXED_INTERSECTION_BACKLOG_STATUS_JSON_PATH + ".tmp"
+
+            with open(tmp_path, "w", encoding="utf-8") as file:
+                json.dump(payload, file, indent=2, sort_keys=True)
+
+            os.replace(tmp_path, FIXED_INTERSECTION_BACKLOG_STATUS_JSON_PATH)
+
+        except Exception:
+            pass
+
     def _ensure_fixed_intersection_backlog_candles(self) -> Dict[str, Any]:
         result = {"started": True, "products": len(PRODUCTS), "timeframes": len(FIXED_INTERSECTION_STARTUP_TIMEFRAMES), "rows_written": 0, "details": []}
         if BinanceBulkHistoricalProvider is None or write_normalized_candles_to_bot_cache is None:
             result["error"] = "historical_data_provider_unavailable"
             return result
-        provider = BinanceBulkHistoricalProvider(base_dir=CSV_ROOT_DIR)
+        provider = BinanceBulkHistoricalProvider(
+            base_dir=CSV_ROOT_DIR,
+            timeout_sec=12.0,
+            daily_fallback_max_days=35,
+        )
         end_ts = int(now_ts())
         for product_id in PRODUCTS:
             for spec in FIXED_INTERSECTION_STARTUP_TIMEFRAMES:
@@ -22229,20 +22264,84 @@ class TradingBot:
                         existing_product_rows = existing_frame[existing_frame["product_id"].astype(str).eq(str(product_id))]
                         min_reuse_rows = int(spec.get("min_sim_rows", spec.get("min_prefix_rows", 120)))
                         if len(existing_product_rows) >= min_reuse_rows:
-                            detail = {"product_id": product_id, "timeframe": timeframe, "rows_written": 0, "existing_rows": int(len(existing_product_rows)), "skipped": True, "reason": "existing_fixed_intersection_cache_sufficient_for_simulation"}
+                            detail = {
+                                "product_id": product_id,
+                                "timeframe": timeframe,
+                                "rows_written": 0,
+                                "existing_rows": int(len(existing_product_rows)),
+                                "skipped": True,
+                                "reason": "existing_fixed_intersection_cache_sufficient_for_simulation",
+                            }
                             result["details"].append(detail)
-                            module_debug(MODULE_NAME, "fixed_intersection_backlog_cache_reused", data=detail, level="INFO", also_overall=True)
+
+                            self._write_fixed_intersection_backlog_status(
+                                stage="cache_reused",
+                                product_id=product_id,
+                                timeframe=timeframe,
+                                detail=detail,
+                            )
+
+                            module_debug(
+                                MODULE_NAME,
+                                "fixed_intersection_backlog_cache_reused",
+                                data=detail,
+                                level="INFO",
+                                also_overall=True,
+                            )
                             continue
                 except Exception:
                     pass
                 try:
-                    candles, info = provider.fetch_bulk_candles(product_id=product_id, timeframe=timeframe, start_ts=start_ts, end_ts=end_ts)
+                    self._write_fixed_intersection_backlog_status(
+                        stage="fetching",
+                        product_id=product_id,
+                        timeframe=timeframe,
+                        detail={
+                            "path": path,
+                            "start_ts": int(start_ts),
+                            "end_ts": int(end_ts),
+                            "lookback_days": int(spec.get("lookback_days", 0)),
+                        },
+                    )
+
+                    module_debug(
+                        MODULE_NAME,
+                        "fixed_intersection_backlog_fetch_start",
+                        data={
+                            "product_id": product_id,
+                            "timeframe": timeframe,
+                            "path": path,
+                            "start_ts": int(start_ts),
+                            "end_ts": int(end_ts),
+                        },
+                        level="INFO",
+                        also_overall=True,
+                    )
+
+                    candles, info = provider.fetch_bulk_candles(
+                        product_id=product_id,
+                        timeframe=timeframe,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                    )
                     rows_written = write_normalized_candles_to_bot_cache(path=path, product_id=product_id, candles=candles, min_ts=start_ts)
                     detail = {"product_id": product_id, "timeframe": timeframe, "rows_written": int(rows_written), "candles_available": len(candles), "info": info}
                     result["rows_written"] += int(rows_written); result["details"].append(detail)
                     module_debug(MODULE_NAME, "fixed_intersection_backlog_candles_ready", data=detail, level="INFO", also_overall=True)
+                    self._write_fixed_intersection_backlog_status(
+                        stage="ready",
+                        product_id=product_id,
+                        timeframe=timeframe,
+                        detail=detail,
+                    )
                 except Exception as exc:
                     result["details"].append({"product_id": product_id, "timeframe": timeframe, "error": str(exc)})
+                    self._write_fixed_intersection_backlog_status(
+                        stage="error",
+                        product_id=product_id,
+                        timeframe=timeframe,
+                        detail={"error": str(exc)},
+                    )
                     module_exception(MODULE_NAME, "fixed_intersection_backlog_fetch_failed", exc, data={"product_id": product_id, "timeframe": timeframe}, also_overall=True)
         return result
 
@@ -22350,20 +22449,61 @@ class TradingBot:
 
     def _fixed_intersection_backlog_progress(self) -> float:
         try:
+            rows = []
             total_checks = 0
             ready_checks = 0
-            for product_id in PRODUCTS:
-                for spec in FIXED_INTERSECTION_STARTUP_TIMEFRAMES:
+            now_value = now_ts()
+            dt_value = datetime.fromtimestamp(now_value, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+            # Read each large timeframe CSV once, not once per product.
+            frames_by_timeframe = {}
+
+            for spec in FIXED_INTERSECTION_STARTUP_TIMEFRAMES:
+                timeframe = str(spec["timeframe"])
+                path = str(spec["csv_path"])
+                frame = self._read_csv_tail_for_bot(path, max_lines=2_000_000)
+                frames_by_timeframe[timeframe] = frame
+
+                if frame.empty or "product_id" not in frame.columns:
+                    counts = {}
+                else:
+                    counts = frame["product_id"].astype(str).value_counts().to_dict()
+
+                min_required = max(
+                    50,
+                    int(spec.get("min_sim_rows", spec.get("min_prefix_rows", 120))),
+                )
+
+                for product_id in PRODUCTS:
                     total_checks += 1
-                    path = str(spec["csv_path"])
-                    frame = self._read_csv_tail_for_bot(path, max_lines=2_000_000)
-                    if frame.empty or "product_id" not in frame.columns:
-                        continue
-                    product_rows = frame[frame["product_id"].astype(str).eq(str(product_id))]
-                    min_required = max(50, int(spec.get("min_sim_rows", spec.get("min_prefix_rows", 120))))
-                    if len(product_rows) >= min_required:
+                    product_rows = int(counts.get(str(product_id), 0) or 0)
+                    ready = bool(product_rows >= min_required)
+
+                    if ready:
                         ready_checks += 1
+
+                    rows.append({
+                        "ts": now_value,
+                        "dt_mst": dt_value,
+                        "product_id": product_id,
+                        "timeframe": timeframe,
+                        "path": path,
+                        "rows": product_rows,
+                        "min_required": int(min_required),
+                        "ready": bool(ready),
+                    })
+
+            try:
+                pd.DataFrame(rows).to_csv(FIXED_INTERSECTION_BACKLOG_PROGRESS_CSV_PATH, index=False)
+                write_generated_file_meta(
+                    FIXED_INTERSECTION_BACKLOG_PROGRESS_CSV_PATH,
+                    reason="fixed_intersection_backlog_progress",
+                )
+            except Exception:
+                pass
+
             return float(ready_checks / max(1, total_checks))
+
         except Exception:
             return 0.0
 

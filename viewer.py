@@ -165,6 +165,10 @@ MARKET_STATE_ANALOG_MATCHES_PATH = runtime_path("market_state_analog_matches.csv
 SELL_MODEL_RATIO_GRID_PATH = runtime_path("sell_model_ratio_grid.csv")
 ADAPTIVE_SELL_MODEL_POLICY_PATH = runtime_path("adaptive_sell_model_policy.csv")
 ADAPTIVE_DECISION_POLICY_PATH = runtime_path("adaptive_decision_policy.csv")
+CROSS_ASSET_ANALOG_SUMMARY_PATH = runtime_path("cross_asset_analog_summary.csv")
+CROSS_ASSET_ANALOG_MATCHES_PATH = runtime_path("cross_asset_analog_matches.csv")
+CROSS_ASSET_SELL_MODEL_RATIO_GRID_PATH = runtime_path("cross_asset_sell_model_ratio_grid.csv")
+CROSS_ASSET_ADAPTIVE_DECISION_POLICY_PATH = runtime_path("cross_asset_adaptive_decision_policy.csv")
 BACKGROUND_REPLAY_EXPANSION_SUMMARY_PATH = runtime_path("background_replay_expansion_summary.csv")
 DECISION_AUDIT_PATH = runtime_path("decision_audit.csv")
 
@@ -3863,7 +3867,7 @@ def render_startup_runtime_inventory_panel(startup_runtime_inventory_df):
         st.dataframe(inv[cols_to_show], width="stretch", hide_index=True)
 
 
-def render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df):
+def render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df, cross_asset_analog_summary_df, cross_asset_analog_matches_df, cross_asset_sell_model_ratio_grid_df, cross_asset_adaptive_decision_policy_df):
     st.markdown("### Continuous Background Research")
     cols = st.columns(4)
     cols[0].metric("Research cycles", 0 if continuous_research_history_df is None else len(continuous_research_history_df))
@@ -3979,6 +3983,33 @@ def render_continuous_research_panel(continuous_research_history_df, market_stat
             fig.update_yaxes(autorange="reversed")
             st.plotly_chart(_quant_fig_layout(fig, "Sell Ratio Grid — Best Consistency Tests", height=620), width="stretch")
 
+
+    st.markdown("#### Cross-Asset Transfer Learning")
+    if cross_asset_adaptive_decision_policy_df is not None and not cross_asset_adaptive_decision_policy_df.empty:
+        cross_policy = cross_asset_adaptive_decision_policy_df.copy()
+        for col in ["sample_count","same_product_sample_count","cross_product_sample_count","weighted_avg_net_bps","weighted_win_rate","weighted_p25_net_bps","position_size_multiplier","policy_confidence"]:
+            if col in cross_policy.columns: cross_policy[col] = pd.to_numeric(cross_policy[col], errors="coerce").fillna(0.0)
+        if "ts" in cross_policy.columns:
+            cross_policy["ts"] = pd.to_numeric(cross_policy["ts"], errors="coerce").fillna(0.0); cross_policy = cross_policy.sort_values("ts")
+        if "target_product_id" in cross_policy.columns:
+            latest = cross_policy.groupby("target_product_id", as_index=False).tail(1)
+            fig = go.Figure(); fig.add_bar(x=latest["target_product_id"].astype(str), y=latest["weighted_avg_net_bps"], name="Weighted avg net bps"); fig.add_scatter(x=latest["target_product_id"].astype(str), y=latest["weighted_win_rate"]*100.0, mode="lines+markers", name="Weighted win rate %", yaxis="y2"); fig.add_hline(y=0.0); fig.update_layout(yaxis=dict(title="Weighted avg net bps"), yaxis2=dict(title="Weighted win rate %", overlaying="y", side="right")); st.plotly_chart(_quant_fig_layout(fig, "Cross-Asset Policy — Similar Setups Across All Coins", height=440), width="stretch")
+            fig2 = go.Figure(); fig2.add_bar(x=latest["target_product_id"].astype(str), y=latest["same_product_sample_count"], name="Same-product samples"); fig2.add_bar(x=latest["target_product_id"].astype(str), y=latest["cross_product_sample_count"], name="Cross-product samples"); fig2.update_layout(barmode="stack"); st.plotly_chart(_quant_fig_layout(fig2, "Cross-Asset Evidence Mix — Same Coin vs Other Coins", height=420), width="stretch")
+            fig3 = go.Figure(); fig3.add_bar(x=latest["target_product_id"].astype(str), y=latest["position_size_multiplier"], name="Cross-asset position size multiplier", text=latest["policy_gate"].astype(str) if "policy_gate" in latest.columns else None, hovertemplate="Target=%{x}<br>Multiplier=%{y:.2f}x<br>Gate=%{text}<extra></extra>"); st.plotly_chart(_quant_fig_layout(fig3, "Cross-Asset Policy — Size Permission", height=360), width="stretch")
+    if cross_asset_analog_matches_df is not None and not cross_asset_analog_matches_df.empty:
+        matches = cross_asset_analog_matches_df.copy()
+        for col in ["similarity_score","transfer_weight","weighted_similarity","outcome_bps"]:
+            if col in matches.columns: matches[col] = pd.to_numeric(matches[col], errors="coerce").fillna(0.0)
+        if {"target_product_id","source_product_id","weighted_similarity","outcome_bps"}.issubset(matches.columns):
+            recent = matches.tail(1000); fig = go.Figure(); fig.add_scatter(x=recent["weighted_similarity"], y=recent["outcome_bps"], mode="markers", text=recent["target_product_id"].astype(str) + " ← " + recent["source_product_id"].astype(str), hovertemplate="%{text}<br>Weighted similarity=%{x:.3f}<br>Outcome=%{y:.2f} bps<extra></extra>", name="Cross-asset analogs"); fig.add_hline(y=0.0); fig.update_xaxes(title="Weighted similarity"); fig.update_yaxes(title="Historical source outcome bps"); st.plotly_chart(_quant_fig_layout(fig, "Cross-Asset Analog Cloud — Source Outcomes Applied to Target Setups", height=460), width="stretch")
+    if cross_asset_sell_model_ratio_grid_df is not None and not cross_asset_sell_model_ratio_grid_df.empty:
+        grid = cross_asset_sell_model_ratio_grid_df.copy()
+        for col in ["consistency_score","weighted_avg_net_bps","weighted_win_rate"]:
+            if col in grid.columns: grid[col] = pd.to_numeric(grid[col], errors="coerce").fillna(0.0)
+        top = grid.sort_values("consistency_score", ascending=False).head(30) if "consistency_score" in grid.columns else grid.head(30)
+        if not top.empty and {"target_product_id","consistency_score"}.issubset(top.columns):
+            fig = go.Figure(); fig.add_bar(x=top["consistency_score"], y=top["target_product_id"].astype(str) + " · scalp " + top["scalp_target_mult"].astype(str) + " / core " + top["core_target_mult"].astype(str), orientation="h", name="Consistency score"); fig.update_yaxes(autorange="reversed"); st.plotly_chart(_quant_fig_layout(fig, "Cross-Asset Sell Ratio Grid — Best Transfer Setups", height=620), width="stretch")
+
     if background_replay_expansion_summary_df is not None and not background_replay_expansion_summary_df.empty:
         exp = background_replay_expansion_summary_df.copy()
         if "rows_written" in exp.columns:
@@ -4007,6 +4038,14 @@ def render_continuous_research_panel(continuous_research_history_df, market_stat
             st.markdown("#### Sell model ratio grid"); st.dataframe(sell_model_ratio_grid_df.tail(250), width="stretch", hide_index=True)
         if background_replay_expansion_summary_df is not None and not background_replay_expansion_summary_df.empty:
             st.markdown("#### Background replay expansion"); st.dataframe(background_replay_expansion_summary_df.tail(100), width="stretch", hide_index=True)
+        if cross_asset_adaptive_decision_policy_df is not None and not cross_asset_adaptive_decision_policy_df.empty:
+            st.markdown("#### Cross-asset adaptive decision policy"); st.dataframe(cross_asset_adaptive_decision_policy_df.tail(150), width="stretch", hide_index=True)
+        if cross_asset_analog_summary_df is not None and not cross_asset_analog_summary_df.empty:
+            st.markdown("#### Cross-asset analog summary"); st.dataframe(cross_asset_analog_summary_df.tail(150), width="stretch", hide_index=True)
+        if cross_asset_analog_matches_df is not None and not cross_asset_analog_matches_df.empty:
+            st.markdown("#### Cross-asset analog matches"); st.dataframe(cross_asset_analog_matches_df.tail(250), width="stretch", hide_index=True)
+        if cross_asset_sell_model_ratio_grid_df is not None and not cross_asset_sell_model_ratio_grid_df.empty:
+            st.markdown("#### Cross-asset sell model ratio grid"); st.dataframe(cross_asset_sell_model_ratio_grid_df.tail(250), width="stretch", hide_index=True)
 
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
@@ -4038,6 +4077,10 @@ def render_live_dashboard(selected, refresh_config):
     adaptive_sell_model_policy_df = load_csv_tail(ADAPTIVE_SELL_MODEL_POLICY_PATH, max_lines=5000)
     adaptive_decision_policy_df = load_csv_tail(ADAPTIVE_DECISION_POLICY_PATH, max_lines=5000)
     background_replay_expansion_summary_df = load_csv_tail(BACKGROUND_REPLAY_EXPANSION_SUMMARY_PATH, max_lines=5000)
+    cross_asset_analog_summary_df = load_csv_tail(CROSS_ASSET_ANALOG_SUMMARY_PATH, max_lines=5000)
+    cross_asset_analog_matches_df = load_csv_tail(CROSS_ASSET_ANALOG_MATCHES_PATH, max_lines=20000)
+    cross_asset_sell_model_ratio_grid_df = load_csv_tail(CROSS_ASSET_SELL_MODEL_RATIO_GRID_PATH, max_lines=20000)
+    cross_asset_adaptive_decision_policy_df = load_csv_tail(CROSS_ASSET_ADAPTIVE_DECISION_POLICY_PATH, max_lines=5000)
     strategy_variant_replay_summary_df = load_csv_tail(
         STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH,
         max_lines=10000,
@@ -4093,7 +4136,7 @@ def render_live_dashboard(selected, refresh_config):
         render_startup_runtime_inventory_panel(startup_runtime_inventory_df)
 
     with st.expander("Continuous background research", expanded=True):
-        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df)
+        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df, cross_asset_analog_summary_df, cross_asset_analog_matches_df, cross_asset_sell_model_ratio_grid_df, cross_asset_adaptive_decision_policy_df)
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):

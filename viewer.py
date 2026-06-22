@@ -905,6 +905,8 @@ def _normalize_completed_calculation_status(status: dict, source: str = "complet
     phase_progress["historical_candle_backlog"] = 1.0
     phase_progress["historical_replay"] = 1.0
     phase_progress["replay_calibration_verdicts"] = 1.0
+    phase_progress["fixed_intersection_backlog"] = 1.0
+    phase_progress["fixed_intersection_simulation"] = 1.0
     out["phase_progress"] = phase_progress
     product_status = out.get("product_status") or {}
     if isinstance(product_status, dict):
@@ -4194,8 +4196,9 @@ def render_live_dashboard(selected, refresh_config):
     with st.expander("Startup runtime inventory", expanded=False):
         render_startup_runtime_inventory_panel(startup_runtime_inventory_df)
 
-    with st.expander("Continuous background research", expanded=True):
-        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df, cross_asset_analog_summary_df, cross_asset_analog_matches_df, cross_asset_sell_model_ratio_grid_df, cross_asset_adaptive_decision_policy_df)
+    if not bool(calc_status.get("policy", {}).get("fixed_intersection_only_model", True)):
+        with st.expander("Continuous background research", expanded=False):
+            render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df, cross_asset_analog_summary_df, cross_asset_analog_matches_df, cross_asset_sell_model_ratio_grid_df, cross_asset_adaptive_decision_policy_df)
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):

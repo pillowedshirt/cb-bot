@@ -32,6 +32,10 @@ except Exception:
 
 import numpy as np
 import pandas as pd
+from fast_data_store import read_table, write_rows_table, write_table, scan_table
+from institutional_math import institutional_agent_score, brier_score, t_stat, beta_lower_quantile, breakeven_probability, conservative_ev_bps, fractional_kelly
+from institutional_agents import train_logistic_meta_agent, train_tree_regime_agent, save_agent_model, predict_meta_probability, make_feature_frame
+from fast_institutional_wrapper import evaluate_agent_thresholds, has_fast_core
 
 try:
     from risk_intelligence import (
@@ -388,6 +392,12 @@ FEATURE_STORE_SUMMARY_COLUMNS = [
 ]
 
 BUY_AGENT_SCORE_COLUMNS = {
+    "bayesian_setup_pattern_edge_agent": "bayesian_setup_pattern_edge_buy_score",
+    "calibrated_logistic_meta_agent": "calibrated_logistic_meta_buy_score",
+    "tree_regime_agent": "tree_regime_buy_score",
+    "validated_liquidity_confirmer_agent": "validated_liquidity_confirmer_buy_score",
+    "execution_cost_gate_agent": "execution_cost_gate_buy_score",
+    "clean_path_analog_gate_agent": "clean_path_analog_gate_buy_score",
     "price_action": "price_action_buy_score",
     "market_structure_agent": "market_structure_buy_score",
     "validated_liquidity_agent": "validated_liquidity_buy_score",
@@ -412,6 +422,7 @@ BUY_AGENT_SCORE_COLUMNS = {
 }
 
 SELL_AGENT_SCORE_COLUMNS = {
+    "failed_entry_hazard_escape_agent": "failed_entry_hazard_escape_sell_score",
     "price_action": "price_action_sell_score",
     "volume_profile_leader": "volume_profile_leader_sell_score",
     "previous_session_volume_profile_agent": "previous_session_profile_sell_score",
@@ -431,6 +442,13 @@ SELL_AGENT_SCORE_COLUMNS = {
 }
 
 AGENT_CANONICAL_ALIASES = {
+    "bayesian_setup_pattern_edge": "bayesian_setup_pattern_edge_agent",
+    "calibrated_logistic_meta": "calibrated_logistic_meta_agent",
+    "tree_regime": "tree_regime_agent",
+    "validated_liquidity_confirmer": "validated_liquidity_confirmer_agent",
+    "execution_cost_gate": "execution_cost_gate_agent",
+    "clean_path_analog_gate": "clean_path_analog_gate_agent",
+    "failed_entry_hazard_escape": "failed_entry_hazard_escape_agent",
     "validated_liquidity": "validated_liquidity_agent",
     "fresh_zone": "fresh_zone_retest_agent",
     "fvg": "fair_value_gap_agent",
@@ -531,6 +549,10 @@ def _safe_bool(value: Any) -> bool:
     return text in {"true", "1", "yes", "y", "win", "won"}
 
 
+INSTITUTIONAL_MODEL_DIR = os.path.join(CSV_ROOT_DIR, "10_models")
+LOGISTIC_META_AGENT_MODEL_PATH = os.path.join(INSTITUTIONAL_MODEL_DIR, "logistic_meta_agent.pkl")
+TREE_REGIME_AGENT_MODEL_PATH = os.path.join(INSTITUTIONAL_MODEL_DIR, "tree_regime_agent.pkl")
+
 GENERATED_FILE_VERSION = "fast_startup_calc_v1_2026_06_21"
 
 
@@ -554,21 +576,14 @@ def _write_generated_file_meta(path: str, *, reason: str = "") -> None:
 
 def _read_csv(path: str) -> pd.DataFrame:
     try:
-        if not path or not os.path.exists(path) or os.path.getsize(path) <= 0:
-            return pd.DataFrame()
-        return pd.read_csv(path, on_bad_lines="skip", engine="python")
+        return read_table(path, prefer_parquet=True)
     except Exception:
         return pd.DataFrame()
 
 
 def _write_rows(path: str, columns: List[str], rows: List[List[Any]]) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(columns)
-        writer.writerows(rows)
-    os.replace(tmp, path)
-    _write_generated_file_meta(path, reason="backtest_intelligence_regenerated")
+    write_rows_table(path, columns, rows, write_csv=True, write_parquet=True)
+    _write_generated_file_meta(path, reason="backtest_intelligence_regenerated_parquet_accelerated")
 
 
 def _numeric(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
@@ -1607,11 +1622,15 @@ def _softmax_weights(scored_rows: List[Dict[str, Any]], *, score_key: str, raw_k
         sample_factor = _sample_reliability(selected_count, half_confidence_count=180)
         raw = (max(0.01, score) ** 2.25 * max(0.05, sample_factor) * max(0.05, 1.0 + avg_net / 80.0) * max(0.05, 1.0 + median_net / 120.0) * max(0.05, 1.0 + (win - 0.50) * 1.60) * max(0.05, 1.0 - max(0.0, adverse - 80.0) / 180.0))
         if avg_net <= 0.0:
-            raw *= 0.18
+            raw *= 0.12
         if median_net < 0.0:
-            raw *= 0.45
+            raw *= 0.25
         if win < 0.50:
-            raw *= 0.35
+            raw *= 0.25
+        if selected_count < 25:
+            raw *= 0.20
+        if selected_count < 10:
+            raw = min(raw, 1e-6)
         new_row = dict(row)
         new_row[raw_key] = float(max(1e-9, raw))
         adjusted.append(new_row)
@@ -1650,11 +1669,11 @@ def _softmax_weights_by_group(
             median_net = float(row.get("median_net_bps", 0.0) or 0.0)
             win = float(row.get("smoothed_win_rate", row.get("win_rate", 0.50)) or 0.50)
             if avg_net <= 0.0:
-                raw *= 0.18
+                raw *= 0.12
             if median_net < 0.0:
-                raw *= 0.45
+                raw *= 0.25
             if win < 0.50:
-                raw *= 0.35
+                raw *= 0.25
             row[raw_key] = raw
             raw_total += raw
         raw_total = max(raw_total, 1e-9)
@@ -1758,6 +1777,59 @@ def _add_proven_buy_agent_scores(frame: pd.DataFrame) -> pd.DataFrame:
     frame["volume_chop_veto_buy_score"] = _clip_series(1.0 - volume_chop_veto_strength)
     frame["quant_regime_veto_buy_score"] = _clip_series(1.0 - quant_regime_veto_strength)
     frame["execution_quality_gate_buy_score"] = _clip_series(execution_quality)
+    frame["execution_cost_gate_buy_score"] = frame["execution_quality_gate_buy_score"]
+    frame["validated_liquidity_confirmer_buy_score"] = _clip_series(validated_liquidity_existing * 0.55 + (1.0 - (spread_bps / 80.0).clip(0.0, 1.0)) * 0.25 + (1.0 - (cost_bps / 140.0).clip(0.0, 1.0)) * 0.20)
+    frame["clean_path_analog_gate_buy_score"] = frame["clean_path_analog_buy_score"]
+    return frame
+
+
+def _setup_pattern_key(frame: pd.DataFrame) -> pd.Series:
+    def col(name: str) -> pd.Series:
+        if name in frame.columns:
+            return frame[name].fillna("").astype(str).str.lower()
+        return pd.Series([""] * len(frame), index=frame.index)
+    parts = [col("value_area_state"), col("volume_node_state"), col("structure_state"), col("fvg_state"), col("setup_tag")]
+    key = parts[0]
+    for part in parts[1:]:
+        key = key + "|" + part
+    return key.str.replace("nan", "", regex=False).str.strip("|")
+
+
+def _add_bayesian_setup_pattern_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return frame
+    frame = frame.copy()
+    outcome_col = "buy_net_bps" if "buy_net_bps" in frame.columns else ("outcome_bps" if "outcome_bps" in frame.columns else "realized_net_pnl_bps")
+    if outcome_col not in frame.columns:
+        frame["bayesian_setup_pattern_edge_buy_score"] = 0.50
+        return frame
+    outcomes = pd.to_numeric(frame[outcome_col], errors="coerce").fillna(0.0)
+    keys = _setup_pattern_key(frame)
+    stats = []
+    total_trials = max(1, keys.nunique())
+    for key, idx in frame.groupby(keys).groups.items():
+        vals = outcomes.loc[idx]
+        n = int(len(vals))
+        if n < 10:
+            continue
+        wins = int((vals > 0).sum()); losses = int((vals <= 0).sum())
+        avg_win = float(vals[vals > 0].mean()) if wins else 0.0
+        avg_loss = float(vals[vals <= 0].mean()) if losses else -1.0
+        hard_stop_rate = early_adverse_rate = 0.0
+        if "exit_reason" in frame.columns:
+            reasons = frame.loc[idx, "exit_reason"].fillna("").astype(str).str.lower()
+            hard_stop_rate = float(reasons.str.contains("hard_stop", regex=False).mean())
+            early_adverse_rate = float(reasons.str.contains("early_adverse", regex=False).mean())
+        pack = institutional_agent_score(wins=wins, losses=losses, avg_win_bps=avg_win, avg_loss_bps=avg_loss, avg_net_bps=float(vals.mean()), median_net_bps=float(vals.median()), hard_stop_rate=hard_stop_rate, early_adverse_rate=early_adverse_rate, brier=0.25, trials=total_trials, t_value=t_stat(vals))
+        stats.append({"setup_pattern_key": key, "hard_stop_rate": hard_stop_rate, "early_adverse_rate": early_adverse_rate, **pack})
+    if not stats:
+        frame["bayesian_setup_pattern_edge_buy_score"] = 0.50
+        return frame
+    sf = pd.DataFrame(stats); raw = sf["institutional_score"].astype(float); lo = float(raw.quantile(0.05)); hi = float(raw.quantile(0.95)); denom = max(hi-lo, 1e-9)
+    sf["bayesian_score_norm"] = ((raw-lo)/denom).clip(0.0, 1.0)
+    frame["setup_pattern_key"] = keys
+    for out_col, src_col, default in [("bayesian_setup_pattern_edge_buy_score","bayesian_score_norm",0.35),("bayesian_setup_ev_low_bps","ev_low_bps",0.0),("bayesian_setup_p_low","p_low",0.50),("bayesian_setup_p_break_even","p_break_even",0.55),("bayesian_setup_hard_stop_rate","hard_stop_rate",0.0),("bayesian_setup_early_adverse_rate","early_adverse_rate",0.0)]:
+        frame[out_col] = keys.map(dict(zip(sf["setup_pattern_key"], sf[src_col]))).fillna(default).astype(float)
     return frame
 
 def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
@@ -1798,7 +1870,31 @@ def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
     frame["buy_adverse_bps"] = _numeric(frame, "max_adverse_bps", 0.0).abs()
     if "market_regime" not in frame.columns:
         frame["market_regime"] = _infer_market_regime(frame)
+    frame = _add_bayesian_setup_pattern_scores(frame)
     frame = _add_proven_buy_agent_scores(frame)
+    try:
+        os.makedirs(INSTITUTIONAL_MODEL_DIR, exist_ok=True)
+        logistic_payload = train_logistic_meta_agent(frame)
+        if logistic_payload.get("ok"):
+            save_agent_model(LOGISTIC_META_AGENT_MODEL_PATH, logistic_payload)
+            feature_frame, _, _ = make_feature_frame(frame)
+            frame["calibrated_logistic_meta_buy_score"] = logistic_payload["model"].predict_proba(feature_frame)[:, 1]
+            frame["calibrated_logistic_meta_brier"] = float(logistic_payload.get("brier", 1.0))
+            frame["calibrated_logistic_meta_auc"] = float(logistic_payload.get("auc", 0.5))
+        else:
+            frame["calibrated_logistic_meta_buy_score"] = 0.50; frame["calibrated_logistic_meta_brier"] = 1.0; frame["calibrated_logistic_meta_auc"] = 0.5
+        tree_payload = train_tree_regime_agent(frame)
+        if tree_payload.get("ok"):
+            save_agent_model(TREE_REGIME_AGENT_MODEL_PATH, tree_payload)
+            feature_frame, _, _ = make_feature_frame(frame)
+            frame["tree_regime_buy_score"] = tree_payload["model"].predict_proba(feature_frame)[:, 1]
+            frame["tree_regime_brier"] = float(tree_payload.get("brier", 1.0))
+            frame["tree_regime_auc"] = float(tree_payload.get("auc", 0.5))
+        else:
+            frame["tree_regime_buy_score"] = 0.50; frame["tree_regime_brier"] = 1.0; frame["tree_regime_auc"] = 0.5
+    except Exception:
+        frame["calibrated_logistic_meta_buy_score"] = 0.50; frame["calibrated_logistic_meta_brier"] = 1.0; frame["calibrated_logistic_meta_auc"] = 0.5
+        frame["tree_regime_buy_score"] = 0.50; frame["tree_regime_brier"] = 1.0; frame["tree_regime_auc"] = 0.5
     _save_feature_frame_cached(base_dir, "buy_training_frame", cache_key, frame)
     return frame
 
@@ -1822,8 +1918,12 @@ def _scan_buy_agent_thresholds(agent: str, col: str, frame: pd.DataFrame) -> Tup
             continue
         stats = _ev_stats(selected["buy_net_bps"])
         avg_adverse = float(pd.to_numeric(selected["buy_adverse_bps"], errors="coerce").fillna(0.0).mean())
-        score = _four_pass_score_from_ev(smoothed_win_rate=stats["smoothed_win_rate"], ev_bps=stats["ev_bps"], avg_net_bps=stats["avg_net_bps"], median_net_bps=stats["median_net_bps"], avg_adverse_bps=avg_adverse, selected_count=selected_count, sample_floor=100)
-        candidate = {"agent": agent, "source_column": col, "sample_count": int(len(valid)), "selected_count": selected_count, "threshold": threshold, "win_rate": stats["smoothed_win_rate"], "raw_win_rate": stats["raw_win_rate"], "avg_win_bps": stats["avg_win_bps"], "avg_loss_bps": stats["avg_loss_bps"], "ev_bps": stats["ev_bps"], "avg_net_bps": stats["avg_net_bps"], "median_net_bps": stats["median_net_bps"], "avg_adverse_bps": avg_adverse, "score": score, "profitability_mode": str(selected.get("profitability_mode", pd.Series(["unknown"])).iloc[0] if "profitability_mode" in selected.columns and not selected.empty else "unknown")}
+        selected_outcomes = pd.to_numeric(selected["buy_net_bps"], errors="coerce").fillna(0.0)
+        wins = int((selected_outcomes > 0).sum()); losses = int((selected_outcomes <= 0).sum())
+        brier = brier_score(pd.to_numeric(selected[col], errors="coerce").fillna(0.50).clip(0.0, 1.0), (selected_outcomes > 0).astype(int))
+        score_pack = institutional_agent_score(wins=wins, losses=losses, avg_win_bps=stats["avg_win_bps"], avg_loss_bps=stats["avg_loss_bps"], avg_net_bps=stats["avg_net_bps"], median_net_bps=stats["median_net_bps"], hard_stop_rate=0.0, early_adverse_rate=0.0, brier=brier, trials=max(1, len(BUY_AGENT_SCORE_COLUMNS)), t_value=t_stat(selected_outcomes))
+        score = float(score_pack["institutional_score"])
+        candidate = {"agent": agent, "source_column": col, "sample_count": int(len(valid)), "selected_count": selected_count, "threshold": threshold, "win_rate": stats["smoothed_win_rate"], "raw_win_rate": stats["raw_win_rate"], "avg_win_bps": stats["avg_win_bps"], "avg_loss_bps": stats["avg_loss_bps"], "ev_bps": stats["ev_bps"], "avg_net_bps": stats["avg_net_bps"], "median_net_bps": stats["median_net_bps"], "avg_adverse_bps": avg_adverse, "score": score, "score_pack": score_pack, "brier": brier, "profitability_mode": str(selected.get("profitability_mode", pd.Series(["unknown"])).iloc[0] if "profitability_mode" in selected.columns and not selected.empty else "unknown")}
         if best is None or score > float(best["score"]):
             best = candidate
     if "product_id" in valid.columns:
@@ -1884,7 +1984,7 @@ def _four_pass_buy_agent_rows(base_dir: str) -> Tuple[List[List[Any]], Dict[str,
     for row in rows_for_weighting:
         agent = str(row["agent"])
         weights[agent] = float(row["buy_weight_pct"])
-        output_rows.append([f"{ts_value:.6f}", dt_value, "buy_pass_1_agent_only_all_agents_bayesian_ev", agent, row["source_column"], int(row["sample_count"]), int(row["selected_count"]), f"{float(row['threshold']):.6f}", f"{float(row['win_rate']):.6f}", f"{float(row['avg_net_bps']):.6f}", f"{float(row['median_net_bps']):.6f}", f"{float(row['avg_adverse_bps']):.6f}", f"{float(row['score']):.6f}", f"{float(row['raw_authority']):.6f}", f"{float(row['buy_weight_pct']):.6f}", (f"buy_agent_pass_all_agents_bayesian_ev;agent={agent};source={row['source_column']};smoothed_win_rate={float(row['win_rate']):.4f};raw_win_rate={float(row['raw_win_rate']):.4f};ev={float(row['ev_bps']):.2f};avg_net={float(row['avg_net_bps']):.2f};median_net={float(row['median_net_bps']):.2f};weight={float(row['buy_weight_pct']):.2f}%")])
+        output_rows.append([f"{ts_value:.6f}", dt_value, "buy_pass_1_agent_only_all_agents_bayesian_ev", agent, row["source_column"], int(row["sample_count"]), int(row["selected_count"]), f"{float(row['threshold']):.6f}", f"{float(row['win_rate']):.6f}", f"{float(row['avg_net_bps']):.6f}", f"{float(row['median_net_bps']):.6f}", f"{float(row['avg_adverse_bps']):.6f}", f"{float(row['score']):.6f}", f"{float(row['raw_authority']):.6f}", f"{float(row['buy_weight_pct']):.6f}", (f"institutional_buy_agent_sim;agent={agent};source={row['source_column']};smoothed_win_rate={float(row['win_rate']):.4f};raw_win_rate={float(row['raw_win_rate']):.4f};ev={float(row['ev_bps']):.2f};avg_net={float(row['avg_net_bps']):.2f};median_net={float(row['median_net_bps']):.2f};p_low={float(row.get('score_pack', {}).get('p_low', 0.0)):.3f};p_break={float(row.get('score_pack', {}).get('p_break_even', 0.0)):.3f};ev_low={float(row.get('score_pack', {}).get('ev_low_bps', 0.0)):.2f};brier={float(row.get('brier', 0.25)):.3f};weight={float(row['buy_weight_pct']):.2f}%")])
 
     context_output_rows: List[List[Any]] = []
     for row in context_rows_for_weighting:
@@ -1973,6 +2073,7 @@ def _add_proven_sell_agent_scores(frame: pd.DataFrame) -> pd.DataFrame:
     frame["profit_pullback_capture_sell_score"] = _clip_series(profit_pullback)
     frame["higher_low_wave_stop_sell_score"] = _clip_series(wave_stop)
     frame["failed_entry_escape_sell_score"] = _clip_series(failed_entry_escape)
+    frame["failed_entry_hazard_escape_sell_score"] = frame["failed_entry_escape_sell_score"]
     frame["hard_stop_prevention_sell_score"] = _clip_series(hard_stop_prevention)
     frame["max_hold_decay_sell_score"] = _clip_series(max_hold_decay)
     return frame
@@ -2311,7 +2412,7 @@ def _four_pass_product_live_gate_rows(
             )
             cooldown_minutes = 0
             reason = (
-                f"four_pass_live_gate;"
+                f"institutional_product_live_gate;"
                 f"buy_selected={buy_selected_count};"
                 f"buy_win={buy_win_rate:.3f};"
                 f"buy_avg={buy_avg_net_bps:.2f};"

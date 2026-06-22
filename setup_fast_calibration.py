@@ -26,6 +26,12 @@ ext_modules = [
         cxx_std=17,
         extra_compile_args=extra_compile_args,
     ),
+    Pybind11Extension(
+        "fast_institutional_core",
+        ["fast_institutional_core.cpp"],
+        cxx_std=17,
+        extra_compile_args=extra_compile_args,
+    ),
 ]
 
 

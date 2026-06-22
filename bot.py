@@ -56,6 +56,9 @@ except Exception:
 
 import numpy as np
 import pandas as pd
+from fast_data_store import read_table, write_table, write_rows_table, append_csv_and_refresh_parquet_periodically, bulk_ensure_parquet_sidecars, ensure_parquet_sidecar
+from institutional_agents import load_agent_model, predict_meta_probability
+from institutional_math import beta_lower_quantile, breakeven_probability, conservative_ev_bps, fractional_kelly
 import requests
 import websockets
 from dotenv import load_dotenv
@@ -819,6 +822,17 @@ WALK_FORWARD_VALIDATION_CSV_PATH: str = runtime_path("walk_forward_validation.cs
 AGENT_ABLATION_CSV_PATH: str = runtime_path("agent_ablation.csv")
 PREVIOUS_SESSION_PROFILE_CSV_PATH: str = runtime_path("previous_session_profile.csv")
 QUANT_CONTEXT_CSV_PATH: str = runtime_path("quant_context.csv")
+INSTITUTIONAL_MODEL_DIR = os.path.join(CSV_ROOT_DIR, "10_models")
+LOGISTIC_META_AGENT_MODEL_PATH = os.path.join(INSTITUTIONAL_MODEL_DIR, "logistic_meta_agent.pkl")
+TREE_REGIME_AGENT_MODEL_PATH = os.path.join(INSTITUTIONAL_MODEL_DIR, "tree_regime_agent.pkl")
+ENABLE_INSTITUTIONAL_BUY_GATE: bool = True
+INSTITUTIONAL_MIN_EV_LOW_BPS: float = 0.0
+INSTITUTIONAL_MIN_POSTERIOR_P_EDGE: float = 0.015
+INSTITUTIONAL_MAX_HARD_STOP_RATE: float = 0.12
+INSTITUTIONAL_MAX_EARLY_ADVERSE_RATE: float = 0.18
+INSTITUTIONAL_MAX_BRIER_SCORE: float = 0.28
+INSTITUTIONAL_REQUIRE_PRODUCT_GATE: bool = True
+INSTITUTIONAL_REQUIRE_MAKER_EXECUTION: bool = True
 
 # Decision-engine completion logs.
 DECISION_AUDIT_CSV_PATH: str = runtime_path("decision_audit.csv")
@@ -7142,6 +7156,8 @@ class TradingBot:
         self._adaptive_decision_policy_cache_ts: float = 0.0
         self._cross_asset_policy_cache: Dict[str, Dict[str, Any]] = {}
         self._cross_asset_policy_cache_ts: float = 0.0
+        self.logistic_meta_agent_model = load_agent_model(LOGISTIC_META_AGENT_MODEL_PATH)
+        self.tree_regime_agent_model = load_agent_model(TREE_REGIME_AGENT_MODEL_PATH)
 
         ensure_runtime_dirs()
         self.runtime_file_migration_result = migrate_root_runtime_files_to_csv_tree()
@@ -10847,11 +10863,17 @@ class TradingBot:
                 self.clog.log_profile(profile)
                 self._product_calibration_ready[product] = False
         self._startup_calibration_ready = all(bool(v) for v in self._product_calibration_ready.values()) if self._product_calibration_ready else False
+        try:
+            self._ensure_startup_parquet_sidecars()
+        except Exception:
+            pass
         log("[calibration] startup walk-forward calibration finished")
         try:
             self._run_backtest_intelligence_if_due(force=True)
             self._write_agent_trade_policy()
             self._write_agent_side_ratings()
+            self.logistic_meta_agent_model = load_agent_model(LOGISTIC_META_AGENT_MODEL_PATH)
+            self.tree_regime_agent_model = load_agent_model(TREE_REGIME_AGENT_MODEL_PATH)
             if self.level8_council is not None and hasattr(self.level8_council, "_clear_level8_memory_cache"):
                 self.level8_council._clear_level8_memory_cache()
             module_debug(MODULE_NAME, "startup_four_pass_agent_reweight_complete", data={"reason": "startup_calibration_completed_then_full_agent_buy_sell_simulation_ran"}, level="INFO", also_overall=True)
@@ -12769,7 +12791,7 @@ class TradingBot:
         self.backtest_setup_performance_by_product = {}
         try:
             if os.path.exists(BACKTEST_RECOMMENDATIONS_CSV_PATH) and os.path.getsize(BACKTEST_RECOMMENDATIONS_CSV_PATH) > 0:
-                recs = pd.read_csv(BACKTEST_RECOMMENDATIONS_CSV_PATH)
+                recs = read_table(BACKTEST_RECOMMENDATIONS_CSV_PATH, prefer_parquet=True)
                 if not recs.empty and "product_id" in recs.columns:
                     for _, row in recs.iterrows():
                         product_id = str(row.get("product_id", "")).strip()
@@ -12779,7 +12801,7 @@ class TradingBot:
             log(f"[backtest] failed to load buy recommendations: {exc}")
         try:
             if os.path.exists(BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH) and os.path.getsize(BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH) > 0:
-                recs = pd.read_csv(BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH)
+                recs = read_table(BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH, prefer_parquet=True)
                 if not recs.empty and "product_id" in recs.columns:
                     for _, row in recs.iterrows():
                         product_id = str(row.get("product_id", "")).strip()
@@ -12793,7 +12815,7 @@ class TradingBot:
                 and os.path.exists(BACKTEST_SETUP_PERFORMANCE_CSV_PATH)
                 and os.path.getsize(BACKTEST_SETUP_PERFORMANCE_CSV_PATH) > 0
             ):
-                setup_frame = pd.read_csv(BACKTEST_SETUP_PERFORMANCE_CSV_PATH)
+                setup_frame = read_table(BACKTEST_SETUP_PERFORMANCE_CSV_PATH, prefer_parquet=True)
                 if not setup_frame.empty and {"product_id", "setup_key"}.issubset(setup_frame.columns):
                     for _, row in setup_frame.iterrows():
                         row_dict = row.to_dict()
@@ -15289,6 +15311,59 @@ class TradingBot:
         except Exception as exc:
             candidate.update({"kalman_available": False, "kalman_live_allowed": True, "kalman_size_multiplier": 0.65, "kalman_reason": f"kalman_filter_error_size_down:{exc}"}); return candidate
 
+
+    def _ensure_startup_parquet_sidecars(self) -> None:
+        """Convert heavy CSV runtime files to Parquet sidecars before repeated startup reads."""
+        heavy_paths = [
+            HIST_REPLAY_15M_90D_CSV_PATH, HIST_REPLAY_1H_365D_CSV_PATH, HIST_REPLAY_1D_2Y_CSV_PATH,
+            HISTORICAL_SHADOW_REPLAY_CSV_PATH, CANDIDATE_REPLAY_CSV_PATH, SHADOW_SELL_REPLAY_CSV_PATH,
+            BACKTEST_RECOMMENDATIONS_CSV_PATH, BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH, BACKTEST_AGENT_PRIORS_CSV_PATH,
+            BACKTEST_SETUP_PERFORMANCE_CSV_PATH, WALK_FORWARD_VALIDATION_CSV_PATH, AGENT_ABLATION_CSV_PATH,
+            FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH, RISK_EV_CONFIDENCE_CSV_PATH, RISK_MONTE_CARLO_SUMMARY_CSV_PATH,
+            RISK_CONTEXT_PERFORMANCE_CSV_PATH, FEATURE_OUTCOME_CORRELATION_CSV_PATH, FEATURE_CORRELATION_MATRIX_CSV_PATH,
+            MARKOV_REGIME_TRANSITIONS_CSV_PATH, MARKOV_REGIME_POLICY_CSV_PATH, KALMAN_FILTER_POLICY_CSV_PATH,
+            QUANT_STATE_SUMMARY_CSV_PATH, MARKET_STATE_ANALOG_SUMMARY_CSV_PATH, MARKET_STATE_ANALOG_MATCHES_CSV_PATH,
+            ADAPTIVE_SELL_MODEL_POLICY_CSV_PATH, ADAPTIVE_DECISION_POLICY_CSV_PATH, SELL_MODEL_RATIO_GRID_CSV_PATH,
+            CROSS_ASSET_ANALOG_SUMMARY_CSV_PATH, CROSS_ASSET_ANALOG_MATCHES_CSV_PATH,
+            CROSS_ASSET_ADAPTIVE_DECISION_POLICY_CSV_PATH, CROSS_ASSET_SELL_MODEL_RATIO_GRID_CSV_PATH,
+        ]
+        try:
+            result = bulk_ensure_parquet_sidecars(heavy_paths)
+            module_debug(MODULE_NAME, "startup_parquet_sidecars_ready", data=result, level="INFO", also_overall=True)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "startup_parquet_sidecars_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+
+    def _institutional_buy_requirements_ok(self, candidate: Dict[str, Any]) -> Tuple[bool, str]:
+        if not bool(ENABLE_INSTITUTIONAL_BUY_GATE):
+            return True, "institutional_buy_gate_disabled"
+        p_low = float(candidate.get("bayesian_setup_p_low", 0.50) or 0.50)
+        p_break = float(candidate.get("bayesian_setup_p_break_even", 0.55) or 0.55)
+        ev_low = float(candidate.get("bayesian_setup_ev_low_bps", 0.0) or 0.0)
+        logistic_brier = float(candidate.get("calibrated_logistic_meta_brier", 0.25) or 0.25)
+        tree_brier = float(candidate.get("tree_regime_brier", 0.25) or 0.25)
+        hard_stop_rate = float(candidate.get("bayesian_setup_hard_stop_rate", 0.0) or 0.0)
+        early_adverse_rate = float(candidate.get("bayesian_setup_early_adverse_rate", 0.0) or 0.0)
+        product_score = float(candidate.get("product_edge_governor_buy_score", 0.50) or 0.50)
+        execution_score = float(candidate.get("execution_cost_gate_buy_score", candidate.get("execution_quality_gate_buy_score", 0.50)) or 0.50)
+        clean_path_score = float(candidate.get("clean_path_analog_gate_buy_score", candidate.get("clean_path_analog_buy_score", 0.50)) or 0.50)
+        if ev_low <= float(INSTITUTIONAL_MIN_EV_LOW_BPS):
+            return False, f"institutional_block:ev_low_not_positive;ev_low={ev_low:.2f}"
+        if (p_low - p_break) < float(INSTITUTIONAL_MIN_POSTERIOR_P_EDGE):
+            return False, f"institutional_block:posterior_edge_too_low;p_low={p_low:.3f};p_break={p_break:.3f}"
+        if hard_stop_rate > float(INSTITUTIONAL_MAX_HARD_STOP_RATE):
+            return False, f"institutional_block:hard_stop_rate_too_high;hard_stop_rate={hard_stop_rate:.3f}"
+        if early_adverse_rate > float(INSTITUTIONAL_MAX_EARLY_ADVERSE_RATE):
+            return False, f"institutional_block:early_adverse_rate_too_high;early_adverse_rate={early_adverse_rate:.3f}"
+        if min(logistic_brier, tree_brier) > float(INSTITUTIONAL_MAX_BRIER_SCORE):
+            return False, f"institutional_block:probability_calibration_bad;logistic_brier={logistic_brier:.3f};tree_brier={tree_brier:.3f}"
+        if bool(INSTITUTIONAL_REQUIRE_PRODUCT_GATE) and product_score < 0.55:
+            return False, f"institutional_block:product_gate_failed;product_score={product_score:.3f}"
+        if bool(INSTITUTIONAL_REQUIRE_MAKER_EXECUTION) and execution_score < 0.58:
+            return False, f"institutional_block:execution_cost_gate_failed;execution_score={execution_score:.3f}"
+        if clean_path_score < 0.55:
+            return False, f"institutional_block:clean_path_gate_failed;clean_path_score={clean_path_score:.3f}"
+        return True, f"institutional_buy_gate_passed;p_low={p_low:.3f};p_break={p_break:.3f};ev_low={ev_low:.2f};product_score={product_score:.3f};execution_score={execution_score:.3f};clean_path_score={clean_path_score:.3f}"
+
     def _level8_live_buy_quality_ok(
         self,
         *,
@@ -15447,6 +15522,12 @@ class TradingBot:
                     "live_buy_blocked:clean_profit_path_gate "
                     f"product_id={product_id};reason={clean_path_gate.get('reason', '')}"
                 )
+
+            institutional_ok, institutional_reason = self._institutional_buy_requirements_ok(candidate)
+            candidate["institutional_buy_gate_ok"] = bool(institutional_ok)
+            candidate["institutional_buy_gate_reason"] = str(institutional_reason)
+            if not institutional_ok:
+                return False, f"live_buy_blocked:institutional_buy_gate {institutional_reason}"
 
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
@@ -16197,16 +16278,22 @@ class TradingBot:
         order_book_buy = clamp01(candidate.get("order_book_buy_score", 0.50))
         order_book_wait = clamp01(candidate.get("order_book_wait_score", 0.20))
         execution_quality = clamp_float((1.0 - min(1.0, max(0.0, spread_bps) / 80.0)) * 0.36 + (1.0 - min(1.0, max(0.0, cost_bps) / 140.0)) * 0.24 + order_book_buy * 0.22 + (1.0 - order_book_wait) * 0.18, 0.0, 1.0)
+        row_for_model = dict(candidate); row_for_model.update(common)
+        logistic_p = predict_meta_probability(self.logistic_meta_agent_model, row_for_model)
+        tree_p = predict_meta_probability(self.tree_regime_agent_model, row_for_model)
         return [
-            vote("setup_pattern_edge_agent", setup_pattern_edge, 0.45 + setup_pattern_edge * 0.25, 0.70 - setup_pattern_edge * 0.45, 0.78, f"setup_pattern_edge;setup={setup_tag};buy={setup_pattern_edge:.3f}"),
+            vote("calibrated_logistic_meta_agent", logistic_p, 0.40 + logistic_p * 0.25, 1.0 - logistic_p, 0.82, f"calibrated_logistic_meta;p_win={logistic_p:.3f}"),
+            vote("tree_regime_agent", tree_p, 0.40 + tree_p * 0.22, 1.0 - tree_p, 0.70, f"tree_regime;p_win={tree_p:.3f}"),
+            vote("bayesian_setup_pattern_edge_agent", clamp_float(0.35 + max(0.0, float(candidate.get("bayesian_setup_p_low", 0.50) or 0.50) - float(candidate.get("bayesian_setup_p_break_even", 0.55) or 0.55)) * 2.0 + max(0.0, float(candidate.get("bayesian_setup_ev_low_bps", 0.0) or 0.0)) / 80.0, 0.0, 1.0), 0.45 + setup_pattern_edge * 0.25, 0.70 - setup_pattern_edge * 0.45, 0.78, f"setup_pattern_edge;setup={setup_tag};buy={setup_pattern_edge:.3f}"),
             vote("market_structure_reclaim_agent", market_structure_reclaim, 0.45 + market_structure_reclaim * 0.25, 0.68 - market_structure_reclaim * 0.42, 0.74, f"market_structure_reclaim;structure={structure_state};value={value_acceptance_state};buy={market_structure_reclaim:.3f}"),
+            vote("validated_liquidity_confirmer_agent", validated_liquidity_score, 0.40 + validated_liquidity_score * 0.25, 1.0 - validated_liquidity_score, 0.72, f"validated_liquidity_confirmer;score={validated_liquidity_score:.3f}"),
             vote("score_band_anti_chase_agent", score_band_anti_chase, 0.45 + score_band_anti_chase * 0.20, 0.70 - score_band_anti_chase * 0.40, 0.68, f"score_band_anti_chase;score={score_norm:.3f};prob={probability:.3f};buy={score_band_anti_chase:.3f}"),
             vote("product_edge_governor_agent", product_edge_governor, 0.40 + product_edge_governor * 0.26, 0.72 - product_edge_governor * 0.42, clamp_float(0.35 + replay_quality * 0.45, 0.20, 0.86), f"product_edge_governor;product={product_id};bt_net={backtest_expected_net:.2f};bt_win={backtest_win:.3f};quality={replay_quality:.3f}"),
-            vote("clean_path_analog_agent", clean_path_analog, 0.42 + clean_path_analog * 0.28, 0.74 - clean_path_analog * 0.48, clamp_float(0.25 + clean_confidence * 0.62, 0.20, 0.90), f"clean_path_analog;allowed={clean_allowed};confidence={clean_confidence:.3f};buy={clean_path_analog:.3f}"),
+            vote("clean_path_analog_gate_agent", clean_path_analog, 0.42 + clean_path_analog * 0.28, 0.74 - clean_path_analog * 0.48, clamp_float(0.25 + clean_confidence * 0.62, 0.20, 0.90), f"clean_path_analog;allowed={clean_allowed};confidence={clean_confidence:.3f};buy={clean_path_analog:.3f}"),
             vote("bad_setup_veto_agent", 1.0 - bad_setup_veto_strength, 0.35, bad_setup_veto_strength, 0.88 if bad_setup_veto_strength > 0.50 else 0.55, f"bad_setup_veto;veto={bad_setup_veto_strength:.3f}"),
             vote("volume_chop_veto_agent", 1.0 - volume_chop_veto_strength, 0.42, volume_chop_veto_strength, 0.74, f"volume_chop_veto;veto={volume_chop_veto_strength:.3f}"),
             vote("quant_regime_veto_agent", 1.0 - quant_regime_veto_strength, 0.42, quant_regime_veto_strength, 0.70, f"quant_regime_veto;veto={quant_regime_veto_strength:.3f};regime={market_regime}"),
-            vote("execution_quality_gate_agent", execution_quality, 0.36 + execution_quality * 0.20, 1.0 - execution_quality, 0.76, f"execution_quality_gate;spread={spread_bps:.2f};cost={cost_bps:.2f};quality={execution_quality:.3f}"),
+            vote("execution_cost_gate_agent", execution_quality, 0.36 + execution_quality * 0.20, 1.0 - execution_quality, 0.76, f"execution_quality_gate;spread={spread_bps:.2f};cost={cost_bps:.2f};quality={execution_quality:.3f}"),
         ]
 
     def _level8_decision_for_candidate(
@@ -16539,15 +16626,18 @@ class TradingBot:
                     return clamp_float(float(vote_by_agent.get(agent, {}).get("wait", default) or default), 0.0, 1.0)
                 except Exception:
                     return float(default)
-            setup_alpha = agent_buy("setup_pattern_edge_agent", 0.30)
+            setup_alpha = agent_buy("bayesian_setup_pattern_edge_agent", 0.30)
             structure_alpha = agent_buy("market_structure_reclaim_agent", 0.30)
             anti_chase_alpha = agent_buy("score_band_anti_chase_agent", 0.30)
             product_alpha = agent_buy("product_edge_governor_agent", 0.30)
-            clean_path_alpha = agent_buy("clean_path_analog_agent", 0.25)
-            execution_alpha = agent_buy("execution_quality_gate_agent", 0.30)
-            veto_pressure = clamp_float(agent_wait("bad_setup_veto_agent", 0.0) * 0.42 + agent_wait("volume_chop_veto_agent", 0.0) * 0.24 + agent_wait("quant_regime_veto_agent", 0.0) * 0.20 + agent_wait("execution_quality_gate_agent", 0.0) * 0.14, 0.0, 1.0)
+            clean_path_alpha = agent_buy("clean_path_analog_gate_agent", 0.25)
+            execution_alpha = agent_buy("execution_cost_gate_agent", 0.30)
+            veto_pressure = clamp_float(agent_wait("bad_setup_veto_agent", 0.0) * 0.42 + agent_wait("volume_chop_veto_agent", 0.0) * 0.24 + agent_wait("quant_regime_veto_agent", 0.0) * 0.20 + agent_wait("execution_cost_gate_agent", 0.0) * 0.14, 0.0, 1.0)
             utility_truth_component = clamp_float(0.50 + float(candidate.get("expected_utility_bps", 0.0) or 0.0) / 260.0 + (float(candidate.get("calibrated_p_win", 0.50) or 0.50) - 0.50) * 0.50 + (float(candidate.get("payoff_ratio", 0.0) or 0.0) - 1.0) * 0.14, 0.0, 1.0)
-            truth_buy = clamp_float(setup_alpha * 0.20 + structure_alpha * 0.17 + anti_chase_alpha * 0.11 + product_alpha * 0.11 + clean_path_alpha * 0.22 + utility_truth_component * 0.11 + execution_alpha * 0.08 - veto_pressure * 0.28, 0.0, 1.0)
+            logistic_alpha = agent_buy("calibrated_logistic_meta_agent", 0.50)
+            tree_alpha = agent_buy("tree_regime_agent", 0.50)
+            liquidity_alpha = agent_buy("validated_liquidity_confirmer_agent", 0.50)
+            truth_buy = clamp_float(setup_alpha * 0.22 + logistic_alpha * 0.20 + tree_alpha * 0.10 + structure_alpha * 0.14 + liquidity_alpha * 0.10 + anti_chase_alpha * 0.08 + product_alpha * 0.08 + clean_path_alpha * 0.08 + utility_truth_component * 0.18 + execution_alpha * 0.14 - veto_pressure * 0.34, 0.0, 1.0)
             truth_vote = vote(
                 "truth",
                 truth_buy,

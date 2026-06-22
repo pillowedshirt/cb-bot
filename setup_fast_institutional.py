@@ -21,8 +21,8 @@ else:
 
 ext_modules = [
     Pybind11Extension(
-        "fast_calibration_core",
-        ["cpp/fast_calibration_core.cpp"],
+        "fast_institutional_core",
+        ["fast_institutional_core.cpp"],
         cxx_std=17,
         extra_compile_args=extra_compile_args,
     ),
@@ -30,9 +30,9 @@ ext_modules = [
 
 
 setup(
-    name="fast_calibration_core",
+    name="fast_institutional_core",
     version="0.1.0",
-    description="Fast C++ calibration core for the trading bot",
+    description="Fast C++ institutional scoring helpers for the trading bot",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     zip_safe=False,

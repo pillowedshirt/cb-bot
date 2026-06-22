@@ -206,6 +206,32 @@ FOUR_PASS_FINAL_AGENT_RATINGS_COLUMNS: List[str] = [
     "profitability_mode", "reason",
 ]
 
+
+BAYESIAN_SETUP_PATTERN_POLICY_COLUMNS = [
+    "ts",
+    "dt_utc",
+    "setup_pattern_key",
+    "sample_count",
+    "wins",
+    "losses",
+    "avg_net_bps",
+    "median_net_bps",
+    "avg_win_bps",
+    "avg_loss_bps",
+    "hard_stop_rate",
+    "early_adverse_rate",
+    "p_mean",
+    "p_low",
+    "p_break_even",
+    "ev_low_bps",
+    "payoff_ratio",
+    "fractional_kelly",
+    "deflated_edge_score",
+    "institutional_score",
+    "bayesian_score_norm",
+    "reason",
+]
+
 FOUR_PASS_PROFITABILITY_SUMMARY_COLUMNS: List[str] = [
     "ts", "dt_utc",
     "buy_agent_rows", "buy_council_rows", "sell_agent_rows", "sell_council_rows",
@@ -1821,12 +1847,67 @@ def _add_bayesian_setup_pattern_scores(frame: pd.DataFrame) -> pd.DataFrame:
             hard_stop_rate = float(reasons.str.contains("hard_stop", regex=False).mean())
             early_adverse_rate = float(reasons.str.contains("early_adverse", regex=False).mean())
         pack = institutional_agent_score(wins=wins, losses=losses, avg_win_bps=avg_win, avg_loss_bps=avg_loss, avg_net_bps=float(vals.mean()), median_net_bps=float(vals.median()), hard_stop_rate=hard_stop_rate, early_adverse_rate=early_adverse_rate, brier=0.25, trials=total_trials, t_value=t_stat(vals))
-        stats.append({"setup_pattern_key": key, "hard_stop_rate": hard_stop_rate, "early_adverse_rate": early_adverse_rate, **pack})
+        stats.append({
+            "setup_pattern_key": key,
+            "n": n,
+            "wins": wins,
+            "losses": losses,
+            "avg_net_bps": float(vals.mean()),
+            "median_net_bps": float(vals.median()),
+            "avg_win_bps": avg_win,
+            "avg_loss_bps": avg_loss,
+            "hard_stop_rate": hard_stop_rate,
+            "early_adverse_rate": early_adverse_rate,
+            **pack,
+        })
     if not stats:
         frame["bayesian_setup_pattern_edge_buy_score"] = 0.50
         return frame
     sf = pd.DataFrame(stats); raw = sf["institutional_score"].astype(float); lo = float(raw.quantile(0.05)); hi = float(raw.quantile(0.95)); denom = max(hi-lo, 1e-9)
     sf["bayesian_score_norm"] = ((raw-lo)/denom).clip(0.0, 1.0)
+    try:
+        ts_value = _utc_ts()
+        dt_value = _utc_dt(ts_value)
+
+        policy_rows = []
+
+        for _, row in sf.iterrows():
+            policy_rows.append({
+                "ts": ts_value,
+                "dt_utc": dt_value,
+                "setup_pattern_key": str(row.get("setup_pattern_key", "")),
+                "sample_count": int(float(row.get("n", 0) or 0)),
+                "wins": int(float(row.get("wins", 0) or 0)),
+                "losses": int(float(row.get("losses", 0) or 0)),
+                "avg_net_bps": float(row.get("avg_net_bps", 0.0) or 0.0),
+                "median_net_bps": float(row.get("median_net_bps", 0.0) or 0.0),
+                "avg_win_bps": float(row.get("avg_win_bps", 0.0) or 0.0),
+                "avg_loss_bps": float(row.get("avg_loss_bps", 0.0) or 0.0),
+                "hard_stop_rate": float(row.get("hard_stop_rate", 0.0) or 0.0),
+                "early_adverse_rate": float(row.get("early_adverse_rate", 0.0) or 0.0),
+                "p_mean": float(row.get("p_mean", 0.50) or 0.50),
+                "p_low": float(row.get("p_low", 0.50) or 0.50),
+                "p_break_even": float(row.get("p_break_even", 0.55) or 0.55),
+                "ev_low_bps": float(row.get("ev_low_bps", 0.0) or 0.0),
+                "payoff_ratio": float(row.get("payoff_ratio", 0.0) or 0.0),
+                "fractional_kelly": float(row.get("fractional_kelly", 0.0) or 0.0),
+                "deflated_edge_score": float(row.get("deflated_edge_score", 0.0) or 0.0),
+                "institutional_score": float(row.get("institutional_score", 0.0) or 0.0),
+                "bayesian_score_norm": float(row.get("bayesian_score_norm", 0.50) or 0.50),
+                "reason": "bayesian_setup_pattern_policy_from_historical_replay",
+            })
+
+        if policy_rows:
+            policy_frame = pd.DataFrame(policy_rows, columns=BAYESIAN_SETUP_PATTERN_POLICY_COLUMNS)
+            write_table(
+                runtime_path("bayesian_setup_pattern_policy.csv"),
+                policy_frame,
+                write_csv=True,
+                write_parquet=True,
+            )
+    except Exception:
+        pass
+
     frame["setup_pattern_key"] = keys
     for out_col, src_col, default in [("bayesian_setup_pattern_edge_buy_score","bayesian_score_norm",0.35),("bayesian_setup_ev_low_bps","ev_low_bps",0.0),("bayesian_setup_p_low","p_low",0.50),("bayesian_setup_p_break_even","p_break_even",0.55),("bayesian_setup_hard_stop_rate","hard_stop_rate",0.0),("bayesian_setup_early_adverse_rate","early_adverse_rate",0.0)]:
         frame[out_col] = keys.map(dict(zip(sf["setup_pattern_key"], sf[src_col]))).fillna(default).astype(float)

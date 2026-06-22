@@ -59,6 +59,8 @@ import pandas as pd
 from fast_data_store import read_table, write_table, write_rows_table, append_csv_and_refresh_parquet_periodically, bulk_ensure_parquet_sidecars, ensure_parquet_sidecar
 from institutional_agents import load_agent_model, predict_meta_probability
 from institutional_math import beta_lower_quantile, breakeven_probability, conservative_ev_bps, fractional_kelly
+from fast_institutional_wrapper import has_fast_core as institutional_fast_core_available
+from fast_institutional_wrapper import fast_core_import_error as institutional_fast_core_import_error
 import requests
 import websockets
 from dotenv import load_dotenv
@@ -812,6 +814,7 @@ AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH: str = runtime_path("agent_component
 AGENT_TRADE_POLICY_CSV_PATH: str = runtime_path("agent_trade_policy.csv")
 AGENT_SIDE_RATINGS_CSV_PATH: str = runtime_path("agent_side_ratings.csv")
 FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH: str = runtime_path("four_pass_product_live_gate.csv")
+BAYESIAN_SETUP_PATTERN_POLICY_CSV_PATH: str = runtime_path("bayesian_setup_pattern_policy.csv")
 PRODUCT_COOLDOWNS_CSV_PATH: str = runtime_path("product_cooldowns.csv")
 BACKTEST_RECOMMENDATIONS_CSV_PATH: str = runtime_path("backtest_recommendations.csv")
 BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = runtime_path("backtest_sell_recommendations.csv")
@@ -7432,13 +7435,12 @@ class TradingBot:
 
         if bool(ENABLE_BACKTEST_INTELLIGENCE) and bool(BACKTEST_INTELLIGENCE_RUN_ON_STARTUP):
             try:
-                if bool(CALCULATION_PARALLEL_PHASES_ENABLED):
-                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True)
-                else:
-                    self._run_backtest_intelligence_if_due(force=True)
-                    self._load_backtest_recommendations()
+                # Do not force heavy institutional four-pass before replay/calibration data exists.
+                # The full force run happens after startup calibration finishes.
+                self._ensure_startup_parquet_sidecars()
+                self._maybe_run_backtest_intelligence_background(force_when_replay_complete=True)
             except Exception as exc:
-                log(f"[backtest] startup backtest intelligence failed: {exc}")
+                log(f"[backtest] startup backtest intelligence scheduling failed: {exc}")
         # positions per product: list of PositionLot
         self.positions: Dict[str, List[PositionLot]] = {p: [] for p in PRODUCTS}
         self.inverted_markers: Dict[str, Dict[str, Any]] = {}
@@ -12676,24 +12678,46 @@ class TradingBot:
             )
             if self.level8_council is not None and hasattr(self.level8_council, "_clear_level8_memory_cache"):
                 self.level8_council._clear_level8_memory_cache()
+            try:
+                self._write_agent_trade_policy()
+                self._write_agent_side_ratings()
+                self.logistic_meta_agent_model = load_agent_model(LOGISTIC_META_AGENT_MODEL_PATH)
+                self.tree_regime_agent_model = load_agent_model(TREE_REGIME_AGENT_MODEL_PATH)
+                if self.level8_council is not None and hasattr(self.level8_council, "_clear_level8_memory_cache"):
+                    self.level8_council._clear_level8_memory_cache()
+            except Exception as refresh_exc:
+                module_exception(
+                    MODULE_NAME,
+                    "post_backtest_policy_refresh_failed",
+                    refresh_exc,
+                    data={"traceback": traceback.format_exc()},
+                    also_overall=False,
+                )
         except Exception as exc:
             log_exception("backtest intelligence update failed", exc)
 
     def _current_replay_training_row_count(self) -> int:
         total = 0
+
         for filename in [
             "candidate_replay.csv",
             "historical_shadow_replay.csv",
             "shadow_sell_replay.csv",
             "sell_outcomes.csv",
         ]:
-            path = os.path.join(BASE_DIR, filename)
+            path = runtime_path(filename)
+
             try:
-                if os.path.exists(path) and os.path.getsize(path) > 0:
-                    frame = self._read_csv_tail_for_bot(path, max_lines=500000)
-                    total += int(len(frame))
+                frame = read_table(path, prefer_parquet=True)
+                total += int(len(frame))
             except Exception:
-                pass
+                try:
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        frame = self._read_csv_tail_for_bot(path, max_lines=500000)
+                        total += int(len(frame))
+                except Exception:
+                    pass
+
         return int(total)
 
     def _maybe_run_backtest_intelligence_background(self, *, force_when_replay_complete: bool = False) -> None:
@@ -15333,6 +15357,88 @@ class TradingBot:
         except Exception as exc:
             module_exception(MODULE_NAME, "startup_parquet_sidecars_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
 
+    def _institutional_setup_pattern_key_for_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        context = context or {}
+        pa = dict(context.get("price_action_context", {}) or {})
+
+        def text(*values: Any) -> str:
+            for value in values:
+                if value is not None and str(value).strip():
+                    return str(value).strip().lower()
+            return ""
+
+        value_area = text(candidate.get("value_area_state"), pa.get("value_area_state"))
+        volume_node = text(candidate.get("volume_node_state"), pa.get("volume_node_state"))
+        structure = text(candidate.get("structure_state"), pa.get("structure_state"))
+        fvg = text(candidate.get("fvg_state"), pa.get("fvg_state"))
+        setup = text(candidate.get("setup_tag"))
+
+        return "|".join([value_area, volume_node, structure, fvg, setup]).strip("|")
+
+    def _hydrate_institutional_candidate_features(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Attach Bayesian setup-pattern policy fields to a live candidate.
+
+        Without this, the institutional buy gate can fail closed because live candidates
+        do not naturally contain bayesian_setup_ev_low_bps / p_low / p_break_even.
+        """
+        try:
+            key = self._institutional_setup_pattern_key_for_candidate(
+                candidate=candidate,
+                context=context,
+            )
+            candidate["setup_pattern_key"] = key
+
+            if not key:
+                candidate["institutional_hydration_reason"] = "missing_setup_pattern_key"
+                return candidate
+
+            frame = read_table(BAYESIAN_SETUP_PATTERN_POLICY_CSV_PATH, prefer_parquet=True)
+
+            if frame.empty or "setup_pattern_key" not in frame.columns:
+                candidate["institutional_hydration_reason"] = "missing_bayesian_setup_policy_file"
+                return candidate
+
+            policy = frame[frame["setup_pattern_key"].astype(str) == str(key)]
+
+            if policy.empty:
+                candidate["institutional_hydration_reason"] = f"no_bayesian_policy_match;key={key}"
+                return candidate
+
+            row = policy.tail(1).iloc[0]
+
+            candidate["bayesian_setup_sample_count"] = int(float(row.get("sample_count", 0) or 0))
+            candidate["bayesian_setup_p_low"] = float(row.get("p_low", 0.50) or 0.50)
+            candidate["bayesian_setup_p_break_even"] = float(row.get("p_break_even", 0.55) or 0.55)
+            candidate["bayesian_setup_ev_low_bps"] = float(row.get("ev_low_bps", 0.0) or 0.0)
+            candidate["bayesian_setup_hard_stop_rate"] = float(row.get("hard_stop_rate", 0.0) or 0.0)
+            candidate["bayesian_setup_early_adverse_rate"] = float(row.get("early_adverse_rate", 0.0) or 0.0)
+            candidate["bayesian_setup_score_norm"] = float(row.get("bayesian_score_norm", 0.50) or 0.50)
+            candidate["bayesian_setup_institutional_score"] = float(row.get("institutional_score", 0.0) or 0.0)
+            candidate["institutional_hydration_reason"] = (
+                f"bayesian_policy_match;key={key};"
+                f"samples={candidate['bayesian_setup_sample_count']};"
+                f"p_low={candidate['bayesian_setup_p_low']:.3f};"
+                f"p_break={candidate['bayesian_setup_p_break_even']:.3f};"
+                f"ev_low={candidate['bayesian_setup_ev_low_bps']:.2f}"
+            )
+
+            return candidate
+
+        except Exception as exc:
+            candidate["institutional_hydration_reason"] = f"bayesian_policy_hydration_failed:{exc}"
+            return candidate
+
     def _institutional_buy_requirements_ok(self, candidate: Dict[str, Any]) -> Tuple[bool, str]:
         if not bool(ENABLE_INSTITUTIONAL_BUY_GATE):
             return True, "institutional_buy_gate_disabled"
@@ -15346,8 +15452,16 @@ class TradingBot:
         product_score = float(candidate.get("product_edge_governor_buy_score", 0.50) or 0.50)
         execution_score = float(candidate.get("execution_cost_gate_buy_score", candidate.get("execution_quality_gate_buy_score", 0.50)) or 0.50)
         clean_path_score = float(candidate.get("clean_path_analog_gate_buy_score", candidate.get("clean_path_analog_buy_score", 0.50)) or 0.50)
+        sample_count = int(float(candidate.get("bayesian_setup_sample_count", 0) or 0))
+
+        if sample_count <= 0:
+            return False, (
+                "institutional_block:missing_bayesian_setup_policy;"
+                f"reason={candidate.get('institutional_hydration_reason', '')}"
+            )
+
         if ev_low <= float(INSTITUTIONAL_MIN_EV_LOW_BPS):
-            return False, f"institutional_block:ev_low_not_positive;ev_low={ev_low:.2f}"
+            return False, f"institutional_block:ev_low_not_positive;ev_low={ev_low:.2f};samples={sample_count}"
         if (p_low - p_break) < float(INSTITUTIONAL_MIN_POSTERIOR_P_EDGE):
             return False, f"institutional_block:posterior_edge_too_low;p_low={p_low:.3f};p_break={p_break:.3f}"
         if hard_stop_rate > float(INSTITUTIONAL_MAX_HARD_STOP_RATE):
@@ -16281,6 +16395,20 @@ class TradingBot:
         row_for_model = dict(candidate); row_for_model.update(common)
         logistic_p = predict_meta_probability(self.logistic_meta_agent_model, row_for_model)
         tree_p = predict_meta_probability(self.tree_regime_agent_model, row_for_model)
+        candidate["calibrated_logistic_meta_buy_score"] = float(logistic_p)
+        candidate["tree_regime_buy_score"] = float(tree_p)
+        candidate["bayesian_setup_pattern_edge_buy_score"] = float(
+            candidate.get("bayesian_setup_score_norm", setup_pattern_edge)
+        )
+        candidate["market_structure_reclaim_buy_score"] = float(market_structure_reclaim)
+        candidate["validated_liquidity_confirmer_buy_score"] = float(validated_liquidity_score)
+        candidate["score_band_anti_chase_buy_score"] = float(score_band_anti_chase)
+        candidate["product_edge_governor_buy_score"] = float(product_edge_governor)
+        candidate["clean_path_analog_gate_buy_score"] = float(clean_path_analog)
+        candidate["bad_setup_veto_buy_score"] = float(1.0 - bad_setup_veto_strength)
+        candidate["volume_chop_veto_buy_score"] = float(1.0 - volume_chop_veto_strength)
+        candidate["quant_regime_veto_buy_score"] = float(1.0 - quant_regime_veto_strength)
+        candidate["execution_cost_gate_buy_score"] = float(execution_quality)
         return [
             vote("calibrated_logistic_meta_agent", logistic_p, 0.40 + logistic_p * 0.25, 1.0 - logistic_p, 0.82, f"calibrated_logistic_meta;p_win={logistic_p:.3f}"),
             vote("tree_regime_agent", tree_p, 0.40 + tree_p * 0.22, 1.0 - tree_p, 0.70, f"tree_regime;p_win={tree_p:.3f}"),
@@ -16389,6 +16517,10 @@ class TradingBot:
 
         try:
             context = self._level8_market_context(product_id=product_id, candidate=candidate)
+            candidate = self._hydrate_institutional_candidate_features(
+                candidate=candidate,
+                context=context,
+            )
             candidate = self._apply_setup_performance_to_candidate(candidate)
 
             utility_info = self._expected_utility_for_candidate(candidate=candidate)
@@ -20888,13 +21020,45 @@ class TradingBot:
             self._ensure_agent_trade_policy_header()
             four_pass_path = runtime_path("four_pass_final_agent_ratings.csv")
             if os.path.exists(four_pass_path) and os.path.getsize(four_pass_path) > 0:
-                four = pd.read_csv(four_pass_path)
+                four = read_table(four_pass_path, prefer_parquet=True)
                 if not four.empty and "agent" in four.columns:
                     ts_val = now_ts()
                     dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
-                    primary_buy_agents = {"setup_pattern_edge_agent", "market_structure_reclaim_agent", "score_band_anti_chase_agent", "product_edge_governor_agent", "clean_path_analog_agent"}
-                    veto_agents = {"bad_setup_veto_agent", "volume_chop_veto_agent", "quant_regime_veto_agent", "execution_quality_gate_agent"}
-                    primary_sell_agents = {"profit_pullback_capture_agent", "higher_low_wave_stop_agent", "failed_entry_escape_agent", "hard_stop_prevention_agent", "max_hold_decay_agent"}
+                    primary_buy_agents = {
+                        "bayesian_setup_pattern_edge_agent",
+                        "calibrated_logistic_meta_agent",
+                        "tree_regime_agent",
+                        "market_structure_reclaim_agent",
+                        "validated_liquidity_confirmer_agent",
+                        "score_band_anti_chase_agent",
+                        "product_edge_governor_agent",
+                        "clean_path_analog_gate_agent",
+
+                        # Compatibility with prior patch names.
+                        "setup_pattern_edge_agent",
+                        "clean_path_analog_agent",
+                    }
+
+                    veto_agents = {
+                        "bad_setup_veto_agent",
+                        "volume_chop_veto_agent",
+                        "quant_regime_veto_agent",
+                        "execution_cost_gate_agent",
+
+                        # Compatibility with prior patch name.
+                        "execution_quality_gate_agent",
+                    }
+
+                    primary_sell_agents = {
+                        "profit_pullback_capture_agent",
+                        "higher_low_wave_stop_agent",
+                        "failed_entry_hazard_escape_agent",
+                        "hard_stop_prevention_agent",
+                        "max_hold_decay_agent",
+
+                        # Compatibility with prior patch name.
+                        "failed_entry_escape_agent",
+                    }
                     rows = []
                     for _, r in four.iterrows():
                         agent = str(r.get("agent") or "")
@@ -21957,7 +22121,7 @@ class TradingBot:
                     phase_label = "Complete"
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
-            status = {"ts": now_ts(), "fast_calibration_core_available": bool(FAST_CALIBRATION_CORE_AVAILABLE), "fast_calibration_warning": ("C++ fast calibration core is unavailable; Python fallback is active. Restore the cpp folder / compiled fast_calibration_core if you want the fastest startup." if not bool(FAST_CALIBRATION_CORE_AVAILABLE) else ""), "fast_calibration_core_import_error": str(FAST_CALIBRATION_CORE_IMPORT_ERROR), "fast_calibration_core_batch_available": bool(FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None and hasattr(fast_calibration_core, "evaluate_best_windows_batch_from_arrays")), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            status = {"ts": now_ts(), "fast_calibration_core_available": bool(FAST_CALIBRATION_CORE_AVAILABLE), "fast_institutional_core_available": bool(institutional_fast_core_available()), "fast_institutional_core_import_error": str(institutional_fast_core_import_error()), "fast_calibration_warning": ("C++ fast calibration core is unavailable; Python fallback is active. Restore the cpp folder / compiled fast_calibration_core if you want the fastest startup." if not bool(FAST_CALIBRATION_CORE_AVAILABLE) else ""), "fast_calibration_core_import_error": str(FAST_CALIBRATION_CORE_IMPORT_ERROR), "fast_calibration_core_batch_available": bool(FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None and hasattr(fast_calibration_core, "evaluate_best_windows_batch_from_arrays")), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
             if bool(status.get("calculation_complete_latched")) or bool(status.get("calculation_work_complete")) or bool(status.get("full_viewer_unlocked")):
                 status = _normalize_completed_calculation_status(status, source="calculation_status_complete")
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):

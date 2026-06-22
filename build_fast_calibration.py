@@ -11,6 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CPP_SOURCE = BASE_DIR / "cpp" / "fast_calibration_core.cpp"
 SETUP_FILE = BASE_DIR / "setup_fast_calibration.py"
 STATUS_FILE = BASE_DIR / "CSVs" / "07_runtime_state" / "fast_calibration_build_status.json"
+FULL_LOG_FILE = BASE_DIR / "CSVs" / "07_runtime_state" / "fast_calibration_build_full.log"
 
 
 def _write_status(status: dict) -> None:
@@ -54,7 +55,22 @@ def main() -> int:
 
     try:
         cmd = [sys.executable, str(SETUP_FILE), "build_ext", "--inplace"]
-        proc = subprocess.run(cmd, cwd=str(BASE_DIR), capture_output=True, text=True, timeout=180)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        FULL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with FULL_LOG_FILE.open("w", encoding="utf-8", errors="replace") as log_file:
+            log_file.write("COMMAND:\n")
+            log_file.write(" ".join(str(x) for x in cmd))
+            log_file.write("\n\nSTDOUT:\n")
+            log_file.write(proc.stdout or "")
+            log_file.write("\n\nSTDERR:\n")
+            log_file.write(proc.stderr or "")
+
         built = _compiled_module_exists()
         _write_status({
             "ok": bool(proc.returncode == 0 and built),
@@ -62,8 +78,9 @@ def main() -> int:
             "cmd": cmd,
             "returncode": proc.returncode,
             "compiled_module_exists": built,
-            "stdout_tail": proc.stdout[-4000:],
-            "stderr_tail": proc.stderr[-4000:],
+            "stdout_tail": proc.stdout[-12000:],
+            "stderr_tail": proc.stderr[-12000:],
+            "full_log_file": str(FULL_LOG_FILE),
             "duration_sec": time.time() - started,
             "repair_hint": (
                 "Install Microsoft C++ Build Tools with the Desktop development with C++ workload, then rerun run.bat."

@@ -10849,6 +10849,15 @@ class TradingBot:
         self._startup_calibration_ready = all(bool(v) for v in self._product_calibration_ready.values()) if self._product_calibration_ready else False
         log("[calibration] startup walk-forward calibration finished")
         try:
+            self._run_backtest_intelligence_if_due(force=True)
+            self._write_agent_trade_policy()
+            self._write_agent_side_ratings()
+            if self.level8_council is not None and hasattr(self.level8_council, "_clear_level8_memory_cache"):
+                self.level8_council._clear_level8_memory_cache()
+            module_debug(MODULE_NAME, "startup_four_pass_agent_reweight_complete", data={"reason": "startup_calibration_completed_then_full_agent_buy_sell_simulation_ran"}, level="INFO", also_overall=True)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "startup_four_pass_agent_reweight_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+        try:
             self._write_calculation_status(force=False)
         except Exception as exc:
             module_exception(MODULE_NAME, "calculation_status_after_startup_calibration_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
@@ -16113,6 +16122,93 @@ class TradingBot:
             module_exception(MODULE_NAME, "select_level8_products_for_eval_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=False)
             return candidates[:int(LEVEL8_MAX_PRODUCTS_PER_EVAL)]
 
+
+    def _proven_entry_agent_votes_from_context(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        context: Dict[str, Any],
+        common: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build the data-ranked entry alpha/veto council votes."""
+        def cf(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value if value is not None else default)
+            except Exception:
+                return float(default)
+        def clamp01(value: Any) -> float:
+            return clamp_float(cf(value, 0.0), 0.0, 1.0)
+        def low_text(value: Any) -> str:
+            return str(value or "").lower()
+        def vote(agent: str, buy: float, hold: float, wait: float, confidence: float, reason: str) -> Dict[str, Any]:
+            buy_v = clamp01(buy)
+            return {**common, "agent": agent, "buy": buy_v, "sell": clamp_float(1.0 - buy_v, 0.0, 1.0), "hold": clamp01(hold), "wait": clamp01(wait), "confidence": clamp01(confidence), "reason": reason}
+        product_id = str(candidate.get("product_id", ""))
+        pa = dict(context.get("price_action_context", {}) or {})
+        quant = dict(context.get("quant_context", {}) or {})
+        setup_tag = low_text(candidate.get("setup_tag", common.get("setup_tag", "")))
+        market_regime = low_text(candidate.get("market_regime", common.get("market_regime", "")))
+        structure_state = low_text(pa.get("structure_state", candidate.get("structure_state", "")))
+        value_area_state = low_text(pa.get("value_area_state", candidate.get("value_area_state", "")))
+        value_acceptance_state = low_text(pa.get("value_acceptance_state", candidate.get("value_acceptance_state", "")))
+        volume_node_state = low_text(pa.get("volume_node_state", candidate.get("volume_node_state", "")))
+        fvg_state = low_text(pa.get("fvg_state", candidate.get("fvg_state", "")))
+        score_raw = cf(candidate.get("score", 0.0), 0.0)
+        score_norm = clamp_float(score_raw / 100.0 if score_raw > 1.50 else score_raw, 0.0, 1.0)
+        probability = clamp_float(cf(candidate.get("estimated_prob_up", candidate.get("probability", 0.50)), 0.50), 0.0, 1.0)
+        expected_edge = cf(candidate.get("expected_net_edge_bps", 0.0), 0.0)
+        expected_utility = cf(candidate.get("expected_utility_bps", 0.0), 0.0)
+        spread_bps = cf(candidate.get("spread_bps", 0.0), 0.0)
+        cost_bps = cf(candidate.get("cost_bps", 0.0), 0.0)
+        bearish_fvg_retest = "bearish_fvg_retest" in setup_tag or "bearish_fvg_retest" in fvg_state
+        inside_value = "inside_value" in setup_tag or "inside" in value_area_state or "inside" in value_acceptance_state
+        inside_fair_value = "inside_fair_value" in value_acceptance_state or "fair" in value_area_state
+        lower_high_lower_low = "lower_high_lower_low" in structure_state or "lower_high_lower_low" in setup_tag
+        lower_high_higher_low = "lower_high_higher_low" in structure_state or "lower_high_higher_low" in setup_tag
+        reclaimed_value_low = "reclaimed_value_low" in value_acceptance_state or "reclaimed_value_low" in setup_tag
+        high_volume_node = "high_volume" in volume_node_state or "high_volume_node" in setup_tag
+        accepted_above_value = "accepted_above" in value_acceptance_state or "accepted_above_value" in setup_tag
+        bullish_fvg_open = "bullish_fvg_open" in setup_tag or "bullish_fvg_open" in fvg_state
+        setup_pattern_edge = 0.30
+        if lower_high_lower_low and bearish_fvg_retest: setup_pattern_edge = 0.96
+        elif inside_value and bearish_fvg_retest: setup_pattern_edge = 0.90
+        elif reclaimed_value_low and bearish_fvg_retest: setup_pattern_edge = 0.82
+        elif lower_high_higher_low and inside_fair_value: setup_pattern_edge = 0.76
+        market_structure_score = clamp01(candidate.get("market_structure_buy_score", pa.get("market_structure_buy_score", 0.50)))
+        validated_liquidity_score = clamp01(candidate.get("validated_liquidity_buy_score", pa.get("validated_liquidity_buy_score", 0.50)))
+        market_structure_reclaim = clamp_float(market_structure_score * 0.52 + validated_liquidity_score * 0.18 + (0.16 if reclaimed_value_low else 0.0) + (0.14 if lower_high_higher_low else 0.0), 0.0, 1.0)
+        score_band = clamp_float(1.0 - abs(score_norm - 0.50) / 0.14, 0.0, 1.0)
+        probability_band = clamp_float(1.0 - abs(probability - 0.58) / 0.18, 0.0, 1.0)
+        score_band_anti_chase = clamp_float(score_band * 0.72 + probability_band * 0.18 + (1.0 - min(1.0, abs(expected_edge) / 260.0)) * 0.10, 0.0, 1.0)
+        backtest_expected_net = cf(candidate.get("backtest_expected_net_bps", 0.0), 0.0)
+        backtest_win = cf(candidate.get("backtest_expected_win_rate", 0.50), 0.50)
+        replay_quality = cf(candidate.get("backtest_replay_quality_score", 0.50), 0.50)
+        product_edge_governor = clamp_float(0.42 + backtest_expected_net / 80.0 + (backtest_win - 0.50) * 0.75 + (replay_quality - 0.50) * 0.35, 0.0, 1.0)
+        clean_allowed = bool(candidate.get("clean_profit_path_gate_allowed", False))
+        clean_confidence = cf(candidate.get("clean_profit_path_confidence", 0.0), 0.0)
+        clean_path_analog = clamp_float((0.72 if clean_allowed else 0.26) + clean_confidence * 0.22 + max(0.0, expected_utility) / 180.0, 0.0, 1.0)
+        bad_setup_veto_strength = 0.95 if bullish_fvg_open and high_volume_node else 0.92 if accepted_above_value and high_volume_node else 0.84 if "higher_high_higher_low" in structure_state and bullish_fvg_open else 0.0
+        volume_wait = clamp01(candidate.get("volume_profile_leader_wait_score", pa.get("volume_profile_leader_wait_score", 0.50)))
+        volume_buy = clamp01(candidate.get("volume_profile_leader_buy_score", pa.get("volume_profile_leader_buy_score", 0.50)))
+        volume_chop_veto_strength = clamp_float(volume_wait * 0.55 + (0.25 if high_volume_node else 0.0) + (1.0 - volume_buy) * 0.20, 0.0, 1.0)
+        quant_wait = clamp01(quant.get("quant_wait_score", candidate.get("quant_wait_score", 0.50)))
+        quant_buy = clamp01(quant.get("quant_buy_score", candidate.get("quant_buy_score", 0.50)))
+        quant_regime_veto_strength = clamp_float(quant_wait * 0.45 + (1.0 - quant_buy) * 0.28 + (0.27 if any(x in market_regime for x in ["downtrend", "range_chop", "chop"]) else 0.0), 0.0, 1.0)
+        order_book_buy = clamp01(candidate.get("order_book_buy_score", 0.50))
+        order_book_wait = clamp01(candidate.get("order_book_wait_score", 0.20))
+        execution_quality = clamp_float((1.0 - min(1.0, max(0.0, spread_bps) / 80.0)) * 0.36 + (1.0 - min(1.0, max(0.0, cost_bps) / 140.0)) * 0.24 + order_book_buy * 0.22 + (1.0 - order_book_wait) * 0.18, 0.0, 1.0)
+        return [
+            vote("setup_pattern_edge_agent", setup_pattern_edge, 0.45 + setup_pattern_edge * 0.25, 0.70 - setup_pattern_edge * 0.45, 0.78, f"setup_pattern_edge;setup={setup_tag};buy={setup_pattern_edge:.3f}"),
+            vote("market_structure_reclaim_agent", market_structure_reclaim, 0.45 + market_structure_reclaim * 0.25, 0.68 - market_structure_reclaim * 0.42, 0.74, f"market_structure_reclaim;structure={structure_state};value={value_acceptance_state};buy={market_structure_reclaim:.3f}"),
+            vote("score_band_anti_chase_agent", score_band_anti_chase, 0.45 + score_band_anti_chase * 0.20, 0.70 - score_band_anti_chase * 0.40, 0.68, f"score_band_anti_chase;score={score_norm:.3f};prob={probability:.3f};buy={score_band_anti_chase:.3f}"),
+            vote("product_edge_governor_agent", product_edge_governor, 0.40 + product_edge_governor * 0.26, 0.72 - product_edge_governor * 0.42, clamp_float(0.35 + replay_quality * 0.45, 0.20, 0.86), f"product_edge_governor;product={product_id};bt_net={backtest_expected_net:.2f};bt_win={backtest_win:.3f};quality={replay_quality:.3f}"),
+            vote("clean_path_analog_agent", clean_path_analog, 0.42 + clean_path_analog * 0.28, 0.74 - clean_path_analog * 0.48, clamp_float(0.25 + clean_confidence * 0.62, 0.20, 0.90), f"clean_path_analog;allowed={clean_allowed};confidence={clean_confidence:.3f};buy={clean_path_analog:.3f}"),
+            vote("bad_setup_veto_agent", 1.0 - bad_setup_veto_strength, 0.35, bad_setup_veto_strength, 0.88 if bad_setup_veto_strength > 0.50 else 0.55, f"bad_setup_veto;veto={bad_setup_veto_strength:.3f}"),
+            vote("volume_chop_veto_agent", 1.0 - volume_chop_veto_strength, 0.42, volume_chop_veto_strength, 0.74, f"volume_chop_veto;veto={volume_chop_veto_strength:.3f}"),
+            vote("quant_regime_veto_agent", 1.0 - quant_regime_veto_strength, 0.42, quant_regime_veto_strength, 0.70, f"quant_regime_veto;veto={quant_regime_veto_strength:.3f};regime={market_regime}"),
+            vote("execution_quality_gate_agent", execution_quality, 0.36 + execution_quality * 0.20, 1.0 - execution_quality, 0.76, f"execution_quality_gate;spread={spread_bps:.2f};cost={cost_bps:.2f};quality={execution_quality:.3f}"),
+        ]
+
     def _level8_decision_for_candidate(
         self,
         *,
@@ -16419,114 +16515,39 @@ class TradingBot:
                 "reason": str(candidate.get("utility_decision_reason", "utility_no_reason")),
             }
 
-            votes = [
-                vote("trend", trend_score, clamp_float(0.40+trend_score*0.30,0.0,1.0), clamp_float(0.60-trend_score*0.35,0.0,1.0), clamp_float(0.35+abs(mom5)/180.0,0.20,0.90), f"trend mom5={mom5:.2f};mom15={mom15:.2f};regime={market_regime}"),
-                vote("mean_reversion", mean_reversion_score, 0.45, clamp_float(0.55-mean_reversion_score*0.25,0.0,1.0), clamp_float(0.35+abs(mom5)/220.0,0.20,0.85), f"mean_reversion setup={setup_tag};mom1={mom1:.2f};mom5={mom5:.2f}"),
-                vote("breakout", breakout_score, clamp_float(0.40+breakout_score*0.20,0.0,1.0), clamp_float(0.65-breakout_score*0.30,0.0,1.0), clamp_float(0.30+max(0.0,mom3)/160.0,0.20,0.85), f"breakout mom3={mom3:.2f};mom5={mom5:.2f};setup={setup_tag}"),
-                vote(
-                    "ai_outcome",
-                    clamp_float(
-                        ai_probability * 0.70
-                        + clamp_float(0.50 + ai_expected_move / 320.0, 0.0, 1.0) * 0.20
-                        + clamp_float(1.0 - ai_expected_adverse / 260.0, 0.0, 1.0) * 0.10,
-                        0.0,
-                        1.0,
-                    ),
-                    clamp_float(0.35 + ai_probability * 0.35, 0.0, 1.0),
-                    clamp_float(0.70 - ai_probability * 0.40, 0.0, 1.0),
-                    ai_confidence,
-                    ai_reason,
-                ),
-                vote("execution", clamp_float(spread_quality*0.45+cost_score*0.35+edge_score*0.20,0.0,1.0), 0.45, clamp_float(1.0-spread_quality,0.0,1.0), clamp_float(0.30+spread_quality*0.55,0.20,0.95), f"execution spread={spread_bps:.2f};cost={cost_bps:.2f};state={execution_state}"),
-                order_book_vote,
-                vote("product_health", clamp_float(score*0.35+edge_score*0.30+forward_score*0.35,0.0,1.0), clamp_float(0.40+forward_score*0.30,0.0,1.0), clamp_float(0.65-forward_score*0.35,0.0,1.0), clamp_float(0.30+score*0.50,0.20,0.85), f"product score={score:.3f};edge={expected_edge:.2f};forward={projected_forward:.2f}"),
-                session_liquidity_vote,
-                previous_session_profile_vote,
-                quant_context_vote,
-                *price_action_votes,
-                smt_vote,
+            votes = self._proven_entry_agent_votes_from_context(
+                candidate=candidate,
+                context=context,
+                common=common,
+            )
+            votes.extend([
                 setup_performance_vote,
                 utility_leader_vote,
-                {**common, "agent": "risk", "buy": float(risk_vote.get("buy",0.55)), "sell": float(risk_vote.get("sell",0.42)), "hold": float(risk_vote.get("hold",0.55)), "wait": float(risk_vote.get("wait",0.40)), "confidence": float(risk_vote.get("confidence",0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
-                vote("exploration", learning_score, 0.35, clamp_float(0.70-learning_score*0.45,0.0,1.0), clamp_float(0.30+learning_score*0.55,0.20,0.85), f"learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"),
-            ]
-            session_buy_score = float(session_liquidity_vote.get("buy", 0.0) or 0.0)
-            session_confidence = float(session_liquidity_vote.get("confidence", 0.0) or 0.0)
+                {**common, "agent": "risk", "buy": float(risk_vote.get("buy", 0.55)), "sell": float(risk_vote.get("sell", 0.42)), "hold": float(risk_vote.get("hold", 0.55)), "wait": float(risk_vote.get("wait", 0.40)), "confidence": float(risk_vote.get("confidence", 0.50)), "reason": f"risk_mode={risk_vote.get('risk_mode','NORMAL')}"},
+            ])
+            if bool(ENABLE_LEVEL8_LEARNING_MODE):
+                votes.append(vote("exploration", 0.0, 0.35, 0.70, 0.20, f"shadow_only_learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"))
 
-            price_action_buy_weighted = 0.0
-            price_action_conf_weighted = 0.0
-            if price_action_votes:
-                price_action_buy_weighted = sum(
-                    float(v.get("buy", 0.0) or 0.0) * float(v.get("confidence", 0.0) or 0.0)
-                    for v in price_action_votes
-                ) / max(
-                    1e-9,
-                    sum(float(v.get("confidence", 0.0) or 0.0) for v in price_action_votes),
-                )
-                price_action_conf_weighted = sum(
-                    float(v.get("confidence", 0.0) or 0.0)
-                    for v in price_action_votes
-                ) / max(1.0, float(len(price_action_votes)))
-
-            utility_truth_component = clamp_float(
-                0.50
-                + float(candidate.get("expected_utility_bps", 0.0) or 0.0) / 260.0
-                + (float(candidate.get("calibrated_p_win", 0.50) or 0.50) - 0.50) * 0.50
-                + (float(candidate.get("payoff_ratio", 0.0) or 0.0) - 1.0) * 0.14,
-                0.0,
-                1.0,
-            )
-
-            volume_leader_truth_component = clamp_float(
-                0.50
-                + float(candidate.get("volume_profile_leader_buy_score", 0.0) or 0.0) * 0.34
-                - float(candidate.get("volume_profile_leader_sell_score", 0.0) or 0.0) * 0.34
-                - max(0.0, float(candidate.get("volume_profile_leader_wait_score", 0.50) or 0.50) - 0.55) * 0.24
-                + float(candidate.get("unfair_trade_score", 0.0) or 0.0) * 0.18
-                + float(candidate.get("volume_profile_utility_adjust_bps", 0.0) or 0.0) / 240.0,
-                0.0,
-                1.0,
-            )
-
-            previous_session_context = dict(context.get("previous_session_profile", {}) or {})
-            quant_context = dict(context.get("quant_context", {}) or {})
-            previous_session_truth_component = clamp_float(
-                0.50
-                + float(previous_session_context.get("buy_score", 0.0) or 0.0) * 0.30
-                - float(previous_session_context.get("sell_score", 0.0) or 0.0) * 0.24
-                - max(0.0, float(previous_session_context.get("wait_score", 0.50) or 0.50) - 0.55) * 0.18
-                + float(previous_session_context.get("bias_confidence", 0.0) or 0.0) * 0.10,
-                0.0,
-                1.0,
-            )
-            quant_truth_component = clamp_float(
-                0.50
-                + float(quant_context.get("quant_buy_score", 0.0) or 0.0) * 0.28
-                - float(quant_context.get("quant_sell_score", 0.0) or 0.0) * 0.24
-                - max(0.0, float(quant_context.get("quant_wait_score", 0.50) or 0.50) - 0.55) * 0.18
-                + float(quant_context.get("stationarity_score", 0.0) or 0.0) * 0.10,
-                0.0,
-                1.0,
-            )
-
-            truth_buy = clamp_float(
-                spread_quality * 0.09
-                + cost_score * 0.08
-                + probability * 0.08
-                + score * 0.07
-                + forward_score * 0.08
-                + learning_score * 0.07
-                + session_buy_score * session_confidence * 0.06
-                + price_action_buy_weighted * price_action_conf_weighted * 0.06
-                + utility_truth_component * 0.10
-                + volume_leader_truth_component * float(VOLUME_PROFILE_LEADER_TRUTH_WEIGHT)
-                + previous_session_truth_component * float(PREVIOUS_SESSION_PROFILE_TRUTH_WEIGHT)
-                + quant_truth_component * float(QUANT_CONTEXT_TRUTH_WEIGHT)
-                + order_book_buy_score * (0.035 if order_book_available else 0.0)
-                - order_book_liquidity_risk * 0.025,
-                0.0,
-                1.0,
-            )
+            vote_by_agent = {str(v.get("agent", "")): v for v in votes}
+            def agent_buy(agent: str, default: float = 0.0) -> float:
+                try:
+                    return clamp_float(float(vote_by_agent.get(agent, {}).get("buy", default) or default), 0.0, 1.0)
+                except Exception:
+                    return float(default)
+            def agent_wait(agent: str, default: float = 0.0) -> float:
+                try:
+                    return clamp_float(float(vote_by_agent.get(agent, {}).get("wait", default) or default), 0.0, 1.0)
+                except Exception:
+                    return float(default)
+            setup_alpha = agent_buy("setup_pattern_edge_agent", 0.30)
+            structure_alpha = agent_buy("market_structure_reclaim_agent", 0.30)
+            anti_chase_alpha = agent_buy("score_band_anti_chase_agent", 0.30)
+            product_alpha = agent_buy("product_edge_governor_agent", 0.30)
+            clean_path_alpha = agent_buy("clean_path_analog_agent", 0.25)
+            execution_alpha = agent_buy("execution_quality_gate_agent", 0.30)
+            veto_pressure = clamp_float(agent_wait("bad_setup_veto_agent", 0.0) * 0.42 + agent_wait("volume_chop_veto_agent", 0.0) * 0.24 + agent_wait("quant_regime_veto_agent", 0.0) * 0.20 + agent_wait("execution_quality_gate_agent", 0.0) * 0.14, 0.0, 1.0)
+            utility_truth_component = clamp_float(0.50 + float(candidate.get("expected_utility_bps", 0.0) or 0.0) / 260.0 + (float(candidate.get("calibrated_p_win", 0.50) or 0.50) - 0.50) * 0.50 + (float(candidate.get("payoff_ratio", 0.0) or 0.0) - 1.0) * 0.14, 0.0, 1.0)
+            truth_buy = clamp_float(setup_alpha * 0.20 + structure_alpha * 0.17 + anti_chase_alpha * 0.11 + product_alpha * 0.11 + clean_path_alpha * 0.22 + utility_truth_component * 0.11 + execution_alpha * 0.08 - veto_pressure * 0.28, 0.0, 1.0)
             truth_vote = vote(
                 "truth",
                 truth_buy,
@@ -16535,12 +16556,14 @@ class TradingBot:
                 clamp_float(0.30 + truth_buy * 0.55, 0.20, 0.90),
                 (
                     f"truth evidence={truth_buy:.3f};"
+                    f"setup_alpha={setup_alpha:.3f};"
+                    f"structure_alpha={structure_alpha:.3f};"
+                    f"anti_chase_alpha={anti_chase_alpha:.3f};"
+                    f"product_alpha={product_alpha:.3f};"
+                    f"clean_path_alpha={clean_path_alpha:.3f};"
                     f"utility_component={utility_truth_component:.3f};"
-                    f"volume_leader_component={volume_leader_truth_component:.3f};"
-                    f"previous_session_component={previous_session_truth_component:.3f};"
-                    f"quant_component={quant_truth_component:.3f};"
-                    f"order_book_buy={order_book_buy_score:.3f};"
-                    f"liquidity_risk={order_book_liquidity_risk:.3f};"
+                    f"execution_alpha={execution_alpha:.3f};"
+                    f"veto_pressure={veto_pressure:.3f};"
                     f"expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f};"
                     f"calibrated_p_win={float(candidate.get('calibrated_p_win', 0.50) or 0.50):.3f};"
                     f"payoff={float(candidate.get('payoff_ratio', 0.0) or 0.0):.3f};"
@@ -16575,6 +16598,10 @@ class TradingBot:
                 f"fvg={fvg_state_for_strategy}|"
                 f"smt={smt_state_for_strategy}|"
                 f"utility={utility_state_for_strategy}|"
+                f"setup_alpha={setup_alpha:.3f}|"
+                f"structure_alpha={structure_alpha:.3f}|"
+                f"clean_path_alpha={clean_path_alpha:.3f}|"
+                f"veto_pressure={veto_pressure:.3f}|"
                 f"execution={execution_state}"
             )
             votes = self._normalize_entry_votes_for_position_state(
@@ -20768,7 +20795,46 @@ class TradingBot:
 
     def _write_agent_trade_policy(self) -> None:
         try:
-            self._ensure_agent_trade_policy_header(); frame = self._read_csv_tail_for_bot(AGENT_PERFORMANCE_CSV_PATH, max_lines=200000)
+            self._ensure_agent_trade_policy_header()
+            four_pass_path = runtime_path("four_pass_final_agent_ratings.csv")
+            if os.path.exists(four_pass_path) and os.path.getsize(four_pass_path) > 0:
+                four = pd.read_csv(four_pass_path)
+                if not four.empty and "agent" in four.columns:
+                    ts_val = now_ts()
+                    dt_mst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                    primary_buy_agents = {"setup_pattern_edge_agent", "market_structure_reclaim_agent", "score_band_anti_chase_agent", "product_edge_governor_agent", "clean_path_analog_agent"}
+                    veto_agents = {"bad_setup_veto_agent", "volume_chop_veto_agent", "quant_regime_veto_agent", "execution_quality_gate_agent"}
+                    primary_sell_agents = {"profit_pullback_capture_agent", "higher_low_wave_stop_agent", "failed_entry_escape_agent", "hard_stop_prevention_agent", "max_hold_decay_agent"}
+                    rows = []
+                    for _, r in four.iterrows():
+                        agent = str(r.get("agent") or "")
+                        if not agent:
+                            continue
+                        buy_rows = int(float(r.get("buy_rows", 0) or 0)); sell_rows = int(float(r.get("sell_rows", 0) or 0))
+                        buy_avg = float(r.get("buy_avg_net_bps", 0.0) or 0.0); sell_avg = float(r.get("sell_avg_net_bps", 0.0) or 0.0)
+                        buy_acc = float(r.get("buy_accuracy", 0.50) or 0.50); sell_acc = float(r.get("sell_accuracy", 0.50) or 0.50)
+                        buy_score = float(r.get("buy_score", 0.50) or 0.50); sell_score = float(r.get("sell_score", 0.50) or 0.50)
+                        role, entry_mult, veto_mult = "neutral", 1.0, 1.0
+                        if agent in primary_buy_agents and buy_rows >= 20 and buy_avg > 0.0 and buy_acc >= 0.52:
+                            role = "primary_buy_alpha"; entry_mult = clamp_float(1.0 + buy_score * 1.75 + max(0.0, buy_avg) / 60.0, 1.10, 4.00)
+                        elif agent in veto_agents:
+                            role = "avoidance_veto_filter"; entry_mult = 0.05; veto_mult = clamp_float(1.0 + buy_score * 1.50, 1.25, 4.00)
+                        elif agent in primary_sell_agents and sell_rows >= 10 and sell_avg > 0.0 and sell_acc >= 0.50:
+                            role = "primary_sell_alpha"; entry_mult = 0.75
+                        elif buy_rows >= 20 and buy_avg <= 0.0:
+                            role = "buy_signal_penalty_veto_filter"; entry_mult = 0.05; veto_mult = 1.50
+                        elif buy_rows >= 20 and buy_avg > 0.0 and buy_acc >= 0.52:
+                            role = "secondary_buy_confirmer"; entry_mult = clamp_float(0.75 + buy_score * 1.20, 0.90, 2.40)
+                        elif sell_rows >= 10 and sell_avg > 0.0:
+                            role = "secondary_sell_confirmer"; entry_mult = 0.85
+                        rows.append({"ts": ts_val, "dt_mst": dt_mst, "agent": agent, "rows": buy_rows + sell_rows, "buy_rows": buy_rows, "buy_avg_move_bps": buy_avg, "buy_success_rate": buy_acc, "wait_hold_rows": 0, "wait_hold_avg_move_bps": 0.0, "wait_hold_success_rate": 0.0, "avg_weighted_credit": max(buy_score, sell_score), "recommended_role": role, "entry_weight_multiplier": entry_mult, "veto_weight_multiplier": veto_mult, "reason": "four_pass_agent_policy_from_full_scale_buy_then_sell_simulation"})
+                    if rows:
+                        with open(AGENT_TRADE_POLICY_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.DictWriter(f, fieldnames=AGENT_TRADE_POLICY_COLUMNS)
+                            for row in rows:
+                                writer.writerow({col: row.get(col, "") for col in AGENT_TRADE_POLICY_COLUMNS})
+                        return
+            frame = self._read_csv_tail_for_bot(AGENT_PERFORMANCE_CSV_PATH, max_lines=200000)
             if frame.empty or "agent" not in frame.columns: return
             frame["move"] = pd.to_numeric(frame.get("outcome_move_bps"), errors="coerce"); frame["weighted_credit"] = pd.to_numeric(frame.get("weighted_agent_credit_score"), errors="coerce"); frame["success"] = pd.to_numeric(frame.get("outcome_success"), errors="coerce")
             rows = []
@@ -20815,14 +20881,23 @@ class TradingBot:
                         buy_weight_pct = float(r.get("buy_weight_pct", 0.0) or 0.0); sell_weight_pct = float(r.get("sell_weight_pct", 0.0) or 0.0)
                         rows.append({"ts": ts_val, "dt_mst": dt_mst, "agent": agent, "buy_rows": buy_rows, "buy_accuracy": buy_accuracy, "buy_avg_move_bps": float(r.get("buy_avg_net_bps", 0.0) or 0.0), "buy_avg_credit": buy_accuracy, "buy_score": buy_score, "buy_weight_pct": buy_weight_pct, "buy_weight_multiplier": 1.0, "sell_rows": sell_rows, "sell_accuracy": sell_accuracy, "sell_avg_move_bps": float(r.get("sell_avg_net_bps", 0.0) or 0.0), "sell_avg_credit": sell_accuracy, "sell_score": sell_score, "sell_weight_pct": sell_weight_pct, "sell_weight_multiplier": 1.0, "total_rows": buy_rows + sell_rows, "formula": "four_pass_backtest_authority", "reason": "source=four_pass_final_agent_ratings.csv"})
                     if rows:
-                        buy_total = sum(float(x["buy_weight_pct"]) for x in rows) or 1.0
-                        sell_total = sum(float(x["sell_weight_pct"]) for x in rows) or 1.0
+                        buy_total = sum(max(0.0, float(x["buy_weight_pct"])) for x in rows) or 1.0
+                        sell_total = sum(max(0.0, float(x["sell_weight_pct"])) for x in rows) or 1.0
                         equal_weight_pct = 100.0 / max(1, len(rows))
                         for row in rows:
-                            row["buy_weight_pct"] = float(row["buy_weight_pct"]) / buy_total * 100.0 if buy_total > 0 else equal_weight_pct
-                            row["sell_weight_pct"] = float(row["sell_weight_pct"]) / sell_total * 100.0 if sell_total > 0 else equal_weight_pct
-                            row["buy_weight_multiplier"] = clamp_float(row["buy_weight_pct"] / max(equal_weight_pct, 1e-9), 0.20, 6.0)
-                            row["sell_weight_multiplier"] = clamp_float(row["sell_weight_pct"] / max(equal_weight_pct, 1e-9), 0.20, 6.0)
+                            buy_rows = int(float(row.get("buy_rows", 0) or 0)); sell_rows = int(float(row.get("sell_rows", 0) or 0))
+                            buy_score = clamp_float(float(row.get("buy_score", 0.50) or 0.50), 0.0, 1.0); sell_score = clamp_float(float(row.get("sell_score", 0.50) or 0.50), 0.0, 1.0)
+                            buy_accuracy = clamp_float(float(row.get("buy_accuracy", 0.50) or 0.50), 0.0, 1.0); sell_accuracy = clamp_float(float(row.get("sell_accuracy", 0.50) or 0.50), 0.0, 1.0)
+                            buy_avg = float(row.get("buy_avg_move_bps", 0.0) or 0.0); sell_avg = float(row.get("sell_avg_move_bps", 0.0) or 0.0)
+                            row["buy_weight_pct"] = max(0.0, float(row["buy_weight_pct"])) / buy_total * 100.0 if buy_total > 0 else equal_weight_pct
+                            row["sell_weight_pct"] = max(0.0, float(row["sell_weight_pct"])) / sell_total * 100.0 if sell_total > 0 else equal_weight_pct
+                            buy_mult = row["buy_weight_pct"] / max(equal_weight_pct, 1e-9); sell_mult = row["sell_weight_pct"] / max(equal_weight_pct, 1e-9)
+                            if buy_rows < 20 or buy_avg <= 0.0 or buy_accuracy < 0.50 or buy_score < 0.50:
+                                buy_mult *= 0.20
+                            if sell_rows < 10 or sell_avg <= 0.0 or sell_accuracy < 0.50 or sell_score < 0.50:
+                                sell_mult *= 0.25
+                            row["buy_weight_multiplier"] = clamp_float(buy_mult, 0.05, 6.0)
+                            row["sell_weight_multiplier"] = clamp_float(sell_mult, 0.05, 6.0)
                         with open(AGENT_SIDE_RATINGS_CSV_PATH, "a", newline="", encoding="utf-8") as f:
                             writer = csv.DictWriter(f, fieldnames=AGENT_SIDE_RATINGS_COLUMNS)
                             for row in rows:
@@ -21003,15 +21078,15 @@ class TradingBot:
                 except Exception:
                     pass
                 try:
+                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=False)
+                except Exception:
+                    pass
+                try:
                     self._write_agent_trade_policy()
                 except Exception:
                     pass
                 try:
                     self._write_agent_side_ratings()
-                except Exception:
-                    pass
-                try:
-                    self._maybe_run_backtest_intelligence_background(force_when_replay_complete=False)
                 except Exception:
                     pass
                 try:

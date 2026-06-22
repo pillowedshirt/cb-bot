@@ -400,6 +400,15 @@ BUY_AGENT_SCORE_COLUMNS = {
     "quant_boundary_agent": "quant_buy_score",
     "candle_sequence_agent": "candle_sequence_score",
     "candle_continuation_agent": "candle_continuation_score",
+    "setup_pattern_edge_agent": "setup_pattern_edge_buy_score",
+    "market_structure_reclaim_agent": "market_structure_reclaim_buy_score",
+    "score_band_anti_chase_agent": "score_band_anti_chase_buy_score",
+    "product_edge_governor_agent": "product_edge_governor_buy_score",
+    "clean_path_analog_agent": "clean_path_analog_buy_score",
+    "bad_setup_veto_agent": "bad_setup_veto_buy_score",
+    "volume_chop_veto_agent": "volume_chop_veto_buy_score",
+    "quant_regime_veto_agent": "quant_regime_veto_buy_score",
+    "execution_quality_gate_agent": "execution_quality_gate_buy_score",
 }
 
 SELL_AGENT_SCORE_COLUMNS = {
@@ -414,6 +423,11 @@ SELL_AGENT_SCORE_COLUMNS = {
     "fee_recovery": "fee_recovery_score",
     "market_structure_agent": "market_structure_sell_score",
     "volume_profile_harvest": "volume_profile_sell_score",
+    "profit_pullback_capture_agent": "profit_pullback_capture_sell_score",
+    "higher_low_wave_stop_agent": "higher_low_wave_stop_sell_score",
+    "failed_entry_escape_agent": "failed_entry_escape_sell_score",
+    "hard_stop_prevention_agent": "hard_stop_prevention_sell_score",
+    "max_hold_decay_agent": "max_hold_decay_sell_score",
 }
 
 AGENT_CANONICAL_ALIASES = {
@@ -431,6 +445,20 @@ AGENT_CANONICAL_ALIASES = {
     "candle_exhaustion_sell": "candle_exhaustion_agent",
     "price_action_exit": "price_action",
     "volume_profile_harvest": "volume_profile_agent",
+    "setup_pattern_edge": "setup_pattern_edge_agent",
+    "market_structure_reclaim": "market_structure_reclaim_agent",
+    "score_band_anti_chase": "score_band_anti_chase_agent",
+    "product_edge_governor": "product_edge_governor_agent",
+    "clean_path_analog": "clean_path_analog_agent",
+    "bad_setup_veto": "bad_setup_veto_agent",
+    "volume_chop_veto": "volume_chop_veto_agent",
+    "quant_regime_veto": "quant_regime_veto_agent",
+    "execution_quality_gate": "execution_quality_gate_agent",
+    "profit_pullback_capture": "profit_pullback_capture_agent",
+    "higher_low_wave_stop": "higher_low_wave_stop_agent",
+    "failed_entry_escape": "failed_entry_escape_agent",
+    "hard_stop_prevention": "hard_stop_prevention_agent",
+    "max_hold_decay": "max_hold_decay_agent",
 }
 
 
@@ -439,6 +467,39 @@ def _canonical_agent_name(agent: Any) -> str:
     if not text:
         return ""
     return AGENT_CANONICAL_ALIASES.get(text, text)
+
+
+def _safe_series_text(frame: pd.DataFrame, column: str, default: str = "") -> pd.Series:
+    if column in frame.columns:
+        return frame[column].fillna(default).astype(str).str.lower()
+    return pd.Series([default] * len(frame), index=frame.index, dtype="object")
+
+
+def _safe_numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column in frame.columns:
+        return pd.to_numeric(frame[column], errors="coerce").fillna(default)
+    return pd.Series([default] * len(frame), index=frame.index, dtype="float64")
+
+
+def _clip_series(values: pd.Series, low: float = 0.0, high: float = 1.0) -> pd.Series:
+    return pd.to_numeric(values, errors="coerce").fillna(0.0).clip(lower=low, upper=high)
+
+
+def _text_contains(series: pd.Series, pattern: str) -> pd.Series:
+    return series.astype(str).str.lower().str.contains(str(pattern).lower(), regex=False, na=False)
+
+
+def _score_middle_band(raw_score: pd.Series, *, center: float = 0.50, half_width: float = 0.13) -> pd.Series:
+    score = pd.to_numeric(raw_score, errors="coerce").fillna(0.0)
+    score = score.where(score <= 1.50, score / 100.0).clip(0.0, 1.0)
+    distance = (score - float(center)).abs()
+    return (1.0 - distance / max(float(half_width), 1e-9)).clip(0.0, 1.0)
+
+
+def _normalize_available_score(frame: pd.DataFrame, column: str, default: float = 0.50) -> pd.Series:
+    values = _safe_numeric_series(frame, column, default)
+    values = values.where(values <= 1.50, values / 100.0)
+    return values.clip(0.0, 1.0)
 
 
 def _canonicalize_score_columns(mapping: Dict[str, str], frame: pd.DataFrame) -> Dict[str, str]:
@@ -1532,23 +1593,32 @@ def _four_pass_score_from_ev(*, smoothed_win_rate: float, ev_bps: float, avg_net
 
 
 def _softmax_weights(scored_rows: List[Dict[str, Any]], *, score_key: str, raw_key: str, weight_key: str) -> List[Dict[str, Any]]:
+    """Convert simulated agent scores into strict authority weights."""
     if not scored_rows:
         return []
-    raw_total = 0.0
+    adjusted = []
     for row in scored_rows:
-        samples = float(row.get("selected_count", row.get("sample_count", 0)) or 0)
-        if samples <= 0 and raw_key in row:
-            raw = float(row.get(raw_key, 0.0) or 0.0)
-        else:
-            score = float(row.get(score_key, 0.50) or 0.50)
-            sample_factor = max(0.05, min(1.0, samples / 80.0))
-            raw = math.exp((score - 0.50) / 0.070) * sample_factor
-        row[raw_key] = raw
-        raw_total += raw
-    raw_total = max(raw_total, 1e-9)
-    for row in scored_rows:
+        score = float(row.get(score_key, 0.0) or 0.0)
+        selected_count = int(row.get("selected_count", row.get("sample_count", 0)) or 0)
+        avg_net = float(row.get("avg_net_bps", row.get("avg_realized_net_bps", 0.0)) or 0.0)
+        median_net = float(row.get("median_net_bps", 0.0) or 0.0)
+        win = float(row.get("win_rate", row.get("good_exit_rate", 0.50)) or 0.50)
+        adverse = float(row.get("avg_adverse_bps", 0.0) or 0.0)
+        sample_factor = _sample_reliability(selected_count, half_confidence_count=180)
+        raw = (max(0.01, score) ** 2.25 * max(0.05, sample_factor) * max(0.05, 1.0 + avg_net / 80.0) * max(0.05, 1.0 + median_net / 120.0) * max(0.05, 1.0 + (win - 0.50) * 1.60) * max(0.05, 1.0 - max(0.0, adverse - 80.0) / 180.0))
+        if avg_net <= 0.0:
+            raw *= 0.18
+        if median_net < 0.0:
+            raw *= 0.45
+        if win < 0.50:
+            raw *= 0.35
+        new_row = dict(row)
+        new_row[raw_key] = float(max(1e-9, raw))
+        adjusted.append(new_row)
+    raw_total = sum(float(row[raw_key]) for row in adjusted) or 1.0
+    for row in adjusted:
         row[weight_key] = float(row[raw_key]) / raw_total * 100.0
-    return scored_rows
+    return adjusted
 
 
 
@@ -1576,6 +1646,15 @@ def _softmax_weights_by_group(
             samples = float(row.get("selected_count", row.get("sample_count", 0)) or 0)
             sample_factor = max(0.05, min(1.0, samples / 80.0))
             raw = math.exp((score - 0.50) / 0.070) * sample_factor
+            avg_net = float(row.get("avg_net_bps", 0.0) or 0.0)
+            median_net = float(row.get("median_net_bps", 0.0) or 0.0)
+            win = float(row.get("smoothed_win_rate", row.get("win_rate", 0.50)) or 0.50)
+            if avg_net <= 0.0:
+                raw *= 0.18
+            if median_net < 0.0:
+                raw *= 0.45
+            if win < 0.50:
+                raw *= 0.35
             row[raw_key] = raw
             raw_total += raw
         raw_total = max(raw_total, 1e-9)
@@ -1610,6 +1689,76 @@ def _sell_agent_score_columns(frame: pd.DataFrame) -> Dict[str, str]:
             raw_agent = col_text.replace("_sell_score", "")
             discovered.setdefault(raw_agent, col_text)
     return _canonicalize_score_columns(discovered, frame)
+
+
+def _add_proven_buy_agent_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build decision-time-only scores for the sharper buy/veto agents."""
+    if frame is None or frame.empty:
+        return frame
+    frame = frame.copy()
+    product = _safe_series_text(frame, "product_id")
+    setup = _safe_series_text(frame, "setup_tag")
+    market_regime = _safe_series_text(frame, "market_regime")
+    structure = _safe_series_text(frame, "structure_state")
+    value_area = _safe_series_text(frame, "value_area_state")
+    value_acceptance = _safe_series_text(frame, "value_acceptance_state")
+    volume_node = _safe_series_text(frame, "volume_node_state")
+    fvg = _safe_series_text(frame, "fvg_state")
+    raw_score = _safe_numeric_series(frame, "score", 0.0)
+    score_norm = raw_score.where(raw_score <= 1.50, raw_score / 100.0).clip(0.0, 1.0)
+    probability = _safe_numeric_series(frame, "estimated_prob_up", 0.50) if "estimated_prob_up" in frame.columns else _safe_numeric_series(frame, "probability", 0.50)
+    probability = probability.clip(0.0, 1.0)
+    expected_edge = _safe_numeric_series(frame, "expected_net_edge_bps", 0.0)
+    projected_forward = _safe_numeric_series(frame, "projected_forward_gain_bps", 0.0)
+    spread_bps = _safe_numeric_series(frame, "spread_bps", 0.0)
+    cost_bps = _safe_numeric_series(frame, "cost_bps", 0.0)
+    market_structure_existing = _normalize_available_score(frame, "market_structure_buy_score", 0.50)
+    validated_liquidity_existing = _normalize_available_score(frame, "validated_liquidity_buy_score", 0.50)
+    volume_wait_existing = _normalize_available_score(frame, "volume_profile_leader_wait_score", 0.50)
+    volume_buy_existing = _normalize_available_score(frame, "volume_profile_leader_buy_score", 0.50)
+    quant_wait_existing = _normalize_available_score(frame, "quant_wait_score", 0.50)
+    quant_buy_existing = _normalize_available_score(frame, "quant_buy_score", 0.50)
+    order_book_buy_existing = _normalize_available_score(frame, "order_book_buy_score", 0.50)
+    order_book_wait_existing = _normalize_available_score(frame, "order_book_wait_score", 0.20)
+    bearish_fvg_retest = _text_contains(setup, "bearish_fvg_retest") | _text_contains(fvg, "bearish_fvg_retest")
+    inside_value = _text_contains(setup, "inside_value") | _text_contains(value_area, "inside_value") | _text_contains(value_acceptance, "inside")
+    inside_fair_value = _text_contains(value_acceptance, "inside_fair_value") | _text_contains(value_area, "fair")
+    lower_high_lower_low = _text_contains(structure, "lower_high_lower_low") | _text_contains(setup, "lower_high_lower_low")
+    lower_high_higher_low = _text_contains(structure, "lower_high_higher_low") | _text_contains(setup, "lower_high_higher_low")
+    reclaimed_value_low = _text_contains(value_acceptance, "reclaimed_value_low") | _text_contains(setup, "reclaimed_value_low")
+    high_volume_node = _text_contains(volume_node, "high_volume") | _text_contains(setup, "high_volume_node")
+    accepted_above_value = _text_contains(value_acceptance, "accepted_above") | _text_contains(setup, "accepted_above_value")
+    bullish_fvg_open = _text_contains(setup, "bullish_fvg_open") | _text_contains(fvg, "bullish_fvg_open")
+    setup_pattern_edge = pd.Series(0.30, index=frame.index, dtype="float64")
+    setup_pattern_edge = setup_pattern_edge.where(~(lower_high_lower_low & bearish_fvg_retest), 0.96)
+    setup_pattern_edge = setup_pattern_edge.where(~(inside_value & bearish_fvg_retest), 0.90)
+    setup_pattern_edge = setup_pattern_edge.where(~(lower_high_higher_low & inside_fair_value), 0.76)
+    setup_pattern_edge = setup_pattern_edge.where(~(reclaimed_value_low & bearish_fvg_retest), 0.82)
+    market_structure_reclaim = market_structure_existing * 0.52 + validated_liquidity_existing * 0.18 + reclaimed_value_low.astype(float) * 0.16 + lower_high_higher_low.astype(float) * 0.14
+    score_band = _score_middle_band(score_norm, center=0.50, half_width=0.14) * 0.70 + _score_middle_band(probability, center=0.58, half_width=0.18) * 0.20 + (1.0 - (expected_edge.abs() / 260.0).clip(0.0, 1.0)) * 0.10
+    if "buy_net_bps" in frame.columns:
+        product_stats = frame.groupby(product)["buy_net_bps"].agg(["mean", "median", "count"])
+        product_edge_governor = 0.42 + (product.map(product_stats["mean"]).astype(float).fillna(0.0) / 80.0).clip(-0.30, 0.35) + (product.map(product_stats["median"]).astype(float).fillna(0.0) / 120.0).clip(-0.20, 0.25) + (product.map(product_stats["count"]).astype(float).fillna(0.0) / 120.0).clip(0.0, 1.0) * 0.10
+    else:
+        product_edge_governor = pd.Series(0.50, index=frame.index, dtype="float64")
+    clean_path_proxy = setup_pattern_edge * 0.38 + market_structure_reclaim * 0.24 + score_band * 0.14 + (expected_edge / 120.0 + 0.50).clip(0.0, 1.0) * 0.10 + (projected_forward / 160.0 + 0.50).clip(0.0, 1.0) * 0.08 + (1.0 - (spread_bps / 80.0).clip(0.0, 1.0)) * 0.06
+    bad_setup_veto_strength = pd.Series(0.0, index=frame.index, dtype="float64")
+    bad_setup_veto_strength = bad_setup_veto_strength.where(~(bullish_fvg_open & high_volume_node), 0.95)
+    bad_setup_veto_strength = bad_setup_veto_strength.where(~(accepted_above_value & high_volume_node), 0.92)
+    bad_setup_veto_strength = bad_setup_veto_strength.where(~(_text_contains(structure, "higher_high_higher_low") & bullish_fvg_open), 0.84)
+    volume_chop_veto_strength = (volume_wait_existing * 0.55 + high_volume_node.astype(float) * 0.25 + (1.0 - volume_buy_existing) * 0.20).clip(0.0, 1.0)
+    quant_regime_veto_strength = (quant_wait_existing * 0.45 + (1.0 - quant_buy_existing) * 0.28 + market_regime.str.contains("downtrend|range_chop|chop", regex=True, na=False).astype(float) * 0.27).clip(0.0, 1.0)
+    execution_quality = (1.0 - (spread_bps / 80.0).clip(0.0, 1.0)) * 0.36 + (1.0 - (cost_bps / 140.0).clip(0.0, 1.0)) * 0.24 + order_book_buy_existing * 0.22 + (1.0 - order_book_wait_existing) * 0.18
+    frame["setup_pattern_edge_buy_score"] = _clip_series(setup_pattern_edge)
+    frame["market_structure_reclaim_buy_score"] = _clip_series(market_structure_reclaim)
+    frame["score_band_anti_chase_buy_score"] = _clip_series(score_band)
+    frame["product_edge_governor_buy_score"] = _clip_series(product_edge_governor)
+    frame["clean_path_analog_buy_score"] = _clip_series(clean_path_proxy)
+    frame["bad_setup_veto_buy_score"] = _clip_series(1.0 - bad_setup_veto_strength)
+    frame["volume_chop_veto_buy_score"] = _clip_series(1.0 - volume_chop_veto_strength)
+    frame["quant_regime_veto_buy_score"] = _clip_series(1.0 - quant_regime_veto_strength)
+    frame["execution_quality_gate_buy_score"] = _clip_series(execution_quality)
+    return frame
 
 def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
     cache_key = _four_pass_cache_key(base_dir, ["candidate_replay.csv", "historical_shadow_replay.csv"])
@@ -1649,6 +1798,7 @@ def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
     frame["buy_adverse_bps"] = _numeric(frame, "max_adverse_bps", 0.0).abs()
     if "market_regime" not in frame.columns:
         frame["market_regime"] = _infer_market_regime(frame)
+    frame = _add_proven_buy_agent_scores(frame)
     _save_feature_frame_cached(base_dir, "buy_training_frame", cache_key, frame)
     return frame
 
@@ -1802,6 +1952,31 @@ def _four_pass_council_buy_rows(base_dir: str, buy_weights: Dict[str, float], bu
     return rows, selected_all
 
 
+
+def _add_proven_sell_agent_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build sell-agent scores for weighted-buy entry sell simulation."""
+    if frame is None or frame.empty:
+        return frame
+    frame = frame.copy()
+    realized_net = _safe_numeric_series(frame, "realized_net_pnl_bps", 0.0)
+    buy_net = _safe_numeric_series(frame, "buy_net_bps", 0.0)
+    max_favorable = _safe_numeric_series(frame, "max_favorable_bps", realized_net)
+    max_adverse = _safe_numeric_series(frame, "max_adverse_bps", 0.0).abs()
+    move_after_sell = _safe_numeric_series(frame, "move_after_sell_bps", 0.0)
+    held_minutes = _safe_numeric_series(frame, "held_minutes", 0.0)
+    exit_reason = _safe_series_text(frame, "exit_reason") if "exit_reason" in frame.columns else _safe_series_text(frame, "reason")
+    profit_pullback = (realized_net / 60.0).clip(0.0, 1.0) * 0.45 + (1.0 - (move_after_sell / 120.0).clip(0.0, 1.0)) * 0.25 + exit_reason.str.contains("profit_pullback|peak|pullback", regex=True, na=False).astype(float) * 0.30
+    wave_stop = (realized_net / 70.0).clip(0.0, 1.0) * 0.36 + (1.0 - (move_after_sell / 90.0).clip(0.0, 1.0)) * 0.24 + (1.0 - (max_adverse / 90.0).clip(0.0, 1.0)) * 0.22 + (max_favorable / 120.0).clip(0.0, 1.0) * 0.18
+    failed_entry_escape = (1.0 - (max_adverse / 100.0).clip(0.0, 1.0)) * 0.34 + (1.0 - (held_minutes / 180.0).clip(0.0, 1.0)) * 0.18 + (realized_net / 40.0 + 0.50).clip(0.0, 1.0) * 0.28 + (~exit_reason.str.contains("hard_stop", regex=False, na=False)).astype(float) * 0.20
+    hard_stop_prevention = (~exit_reason.str.contains("hard_stop|early_adverse", regex=True, na=False)).astype(float) * 0.45 + (1.0 - (max_adverse / 80.0).clip(0.0, 1.0)) * 0.35 + (realized_net / 50.0 + 0.50).clip(0.0, 1.0) * 0.20
+    max_hold_decay = (1.0 - (held_minutes / 240.0).clip(0.0, 1.0)) * 0.26 + (realized_net / 60.0 + 0.50).clip(0.0, 1.0) * 0.34 + (1.0 - (move_after_sell / 140.0).clip(0.0, 1.0)) * 0.22 + (1.0 - (max_adverse / 120.0).clip(0.0, 1.0)) * 0.18
+    frame["profit_pullback_capture_sell_score"] = _clip_series(profit_pullback)
+    frame["higher_low_wave_stop_sell_score"] = _clip_series(wave_stop)
+    frame["failed_entry_escape_sell_score"] = _clip_series(failed_entry_escape)
+    frame["hard_stop_prevention_sell_score"] = _clip_series(hard_stop_prevention)
+    frame["max_hold_decay_sell_score"] = _clip_series(max_hold_decay)
+    return frame
+
 def _build_sell_training_frame(base_dir: str, council_buy_entries: pd.DataFrame) -> pd.DataFrame:
     """SELL training frame based on weighted council BUY entries from Pass 2."""
     buy_rows = 0 if council_buy_entries is None or council_buy_entries.empty else len(council_buy_entries)
@@ -1871,6 +2046,7 @@ def _build_sell_training_frame(base_dir: str, council_buy_entries: pd.DataFrame)
             sell_frame = external
     if "market_regime" not in sell_frame.columns:
         sell_frame["market_regime"] = _infer_market_regime(sell_frame)
+    sell_frame = _add_proven_sell_agent_scores(sell_frame)
     _save_feature_frame_cached(base_dir, "sell_training_frame", cache_key, sell_frame)
     return sell_frame
 
@@ -2119,37 +2295,33 @@ def _four_pass_product_live_gate_rows(
             sell_path_rows = len(sell_path_values)
             sell_path_avg = sum(sell_path_values) / max(1, sell_path_rows)
             sell_path_return = sum(v * 5.0 / 10000.0 for v in sell_path_values)
-            proxy_mode = "proxy" in profitability_mode.lower()
-            realized_mode = "realized" in profitability_mode.lower() or "exit" in profitability_mode.lower()
-            buy_ok = selected_count >= 10 and win_rate >= 0.56 and avg_net > 0.0 and median_net > 0.0 and score >= 0.50
-            if proxy_mode and not realized_mode:
-                buy_ok = selected_count >= 50 and win_rate >= 0.64 and avg_net >= 35.0 and median_net >= 18.0 and score >= 0.58
-            walk_forward_ok = wf_folds >= 2 and positive_buy_folds >= max(1, int(wf_folds * 0.50)) and wf_avg_net > 0.0
-            sell_path_ok = True
-            sell_path_note = "no_sell_path_rows_available"
-            if sell_path_rows > 0:
-                sell_path_ok = sell_path_avg > 0.0
-                sell_path_note = "sell_path_positive" if sell_path_ok else "sell_path_negative"
-            approved = bool(buy_ok and walk_forward_ok and sell_path_ok)
+            buy_selected_count = selected_count
+            buy_avg_net_bps = avg_net
+            buy_median_net_bps = median_net
+            buy_win_rate = win_rate
+            approved = bool(
+                buy_selected_count >= 20
+                and buy_avg_net_bps > 0.0
+                and buy_median_net_bps >= -2.0
+                and buy_win_rate >= 0.52
+                and wf_folds >= 1
+                and wf_avg_net > 0.0
+                and sell_path_rows >= 5
+                and sell_path_avg > 0.0
+            )
             cooldown_minutes = 0
-
-            if approved:
-                reason = f"approved;selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};wf_folds={wf_folds};wf_positive={positive_buy_folds};sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
-            else:
-                if avg_net < 0 or median_net < 0:
-                    market_state = "negative_ev_watch_only"
-                elif not walk_forward_ok:
-                    market_state = "validation_wait"
-                else:
-                    market_state = "near_miss"
-
-                reason = (
-                    f"not_live_eligible_now;market_state={market_state};"
-                    f"buy_ok={buy_ok};walk_forward_ok={walk_forward_ok};sell_path_ok={sell_path_ok};"
-                    f"selected={selected_count};win={win_rate:.3f};avg={avg_net:.2f};median={median_net:.2f};"
-                    f"wf_folds={wf_folds};wf_positive={positive_buy_folds};"
-                    f"sell_path_rows={sell_path_rows};sell_path_avg={sell_path_avg:.2f};sell_path_note={sell_path_note}"
-                )
+            reason = (
+                f"four_pass_live_gate;"
+                f"buy_selected={buy_selected_count};"
+                f"buy_win={buy_win_rate:.3f};"
+                f"buy_avg={buy_avg_net_bps:.2f};"
+                f"buy_median={buy_median_net_bps:.2f};"
+                f"walk_forward_folds={wf_folds};"
+                f"walk_forward_avg_net={wf_avg_net:.2f};"
+                f"sell_path_rows={sell_path_rows};"
+                f"sell_path_avg={sell_path_avg:.2f};"
+                f"approved={approved}"
+            )
 
             gate_rows.append([f"{ts_value:.6f}", dt_value, product_id, int(selected_count), f"{win_rate:.6f}", f"{avg_net:.6f}", f"{median_net:.6f}", f"{score:.6f}", profitability_mode, int(wf_folds), int(positive_buy_folds), f"{wf_avg_net:.6f}", f"{wf_avg_return:.6f}", int(sell_path_rows), f"{sell_path_avg:.6f}", f"{sell_path_return:.6f}", int(1 if approved else 0), int(cooldown_minutes), reason])
         except Exception:

@@ -107,11 +107,27 @@ def score_buy_intersections(row: Dict[str, Any]) -> Dict[str, float]:
     scores["upside_room_score"] = clamp(upside_room / 150.0)
     scores["low_volume_path_score"] = clamp((upside_room / 150.0) * 0.75 + (1.0 - clamp(downside_room / 180.0)) * 0.25)
     scores["poc_fair_value_stretch_score"] = clamp(poc_distance_abs / 120.0)
-    scores["value_acceptance_score"] = clamp((1.0 - range_pos) * 0.60 + clamp((ret_5 + 20.0) / 50.0) * 0.40)
+    explicit_value_acceptance = row.get("explicit_value_acceptance_score", None)
+    if explicit_value_acceptance is not None:
+        scores["value_acceptance_score"] = clamp(
+            float(explicit_value_acceptance) * 0.65
+            + ((1.0 - range_pos) * 0.60 + clamp((ret_5 + 20.0) / 50.0) * 0.40) * 0.35
+        )
+    else:
+        scores["value_acceptance_score"] = clamp((1.0 - range_pos) * 0.60 + clamp((ret_5 + 20.0) / 50.0) * 0.40)
     scores["volatility_expansion_score"] = clamp(vol / 20.0) * (1.0 - clamp(max(0.0, vol - 45.0) / 45.0))
     scores["range_discount_score"] = clamp(1.0 - range_pos)
     scores["rsi_mean_reversion_score"] = clamp((55.0 - rsi) / 30.0)
-    scores["fvg_fresh_zone_score"] = clamp(((-min(0.0, ret_15)) / 80.0) * 0.45 + clamp((ret_5 + 10.0) / 35.0) * 0.35 + (1.0 - clamp(volume_z / 4.0)) * 0.20)
+    fvg_proxy = clamp(
+        ((-min(0.0, ret_15)) / 80.0) * 0.45
+        + clamp((ret_5 + 10.0) / 35.0) * 0.35
+        + (1.0 - clamp(volume_z / 4.0)) * 0.20
+    )
+    explicit_fvg = row.get("explicit_fvg_fresh_zone_score", None)
+    if explicit_fvg is not None:
+        scores["fvg_fresh_zone_score"] = clamp(float(explicit_fvg) * 0.70 + fvg_proxy * 0.30)
+    else:
+        scores["fvg_fresh_zone_score"] = fvg_proxy
     scores["buy_intersection_score"] = clamp(sum(float(w) * float(scores.get(n, 0.0)) for n, w in BUY_AGENT_WEIGHTS.items()))
     return scores
 

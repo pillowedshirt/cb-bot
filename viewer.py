@@ -162,6 +162,10 @@ CONTINUOUS_RESEARCH_STATUS_PATH = runtime_path("continuous_research_status.json"
 CONTINUOUS_RESEARCH_HISTORY_PATH = runtime_path("continuous_research_history.csv")
 MARKET_STATE_ANALOG_SUMMARY_PATH = runtime_path("market_state_analog_summary.csv")
 MARKET_STATE_ANALOG_MATCHES_PATH = runtime_path("market_state_analog_matches.csv")
+SELL_MODEL_RATIO_GRID_PATH = runtime_path("sell_model_ratio_grid.csv")
+ADAPTIVE_SELL_MODEL_POLICY_PATH = runtime_path("adaptive_sell_model_policy.csv")
+ADAPTIVE_DECISION_POLICY_PATH = runtime_path("adaptive_decision_policy.csv")
+BACKGROUND_REPLAY_EXPANSION_SUMMARY_PATH = runtime_path("background_replay_expansion_summary.csv")
 DECISION_AUDIT_PATH = runtime_path("decision_audit.csv")
 
 SNAPSHOT_STALE_WARN_SEC = 20.0
@@ -3859,7 +3863,7 @@ def render_startup_runtime_inventory_panel(startup_runtime_inventory_df):
         st.dataframe(inv[cols_to_show], width="stretch", hide_index=True)
 
 
-def render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df):
+def render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df):
     st.markdown("### Continuous Background Research")
     cols = st.columns(4)
     cols[0].metric("Research cycles", 0 if continuous_research_history_df is None else len(continuous_research_history_df))
@@ -3921,6 +3925,69 @@ def render_continuous_research_panel(continuous_research_history_df, market_stat
             fig.update_xaxes(title="Similarity score")
             fig.update_yaxes(title="Historical analog outcome bps")
             st.plotly_chart(_quant_fig_layout(fig, "Analog Match Cloud — Similarity vs Historical Outcome", height=440), width="stretch")
+
+    if adaptive_decision_policy_df is not None and not adaptive_decision_policy_df.empty:
+        policy = adaptive_decision_policy_df.copy()
+        for col in ["position_size_multiplier", "buy_score_delta", "probability_delta", "ev_delta_bps", "policy_confidence", "sample_count"]:
+            if col in policy.columns:
+                policy[col] = pd.to_numeric(policy[col], errors="coerce").fillna(0.0)
+        if "ts" in policy.columns:
+            policy["ts"] = pd.to_numeric(policy["ts"], errors="coerce").fillna(0.0)
+            policy = policy.sort_values("ts")
+        if "product_id" in policy.columns:
+            latest = policy.groupby("product_id", as_index=False).tail(1)
+            fig = go.Figure()
+            fig.add_bar(x=latest["product_id"].astype(str), y=latest["position_size_multiplier"], name="Position size multiplier", text=latest["policy_gate"].astype(str) if "policy_gate" in latest.columns else None, hovertemplate="Product=%{x}<br>Size mult=%{y:.2f}x<br>Gate=%{text}<extra></extra>")
+            st.plotly_chart(_quant_fig_layout(fig, "Adaptive Decision Policy — Position Sizing by Similar Market State", height=420), width="stretch")
+            fig2 = go.Figure()
+            fig2.add_bar(x=latest["product_id"].astype(str), y=latest["buy_score_delta"], name="Buy score delta")
+            fig2.add_scatter(x=latest["product_id"].astype(str), y=latest["ev_delta_bps"], mode="lines+markers", name="EV delta bps", yaxis="y2")
+            fig2.update_layout(yaxis=dict(title="Buy score delta"), yaxis2=dict(title="EV delta bps", overlaying="y", side="right"))
+            st.plotly_chart(_quant_fig_layout(fig2, "Adaptive Decision Policy — Buy/EV Threshold Bias", height=420), width="stretch")
+
+    if adaptive_sell_model_policy_df is not None and not adaptive_sell_model_policy_df.empty:
+        sell = adaptive_sell_model_policy_df.copy()
+        for col in ["scalp_target_mult", "core_target_mult", "scalp_pullback_pct", "core_pullback_pct", "expected_avg_net_bps", "expected_win_rate", "consistency_score", "policy_confidence"]:
+            if col in sell.columns:
+                sell[col] = pd.to_numeric(sell[col], errors="coerce").fillna(0.0)
+        if "ts" in sell.columns:
+            sell["ts"] = pd.to_numeric(sell["ts"], errors="coerce").fillna(0.0)
+            sell = sell.sort_values("ts")
+        if "product_id" in sell.columns:
+            latest_sell = sell.groupby("product_id", as_index=False).tail(1)
+            fig = go.Figure()
+            fig.add_bar(x=latest_sell["product_id"].astype(str), y=latest_sell["expected_avg_net_bps"], name="Expected avg net bps", hovertemplate="Product=%{x}<br>Expected avg=%{y:.2f} bps<extra></extra>")
+            fig.add_scatter(x=latest_sell["product_id"].astype(str), y=latest_sell["expected_win_rate"] * 100.0, mode="lines+markers", name="Expected win rate %", yaxis="y2")
+            fig.add_hline(y=0.0)
+            fig.update_layout(yaxis=dict(title="Expected avg net bps"), yaxis2=dict(title="Expected win rate %", overlaying="y", side="right"))
+            st.plotly_chart(_quant_fig_layout(fig, "Adaptive Sell Model Policy — Expected Consistency", height=420), width="stretch")
+            fig2 = go.Figure()
+            fig2.add_bar(x=latest_sell["product_id"].astype(str), y=latest_sell["scalp_target_mult"], name="Scalp target multiplier")
+            fig2.add_bar(x=latest_sell["product_id"].astype(str), y=latest_sell["core_target_mult"], name="Core target multiplier")
+            fig2.update_layout(barmode="group")
+            st.plotly_chart(_quant_fig_layout(fig2, "Adaptive Sell Model Policy — Target Multipliers", height=420), width="stretch")
+
+    if sell_model_ratio_grid_df is not None and not sell_model_ratio_grid_df.empty:
+        grid = sell_model_ratio_grid_df.copy()
+        for col in ["consistency_score", "avg_net_bps", "win_rate"]:
+            if col in grid.columns:
+                grid[col] = pd.to_numeric(grid[col], errors="coerce").fillna(0.0)
+        top = grid.sort_values("consistency_score", ascending=False).head(30) if "consistency_score" in grid.columns else grid.head(30)
+        if not top.empty and {"product_id", "consistency_score"}.issubset(top.columns):
+            fig = go.Figure()
+            fig.add_bar(x=top["consistency_score"], y=top["product_id"].astype(str) + " · scalp " + top["scalp_target_mult"].astype(str) + " / core " + top["core_target_mult"].astype(str), orientation="h", name="Consistency score", hovertemplate="%{y}<br>Consistency=%{x:.2f}<extra></extra>")
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(_quant_fig_layout(fig, "Sell Ratio Grid — Best Consistency Tests", height=620), width="stretch")
+
+    if background_replay_expansion_summary_df is not None and not background_replay_expansion_summary_df.empty:
+        exp = background_replay_expansion_summary_df.copy()
+        if "rows_written" in exp.columns:
+            exp["rows_written"] = pd.to_numeric(exp["rows_written"], errors="coerce").fillna(0.0)
+        if {"product_id", "timeframe", "rows_written"}.issubset(exp.columns):
+            fig = go.Figure()
+            recent_exp = exp.tail(50)
+            fig.add_bar(x=recent_exp["product_id"].astype(str) + " · " + recent_exp["timeframe"].astype(str), y=recent_exp["rows_written"], name="Rows written", hovertemplate="%{x}<br>Rows written=%{y}<extra></extra>")
+            st.plotly_chart(_quant_fig_layout(fig, "Background Historical Expansion — Rows Added", height=420), width="stretch")
     with st.expander("Continuous research tables", expanded=False):
         if continuous_research_history_df is not None and not continuous_research_history_df.empty:
             st.markdown("#### Research cycle history"); st.dataframe(continuous_research_history_df.tail(100), width="stretch", hide_index=True)
@@ -3932,6 +3999,14 @@ def render_continuous_research_panel(continuous_research_history_df, market_stat
             st.markdown("#### Research file health"); st.dataframe(research_file_health_df.tail(100), width="stretch", hide_index=True)
         if research_backfill_plan_df is not None and not research_backfill_plan_df.empty:
             st.markdown("#### Research backfill plan"); st.dataframe(research_backfill_plan_df.tail(100), width="stretch", hide_index=True)
+        if adaptive_decision_policy_df is not None and not adaptive_decision_policy_df.empty:
+            st.markdown("#### Adaptive decision policy"); st.dataframe(adaptive_decision_policy_df.tail(100), width="stretch", hide_index=True)
+        if adaptive_sell_model_policy_df is not None and not adaptive_sell_model_policy_df.empty:
+            st.markdown("#### Adaptive sell model policy"); st.dataframe(adaptive_sell_model_policy_df.tail(100), width="stretch", hide_index=True)
+        if sell_model_ratio_grid_df is not None and not sell_model_ratio_grid_df.empty:
+            st.markdown("#### Sell model ratio grid"); st.dataframe(sell_model_ratio_grid_df.tail(250), width="stretch", hide_index=True)
+        if background_replay_expansion_summary_df is not None and not background_replay_expansion_summary_df.empty:
+            st.markdown("#### Background replay expansion"); st.dataframe(background_replay_expansion_summary_df.tail(100), width="stretch", hide_index=True)
 
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
@@ -3959,6 +4034,10 @@ def render_live_dashboard(selected, refresh_config):
     market_state_analog_matches_df = load_csv_tail(MARKET_STATE_ANALOG_MATCHES_PATH, max_lines=10000)
     research_file_health_df = load_csv_tail(RESEARCH_FILE_HEALTH_PATH, max_lines=1000)
     research_backfill_plan_df = load_csv_tail(RESEARCH_BACKFILL_PLAN_PATH, max_lines=1000)
+    sell_model_ratio_grid_df = load_csv_tail(SELL_MODEL_RATIO_GRID_PATH, max_lines=20000)
+    adaptive_sell_model_policy_df = load_csv_tail(ADAPTIVE_SELL_MODEL_POLICY_PATH, max_lines=5000)
+    adaptive_decision_policy_df = load_csv_tail(ADAPTIVE_DECISION_POLICY_PATH, max_lines=5000)
+    background_replay_expansion_summary_df = load_csv_tail(BACKGROUND_REPLAY_EXPANSION_SUMMARY_PATH, max_lines=5000)
     strategy_variant_replay_summary_df = load_csv_tail(
         STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH,
         max_lines=10000,
@@ -4014,7 +4093,7 @@ def render_live_dashboard(selected, refresh_config):
         render_startup_runtime_inventory_panel(startup_runtime_inventory_df)
 
     with st.expander("Continuous background research", expanded=True):
-        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df)
+        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df, sell_model_ratio_grid_df, adaptive_sell_model_policy_df, adaptive_decision_policy_df, background_replay_expansion_summary_df)
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):

@@ -741,6 +741,15 @@ ANALOG_MIN_SAMPLE_COUNT_TO_BLOCK: int = 20
 ANALOG_BLOCK_AVG_BPS_BELOW: float = -5.0
 ANALOG_BLOCK_WIN_RATE_BELOW: float = 0.42
 ANALOG_SIZE_DOWN_WHEN_MISSING: float = 0.75
+ENABLE_ADAPTIVE_DECISION_POLICY: bool = True
+ADAPTIVE_DECISION_POLICY_CACHE_SEC: float = 15.0
+ADAPTIVE_POLICY_MIN_SAMPLE_COUNT: int = 20
+ADAPTIVE_POLICY_MIN_CONFIDENCE_FOR_LIVE_ADJUST: float = 0.25
+ADAPTIVE_MAX_BUY_SCORE_DELTA: float = 4.0
+ADAPTIVE_MAX_PROBABILITY_DELTA: float = 0.035
+ADAPTIVE_MAX_EV_DELTA_BPS: float = 6.0
+ADAPTIVE_MIN_POSITION_SIZE_MULTIPLIER: float = 0.35
+ADAPTIVE_MAX_POSITION_SIZE_MULTIPLIER: float = 1.00
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = runtime_path("historical_replay_summary.csv")
 REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH: str = runtime_path("replay_fee_comparison_summary.csv")
 STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH: str = runtime_path("strategy_variant_replay_summary.csv")
@@ -798,6 +807,9 @@ LIVE_TRADE_BLOCKERS_CSV_PATH: str = runtime_path("live_trade_blockers.csv")
 APPROVED_BUT_SHADOWED_CSV_PATH: str = runtime_path("approved_but_shadowed.csv")
 MARKET_STATE_ANALOG_SUMMARY_CSV_PATH: str = runtime_path("market_state_analog_summary.csv")
 MARKET_STATE_ANALOG_MATCHES_CSV_PATH: str = runtime_path("market_state_analog_matches.csv")
+ADAPTIVE_SELL_MODEL_POLICY_CSV_PATH: str = runtime_path("adaptive_sell_model_policy.csv")
+ADAPTIVE_DECISION_POLICY_CSV_PATH: str = runtime_path("adaptive_decision_policy.csv")
+SELL_MODEL_RATIO_GRID_CSV_PATH: str = runtime_path("sell_model_ratio_grid.csv")
 
 RUNTIME_CSV_ROW_LIMITS = {
     "market.csv": 15000,
@@ -7063,6 +7075,8 @@ class TradingBot:
         self._last_continuous_research_cycle_ts: float = 0.0
         self._market_state_analog_cache: Dict[str, Dict[str, Any]] = {}
         self._market_state_analog_cache_ts: float = 0.0
+        self._adaptive_decision_policy_cache: Dict[str, Dict[str, Any]] = {}
+        self._adaptive_decision_policy_cache_ts: float = 0.0
 
         ensure_runtime_dirs()
         self.runtime_file_migration_result = migrate_root_runtime_files_to_csv_tree()
@@ -15300,6 +15314,24 @@ class TradingBot:
             candidate["analog_market_state_gate_reason"] = str(analog_gate.get("reason", ""))
             if not bool(analog_gate.get("allowed", True)):
                 return False, ("live_buy_blocked:analog_market_state_gate " f"product_id={product_id};reason={analog_gate.get('reason', '')}")
+
+            adaptive_policy = self._adaptive_policy_for_candidate(candidate)
+            candidate["adaptive_policy_available"] = bool(adaptive_policy.get("available", False))
+            candidate["adaptive_policy_sample_count"] = int(float(adaptive_policy.get("sample_count", 0) or 0))
+            candidate["adaptive_policy_confidence"] = float(adaptive_policy.get("policy_confidence", 0.0) or 0.0)
+            candidate["adaptive_buy_score_delta"] = float(adaptive_policy.get("buy_score_delta", 0.0) or 0.0)
+            candidate["adaptive_probability_delta"] = float(adaptive_policy.get("probability_delta", 0.0) or 0.0)
+            candidate["adaptive_ev_delta_bps"] = float(adaptive_policy.get("ev_delta_bps", 0.0) or 0.0)
+            candidate["adaptive_policy_position_size_multiplier"] = float(adaptive_policy.get("position_size_multiplier", 1.0) or 1.0)
+            candidate["adaptive_policy_reason"] = str(adaptive_policy.get("reason", ""))
+            candidate["adaptive_adjusted_score"] = float(candidate.get("score", 0.0) or 0.0) + float(candidate["adaptive_buy_score_delta"])
+            candidate["adaptive_adjusted_probability"] = float(candidate.get("estimated_prob_up", candidate.get("probability", 0.0)) or 0.0) + float(candidate["adaptive_probability_delta"])
+            candidate["adaptive_adjusted_expected_net_edge_bps"] = float(candidate.get("expected_net_edge_bps", 0.0) or 0.0) + float(candidate["adaptive_ev_delta_bps"])
+            candidate["scalp_target_mult"] = float(adaptive_policy.get("scalp_target_mult", 1.0) or 1.0)
+            candidate["core_target_mult"] = float(adaptive_policy.get("core_target_mult", 1.0) or 1.0)
+            candidate["scalp_pullback_pct"] = float(adaptive_policy.get("scalp_pullback_pct", 0.0) or 0.0)
+            candidate["core_pullback_pct"] = float(adaptive_policy.get("core_pullback_pct", 0.0) or 0.0)
+            candidate["max_hold_minutes"] = float(adaptive_policy.get("max_hold_minutes", 0.0) or 0.0)
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
@@ -15883,6 +15915,7 @@ class TradingBot:
                 f"feature_gate={candidate.get('feature_correlation_gate_reason', '')};"
                 f"markov_gate={candidate.get('markov_regime_gate_reason', '')};"
                 f"kalman_gate={candidate.get('kalman_reason', '')};"
+                f"adaptive_policy={candidate.get('adaptive_policy_reason', '')};"
                 f"{backtest_reason}"
             )
 
@@ -21288,6 +21321,70 @@ class TradingBot:
         except Exception as exc:
             return {"available": False, "allowed": True, "size_multiplier": float(ANALOG_SIZE_DOWN_WHEN_MISSING), "reason": f"analog_market_state_gate_error_size_down:{exc}"}
 
+
+    def _load_adaptive_decision_policy_map(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            now_value = now_ts()
+            if (
+                self._adaptive_decision_policy_cache
+                and now_value - float(self._adaptive_decision_policy_cache_ts or 0.0) < float(ADAPTIVE_DECISION_POLICY_CACHE_SEC)
+            ):
+                return dict(self._adaptive_decision_policy_cache)
+
+            df = self._read_csv_tail_for_bot(ADAPTIVE_DECISION_POLICY_CSV_PATH, max_lines=5000)
+            if df.empty or "product_id" not in df.columns:
+                self._adaptive_decision_policy_cache = {}
+                self._adaptive_decision_policy_cache_ts = now_value
+                return {}
+
+            if "ts" in df.columns:
+                df["ts"] = pd.to_numeric(df["ts"], errors="coerce").fillna(0.0)
+                df = df.sort_values("ts")
+
+            latest = df.groupby("product_id", as_index=False).tail(1)
+            result = {str(row.get("product_id", "")): row.to_dict() for _, row in latest.iterrows()}
+            self._adaptive_decision_policy_cache = result
+            self._adaptive_decision_policy_cache_ts = now_value
+            return dict(result)
+
+        except Exception:
+            return {}
+
+    def _adaptive_policy_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(ENABLE_ADAPTIVE_DECISION_POLICY):
+            return {"available": False, "allowed": True, "position_size_multiplier": 1.0, "reason": "adaptive_decision_policy_disabled"}
+        try:
+            product_id = str(candidate.get("product_id", ""))
+            row = dict(self._load_adaptive_decision_policy_map().get(product_id, {}) or {})
+            if not row:
+                return {"available": False, "allowed": True, "position_size_multiplier": 0.85, "reason": f"adaptive_decision_policy_missing_size_down product_id={product_id}"}
+
+            sample_count = int(float(row.get("sample_count", 0) or 0))
+            confidence = float(row.get("policy_confidence", 0.0) or 0.0)
+            if sample_count < int(ADAPTIVE_POLICY_MIN_SAMPLE_COUNT):
+                return {"available": True, "allowed": True, "position_size_multiplier": 0.75, "sample_count": sample_count, "policy_confidence": confidence, "reason": f"adaptive_policy_low_sample_size_down;sample_count={sample_count};confidence={confidence:.3f}"}
+            if confidence < float(ADAPTIVE_POLICY_MIN_CONFIDENCE_FOR_LIVE_ADJUST):
+                return {"available": True, "allowed": True, "position_size_multiplier": 0.80, "sample_count": sample_count, "policy_confidence": confidence, "reason": f"adaptive_policy_low_confidence_size_down;sample_count={sample_count};confidence={confidence:.3f}"}
+
+            buy_score_delta = clamp_float(float(row.get("buy_score_delta", 0.0) or 0.0), -float(ADAPTIVE_MAX_BUY_SCORE_DELTA), float(ADAPTIVE_MAX_BUY_SCORE_DELTA))
+            probability_delta = clamp_float(float(row.get("probability_delta", 0.0) or 0.0), -float(ADAPTIVE_MAX_PROBABILITY_DELTA), float(ADAPTIVE_MAX_PROBABILITY_DELTA))
+            ev_delta_bps = clamp_float(float(row.get("ev_delta_bps", 0.0) or 0.0), -float(ADAPTIVE_MAX_EV_DELTA_BPS), float(ADAPTIVE_MAX_EV_DELTA_BPS))
+            position_size_multiplier = clamp_float(float(row.get("position_size_multiplier", 1.0) or 1.0), float(ADAPTIVE_MIN_POSITION_SIZE_MULTIPLIER), float(ADAPTIVE_MAX_POSITION_SIZE_MULTIPLIER))
+            return {
+                "available": True, "allowed": True, "sample_count": sample_count, "policy_confidence": confidence,
+                "buy_score_delta": buy_score_delta, "probability_delta": probability_delta, "ev_delta_bps": ev_delta_bps,
+                "position_size_multiplier": position_size_multiplier,
+                "scalp_target_mult": float(row.get("scalp_target_mult", 1.0) or 1.0),
+                "core_target_mult": float(row.get("core_target_mult", 1.0) or 1.0),
+                "scalp_pullback_pct": float(row.get("scalp_pullback_pct", 0.0) or 0.0),
+                "core_pullback_pct": float(row.get("core_pullback_pct", 0.0) or 0.0),
+                "max_hold_minutes": float(row.get("max_hold_minutes", 0.0) or 0.0),
+                "policy_gate": str(row.get("policy_gate", "")),
+                "reason": f"adaptive_policy_loaded;sample_count={sample_count};confidence={confidence:.3f};gate={row.get('policy_gate', '')};source_reason={row.get('reason', '')}",
+            }
+        except Exception as exc:
+            return {"available": False, "allowed": True, "position_size_multiplier": 0.80, "reason": f"adaptive_policy_error_size_down:{exc}"}
+
     def _calculation_status(self, *, include_readiness: bool = True, readiness_override: Optional[Dict[str, Any]] = None, force: bool = False) -> Dict[str, Any]:
         now_value = now_ts()
         if (not bool(force) and getattr(self, "_calculation_status_cache", None) and now_value - float(getattr(self, "_calculation_status_cache_ts", 0.0) or 0.0) < float(CALCULATION_STATUS_RESCAN_EVERY_SEC)):
@@ -21698,6 +21795,14 @@ class TradingBot:
                         "core_done": False,
                         "scalp_armed": False,
                         "core_armed": False,
+                        "adaptive_policy_available": False,
+                        "adaptive_policy_confidence": 0.0,
+                        "adaptive_scalp_target_mult": 1.0,
+                        "adaptive_core_target_mult": 1.0,
+                        "adaptive_scalp_pullback_pct": 0.0,
+                        "adaptive_core_pullback_pct": 0.0,
+                        "adaptive_max_hold_minutes": 0.0,
+                        "adaptive_policy_reason": "",
                         "profit_lock_armed": False,
                     },
                 )
@@ -26364,8 +26469,13 @@ class TradingBot:
                         0.0,
                         1.0,
                     )
+                    adaptive_policy_size_multiplier = clamp_float(
+                        float(candidate.get("adaptive_policy_position_size_multiplier", 1.0) or 1.0),
+                        float(ADAPTIVE_MIN_POSITION_SIZE_MULTIPLIER),
+                        float(ADAPTIVE_MAX_POSITION_SIZE_MULTIPLIER),
+                    )
                     combined_risk_multiplier = clamp_float(
-                        risk_size_multiplier * context_size_multiplier * feature_size_multiplier * markov_size_multiplier * kalman_size_multiplier * analog_size_multiplier,
+                        risk_size_multiplier * context_size_multiplier * feature_size_multiplier * markov_size_multiplier * kalman_size_multiplier * analog_size_multiplier * adaptive_policy_size_multiplier,
                         0.0,
                         float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
                     )
@@ -26387,6 +26497,8 @@ class TradingBot:
                         f"markov_size_multiplier={markov_size_multiplier:.3f};"
                         f"kalman_size_multiplier={kalman_size_multiplier:.3f};"
                         f"analog_size_multiplier={analog_size_multiplier:.3f};"
+                        f"adaptive_policy_size_multiplier={adaptive_policy_size_multiplier:.3f};"
+                        f"adaptive_policy_reason={candidate.get('adaptive_policy_reason', '')};"
                         f"analog_reason={candidate.get('analog_market_state_gate_reason', '')};"
                         f"combined_risk_multiplier={combined_risk_multiplier:.3f};"
                         f"risk_reason={candidate.get('risk_live_gate_reason', '')};"
@@ -26758,6 +26870,14 @@ class TradingBot:
                         "position_pct": float(candidate.get("position_pct", 0.0)),
                         "target_bps": float(candidate.get("target_bps", 0.0)),
                         "cost_bps": float(candidate.get("cost_bps", 0.0)),
+                        "adaptive_policy_available": bool(candidate.get("adaptive_policy_available", False)),
+                        "adaptive_policy_confidence": float(candidate.get("adaptive_policy_confidence", 0.0) or 0.0),
+                        "adaptive_scalp_target_mult": float(candidate.get("scalp_target_mult", candidate.get("adaptive_scalp_target_mult", 1.0)) or 1.0),
+                        "adaptive_core_target_mult": float(candidate.get("core_target_mult", candidate.get("adaptive_core_target_mult", 1.0)) or 1.0),
+                        "adaptive_scalp_pullback_pct": float(candidate.get("scalp_pullback_pct", 0.0) or 0.0),
+                        "adaptive_core_pullback_pct": float(candidate.get("core_pullback_pct", 0.0) or 0.0),
+                        "adaptive_max_hold_minutes": float(candidate.get("max_hold_minutes", 0.0) or 0.0),
+                        "adaptive_policy_reason": str(candidate.get("adaptive_policy_reason", "")),
                         "profit_lock_armed": False,
                         "profit_lock_price": None,
                         "min_profitable_exit_price": None,
@@ -26973,6 +27093,14 @@ class TradingBot:
                 scalp_pullback_pct = float(profile.scalp_pullback_pct)
                 core_pullback_pct = float(profile.core_pullback_pct)
 
+                adaptive_policy = self._adaptive_policy_for_candidate({"product_id": product_id})
+                adaptive_scalp_target_mult = float(adaptive_policy.get("scalp_target_mult", 1.0) or 1.0)
+                adaptive_core_target_mult = float(adaptive_policy.get("core_target_mult", 1.0) or 1.0)
+                if float(adaptive_policy.get("scalp_pullback_pct", 0.0) or 0.0) > 0.0:
+                    scalp_pullback_pct = clamp_float(float(adaptive_policy.get("scalp_pullback_pct")), CALIB_MIN_SCALP_PULLBACK, CALIB_MAX_SCALP_PULLBACK)
+                if float(adaptive_policy.get("core_pullback_pct", 0.0) or 0.0) > 0.0:
+                    core_pullback_pct = clamp_float(float(adaptive_policy.get("core_pullback_pct")), CALIB_MIN_CORE_PULLBACK, CALIB_MAX_CORE_PULLBACK)
+
                 try:
                     min_exit_px = required_exit_price_for_net_gain(
                         effective_entry_price=avg_entry_price,
@@ -26987,8 +27115,8 @@ class TradingBot:
                 except Exception:
                     min_exit_px = None
 
-                scalp_target = max(float(targets["scalp_target"]), float(min_exit_px or 0.0))
-                core_target = max(float(targets["core_target"]), float(min_exit_px or 0.0))
+                scalp_target = max(float(targets["scalp_target"]) * float(adaptive_scalp_target_mult), float(min_exit_px or 0.0))
+                core_target = max(float(targets["core_target"]) * float(adaptive_core_target_mult), float(min_exit_px or 0.0))
                 scalp_peak = lot_meta.get("scalp_arm_peak")
                 core_peak = lot_meta.get("core_arm_peak")
                 scalp_trigger = (
@@ -27027,6 +27155,11 @@ class TradingBot:
                     "core_arm_peak": core_peak,
                     "scalp_pullback_pct": scalp_pullback_pct,
                     "core_pullback_pct": core_pullback_pct,
+                    "adaptive_sell_policy_available": bool(adaptive_policy.get("available", False)),
+                    "adaptive_sell_policy_confidence": float(adaptive_policy.get("policy_confidence", 0.0) or 0.0),
+                    "adaptive_scalp_target_mult": float(adaptive_scalp_target_mult),
+                    "adaptive_core_target_mult": float(adaptive_core_target_mult),
+                    "adaptive_policy_reason": str(adaptive_policy.get("reason", "")),
                     "scalp_pullback_trigger_price": scalp_trigger,
                     "core_pullback_trigger_price": core_trigger,
                     "distance_to_min_profit_bps": dist_bps(min_exit_px),

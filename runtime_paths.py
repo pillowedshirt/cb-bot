@@ -26,7 +26,19 @@ RISK_FILES = {"risk_live_gate.csv","risk_ev_confidence.csv","risk_monte_carlo_su
 QUANT_FILES = {"feature_outcome_correlation.csv","feature_correlation_matrix.csv","markov_regime_policy.csv","markov_regime_transitions.csv","kalman_filter_policy.csv","kalman_live_state.csv","quant_state_summary.csv"}
 LIVE_FILES = {"trades.csv","orders.csv","live_trade_blockers.csv","approved_but_shadowed.csv","position_targets.csv","account_balance_diagnostics.csv","reconciliation.csv","council_decisions.csv","council_votes.csv","council_observation_outcomes.csv","decision_audit.csv","signal_events.csv","ai_predictions.csv","ai_feature_importance.csv","product_cooldowns.csv","agent_performance.csv","agent_leaderboard.csv","agent_adjustments.csv","agent_component_replay_attribution.csv","agent_side_ratings.csv","agent_trade_policy.csv"}
 RUNTIME_FILES = {"calculation_status.json","calculation_complete_latch.json","viewer_snapshot.json","historical_replay_manifest.json","startup_runtime_inventory.csv","post_patch_audit.csv","exchange_product_map.csv","products_active.csv","products_selected.json"}
-RESEARCH_FILES = {"continuous_research_status.json","continuous_research_history.csv","market_state_analog_matches.csv","market_state_analog_summary.csv","incremental_strategy_simulation_summary.csv","background_replay_expansion_summary.csv","research_file_health.csv"}
+RESEARCH_FILES = {
+    "continuous_research_status.json",
+    "continuous_research_history.csv",
+    "market_state_analog_matches.csv",
+    "market_state_analog_summary.csv",
+    "sell_model_ratio_grid.csv",
+    "adaptive_sell_model_policy.csv",
+    "adaptive_decision_policy.csv",
+    "incremental_strategy_simulation_summary.csv",
+    "background_replay_expansion_summary.csv",
+    "research_file_health.csv",
+    "research_backfill_plan.csv",
+}
 
 def ensure_runtime_dirs() -> None:
     for path in [CSV_ROOT_DIR, RAW_CACHE_DIR, REPLAY_DIR, BACKTEST_DIR, RISK_DIR, QUANT_DIR, LIVE_DIR, RUNTIME_DIR, VIEWER_DIR, RESEARCH_DIR, ARCHIVE_DIR, DEBUG_DIR]:

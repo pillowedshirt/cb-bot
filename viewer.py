@@ -102,8 +102,20 @@ HISTORICAL_SHADOW_REPLAY_CSV_PATH = runtime_path("historical_shadow_replay.csv")
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH = runtime_path("historical_replay_summary.csv")
 HISTORICAL_REPLAY_MANIFEST_JSON_PATH = runtime_path("historical_replay_manifest.json")
 STARTUP_RUNTIME_INVENTORY_PATH = runtime_path("startup_runtime_inventory.csv")
+FAST_CALIBRATION_BUILD_STATUS_PATH = runtime_path("fast_calibration_build_status.json")
+RESEARCH_FILE_HEALTH_PATH = runtime_path("research_file_health.csv")
+RESEARCH_BACKFILL_PLAN_PATH = runtime_path("research_backfill_plan.csv")
 HIST_REPLAY_15M_90D_CSV_PATH = runtime_path("historical_replay_15m_90d.csv")
 HIST_REPLAY_1H_365D_CSV_PATH = runtime_path("historical_replay_1h_365d.csv")
+
+def load_fast_calibration_build_status() -> dict:
+    try:
+        if os.path.exists(FAST_CALIBRATION_BUILD_STATUS_PATH):
+            with open(FAST_CALIBRATION_BUILD_STATUS_PATH, "r", encoding="utf-8") as file:
+                return json.load(file)
+    except Exception:
+        pass
+    return {}
 
 STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT = 120
 STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT = int(90 * 24 * 4 * 0.92)
@@ -2750,6 +2762,14 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     st.progress(progress)
     if calc_status.get("fast_calibration_warning"):
         st.warning(str(calc_status.get("fast_calibration_warning")))
+    fast_build_status = load_fast_calibration_build_status()
+    if fast_build_status and not bool(fast_build_status.get("ok", False)):
+        st.warning(
+            "C++ build status: "
+            + str(fast_build_status.get("action", "unknown"))
+            + " — "
+            + str(fast_build_status.get("repair_hint", fast_build_status.get("reason", "")))
+        )
     if calc_status.get("viewer_progress_stabilized"):
         st.caption(str(calc_status.get("viewer_progress_stabilized_reason", "")))
 
@@ -3839,13 +3859,35 @@ def render_startup_runtime_inventory_panel(startup_runtime_inventory_df):
         st.dataframe(inv[cols_to_show], width="stretch", hide_index=True)
 
 
-def render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df):
+def render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df):
     st.markdown("### Continuous Background Research")
     cols = st.columns(4)
     cols[0].metric("Research cycles", 0 if continuous_research_history_df is None else len(continuous_research_history_df))
     cols[1].metric("Analog summaries", 0 if market_state_analog_summary_df is None else len(market_state_analog_summary_df))
     cols[2].metric("Analog matches", 0 if market_state_analog_matches_df is None else len(market_state_analog_matches_df))
     cols[3].metric("Research mode", "Active")
+    if research_file_health_df is not None and not research_file_health_df.empty:
+        health = research_file_health_df.copy()
+        if "priority" in health.columns:
+            health["priority"] = pd.to_numeric(health["priority"], errors="coerce").fillna(0)
+        fig = go.Figure()
+        fig.add_bar(
+            x=health["filename"].astype(str),
+            y=health["priority"],
+            name="Research priority",
+            hovertemplate="File=%{x}<br>Priority=%{y}<br>Health=%{customdata}<extra></extra>",
+            customdata=health["health"].astype(str) if "health" in health.columns else None,
+        )
+        st.plotly_chart(_quant_fig_layout(fig, "Research File Health / Learning Priority", height=420), width="stretch")
+    if research_backfill_plan_df is not None and not research_backfill_plan_df.empty:
+        plan = research_backfill_plan_df.copy()
+        if "priority" in plan.columns:
+            plan["priority"] = pd.to_numeric(plan["priority"], errors="coerce").fillna(0)
+        top = plan.sort_values("priority", ascending=False).head(25)
+        fig = go.Figure()
+        fig.add_bar(x=top["priority"], y=top["task_id"].astype(str), orientation="h", name="Task priority", hovertemplate="%{y}<br>Priority=%{x}<extra></extra>")
+        fig.update_yaxes(autorange="reversed")
+        st.plotly_chart(_quant_fig_layout(fig, "Next Background Learning Tasks", height=520), width="stretch")
     if market_state_analog_summary_df is not None and not market_state_analog_summary_df.empty:
         df = market_state_analog_summary_df.copy()
         for col in ["analog_avg_outcome_bps", "analog_win_rate", "analog_sample_count", "size_multiplier"]:
@@ -3886,6 +3928,10 @@ def render_continuous_research_panel(continuous_research_history_df, market_stat
             st.markdown("#### Market-state analog summary"); st.dataframe(market_state_analog_summary_df.tail(100), width="stretch", hide_index=True)
         if market_state_analog_matches_df is not None and not market_state_analog_matches_df.empty:
             st.markdown("#### Market-state analog matches"); st.dataframe(market_state_analog_matches_df.tail(250), width="stretch", hide_index=True)
+        if research_file_health_df is not None and not research_file_health_df.empty:
+            st.markdown("#### Research file health"); st.dataframe(research_file_health_df.tail(100), width="stretch", hide_index=True)
+        if research_backfill_plan_df is not None and not research_backfill_plan_df.empty:
+            st.markdown("#### Research backfill plan"); st.dataframe(research_backfill_plan_df.tail(100), width="stretch", hide_index=True)
 
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
@@ -3911,6 +3957,8 @@ def render_live_dashboard(selected, refresh_config):
     continuous_research_history_df = load_csv_tail(CONTINUOUS_RESEARCH_HISTORY_PATH, max_lines=1000)
     market_state_analog_summary_df = load_csv_tail(MARKET_STATE_ANALOG_SUMMARY_PATH, max_lines=5000)
     market_state_analog_matches_df = load_csv_tail(MARKET_STATE_ANALOG_MATCHES_PATH, max_lines=10000)
+    research_file_health_df = load_csv_tail(RESEARCH_FILE_HEALTH_PATH, max_lines=1000)
+    research_backfill_plan_df = load_csv_tail(RESEARCH_BACKFILL_PLAN_PATH, max_lines=1000)
     strategy_variant_replay_summary_df = load_csv_tail(
         STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH,
         max_lines=10000,
@@ -3966,7 +4014,7 @@ def render_live_dashboard(selected, refresh_config):
         render_startup_runtime_inventory_panel(startup_runtime_inventory_df)
 
     with st.expander("Continuous background research", expanded=True):
-        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df)
+        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df, research_file_health_df, research_backfill_plan_df)
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):

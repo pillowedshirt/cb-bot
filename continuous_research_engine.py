@@ -15,6 +15,8 @@ from runtime_paths import ensure_runtime_dirs, runtime_path, write_generated_fil
 CONTINUOUS_RESEARCH_HISTORY_COLUMNS = ["ts","dt_utc","cycle_id","cycle_type","status","duration_sec","input_rows","output_rows","reason"]
 MARKET_STATE_ANALOG_MATCH_COLUMNS = ["ts","dt_utc","cycle_id","product_id","match_rank","similarity_score","source_timeframe","source_row_ts","source_regime","outcome_bps","features_used","reason"]
 MARKET_STATE_ANALOG_SUMMARY_COLUMNS = ["ts","dt_utc","cycle_id","product_id","analog_sample_count","analog_avg_outcome_bps","analog_median_outcome_bps","analog_win_rate","analog_p25_bps","analog_p75_bps","analog_best_similarity","analog_gate","size_multiplier","reason"]
+RESEARCH_FILE_HEALTH_COLUMNS = ["ts", "dt_utc", "filename", "path", "exists", "rows", "products", "health", "priority", "reason"]
+RESEARCH_BACKFILL_PLAN_COLUMNS = ["ts", "dt_utc", "task_id", "task_type", "product_id", "timeframe", "priority", "status", "reason"]
 
 def _utc_ts() -> float: return float(time.time())
 def _utc_dt(ts_value: Optional[float] = None) -> str:
@@ -40,6 +42,69 @@ def _append_rows(path: str, columns: List[str], rows: List[List[Any]], reason: s
         if write_header: writer.writerow(columns)
         writer.writerows(rows)
     write_generated_file_meta(path, reason=reason)
+
+def _file_health(filename: str, min_rows: int = 1, min_products: int = 0) -> dict:
+    path = runtime_path(filename)
+    result = {"filename": filename, "path": path, "exists": os.path.exists(path), "rows": 0, "products": 0, "health": "MISSING", "priority": 100, "reason": "missing"}
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return result
+        if filename.endswith(".json"):
+            result.update({"health": "OK", "priority": 20, "reason": "json_exists"})
+            return result
+        frame = _read_csv(path)
+        if frame.empty:
+            result.update({"health": "EMPTY", "priority": 90, "reason": "empty_or_header_only"})
+            return result
+        result["rows"] = int(len(frame))
+        if "product_id" in frame.columns:
+            result["products"] = int(frame["product_id"].astype(str).nunique())
+        if result["rows"] < int(min_rows):
+            result.update({"health": "LOW_ROWS", "priority": 80, "reason": f"rows={result['rows']};min_rows={min_rows}"})
+        elif min_products > 0 and result["products"] < int(min_products):
+            result.update({"health": "LOW_PRODUCT_COVERAGE", "priority": 75, "reason": f"products={result['products']};min_products={min_products}"})
+        else:
+            result.update({"health": "OK", "priority": 10, "reason": "usable"})
+        return result
+    except Exception as exc:
+        result.update({"health": "READ_ERROR", "priority": 95, "reason": f"read_error:{exc}"})
+        return result
+
+
+def build_research_data_plan(products: list[str]) -> dict:
+    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
+    health_targets = [
+        ("historical_replay_15m_90d.csv", 60 * max(1, len(products)), max(1, len(products))),
+        ("historical_replay_1h_365d.csv", 20 * max(1, len(products)), max(1, len(products))),
+        ("historical_shadow_replay.csv", 100, 1), ("candidate_replay.csv", 100, 1),
+        ("risk_live_gate.csv", 1, 1), ("feature_outcome_correlation.csv", 1, 1),
+        ("markov_regime_policy.csv", 1, 1), ("kalman_filter_policy.csv", 1, 1),
+        ("market_state_analog_summary.csv", 1, 1),
+    ]
+    health_rows, plan_rows = [], []
+    for filename, min_rows, min_products in health_targets:
+        h = _file_health(filename, min_rows=min_rows, min_products=min_products)
+        health_rows.append([f"{ts_value:.6f}", dt_value, h["filename"], h["path"], bool(h["exists"]), int(h["rows"]), int(h["products"]), h["health"], int(h["priority"]), h["reason"]])
+    raw_15m = _read_csv(runtime_path("historical_replay_15m_90d.csv")); raw_1h = _read_csv(runtime_path("historical_replay_1h_365d.csv")); analog = _read_csv(runtime_path("market_state_analog_summary.csv"))
+    for product_id in products:
+        p = str(product_id)
+        rows_15m = int(raw_15m[raw_15m["product_id"].astype(str).eq(p)].shape[0]) if not raw_15m.empty and "product_id" in raw_15m.columns else 0
+        rows_1h = int(raw_1h[raw_1h["product_id"].astype(str).eq(p)].shape[0]) if not raw_1h.empty and "product_id" in raw_1h.columns else 0
+        analog_n = 0
+        if not analog.empty and "product_id" in analog.columns and "analog_sample_count" in analog.columns:
+            sub = analog[analog["product_id"].astype(str).eq(p)]
+            if not sub.empty:
+                analog_n = int(float(sub.tail(1)["analog_sample_count"].iloc[0] or 0))
+        if rows_15m < 300:
+            plan_rows.append([f"{ts_value:.6f}", dt_value, f"{p}__expand_15m_history", "expand_historical_cache", p, "primary_15m_90d", 90, "planned", f"15m rows low: {rows_15m}"])
+        if rows_1h < 120:
+            plan_rows.append([f"{ts_value:.6f}", dt_value, f"{p}__expand_1h_history", "expand_historical_cache", p, "regime_1h_365d", 95, "planned", f"1h rows low or missing: {rows_1h}"])
+        if analog_n < 20:
+            plan_rows.append([f"{ts_value:.6f}", dt_value, f"{p}__analog_research", "market_state_analog_research", p, "current_state", 70, "planned", f"analog samples low: {analog_n}"])
+    plan_rows.sort(key=lambda row: int(row[6]), reverse=True)
+    _write_rows(runtime_path("research_file_health.csv"), RESEARCH_FILE_HEALTH_COLUMNS, health_rows, reason="research_file_health_scan")
+    _write_rows(runtime_path("research_backfill_plan.csv"), RESEARCH_BACKFILL_PLAN_COLUMNS, plan_rows, reason="research_backfill_plan")
+    return {"health_rows": len(health_rows), "plan_rows": len(plan_rows), "top_tasks": plan_rows[:10]}
 
 def _latest_market_rows() -> pd.DataFrame:
     market = _read_csv(runtime_path("market.csv"))
@@ -102,8 +167,13 @@ def run_market_state_analog_research(max_matches: int = 50) -> Dict[str, Any]:
 def run_continuous_research_cycle() -> Dict[str, Any]:
     started = time.time(); ts_value = _utc_ts(); cycle_id = str(int(ts_value))
     try:
+        current = _latest_market_rows()
+        products = []
+        if current is not None and not current.empty and "product_id" in current.columns:
+            products = current["product_id"].dropna().astype(str).unique().tolist()
+        data_plan = build_research_data_plan(products)
         analog = run_market_state_analog_research(max_matches=50)
-        status = {"ts":ts_value,"dt_utc":_utc_dt(ts_value),"cycle_id":cycle_id,"status":"ok","analog":analog,"duration_sec":time.time()-started}
+        status = {"ts":ts_value,"dt_utc":_utc_dt(ts_value),"cycle_id":cycle_id,"status":"ok","data_plan":data_plan,"analog":analog,"duration_sec":time.time()-started}
         with open(runtime_path("continuous_research_status.json"), "w", encoding="utf-8") as file: json.dump(status, file, indent=2, sort_keys=True)
         write_generated_file_meta(runtime_path("continuous_research_status.json"), reason="continuous_research_cycle")
         _append_rows(runtime_path("continuous_research_history.csv"), CONTINUOUS_RESEARCH_HISTORY_COLUMNS, [[f"{ts_value:.6f}", _utc_dt(ts_value), cycle_id, "market_state_analog_research", str(analog.get("status", "")), f"{float(analog.get('duration_sec',0.0) or 0.0):.6f}", 0, int(analog.get("summary_rows",0) or 0), str(analog.get("reason", ""))]], "continuous_research_history_append")

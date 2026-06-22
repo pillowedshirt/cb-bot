@@ -9,6 +9,7 @@ import os
 import json
 import time
 import sys
+import subprocess
 import traceback
 import threading
 import shutil
@@ -59,14 +60,51 @@ import requests
 import websockets
 from dotenv import load_dotenv
 
+def _try_build_fast_calibration_core_once() -> str:
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        build_script = os.path.join(base_dir, "build_fast_calibration.py")
+        if not os.path.exists(build_script):
+            return "build_fast_calibration.py_missing"
+
+        proc = subprocess.run(
+            [sys.executable, build_script],
+            cwd=base_dir,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+        return (
+            f"returncode={proc.returncode};"
+            f"stdout_tail={proc.stdout[-1000:]};"
+            f"stderr_tail={proc.stderr[-1000:]}"
+        )
+    except Exception as exc:
+        return f"build_attempt_failed:{exc}"
+
+
 try:
     import fast_calibration_core
     FAST_CALIBRATION_CORE_AVAILABLE = True
     FAST_CALIBRATION_CORE_IMPORT_ERROR = ""
+    FAST_CALIBRATION_CORE_BUILD_ATTEMPT = ""
 except Exception as _fast_calibration_core_exc:
-    fast_calibration_core = None
-    FAST_CALIBRATION_CORE_AVAILABLE = False
-    FAST_CALIBRATION_CORE_IMPORT_ERROR = str(_fast_calibration_core_exc)
+    FAST_CALIBRATION_CORE_BUILD_ATTEMPT = _try_build_fast_calibration_core_once()
+
+    try:
+        import importlib
+        fast_calibration_core = importlib.import_module("fast_calibration_core")
+        FAST_CALIBRATION_CORE_AVAILABLE = True
+        FAST_CALIBRATION_CORE_IMPORT_ERROR = ""
+    except Exception as _fast_calibration_core_exc_2:
+        fast_calibration_core = None
+        FAST_CALIBRATION_CORE_AVAILABLE = False
+        FAST_CALIBRATION_CORE_IMPORT_ERROR = (
+            f"initial_import={_fast_calibration_core_exc};"
+            f"build_attempt={FAST_CALIBRATION_CORE_BUILD_ATTEMPT};"
+            f"post_build_import={_fast_calibration_core_exc_2}"
+        )
 
 RESTClient = None
 jwt_generator = None
@@ -1187,6 +1225,13 @@ def _runtime_inventory_targets() -> List[Tuple[str, str]]:
         ("derived", "risk_context_performance.csv"), ("derived", "feature_outcome_correlation.csv"),
         ("derived", "feature_correlation_matrix.csv"), ("derived", "markov_regime_policy.csv"),
         ("derived", "markov_regime_transitions.csv"), ("derived", "kalman_filter_policy.csv"),
+        ("research", "continuous_research_status.json"),
+        ("research", "continuous_research_history.csv"),
+        ("research", "market_state_analog_matches.csv"),
+        ("research", "market_state_analog_summary.csv"),
+        ("research", "incremental_strategy_simulation_summary.csv"),
+        ("research", "background_replay_expansion_summary.csv"),
+        ("research", "research_file_health.csv"),
         ("runtime_state", "historical_replay_manifest.json"), ("runtime_state", "calculation_status.json"),
         ("runtime_state", "calculation_complete_latch.json"), ("runtime_state", "viewer_snapshot.json"),
     ]
@@ -1199,7 +1244,7 @@ def scan_startup_runtime_inventory() -> Dict[str, Any]:
     now_value = now_ts()
     dt_value = datetime.fromtimestamp(now_value, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
     for category, filename in _runtime_inventory_targets():
-        path = os.path.join(BASE_DIR, filename)
+        path = runtime_path(filename)
         inv = _csv_basic_inventory(path)
         usable = False
         needs_rebuild = False
@@ -1214,6 +1259,13 @@ def scan_startup_runtime_inventory() -> Dict[str, Any]:
                 if usable and needs_rebuild:
                     reason = "usable_but_meta_stale_regenerate_when_safe"
             else:
+                needs_rebuild = True
+        elif category == "research":
+            if inv.get("exists") and inv.get("size_bytes", 0) > 0:
+                usable = bool(inv.get("rows", 0) > 0 or filename.endswith(".json"))
+                needs_rebuild = False
+            else:
+                usable = False
                 needs_rebuild = True
         elif category == "runtime_state":
             usable = bool(inv.get("exists") and inv.get("size_bytes", 0) > 2)
@@ -1266,7 +1318,7 @@ def replay_history_needs_expansion() -> Tuple[bool, Dict[str, Any]]:
 def derived_outputs_are_stale() -> Tuple[bool, Dict[str, Any]]:
     stale, current, missing = [], [], []
     for filename in DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE:
-        path = os.path.join(BASE_DIR, filename)
+        path = runtime_path(filename)
         if not os.path.exists(path) or os.path.getsize(path) <= 0:
             missing.append(filename); stale.append(filename); continue
         (current if generated_file_is_current(path) else stale).append(filename)
@@ -1290,7 +1342,7 @@ def remove_stale_derived_outputs_if_needed() -> Dict[str, Any]:
     raw_replay_ok = bool(replay_info.get("primary_ok") and replay_info.get("regime_ok"))
 
     for filename in DERIVED_RUNTIME_FILES_TO_REGENERATE_WHEN_STALE:
-        path = os.path.join(BASE_DIR, filename)
+        path = runtime_path(filename)
         try:
             if raw_replay_ok and str(filename).endswith(".csv") and os.path.exists(path) and os.path.getsize(path) > 0:
                 kept.append({"filename": filename, "reason": "kept_as_warm_start_evidence_raw_replay_ok"})
@@ -24728,42 +24780,74 @@ class TradingBot:
 
     def _reconstruct_historical_manifest_from_master_csv(self) -> Dict[str, Any]:
         try:
-            frame = self._read_csv_tail_for_bot(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=1000000)
-            if frame.empty or "product_id" not in frame.columns or "timeframe" not in frame.columns:
-                return {"updated_jobs": 0, "reason": "historical_shadow_replay_missing_or_unusable"}
             updated_jobs = 0
-            for product_id in PRODUCTS:
-                for timeframe in HISTORICAL_REPLAY_WORKER_TIMEFRAMES:
-                    job_id = safe_job_id(product_id, timeframe)
-                    sub = frame[frame["product_id"].astype(str).eq(str(product_id)) & frame["timeframe"].astype(str).eq(str(timeframe))].copy()
-                    if sub.empty:
-                        continue
-                    rows = int(len(sub))
-                    variant_counts = {}
-                    if "strategy_variant" in sub.columns:
-                        variant_counts = sub["strategy_variant"].fillna("baseline").astype(str).value_counts().to_dict()
-                    merge_note = f"reconstructed_from_master_csv;rows={rows};variant_counts={variant_counts}"
-                    update_job(
-                        path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH,
-                        job_id=job_id,
-                        updates={
-                            "status": JOB_MERGED,
-                            "started_ts": now_ts(),
-                            "finished_ts": now_ts(),
-                            "merged_ts": now_ts(),
-                            "rows_written": rows,
-                            "rows_appended_to_master": 0,
-                            "accepted_rows": rows,
-                            "qualified_rows": rows,
-                            "source": "historical_shadow_replay_master_csv",
-                            "merge_note": merge_note,
-                            "error": "",
-                        },
-                    )
-                    updated_jobs += 1
+            source_reports = []
+
+            sources = [
+                (HISTORICAL_SHADOW_REPLAY_CSV_PATH, "historical_shadow_replay", "timeframe"),
+                (HISTORICAL_REPLAY_15M_90D_CSV_PATH, "historical_replay_15m_90d", "primary_15m_90d"),
+                (HISTORICAL_REPLAY_1H_365D_CSV_PATH, "historical_replay_1h_365d", "regime_1h_365d"),
+            ]
+
+            for path, source_name, timeframe_mode in sources:
+                frame = self._read_csv_tail_for_bot(path, max_lines=1000000)
+
+                if frame.empty or "product_id" not in frame.columns:
+                    source_reports.append({"source": source_name, "path": path, "rows": 0, "reason": "missing_or_empty"})
+                    continue
+
+                for product_id in PRODUCTS:
+                    if timeframe_mode == "timeframe":
+                        if "timeframe" not in frame.columns:
+                            continue
+                        product_timeframes = HISTORICAL_REPLAY_WORKER_TIMEFRAMES
+                    else:
+                        product_timeframes = [timeframe_mode]
+
+                    for timeframe in product_timeframes:
+                        if timeframe_mode == "timeframe":
+                            sub = frame[frame["product_id"].astype(str).eq(str(product_id)) & frame["timeframe"].astype(str).eq(str(timeframe))].copy()
+                        else:
+                            sub = frame[frame["product_id"].astype(str).eq(str(product_id))].copy()
+
+                        if sub.empty:
+                            continue
+
+                        rows = int(len(sub))
+                        min_resume_rows = 20 if str(timeframe) == "regime_1h_365d" else 60
+
+                        if rows < int(min_resume_rows):
+                            continue
+
+                        job_id = safe_job_id(product_id, timeframe)
+                        merge_note = f"reconstructed_from_{source_name};rows={rows};min_resume_rows={min_resume_rows}"
+
+                        update_job(
+                            path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH,
+                            job_id=job_id,
+                            updates={
+                                "status": JOB_MERGED,
+                                "started_ts": now_ts(),
+                                "finished_ts": now_ts(),
+                                "merged_ts": now_ts(),
+                                "rows_written": rows,
+                                "rows_appended_to_master": 0,
+                                "accepted_rows": rows,
+                                "qualified_rows": rows,
+                                "source": source_name,
+                                "merge_note": merge_note,
+                                "error": "",
+                            },
+                        )
+                        updated_jobs += 1
+
+                source_reports.append({"source": source_name, "path": path, "rows": int(len(frame)), "reason": "processed"})
+
             self._calculation_status_cache_ts = 0.0
             self._historical_replay_counts_cache_ts = 0.0
-            return {"updated_jobs": int(updated_jobs), "reason": "manifest_reconstructed_from_historical_shadow_replay"}
+
+            return {"updated_jobs": int(updated_jobs), "sources": source_reports, "reason": "manifest_reconstructed_from_available_raw_caches"}
+
         except Exception as exc:
             module_exception(MODULE_NAME, "reconstruct_historical_manifest_from_master_csv_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
             return {"updated_jobs": 0, "reason": f"failed:{exc}"}

@@ -29,7 +29,15 @@ CROSS_ASSET_SELL_MODEL_RATIO_GRID_COLUMNS = ["ts","dt_utc","cycle_id","target_pr
 CROSS_ASSET_ADAPTIVE_DECISION_POLICY_COLUMNS = ["ts","dt_utc","cycle_id","target_product_id","market_state_bucket","sample_count","same_product_sample_count","cross_product_sample_count","weighted_avg_net_bps","weighted_win_rate","weighted_p25_net_bps","buy_score_delta","probability_delta","ev_delta_bps","position_size_multiplier","scalp_target_mult","core_target_mult","scalp_pullback_pct","core_pullback_pct","max_hold_minutes","policy_confidence","policy_gate","reason"]
 
 MAX_BUY_SCORE_DELTA=4.0; MAX_PROBABILITY_DELTA=0.035; MAX_EV_DELTA_BPS=6.0; MIN_POSITION_SIZE_MULT=0.35; MAX_POSITION_SIZE_MULT=1.0
-MIN_POLICY_SAMPLE_COUNT=20; STRONG_POLICY_SAMPLE_COUNT=50
+MIN_POLICY_SAMPLE_COUNT=25; STRONG_POLICY_SAMPLE_COUNT=60
+
+CLEAN_ANALOG_MIN_AVG_BPS = 15.0
+CLEAN_ANALOG_MIN_MEDIAN_BPS = 3.0
+CLEAN_ANALOG_MIN_WIN_RATE = 0.62
+CLEAN_ANALOG_MIN_P25_BPS = -10.0
+CLEAN_ANALOG_MAX_HARD_STOP_RATE = 0.12
+CLEAN_ANALOG_MAX_EARLY_ADVERSE_RATE = 0.18
+CLEAN_ANALOG_MIN_CLEAN_PROFIT_RATE = 0.58
 
 ENABLE_CROSS_ASSET_ANALOG_RESEARCH = True
 CROSS_ASSET_MAX_MATCHES = 160
@@ -162,8 +170,53 @@ def _analog_matches_for_product(product_id,current_row,hist_features,max_matches
     outs=pd.to_numeric(ph['outcome_bps'],errors='coerce').fillna(0); rows=[]
     for rank,(_,r) in enumerate(ph.iterrows(),1): rows.append([f'{ts:.6f}',dt,cid,product_id,rank,f"{float(r.get('similarity_score',0)):.8f}",str(r.get('timeframe','')),r.get('row_ts',''),str(r.get('market_regime',r.get('regime_tag',''))),f"{float(r.get('outcome_bps',0)):.8f}",'|'.join(used),'proportional_market_state_analog_match'])
     n=len(outs); avg=float(outs.mean()) if n else 0; wr=float((outs>0).mean()) if n else 0
-    gate='ANALOG_POSITIVE' if n>=20 and avg>5 and wr>=.55 else 'ANALOG_NEGATIVE' if n>=20 and (avg<-5 or wr<.42) else 'ANALOG_NEUTRAL' if n>=10 else 'ANALOG_LOW_SAMPLE'
-    sm=1.0 if gate=='ANALOG_POSITIVE' else .5 if gate=='ANALOG_NEGATIVE' else .75 if gate=='ANALOG_NEUTRAL' else .65
+    exit_reason = ph.get('exit_reason', pd.Series('', index=ph.index)).astype(str).str.lower() if 'exit_reason' in ph.columns else pd.Series('', index=ph.index)
+    hard_stop_rate = float(exit_reason.str.contains('hard_stop', regex=False).mean()) if len(ph) else 1.0
+    early_adverse_rate = float(exit_reason.str.contains('early_adverse', regex=False).mean()) if len(ph) else 1.0
+
+    mfe = pd.to_numeric(ph.get('max_favorable_bps', ph.get('outcome_bps', 0.0)), errors='coerce').fillna(0.0)
+    mae = pd.to_numeric(ph.get('max_adverse_bps', 0.0), errors='coerce').fillna(0.0).abs()
+    adverse_before_profit = pd.to_numeric(ph.get('adverse_before_profit_bps', mae), errors='coerce').fillna(mae).abs()
+
+    clean_profit = (
+        outs.gt(0.0)
+        & mfe.ge(12.0)
+        & adverse_before_profit.le(35.0)
+        & ~exit_reason.str.contains('hard_stop', regex=False)
+        & ~exit_reason.str.contains('early_adverse', regex=False)
+    )
+    clean_profit_rate = float(clean_profit.mean()) if len(clean_profit) else 0.0
+    median_bps = float(outs.median()) if n else 0.0
+    p25_bps = float(outs.quantile(.25)) if n else 0.0
+
+    gate = (
+        'ANALOG_CLEAN_PROFIT_PATH'
+        if (
+            n >= 25
+            and avg >= CLEAN_ANALOG_MIN_AVG_BPS
+            and median_bps >= CLEAN_ANALOG_MIN_MEDIAN_BPS
+            and wr >= CLEAN_ANALOG_MIN_WIN_RATE
+            and p25_bps >= CLEAN_ANALOG_MIN_P25_BPS
+            and hard_stop_rate <= CLEAN_ANALOG_MAX_HARD_STOP_RATE
+            and early_adverse_rate <= CLEAN_ANALOG_MAX_EARLY_ADVERSE_RATE
+            and clean_profit_rate >= CLEAN_ANALOG_MIN_CLEAN_PROFIT_RATE
+        )
+        else 'ANALOG_NEGATIVE'
+        if (
+            n >= 20
+            and (
+                avg < 0.0
+                or wr < 0.50
+                or p25_bps < -18.0
+                or hard_stop_rate > 0.22
+                or early_adverse_rate > 0.30
+            )
+        )
+        else 'ANALOG_NEUTRAL'
+        if n >= 10
+        else 'ANALOG_LOW_SAMPLE'
+    )
+    sm = 1.0 if gate == 'ANALOG_CLEAN_PROFIT_PATH' else .5 if gate == 'ANALOG_NEGATIVE' else .75 if gate == 'ANALOG_NEUTRAL' else .65
     summary=[f'{ts:.6f}',dt,cid,product_id,n,f'{avg:.8f}',f'{float(outs.median()) if n else 0:.8f}',f'{wr:.8f}',f'{float(outs.quantile(.25)) if n else 0:.8f}',f'{float(outs.quantile(.75)) if n else 0:.8f}',f"{float(ph['similarity_score'].max()) if n else 0:.8f}",gate,f'{sm:.8f}',f"proportional_features={','.join(used)};max_matches={max_matches}"]
     return rows,summary,ph
 
@@ -235,8 +288,54 @@ def _cross_asset_analog_matches_for_target(target_product_id: str, current_row: 
     outs=pd.to_numeric(local['outcome_bps'],errors='coerce').fillna(0.0); w=pd.to_numeric(local['transfer_weight'],errors='coerce').fillna(0.0).clip(lower=0.0)
     n=len(local); same=int(local['product_id'].astype(str).eq(str(target_product_id)).sum()); cross=n-same
     avg=_weighted_mean(outs,w); med=_weighted_quantile(outs,w,.5); wr=_weighted_win_rate(outs,w); p25=_weighted_quantile(outs,w,.25); p75=_weighted_quantile(outs,w,.75)
-    gate='CROSS_ASSET_ANALOG_POSITIVE' if n>=CROSS_ASSET_MIN_SAMPLE_COUNT and avg>5 and wr>=.55 else 'CROSS_ASSET_ANALOG_NEGATIVE' if n>=CROSS_ASSET_MIN_SAMPLE_COUNT and (avg<-5 or wr<.42) else 'CROSS_ASSET_ANALOG_NEUTRAL' if n>=10 else 'CROSS_ASSET_ANALOG_LOW_SAMPLE'
-    sm=1.0 if gate.endswith('POSITIVE') else .5 if gate.endswith('NEGATIVE') else .75 if gate.endswith('NEUTRAL') else .65
+    exit_reason = local.get('exit_reason', pd.Series('', index=local.index)).astype(str).str.lower() if 'exit_reason' in local.columns else pd.Series('', index=local.index)
+    hard_stop_flags = exit_reason.str.contains('hard_stop', regex=False).astype(float)
+    early_adverse_flags = exit_reason.str.contains('early_adverse', regex=False).astype(float)
+
+    mfe = pd.to_numeric(local.get('max_favorable_bps', local.get('outcome_bps', 0.0)), errors='coerce').fillna(0.0)
+    mae = pd.to_numeric(local.get('max_adverse_bps', 0.0), errors='coerce').fillna(0.0).abs()
+    adverse_before_profit = pd.to_numeric(local.get('adverse_before_profit_bps', mae), errors='coerce').fillna(mae).abs()
+
+    clean_profit_flags = (
+        outs.gt(0.0)
+        & mfe.ge(12.0)
+        & adverse_before_profit.le(35.0)
+        & ~exit_reason.str.contains('hard_stop', regex=False)
+        & ~exit_reason.str.contains('early_adverse', regex=False)
+    ).astype(float)
+
+    hard_stop_rate = _weighted_mean(hard_stop_flags, w, default=1.0)
+    early_adverse_rate = _weighted_mean(early_adverse_flags, w, default=1.0)
+    clean_profit_rate = _weighted_mean(clean_profit_flags, w, default=0.0)
+
+    gate = (
+        'CROSS_ASSET_CLEAN_PROFIT_PATH'
+        if (
+            n >= CROSS_ASSET_MIN_SAMPLE_COUNT
+            and avg >= CLEAN_ANALOG_MIN_AVG_BPS
+            and med >= CLEAN_ANALOG_MIN_MEDIAN_BPS
+            and wr >= CLEAN_ANALOG_MIN_WIN_RATE
+            and p25 >= CLEAN_ANALOG_MIN_P25_BPS
+            and hard_stop_rate <= CLEAN_ANALOG_MAX_HARD_STOP_RATE
+            and early_adverse_rate <= CLEAN_ANALOG_MAX_EARLY_ADVERSE_RATE
+            and clean_profit_rate >= CLEAN_ANALOG_MIN_CLEAN_PROFIT_RATE
+        )
+        else 'CROSS_ASSET_ANALOG_NEGATIVE'
+        if (
+            n >= CROSS_ASSET_MIN_SAMPLE_COUNT
+            and (
+                avg < 0.0
+                or wr < 0.50
+                or p25 < -18.0
+                or hard_stop_rate > 0.22
+                or early_adverse_rate > 0.30
+            )
+        )
+        else 'CROSS_ASSET_ANALOG_NEUTRAL'
+        if n >= 10
+        else 'CROSS_ASSET_ANALOG_LOW_SAMPLE'
+    )
+    sm = 1.0 if gate.endswith('CLEAN_PROFIT_PATH') else .5 if gate.endswith('NEGATIVE') else .75 if gate.endswith('NEUTRAL') else .65
     summary=[f'{ts:.6f}',dt,cid,target_product_id,n,same,cross,f'{avg:.8f}',f'{med:.8f}',f'{wr:.8f}',f'{p25:.8f}',f'{p75:.8f}',f"{float(local['similarity_score'].max()) if n else 0:.8f}",f'{float(w.mean()) if n else 0:.8f}',gate,f'{sm:.8f}',f"cross_asset_proportional_features={','.join(used)};max_matches={max_matches};same={same};cross={cross}"]
     return rows, summary, local
 
@@ -261,8 +360,20 @@ def _simulate_cross_asset_sell_policy_on_analogs(*, cycle_id: str, target_produc
     if not best: return grid, None
     cr=best['cross_count']/max(1,best['sample_count']); sr=best['same_count']/max(1,best['sample_count'])
     conf=_clip((best['sample_count']/120)*.45+max(0,best['weighted_win_rate']-.45)*.80+max(0,best['weighted_p25'])/30+sr*.20-max(0,cr-.80)*.10,0,1)
-    gate='CROSS_ASSET_POLICY_LOW_SAMPLE' if best['sample_count']<CROSS_ASSET_MIN_SAMPLE_COUNT else 'CROSS_ASSET_POLICY_DEFENSIVE' if best['weighted_p25']<-8 or best['weighted_win_rate']<.42 else 'CROSS_ASSET_POLICY_STRONG' if conf>=CROSS_ASSET_STRONG_POLICY_CONFIDENCE and best['weighted_avg']>5 else 'CROSS_ASSET_POLICY_NEUTRAL'
-    bd,pdlt,ev,pm=(2,.015,3,.55) if gate=='CROSS_ASSET_POLICY_DEFENSIVE' else (-.75,-.003,-1,1.0) if gate=='CROSS_ASSET_POLICY_STRONG' else (0,0,0,.75 if best['sample_count']<50 else .9)
+    gate = (
+        'CROSS_ASSET_POLICY_LOW_SAMPLE'
+        if best['sample_count'] < CROSS_ASSET_MIN_SAMPLE_COUNT
+        else 'CROSS_ASSET_POLICY_DEFENSIVE'
+        if (best['weighted_p25'] < -8 or best['weighted_win_rate'] < 0.50 or best['weighted_avg'] < 0.0)
+        else 'CROSS_ASSET_POLICY_STRONG'
+        if (conf >= CROSS_ASSET_STRONG_POLICY_CONFIDENCE and best['weighted_avg'] >= 12.0 and best['weighted_median'] >= 3.0 and best['weighted_win_rate'] >= 0.62 and best['weighted_p25'] >= -10.0)
+        else 'CROSS_ASSET_POLICY_NEUTRAL'
+    )
+    bd,pdlt,ev,pm = (
+        (-3.0, -0.020, -5.0, 0.50) if gate == 'CROSS_ASSET_POLICY_DEFENSIVE'
+        else (1.5, 0.012, 3.0, 1.00) if gate == 'CROSS_ASSET_POLICY_STRONG'
+        else (0.0, 0.0, 0.0, 0.75 if best['sample_count'] < 50 else 0.90)
+    )
     policy=[f'{ts:.6f}',dt,cycle_id,target_product_id,market_state_bucket,best['sample_count'],best['same_count'],best['cross_count'],f"{best['weighted_avg']:.8f}",f"{best['weighted_win_rate']:.8f}",f"{best['weighted_p25']:.8f}",f'{_clip(bd,-MAX_BUY_SCORE_DELTA,MAX_BUY_SCORE_DELTA):.8f}',f'{_clip(pdlt,-MAX_PROBABILITY_DELTA,MAX_PROBABILITY_DELTA):.8f}',f'{_clip(ev,-MAX_EV_DELTA_BPS,MAX_EV_DELTA_BPS):.8f}',f'{_clip(pm,MIN_POSITION_SIZE_MULT,MAX_POSITION_SIZE_MULT):.8f}',f"{best['scalp_target_mult']:.8f}",f"{best['core_target_mult']:.8f}",f"{best['scalp_pullback_pct']:.8f}",f"{best['core_pullback_pct']:.8f}",f"{best['max_hold_minutes']:.6f}",f'{conf:.8f}',gate,f"cross_asset_adaptive_policy;same={best['same_count']};cross={best['cross_count']};avg={best['weighted_avg']:.2f};win={best['weighted_win_rate']:.3f};p25={best['weighted_p25']:.2f}"]
     return grid, policy
 
@@ -284,9 +395,23 @@ def _simulate_sell_policy_on_analogs(cycle_id,product_id,market_state_bucket,ana
           grid.append([f'{ts:.6f}',dt,cycle_id,product_id,market_state_bucket,n,f'{sm:.8f}',f'{cm:.8f}',f'{sp:.8f}',f'{cp:.8f}',f'{float(mh):.6f}',f'{avg:.8f}',f'{med:.8f}',f'{wr:.8f}',f'{p25:.8f}',f'{p75:.8f}',f'{ah:.8f}',f'{cons:.8f}','sell_model_ratio_grid_proportional_analog_test'])
           if cons>best_score: best_score=cons; best=dict(sample_count=n,scalp_target_mult=sm,core_target_mult=cm,scalp_pullback_pct=sp,core_pullback_pct=cp,max_hold_minutes=mh,avg=avg,median=med,win_rate=wr,p25=p25,p75=p75,avg_hold=ah,consistency=cons)
     conf=_clip((n/80)*.55+max(0,best['win_rate']-.45)*.9+max(0,best['p25'])/25,0,1)
-    gate='SELL_POLICY_LOW_SAMPLE' if n<MIN_POLICY_SAMPLE_COUNT else 'SELL_POLICY_DEFENSIVE' if best['p25']<-8 or best['win_rate']<.42 else 'SELL_POLICY_STRONG' if conf>=.65 and best['avg']>5 else 'SELL_POLICY_NEUTRAL'
+    gate = (
+        'SELL_POLICY_LOW_SAMPLE'
+        if n < MIN_POLICY_SAMPLE_COUNT
+        else 'SELL_POLICY_DEFENSIVE'
+        if (best['p25'] < -8 or best['win_rate'] < 0.50 or best['avg'] < 0.0)
+        else 'SELL_POLICY_STRONG'
+        if (conf >= 0.65 and best['avg'] >= 12.0 and best['median'] >= 3.0 and best['win_rate'] >= 0.62 and best['p25'] >= -10.0)
+        else 'SELL_POLICY_NEUTRAL'
+    )
     sell=[f'{ts:.6f}',dt,cycle_id,product_id,market_state_bucket,n,f"{best['scalp_target_mult']:.8f}",f"{best['core_target_mult']:.8f}",f"{best['scalp_pullback_pct']:.8f}",f"{best['core_pullback_pct']:.8f}",f"{best['max_hold_minutes']:.6f}",f"{best['avg']:.8f}",f"{best['win_rate']:.8f}",f"{best['consistency']:.8f}",f'{conf:.8f}',gate,f"best_sell_ratio_from_proportional_analogs;p25={best['p25']:.2f};median={best['median']:.2f};p75={best['p75']:.2f};avg_hold={best['avg_hold']:.2f}"]
-    bd,pdlt,ev,pm=(2,.015,3,.55) if gate=='SELL_POLICY_DEFENSIVE' else (-1,-.005,-1.5,1.0) if gate=='SELL_POLICY_STRONG' else (0,0,0,.75 if n<STRONG_POLICY_SAMPLE_COUNT else .9)
+    # DEFENSIVE means similar trades had weak sell paths, bad p25, or poor win rate.
+    # STRONG means similar trades had good sell paths.
+    bd,pdlt,ev,pm = (
+        (-3.0, -0.020, -5.0, 0.50) if gate == 'SELL_POLICY_DEFENSIVE'
+        else (2.0, 0.015, 4.0, 1.00) if gate == 'SELL_POLICY_STRONG'
+        else (0.0, 0.0, 0.0, 0.75 if n < STRONG_POLICY_SAMPLE_COUNT else 0.90)
+    )
     dec=[f'{ts:.6f}',dt,cycle_id,product_id,market_state_bucket,n,f'{_clip(bd,-MAX_BUY_SCORE_DELTA,MAX_BUY_SCORE_DELTA):.8f}',f'{_clip(pdlt,-MAX_PROBABILITY_DELTA,MAX_PROBABILITY_DELTA):.8f}',f'{_clip(ev,-MAX_EV_DELTA_BPS,MAX_EV_DELTA_BPS):.8f}',f'{_clip(pm,MIN_POSITION_SIZE_MULT,MAX_POSITION_SIZE_MULT):.8f}',f"{best['scalp_target_mult']:.8f}",f"{best['core_target_mult']:.8f}",f"{best['scalp_pullback_pct']:.8f}",f"{best['core_pullback_pct']:.8f}",f"{best['max_hold_minutes']:.6f}",f'{conf:.8f}',gate,'adaptive_decision_policy_from_sell_model_analog_research']
     return grid,sell,dec
 

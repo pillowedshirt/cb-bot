@@ -737,25 +737,55 @@ CONTINUOUS_RESEARCH_INTERVAL_SEC: float = 900.0
 CONTINUOUS_RESEARCH_START_DELAY_SEC: float = 60.0
 CONTINUOUS_RESEARCH_REQUIRE_STARTUP_COMPLETE: bool = True
 ENABLE_MARKET_STATE_ANALOG_LIVE_GATE: bool = True
+
+# High-conviction mode:
+# Weak analogs should block live buys. They should not merely shrink size.
 ANALOG_MIN_SAMPLE_COUNT_TO_BLOCK: int = 20
-ANALOG_BLOCK_AVG_BPS_BELOW: float = -5.0
-ANALOG_BLOCK_WIN_RATE_BELOW: float = 0.42
-ANALOG_SIZE_DOWN_WHEN_MISSING: float = 0.75
+ANALOG_BLOCK_AVG_BPS_BELOW: float = 5.0
+ANALOG_BLOCK_WIN_RATE_BELOW: float = 0.55
+ANALOG_SIZE_DOWN_WHEN_MISSING: float = 0.50
+
 ENABLE_ADAPTIVE_DECISION_POLICY: bool = True
 ADAPTIVE_DECISION_POLICY_CACHE_SEC: float = 15.0
-ADAPTIVE_POLICY_MIN_SAMPLE_COUNT: int = 20
-ADAPTIVE_POLICY_MIN_CONFIDENCE_FOR_LIVE_ADJUST: float = 0.25
-ADAPTIVE_MAX_BUY_SCORE_DELTA: float = 4.0
-ADAPTIVE_MAX_PROBABILITY_DELTA: float = 0.035
-ADAPTIVE_MAX_EV_DELTA_BPS: float = 6.0
-ADAPTIVE_MIN_POSITION_SIZE_MULTIPLIER: float = 0.35
+ADAPTIVE_POLICY_MIN_SAMPLE_COUNT: int = 25
+ADAPTIVE_POLICY_MIN_CONFIDENCE_FOR_LIVE_ADJUST: float = 0.35
+ADAPTIVE_MAX_BUY_SCORE_DELTA: float = 5.0
+ADAPTIVE_MAX_PROBABILITY_DELTA: float = 0.045
+ADAPTIVE_MAX_EV_DELTA_BPS: float = 9.0
+
+# Real live trades are no longer “sized down” below 50%.
+# Any learned policy that would size below this should block or shadow instead.
+ADAPTIVE_MIN_POSITION_SIZE_MULTIPLIER: float = 0.50
 ADAPTIVE_MAX_POSITION_SIZE_MULTIPLIER: float = 1.00
+
 ENABLE_CROSS_ASSET_ADAPTIVE_POLICY: bool = True
 CROSS_ASSET_POLICY_CACHE_SEC: float = 15.0
-CROSS_ASSET_POLICY_MIN_SAMPLE_COUNT: int = 25
-CROSS_ASSET_POLICY_MIN_CONFIDENCE: float = 0.25
+CROSS_ASSET_POLICY_MIN_SAMPLE_COUNT: int = 35
+CROSS_ASSET_POLICY_MIN_CONFIDENCE: float = 0.35
 CROSS_ASSET_POLICY_MAX_SIZE_MULTIPLIER: float = 1.00
-CROSS_ASSET_POLICY_MISSING_SIZE_MULTIPLIER: float = 0.85
+CROSS_ASSET_POLICY_MISSING_SIZE_MULTIPLIER: float = 0.50
+
+# Clean Profit Path Gate.
+# This is the main high-accuracy live-buy filter.
+ENABLE_CLEAN_PROFIT_PATH_LIVE_GATE: bool = True
+CLEAN_PATH_MIN_TOTAL_ANALOG_SAMPLES: int = 35
+CLEAN_PATH_MIN_SAME_PRODUCT_SAMPLES: int = 8
+CLEAN_PATH_STRONG_SAME_PRODUCT_SAMPLES: int = 25
+CLEAN_PATH_MIN_AVG_BPS: float = 15.0
+CLEAN_PATH_MIN_MEDIAN_BPS: float = 3.0
+CLEAN_PATH_MIN_WIN_RATE: float = 0.62
+CLEAN_PATH_MIN_P25_BPS: float = -10.0
+CLEAN_PATH_MIN_CLEAN_PROFIT_RATE: float = 0.58
+CLEAN_PATH_MAX_HARD_STOP_RATE: float = 0.12
+CLEAN_PATH_MAX_EARLY_ADVERSE_RATE: float = 0.18
+CLEAN_PATH_MAX_MEDIAN_TIME_TO_PROFIT_MIN: float = 120.0
+CLEAN_PATH_MIN_POLICY_CONFIDENCE: float = 0.45
+CLEAN_PATH_REQUIRE_FOR_LIVE_BUY: bool = True
+
+# With 50%-100% sizing, low-quality sizing multipliers should block the trade.
+# They should not create a 10%-30% “kind of confident” live buy.
+HIGH_CONVICTION_MIN_QUALITY_MULTIPLIER_TO_TRADE: float = 0.62
+HIGH_CONVICTION_BLOCK_LOW_MULTIPLIER: bool = True
 HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = runtime_path("historical_replay_summary.csv")
 REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH: str = runtime_path("replay_fee_comparison_summary.csv")
 STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH: str = runtime_path("strategy_variant_replay_summary.csv")
@@ -947,19 +977,21 @@ PROFITABILITY_PREFERRED_STRATEGY_VARIANTS: List[str] = [
 
 # These are stricter than the previous permissive replay gate.
 # They are designed to block volatility that scores high but historically turns into hard stops.
-REPLAY_POLICY_MIN_ROWS: int = 30
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 3.5
-REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.34
-REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 3.5
-REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.30
-REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = 0.48
+REPLAY_POLICY_MIN_ROWS: int = 35
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_AVG_BPS: float = 8.0
+REPLAY_POLICY_MIN_BINANCE_TAKER_TAKER_WIN_RATE: float = 0.50
+REPLAY_POLICY_MIN_BINANCE_MAKER_TAKER_AVG_BPS: float = 8.0
+REPLAY_POLICY_MIN_PROFIT_PULLBACK_RATE: float = 0.45
+REPLAY_POLICY_MAX_BINANCE_HARD_STOP_RATE: float = 0.25
 
 # Exception rules let a normally weaker product trade only when the replay edge is unusually strong.
-REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS: float = 8.0
-REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP: float = 0.38
-REPLAY_POLICY_EXCEPTION_MIN_PROFIT_PULLBACK_RATE: float = 0.34
+REPLAY_POLICY_EXCEPTION_MIN_AVG_BPS: float = 14.0
+REPLAY_POLICY_EXCEPTION_MAX_HARD_STOP: float = 0.18
+REPLAY_POLICY_EXCEPTION_MIN_PROFIT_PULLBACK_RATE: float = 0.55
 
-REPLAY_POLICY_USE_PRODUCT_ALLOWLIST: bool = True
+# Let the replay + clean-path system decide product eligibility dynamically.
+# Static product allowlists got stale in the prior simulations.
+REPLAY_POLICY_USE_PRODUCT_ALLOWLIST: bool = False
 
 REPLAY_POLICY_ALLOWED_PRODUCTS = {
     "DOGE-USD",
@@ -985,23 +1017,24 @@ REPLAY_POLICY_BLOCKED_UNLESS_EXCEPTION_PRODUCTS = {
 # Position sizing multipliers based on replay results.
 # Stronger products can use normal size.
 # Weaker products need exceptional replay approval and smaller size.
+# In 50%-100% mode, products should not be allowed through by giving them tiny size.
+# If a product is weak, the gates should block it. If it passes, it can use full confidence sizing.
 PROFITABILITY_PRODUCT_SIZE_MULTIPLIER = {
-    "DOGE-USD": 1.10,
-    "XLM-USD": 1.05,
-    "SUI-USD": 1.05,
-    "LINK-USD": 1.00,
+    "BTC-USD": 1.00,
+    "ETH-USD": 1.00,
+    "SOL-USD": 1.00,
+    "BNB-USD": 1.00,
     "LTC-USD": 1.00,
-    "AVAX-USD": 1.00,
+    "LINK-USD": 1.00,
+    "DOGE-USD": 1.00,
+    "XRP-USD": 1.00,
+    "BCH-USD": 1.00,
     "ADA-USD": 1.00,
-
-    "ETH-USD": 0.60,
-    "BTC-USD": 0.50,
-    "BNB-USD": 0.50,
-    "BCH-USD": 0.45,
-    "XRP-USD": 0.40,
-    "SOL-USD": 0.40,
-    "DOT-USD": 0.35,
-    "SHIB-USD": 0.30,
+    "AVAX-USD": 1.00,
+    "DOT-USD": 1.00,
+    "SUI-USD": 1.00,
+    "XLM-USD": 1.00,
+    "SHIB-USD": 1.00,
 }
 
 # Live context hard blocks based on worst-buy replay conditions.
@@ -1670,7 +1703,9 @@ MAX_CASH_DEPLOYED_PER_EVAL_PCT_OF_EQUITY: float = 1.00
 ENABLE_MULTI_CANDIDATE_BUYS: bool = True
 
 # Allocation / exposure
-MAX_OPEN_POSITIONS: int = 3
+# With 50%-100% allocation, the bot should normally hold at most two products:
+# example: 60% first buy, 40% remaining cash into the next qualified buy.
+MAX_OPEN_POSITIONS: int = 2
 
 # Minimum Coinbase order size guard.
 # This is a bot-side minimum. Coinbase may still enforce product-specific minimums.
@@ -1706,7 +1741,8 @@ LEVEL5_DISABLE_INVERTED_CYCLE: bool = False
 LEVEL5_MODE: str = "DISABLED"
 LEVEL5_MIN_POSITION_PCT: float = 0.0
 LEVEL5_MAX_POSITION_PCT: float = 1.0
-NEAR_MISS_EXPLORATION_ENABLED: bool = env_bool("NEAR_MISS_EXPLORATION_ENABLED", True)
+# In 50%-100% mode, near misses should be SHADOW learning only, not tiny live buys.
+NEAR_MISS_EXPLORATION_ENABLED: bool = env_bool("NEAR_MISS_EXPLORATION_ENABLED", False)
 NEAR_MISS_MAX_POSITION_PCT: float = env_float("NEAR_MISS_MAX_POSITION_PCT", 5.0)
 NEAR_MISS_MIN_EXPECTED_UTILITY_BPS: float = env_float("NEAR_MISS_MIN_EXPECTED_UTILITY_BPS", 20.0)
 
@@ -1921,7 +1957,9 @@ LEVEL8_RESPECT_RISK_PAUSE_FOR_NEW_BUYS: bool = True
 # Level 8 sell sizing / wave-riding behavior.
 # The council decides when to sell. These settings let it sell part of a position
 # when profit exists but continuation is still possible.
-LEVEL8_ENABLE_PARTIAL_SELLS: bool = True
+# In wave-riding mode, prefer full-position exits when the wave breaks.
+# This keeps the position fully exposed while the higher-low structure remains intact.
+LEVEL8_ENABLE_PARTIAL_SELLS: bool = False
 LEVEL8_MIN_PARTIAL_SELL_FRACTION: float = 0.25
 LEVEL8_MAX_PARTIAL_SELL_FRACTION: float = 1.00
 LEVEL8_FULL_SELL_FRACTION: float = 1.00
@@ -1938,6 +1976,19 @@ LEVEL8_STRONG_CONTINUATION_PULLBACK_MAX_BPS: float = 35.0
 # ============================================================
 # ADAPTIVE WAVE-RIDING / SELL CAPTURE SYSTEM
 # ============================================================
+
+# Higher-low wave stop:
+# Tracks the latest confirmed dip low after price bounces.
+# The stop only moves upward. It never moves downward.
+ENABLE_HIGHER_LOW_WAVE_STOP: bool = True
+WAVE_STOP_LOOKBACK_CANDLES: int = 8
+WAVE_STOP_CONFIRM_BOUNCE_BPS: float = 8.0
+WAVE_STOP_BUFFER_BPS: float = 3.0
+WAVE_STOP_MIN_RAISE_BPS: float = 2.0
+WAVE_STOP_MIN_PEAK_TO_ARM_BPS: float = 16.0
+WAVE_STOP_MIN_NET_TO_ARM_BPS: float = 0.0
+WAVE_STOP_HARD_FLOOR_BPS: float = -75.0
+WAVE_STOP_EXIT_CONFIRM_TICKS: int = 1
 
 ENABLE_ADAPTIVE_WAVE_EXIT: bool = True
 ADAPTIVE_BREAKEVEN_MIN_HOLD_SEC: float = 60.0
@@ -2014,7 +2065,9 @@ LEVEL8_LEARNING_MAX_SPREAD_BPS: float = 80.0
 LEVEL8_LEARNING_MAX_EXTRA_CANDIDATES: int = 8
 
 # Let the bot buy more than one learning candidate per evaluation if cash allows.
-LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL: int = 1
+# This only controls how many candidates can pass through evaluation.
+# The clean-path gate still blocks weak/low-sample candidates from real money.
+LEVEL8_LEARNING_MAX_NEW_ENTRIES_PER_EVAL: int = 2
 LEVEL8_MAX_PRODUCTS_PER_EVAL: int = 4
 LEVEL8_ALWAYS_INCLUDE_HELD_PRODUCTS: bool = True
 LEVEL8_ROTATE_UNEVALUATED_PRODUCTS: bool = True
@@ -7409,6 +7462,9 @@ class TradingBot:
         self.entry_buy_fee_usd: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
         self.entry_buy_fee_bps: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
         self.trailing_active: Dict[str, bool] = {p: False for p in PRODUCTS}
+        self.wave_stop_price: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
+        self.wave_stop_last_dip_low: Dict[str, Optional[float]] = {p: None for p in PRODUCTS}
+        self.wave_stop_breach_counts: Dict[str, int] = {p: 0 for p in PRODUCTS}
         # Tier tracking for the active position
         self.position_tier: Dict[str, int] = {p: 0 for p in PRODUCTS}
         self.last_tier_tp_ts: Dict[str, float] = {p: 0.0 for p in PRODUCTS}
@@ -7768,6 +7824,9 @@ class TradingBot:
             self.position_start_ts[product] = None
             self.position_entry_price[product] = None
             self.peak_bid[product] = None
+            self.wave_stop_price[product] = None
+            self.wave_stop_last_dip_low[product] = None
+            self.wave_stop_breach_counts[product] = 0
             self.scale_add_count[product] = 0
         avg_entry = (removed_cost / removed_qty) if removed_qty > 1e-12 else None
         return removed_qty, avg_entry
@@ -15365,6 +15424,21 @@ class TradingBot:
                 candidate["cross_asset_scalp_pullback_pct"] = float(cross_asset_policy.get("scalp_pullback_pct", 0.0) or 0.0)
                 candidate["cross_asset_core_pullback_pct"] = float(cross_asset_policy.get("core_pullback_pct", 0.0) or 0.0)
                 candidate["cross_asset_max_hold_minutes"] = float(cross_asset_policy.get("max_hold_minutes", 0.0) or 0.0)
+
+            clean_path_gate = self._clean_profit_path_gate_for_candidate(candidate)
+            candidate["clean_profit_path_gate_available"] = bool(clean_path_gate.get("available", False))
+            candidate["clean_profit_path_gate_allowed"] = bool(clean_path_gate.get("allowed", False))
+            candidate["clean_profit_path_confidence"] = float(clean_path_gate.get("confidence", 0.0) or 0.0)
+            candidate["clean_profit_path_same_samples"] = int(float(clean_path_gate.get("same_samples", 0) or 0))
+            candidate["clean_profit_path_cross_samples"] = int(float(clean_path_gate.get("cross_samples", 0) or 0))
+            candidate["clean_profit_path_reason"] = str(clean_path_gate.get("reason", ""))
+
+            if bool(CLEAN_PATH_REQUIRE_FOR_LIVE_BUY) and not bool(clean_path_gate.get("allowed", False)):
+                return False, (
+                    "live_buy_blocked:clean_profit_path_gate "
+                    f"product_id={product_id};reason={clean_path_gate.get('reason', '')}"
+                )
+
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
@@ -17273,6 +17347,68 @@ class TradingBot:
                 "max_hold_sec": float(LEVEL8_MAX_HOLD_SEC),
             }
 
+    def _higher_low_wave_stop_profile(
+        self,
+        *,
+        product_id: str,
+        entry_price: float,
+        current_price: float,
+        unrealized_bps: float,
+        net_after_exit_bps: float,
+        peak_unrealized_bps: float,
+    ) -> Dict[str, Any]:
+        """Ride the wave using confirmed higher-low stops."""
+        if not bool(ENABLE_HIGHER_LOW_WAVE_STOP):
+            return {"enabled": False, "armed": False, "exit_confirmed": False, "reason": "higher_low_wave_stop_disabled"}
+        try:
+            entry = float(entry_price); current = float(current_price)
+            if entry <= 0 or current <= 0:
+                return {"enabled": True, "armed": False, "exit_confirmed": False, "reason": "higher_low_wave_stop_invalid_price"}
+            series = self.live_1m.get(product_id)
+            candles = list(series.candles) if series is not None else []
+            candles = candles[-max(3, int(WAVE_STOP_LOOKBACK_CANDLES)):]
+            if len(candles) < 3:
+                return {"enabled": True, "armed": False, "exit_confirmed": False, "reason": f"higher_low_wave_stop_waiting_for_candles;rows={len(candles)}"}
+            lows=[]; highs=[]
+            for candle in candles:
+                low=float(getattr(candle, "low", 0.0) or 0.0); high=float(getattr(candle, "high", 0.0) or 0.0)
+                if low > 0: lows.append(low)
+                if high > 0: highs.append(high)
+            if not lows:
+                return {"enabled": True, "armed": False, "exit_confirmed": False, "reason": "higher_low_wave_stop_no_lows"}
+            recent_low=float(min(lows)); recent_high=float(max(highs)) if highs else current
+            bounce_bps=((current / max(recent_low, 1e-12)) - 1.0) * 10000.0
+            range_bps=((recent_high / max(recent_low, 1e-12)) - 1.0) * 10000.0
+            old_stop = self.wave_stop_price.get(product_id)
+            old_stop = float(old_stop) if old_stop else 0.0
+            hard_floor = entry * (1.0 + float(WAVE_STOP_HARD_FLOOR_BPS) / 10000.0)
+            proposed_stop = max(recent_low * (1.0 - float(WAVE_STOP_BUFFER_BPS) / 10000.0), hard_floor)
+            can_arm = bool(peak_unrealized_bps >= float(WAVE_STOP_MIN_PEAK_TO_ARM_BPS) and net_after_exit_bps >= float(WAVE_STOP_MIN_NET_TO_ARM_BPS) and bounce_bps >= float(WAVE_STOP_CONFIRM_BOUNCE_BPS))
+            raised=False; armed=old_stop > 0.0
+            if can_arm:
+                if old_stop <= 0.0:
+                    self.wave_stop_price[product_id] = float(proposed_stop); self.wave_stop_last_dip_low[product_id] = float(recent_low)
+                    old_stop=float(proposed_stop); armed=True; raised=True
+                else:
+                    min_raise_price = old_stop * (1.0 + float(WAVE_STOP_MIN_RAISE_BPS) / 10000.0)
+                    if proposed_stop > min_raise_price:
+                        self.wave_stop_price[product_id] = float(proposed_stop); self.wave_stop_last_dip_low[product_id] = float(recent_low)
+                        old_stop=float(proposed_stop); armed=True; raised=True
+            stop_price=float(self.wave_stop_price.get(product_id) or 0.0)
+            breached=bool(armed and stop_price > 0.0 and current <= stop_price)
+            count=int(self.wave_stop_breach_counts.get(product_id, 0) or 0) + 1 if breached else 0
+            self.wave_stop_breach_counts[product_id] = count
+            exit_confirmed=bool(breached and count >= int(WAVE_STOP_EXIT_CONFIRM_TICKS))
+            stop_unrealized_bps=((stop_price / entry) - 1.0) * 10000.0 if stop_price > 0.0 else 0.0
+            return {
+                "enabled": True, "armed": bool(armed), "raised": bool(raised), "exit_confirmed": bool(exit_confirmed),
+                "stop_price": float(stop_price), "stop_unrealized_bps": float(stop_unrealized_bps), "recent_dip_low": float(recent_low),
+                "bounce_bps": float(bounce_bps), "range_bps": float(range_bps), "breached": bool(breached), "breach_count": int(count),
+                "reason": (f"higher_low_wave_stop;armed={armed};raised={raised};stop={stop_price:.10f};stop_unrealized_bps={stop_unrealized_bps:.2f};recent_low={recent_low:.10f};bounce_bps={bounce_bps:.2f};range_bps={range_bps:.2f};can_arm={can_arm};breached={breached};breach_count={count};exit_confirmed={exit_confirmed}"),
+            }
+        except Exception as exc:
+            return {"enabled": True, "armed": False, "exit_confirmed": False, "reason": f"higher_low_wave_stop_error:{exc}"}
+
     def _level8_position_hold_state(
         self,
         *,
@@ -17417,6 +17553,23 @@ class TradingBot:
                 1.0,
             )
         )
+        try:
+            wave_stop_profile = self._higher_low_wave_stop_profile(
+                product_id=product_id,
+                entry_price=float(entry_px),
+                current_price=float(current_px),
+                unrealized_bps=float(unrealized_bps),
+                net_after_exit_bps=float(net_after_exit_bps),
+                peak_unrealized_bps=float(peak_unrealized_bps),
+            )
+        except Exception as exc:
+            wave_stop_profile = {"enabled": True, "armed": False, "exit_confirmed": False, "reason": f"higher_low_wave_stop_profile_failed:{exc}"}
+
+        base_state["wave_stop_profile"] = wave_stop_profile
+        for key, value in wave_stop_profile.items():
+            if isinstance(value, (int, float, bool, str)):
+                base_state[f"wave_stop_{key}"] = value
+
         try:
             adaptive_exit_profile = self._adaptive_wave_exit_profile(
                 product_id=product_id,
@@ -18120,6 +18273,16 @@ class TradingBot:
             1.0,
         )
 
+        wave_stop_profile = dict(hold_state.get("wave_stop_profile", {}) or {})
+        wave_stop_exit_confirmed = bool(wave_stop_profile.get("exit_confirmed", False))
+        wave_stop_reason = str(wave_stop_profile.get("reason", "no_wave_stop_profile"))
+
+        if wave_stop_exit_confirmed:
+            return True, (
+                f"higher_low_wave_stop_full_exit;"
+                f"{wave_stop_reason};{default_exit_reason}"
+            ), 1.0
+
         if adaptive_floor_exit_confirmed:
             return True, f"adaptive_fee_adjusted_floor_exit;{adaptive_reason};{default_exit_reason}", 1.0
         if adaptive_full_exit:
@@ -18292,6 +18455,14 @@ class TradingBot:
                     hold_state=hold_state,
                 ),
                 "sell_quality_context": self._sell_quality_recent_context(product_id),
+                "wave_stop_profile": wave_stop_profile,
+                "wave_stop_enabled": bool(wave_stop_profile.get("enabled", False)),
+                "wave_stop_armed": bool(wave_stop_profile.get("armed", False)),
+                "wave_stop_exit_confirmed": bool(wave_stop_profile.get("exit_confirmed", False)),
+                "wave_stop_stop_price": safe_float(wave_stop_profile.get("stop_price"), 0.0),
+                "wave_stop_stop_unrealized_bps": safe_float(wave_stop_profile.get("stop_unrealized_bps"), 0.0),
+                "wave_stop_bounce_bps": safe_float(wave_stop_profile.get("bounce_bps"), 0.0),
+                "wave_stop_reason": str(wave_stop_profile.get("reason", "")),
                 "adaptive_exit_profile": adaptive_exit_profile,
                 "adaptive_expected_favorable_bps": safe_float(adaptive_exit_profile.get("expected_favorable_bps"), 0.0),
                 "adaptive_progress_to_expected": safe_float(adaptive_exit_profile.get("progress_to_expected"), 0.0),
@@ -18532,9 +18703,17 @@ class TradingBot:
                 or mom5 >= float(MIN_ENTRY_MOMENTUM_5_BPS)
             )
         )
+        # For high-conviction entries, avoid chasing already-extended green candles.
+        # Prefer pullback -> reclaim -> higher-low or VWAP reclaim.
+        clean_reclaim_structure = bool(
+            higher_low_ok
+            or vwap_ok
+            or green_count >= int(ENTRY_MIN_GREEN_CANDLES)
+        )
+
         vwap_confirmed = bool(vwap_ok) if REQUIRE_PRICE_ABOVE_MICRO_VWAP_FOR_BUY else True
         structure_confirmed = (
-            bool(higher_low_ok or green_count >= int(ENTRY_MIN_GREEN_CANDLES))
+            bool(clean_reclaim_structure)
             if REQUIRE_HIGHER_LOW_OR_GREEN_SEQUENCE_FOR_BUY
             else True
         )
@@ -21464,6 +21643,55 @@ class TradingBot:
         except Exception as exc:
             return {"available": False, "position_size_multiplier": 0.80, "reason": f"cross_asset_policy_error_size_down:{exc}"}
 
+    def _clean_profit_path_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """High-conviction live-buy gate for clean historical profit paths."""
+        if not bool(ENABLE_CLEAN_PROFIT_PATH_LIVE_GATE):
+            return {"available": False, "allowed": True, "confidence": 0.0, "reason": "clean_profit_path_gate_disabled"}
+        try:
+            product_id = str(candidate.get("product_id", ""))
+            same = dict(self._load_market_state_analog_summary_map().get(product_id, {}) or {})
+            cross = dict(self._load_cross_asset_adaptive_policy_map().get(product_id, {}) or {})
+
+            def f(row: Dict[str, Any], *keys: str, default: float = 0.0) -> float:
+                for key in keys:
+                    if key in row:
+                        try:
+                            return float(row.get(key, default) or default)
+                        except Exception:
+                            pass
+                return float(default)
+
+            same_samples = int(f(same, "analog_sample_count", default=0.0))
+            same_avg = f(same, "analog_avg_outcome_bps", "weighted_avg_outcome_bps", default=0.0)
+            same_median = f(same, "analog_median_outcome_bps", "weighted_median_outcome_bps", default=0.0)
+            same_win = f(same, "analog_win_rate", "weighted_win_rate", default=0.0)
+            same_p25 = f(same, "analog_p25_bps", "weighted_p25_bps", default=-999.0)
+            same_gate = str(same.get("analog_gate", ""))
+
+            cross_samples = int(f(cross, "sample_count", default=0.0))
+            cross_same_samples = int(f(cross, "same_product_sample_count", default=0.0))
+            cross_cross_samples = int(f(cross, "cross_product_sample_count", default=0.0))
+            cross_avg = f(cross, "weighted_avg_net_bps", "weighted_avg_outcome_bps", default=0.0)
+            cross_win = f(cross, "weighted_win_rate", default=0.0)
+            cross_p25 = f(cross, "weighted_p25_net_bps", "weighted_p25_bps", default=-999.0)
+            cross_conf = f(cross, "policy_confidence", default=0.0)
+            cross_policy_gate = str(cross.get("policy_gate", ""))
+
+            same_clean = bool(same_samples >= int(CLEAN_PATH_STRONG_SAME_PRODUCT_SAMPLES) and same_avg >= float(CLEAN_PATH_MIN_AVG_BPS) and same_median >= float(CLEAN_PATH_MIN_MEDIAN_BPS) and same_win >= float(CLEAN_PATH_MIN_WIN_RATE) and same_p25 >= float(CLEAN_PATH_MIN_P25_BPS) and ("CLEAN_PROFIT_PATH" in same_gate or "POSITIVE" in same_gate or same_avg >= float(CLEAN_PATH_MIN_AVG_BPS) + 5.0))
+            cross_clean = bool(cross_samples >= int(CLEAN_PATH_MIN_TOTAL_ANALOG_SAMPLES) and cross_same_samples >= int(CLEAN_PATH_MIN_SAME_PRODUCT_SAMPLES) and cross_avg >= float(CLEAN_PATH_MIN_AVG_BPS) and cross_win >= float(CLEAN_PATH_MIN_WIN_RATE) and cross_p25 >= float(CLEAN_PATH_MIN_P25_BPS) and cross_conf >= float(CLEAN_PATH_MIN_POLICY_CONFIDENCE) and ("CLEAN_PROFIT_PATH" in cross_policy_gate or "STRONG" in cross_policy_gate or cross_avg >= float(CLEAN_PATH_MIN_AVG_BPS) + 5.0))
+            clearly_negative = bool((same_samples >= 20 and (same_avg < 0.0 or same_win < 0.50 or same_p25 < -18.0 or "NEGATIVE" in same_gate)) or (cross_samples >= 35 and (cross_avg < 0.0 or cross_win < 0.50 or cross_p25 < -18.0 or "DEFENSIVE" in cross_policy_gate)))
+            confidence = clamp_float(max(0.0, min(1.0, same_samples / 80.0) * 0.45 + min(1.0, cross_samples / 120.0) * 0.25 + max(0.0, same_win - 0.50) * 1.20 + max(0.0, cross_win - 0.50) * 0.80 + max(0.0, same_avg) / 120.0 + max(0.0, cross_avg) / 160.0), 0.0, 1.0)
+            allowed = bool((same_clean or cross_clean) and not clearly_negative)
+            reason_prefix = "clean_profit_path_allowed" if allowed else "clean_profit_path_blocked"
+            return {
+                "available": bool(same or cross), "allowed": bool(allowed), "confidence": float(confidence),
+                "same_samples": int(same_samples), "cross_samples": int(cross_samples),
+                "same_clean": bool(same_clean), "cross_clean": bool(cross_clean), "clearly_negative": bool(clearly_negative),
+                "reason": (f"{reason_prefix};confidence={confidence:.3f};same_samples={same_samples};same_avg={same_avg:.2f};same_median={same_median:.2f};same_win={same_win:.3f};same_p25={same_p25:.2f};same_gate={same_gate};cross_samples={cross_samples};cross_same={cross_same_samples};cross_cross={cross_cross_samples};cross_avg={cross_avg:.2f};cross_win={cross_win:.3f};cross_p25={cross_p25:.2f};cross_conf={cross_conf:.3f};cross_gate={cross_policy_gate};same_clean={same_clean};cross_clean={cross_clean};clearly_negative={clearly_negative}")
+            }
+        except Exception as exc:
+            return {"available": False, "allowed": False, "confidence": 0.0, "reason": f"clean_profit_path_gate_error_fail_closed:{exc}"}
+
     def _calculation_status(self, *, include_readiness: bool = True, readiness_override: Optional[Dict[str, Any]] = None, force: bool = False) -> Dict[str, Any]:
         now_value = now_ts()
         if (not bool(force) and getattr(self, "_calculation_status_cache", None) and now_value - float(getattr(self, "_calculation_status_cache_ts", 0.0) or 0.0) < float(CALCULATION_STATUS_RESCAN_EVERY_SEC)):
@@ -22249,6 +22477,9 @@ class TradingBot:
                 self.position_start_ts[held_product] = None
                 self.position_entry_price[held_product] = None
                 self.peak_bid[held_product] = None
+                self.wave_stop_price[held_product] = None
+                self.wave_stop_last_dip_low[held_product] = None
+                self.wave_stop_breach_counts[held_product] = 0
                 self.scale_add_count[held_product] = 0
 
             await self._live_refresh_snapshot(force=True, ttl_sec=0.0)
@@ -22930,6 +23161,9 @@ class TradingBot:
             self.position_start_ts[product_id] = None
             self.position_entry_price[product_id] = None
             self.peak_bid[product_id] = None
+            self.wave_stop_price[product_id] = None
+            self.wave_stop_last_dip_low[product_id] = None
+            self.wave_stop_breach_counts[product_id] = 0
             self.scale_add_count[product_id] = 0
             self.trailing_active[product_id] = False
             self.last_exit_ts = now_ts()
@@ -26559,15 +26793,42 @@ class TradingBot:
                         float(CROSS_ASSET_POLICY_MAX_SIZE_MULTIPLIER),
                     )
                     combined_risk_multiplier = clamp_float(
-                        risk_size_multiplier * context_size_multiplier * feature_size_multiplier * markov_size_multiplier * kalman_size_multiplier * analog_size_multiplier * adaptive_policy_size_multiplier * cross_asset_policy_size_multiplier,
+                        risk_size_multiplier
+                        * context_size_multiplier
+                        * feature_size_multiplier
+                        * markov_size_multiplier
+                        * kalman_size_multiplier
+                        * analog_size_multiplier
+                        * adaptive_policy_size_multiplier
+                        * cross_asset_policy_size_multiplier,
                         0.0,
                         float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
                     )
-                    adjusted_l8_pct = clamp_float(
-                        float(l8_pct) * float(combined_risk_multiplier),
-                        0.0,
-                        float(LEVEL8_MAX_SINGLE_TRADE_PCT),
-                    )
+
+                    if (
+                        bool(HIGH_CONVICTION_BLOCK_LOW_MULTIPLIER)
+                        and combined_risk_multiplier < float(HIGH_CONVICTION_MIN_QUALITY_MULTIPLIER_TO_TRADE)
+                    ):
+                        adjusted_l8_pct = 0.0
+                        candidate["high_conviction_size_blocked"] = True
+                        candidate["high_conviction_size_block_reason"] = (
+                            f"combined_quality_multiplier_too_low_for_50pct_trade;"
+                            f"combined={combined_risk_multiplier:.3f};"
+                            f"min_required={float(HIGH_CONVICTION_MIN_QUALITY_MULTIPLIER_TO_TRADE):.3f}"
+                        )
+                    else:
+                        adjusted_l8_pct = clamp_float(
+                            float(l8_pct),
+                            float(MIN_POSITION_PCT_OF_EQUITY),
+                            float(LEVEL8_MAX_SINGLE_TRADE_PCT),
+                        )
+                        candidate["high_conviction_size_blocked"] = False
+                        candidate["high_conviction_size_block_reason"] = (
+                            f"approved_high_conviction_size;"
+                            f"raw_l8_pct={float(l8_pct):.3f};"
+                            f"combined_quality_multiplier={combined_risk_multiplier:.3f};"
+                            f"final_pct={adjusted_l8_pct:.3f}"
+                        )
 
                     candidate["level8_raw_recommended_position_pct"] = float(raw_l8_pct)
                     candidate["level8_pre_risk_recommended_position_pct"] = float(l8_pct)
@@ -26587,6 +26848,8 @@ class TradingBot:
                         f"cross_asset_policy_reason={candidate.get('cross_asset_policy_reason', '')};"
                         f"analog_reason={candidate.get('analog_market_state_gate_reason', '')};"
                         f"combined_risk_multiplier={combined_risk_multiplier:.3f};"
+                        f"high_conviction_size_blocked={candidate.get('high_conviction_size_blocked', False)};"
+                        f"high_conviction_size_block_reason={candidate.get('high_conviction_size_block_reason', '')};"
                         f"risk_reason={candidate.get('risk_live_gate_reason', '')};"
                         f"context_reason={candidate.get('risk_context_gate_reason', '')};"
                         f"feature_reason={candidate.get('feature_correlation_gate_reason', '')};"
@@ -26766,8 +27029,11 @@ class TradingBot:
                 candidate["entry_reason"] = (
                     str(candidate.get("entry_reason", ""))
                     + ";execution_policy=maker_first_fee_efficient"
+                    + ";position_sizing=high_conviction_50_to_100pct"
                     + f";expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f}"
                     + f";truth={float(candidate.get('level8_truth_score', candidate.get('truth_score', 0.0)) or 0.0):.3f}"
+                    + f";clean_profit_path={candidate.get('clean_profit_path_reason', '')}"
+                    + f";high_conviction_size={candidate.get('high_conviction_size_block_reason', '')}"
                 )
 
                 log(
@@ -27157,6 +27423,14 @@ class TradingBot:
                 "adaptive_dynamic_pullback_bps": 0.0,
                 "adaptive_strong_continuation": False,
                 "adaptive_harvest_fraction": 0.0,
+                "wave_stop_enabled": False,
+                "wave_stop_armed": False,
+                "wave_stop_stop_price": 0.0,
+                "wave_stop_stop_unrealized_bps": 0.0,
+                "wave_stop_recent_dip_low": 0.0,
+                "wave_stop_bounce_bps": 0.0,
+                "wave_stop_exit_confirmed": False,
+                "wave_stop_reason": "",
                 "exit_plan_note": "no open position",
             }
 
@@ -27241,6 +27515,7 @@ class TradingBot:
                     current_price=float(bid or 0.0),
                 )
                 adaptive_exit = dict(hold_state_for_targets.get("adaptive_exit_profile", {}) or {})
+                wave_exit = dict(hold_state_for_targets.get("wave_stop_profile", {}) or {})
                 row.update({
                     "avg_entry_price": avg_entry_price,
                     "min_profitable_exit_price": min_exit_px,
@@ -27281,6 +27556,14 @@ class TradingBot:
                     "adaptive_dynamic_pullback_bps": safe_float(adaptive_exit.get("dynamic_pullback_bps"), 0.0),
                     "adaptive_strong_continuation": bool(adaptive_exit.get("strong_continuation", False)),
                     "adaptive_harvest_fraction": safe_float(adaptive_exit.get("adaptive_harvest_fraction"), 0.0),
+                    "wave_stop_enabled": bool(hold_state_for_targets.get("wave_stop_enabled", False)),
+                    "wave_stop_armed": bool(hold_state_for_targets.get("wave_stop_armed", False)),
+                    "wave_stop_stop_price": float(hold_state_for_targets.get("wave_stop_stop_price", 0.0) or 0.0),
+                    "wave_stop_stop_unrealized_bps": float(hold_state_for_targets.get("wave_stop_stop_unrealized_bps", 0.0) or 0.0),
+                    "wave_stop_recent_dip_low": float(hold_state_for_targets.get("wave_stop_recent_dip_low", 0.0) or 0.0),
+                    "wave_stop_bounce_bps": float(hold_state_for_targets.get("wave_stop_bounce_bps", 0.0) or 0.0),
+                    "wave_stop_exit_confirmed": bool(hold_state_for_targets.get("wave_stop_exit_confirmed", False)),
+                    "wave_stop_reason": str(hold_state_for_targets.get("wave_stop_reason", "")),
                     "exit_plan_note": (
                         (
                             "scalp/core armed trailing active"

@@ -180,6 +180,34 @@ INITIAL_AGENT_RELIABILITY_PRIORS = {
     "exploration": 0.28,
 }
 
+INITIAL_AGENT_RELIABILITY_PRIORS.update({
+    "setup_pattern_edge_agent": 1.38,
+    "market_structure_reclaim_agent": 1.34,
+    "score_band_anti_chase_agent": 1.22,
+    "product_edge_governor_agent": 1.18,
+    "clean_path_analog_agent": 1.36,
+    "bad_setup_veto_agent": 1.30,
+    "volume_chop_veto_agent": 1.24,
+    "quant_regime_veto_agent": 1.20,
+    "execution_quality_gate_agent": 1.18,
+    "profit_pullback_capture_agent": 1.35,
+    "higher_low_wave_stop_agent": 1.32,
+    "failed_entry_escape_agent": 1.28,
+    "hard_stop_prevention_agent": 1.26,
+    "max_hold_decay_agent": 1.16,
+    "volume_profile_leader": 0.45,
+    "volume_profile_agent": 0.50,
+    "quant_boundary_agent": 0.55,
+    "fresh_zone_retest_agent": 0.45,
+    "fair_value_gap_agent": 0.62,
+    "trend": 0.45,
+    "mean_reversion": 0.45,
+    "breakout": 0.45,
+    "execution": 0.55,
+    "order_book_liquidity_agent": 0.55,
+    "exploration": 0.10,
+})
+
 # ============================================================
 # AGENT PRIORITY / REDUNDANCY POLICY
 # ============================================================
@@ -189,22 +217,28 @@ AGENT_UNPROVEN_MAX_DIRECTIONAL_ADJ: float = 0.07
 AGENT_PROVEN_MAX_DIRECTIONAL_ADJ: float = 0.24
 
 BUY_REDUNDANCY_GROUP_CAPS = {
-    "economics": 0.34, "volume": 0.34, "previous_session": 0.20,
-    "quant": 0.24, "price_action": 0.30, "session_liquidity": 0.26,
-    "cross_asset": 0.14, "risk_execution": 0.30, "learning": 0.30,
-    "other": 0.22,
+    "buy_alpha": 0.42, "buy_veto": 0.34, "economics": 0.30,
+    "volume": 0.16, "previous_session": 0.16, "quant": 0.14,
+    "price_action": 0.26, "session_liquidity": 0.20, "cross_asset": 0.12,
+    "risk_execution": 0.22, "learning": 0.20, "other": 0.12,
 }
 SELL_REDUNDANCY_GROUP_CAPS = {
-    "economics": 0.34, "volume": 0.32, "previous_session": 0.22,
-    "quant": 0.24, "price_action": 0.30, "session_liquidity": 0.24,
-    "cross_asset": 0.14, "risk_execution": 0.30, "profit_capture": 0.38,
-    "learning": 0.28, "other": 0.22,
+    "sell_alpha": 0.46, "profit_capture": 0.38, "economics": 0.28,
+    "volume": 0.18, "previous_session": 0.16, "quant": 0.14,
+    "price_action": 0.22, "session_liquidity": 0.18, "cross_asset": 0.12,
+    "risk_execution": 0.24, "learning": 0.18, "other": 0.12,
 }
 
 
 def agent_redundancy_group(agent: str) -> str:
     """Return the evidence family for redundancy control."""
     text = str(agent or "").lower()
+    if text in {"setup_pattern_edge_agent", "market_structure_reclaim_agent", "score_band_anti_chase_agent", "product_edge_governor_agent", "clean_path_analog_agent"}:
+        return "buy_alpha"
+    if text in {"bad_setup_veto_agent", "volume_chop_veto_agent", "quant_regime_veto_agent", "execution_quality_gate_agent"}:
+        return "buy_veto"
+    if text in {"profit_pullback_capture_agent", "higher_low_wave_stop_agent", "failed_entry_escape_agent", "hard_stop_prevention_agent", "max_hold_decay_agent"}:
+        return "sell_alpha"
     if text in {"truth", "exit_truth", "utility_leader", "sell_utility_leader"}:
         return "economics"
     if "volume_profile" in text or text in {"volume_profile_agent", "volume_profile_harvest"}:
@@ -1692,10 +1726,16 @@ class Level8Council:
             veto_mult = float(policy.get("veto_weight_multiplier", 1.0) or 1.0)
             if direction == "BUY":
                 raw_weight *= entry_mult
-                if role == "buy_signal_penalty_veto_filter":
-                    raw_weight *= 0.70
+                if role in {"avoidance_veto_filter", "buy_signal_penalty_veto_filter"}:
+                    raw_weight *= 0.05
+                if role == "primary_sell_alpha":
+                    raw_weight *= 0.10
             if direction in {"WAIT", "HOLD"} and role in {"avoidance_veto_filter", "buy_signal_penalty_veto_filter"}:
                 raw_weight *= veto_mult
+            if direction == "BUY" and role in {"primary_buy_alpha", "secondary_buy_confirmer"}:
+                raw_weight *= max(1.0, entry_mult)
+            if str(decision_side).upper() == "SELL" and role in {"primary_sell_alpha", "secondary_sell_confirmer"}:
+                raw_weight *= max(1.0, float(policy.get("sell_weight_multiplier", 1.0) or 1.0))
             group = agent_redundancy_group(vote.agent)
             raw_pairs.append((vote, raw_weight, group))
 
@@ -1801,7 +1841,7 @@ class Level8Council:
             risk_mode=thresholds["risk_mode"],
         )
 
-        if bucket in ("TEST", "CORE"):
+        if bucket in ("APPROVED", "TEST", "CORE"):
             action = "ALLOW_BUY"
         elif final_buy >= buy_threshold and bucket == "SHADOW":
             action = "SHADOW"
@@ -1900,6 +1940,8 @@ class Level8Council:
         spread_bps = float(context.get("spread_bps", 0.0) or 0.0)
         cost_bps = float(context.get("cost_bps", 0.0) or 0.0)
         hold_seconds = float(context.get("hold_seconds", 0.0) or 0.0)
+        hold_minutes = hold_seconds / 60.0
+        max_hold_minutes = float(context.get("adaptive_max_hold_minutes", context.get("max_hold_minutes", 120.0)) or 120.0)
 
         min_hold_elapsed = bool(context.get("min_hold_elapsed", False))
         target_hold_elapsed = bool(context.get("target_hold_elapsed", False))
@@ -2066,7 +2108,7 @@ class Level8Council:
             {"agent": "peak_capture", "buy": 0.0, "sell": peak_capture, "hold": 1.0 - peak_capture * 0.70, "wait": 0.25, "confidence": 0.72, "reason": "sell when price pulls back from a profitable local peak"},
             {"agent": "momentum_fade", "buy": 0.0, "sell": momentum_fade_sell, "hold": 1.0 - momentum_fade_sell * 0.65, "wait": 0.30, "confidence": 0.66, "reason": "sell more when short-term momentum fades"},
             {
-                "agent": "higher_low_wave_stop",
+                "agent": "higher_low_wave_stop_agent",
                 "buy": 0.0,
                 "sell": 1.0 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.15,
                 "hold": 0.15 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.85,
@@ -2074,6 +2116,10 @@ class Level8Council:
                 "confidence": 0.86 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.55,
                 "reason": "ride wave until confirmed higher-low stop breaks",
             },
+            {"agent": "profit_pullback_capture_agent", "buy": 0.0, "sell": clamp(profit_capture * 0.70 + peak_capture * 0.30, 0.0, 1.0), "hold": clamp(1.0 - profit_capture * 0.50 - peak_capture * 0.25, 0.0, 1.0), "wait": 0.20, "confidence": 0.86, "reason": "new_sell_alpha_profit_pullback_capture"},
+            {"agent": "failed_entry_escape_agent", "buy": 0.0, "sell": clamp(loss_exit * 0.55 + max(0.0, -net_after_exit_bps) / 120.0 + max(0.0, -momentum_1_bps) / 160.0, 0.0, 1.0), "hold": clamp(0.75 - loss_exit * 0.55, 0.0, 1.0), "wait": 0.25, "confidence": 0.78, "reason": "new_sell_alpha_failed_entry_escape"},
+            {"agent": "hard_stop_prevention_agent", "buy": 0.0, "sell": clamp(loss_exit * 0.70 + max(0.0, -net_after_exit_bps) / 160.0, 0.0, 1.0), "hold": clamp(0.80 - loss_exit * 0.65, 0.0, 1.0), "wait": 0.25, "confidence": 0.76, "reason": "new_sell_alpha_hard_stop_prevention"},
+            {"agent": "max_hold_decay_agent", "buy": 0.0, "sell": clamp(max(0.0, hold_minutes - max_hold_minutes) / max(max_hold_minutes, 1.0), 0.0, 1.0), "hold": clamp(1.0 - max(0.0, hold_minutes - max_hold_minutes) / max(max_hold_minutes, 1.0), 0.0, 1.0), "wait": 0.20, "confidence": 0.62, "reason": "new_sell_alpha_max_hold_decay"},
             {"agent": "execution", "buy": 0.0, "sell": execution_sell_quality, "hold": 0.40, "wait": 1.0 - execution_sell_quality, "confidence": 0.65, "reason": "avoid selling into poor spread conditions unless necessary"},
             {"agent": "fee_recovery", "buy": 0.0, "sell": fee_recovery, "hold": clamp(0.85 - fee_recovery * 0.35, 0.0, 1.0), "wait": 0.30, "confidence": 0.67, "reason": "protect all-in fee-adjusted breakeven"},
             {"agent": "harvest_sizing", "buy": 0.0, "sell": harvest_pressure, "hold": 1.0 - harvest_pressure * 0.55, "wait": 0.25, "confidence": 0.64, "reason": "choose partial vs full sell pressure"},

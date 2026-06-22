@@ -5,6 +5,27 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from runtime_paths import (
+        CSV_ROOT_DIR, DEBUG_DIR, RESEARCH_DIR, ensure_runtime_dirs,
+        migrate_root_runtime_files_to_csv_tree, runtime_path, sidecar_meta_path,
+        write_generated_file_meta,
+    )
+except Exception:
+    CSV_ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CSVs")
+    DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    RESEARCH_DIR = os.path.join(CSV_ROOT_DIR, "09_continuous_research")
+    def ensure_runtime_dirs() -> None:
+        os.makedirs(CSV_ROOT_DIR, exist_ok=True); os.makedirs(DEBUG_DIR, exist_ok=True); os.makedirs(RESEARCH_DIR, exist_ok=True)
+    def migrate_root_runtime_files_to_csv_tree() -> Dict[str, object]:
+        return {"moved": [], "skipped": [], "errors": ["runtime_paths_import_failed"]}
+    def runtime_path(filename: str) -> str:
+        ensure_runtime_dirs(); return os.path.join(CSV_ROOT_DIR, os.path.basename(str(filename)))
+    def sidecar_meta_path(path: str) -> str:
+        return f"{path}.meta.json"
+    def write_generated_file_meta(path: str, reason: str = "") -> None:
+        pass
+
 
 import numpy as np
 import pandas as pd
@@ -210,7 +231,7 @@ def _source_frames(base_dir: str) -> pd.DataFrame:
     ]
     frames: List[pd.DataFrame] = []
     for filename, source_name, source_weight in sources:
-        raw = _read_csv(os.path.join(base_dir, filename))
+        raw = _read_csv(runtime_path(filename))
         if raw.empty or "product_id" not in raw.columns:
             continue
         out = pd.DataFrame(index=raw.index)
@@ -619,11 +640,11 @@ def run_quant_state_engine(*, base_dir: str, log_fn=None) -> Dict[str, Any]:
     base_dir = os.path.abspath(base_dir); ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); frame = _source_frames(base_dir)
     if frame.empty:
         for path, columns in [("feature_outcome_correlation.csv", FEATURE_OUTCOME_CORRELATION_COLUMNS), ("feature_correlation_matrix.csv", FEATURE_CORRELATION_MATRIX_COLUMNS), ("markov_regime_transitions.csv", MARKOV_TRANSITION_COLUMNS), ("markov_regime_policy.csv", MARKOV_POLICY_COLUMNS), ("kalman_filter_policy.csv", KALMAN_POLICY_COLUMNS), ("quant_state_summary.csv", QUANT_STATE_SUMMARY_COLUMNS)]:
-            _write_rows(os.path.join(base_dir, path), columns, [])
+            _write_rows(runtime_path(path), columns, [])
         return {"rows": 0, "reason": "no_quant_state_training_rows"}
     feature_rows, matrix_rows = _feature_rows(frame, ts_value, dt_value); transition_rows, policy_rows = _markov_rows(frame, ts_value, dt_value); kalman_rows = _kalman_policy_rows(frame, ts_value, dt_value)
     summary_rows = [[f"{ts_value:.6f}", dt_value, "training_rows", int(len(frame)), "quant_state_engine source rows"], [f"{ts_value:.6f}", dt_value, "feature_outcome_rows", int(len(feature_rows)), "active covariance/correlation feature policy rows"], [f"{ts_value:.6f}", dt_value, "feature_pair_rows", int(len(matrix_rows)), "feature covariance/correlation matrix rows"], [f"{ts_value:.6f}", dt_value, "markov_transition_rows", int(len(transition_rows)), "market-regime Markov transition rows"], [f"{ts_value:.6f}", dt_value, "markov_policy_rows", int(len(policy_rows)), "active Markov regime policy rows"], [f"{ts_value:.6f}", dt_value, "kalman_policy_rows", int(len(kalman_rows)), "active Kalman policy rows"]]
-    _write_rows(os.path.join(base_dir, "feature_outcome_correlation.csv"), FEATURE_OUTCOME_CORRELATION_COLUMNS, feature_rows); _write_rows(os.path.join(base_dir, "feature_correlation_matrix.csv"), FEATURE_CORRELATION_MATRIX_COLUMNS, matrix_rows); _write_rows(os.path.join(base_dir, "markov_regime_transitions.csv"), MARKOV_TRANSITION_COLUMNS, transition_rows); _write_rows(os.path.join(base_dir, "markov_regime_policy.csv"), MARKOV_POLICY_COLUMNS, policy_rows); _write_rows(os.path.join(base_dir, "kalman_filter_policy.csv"), KALMAN_POLICY_COLUMNS, kalman_rows); _write_rows(os.path.join(base_dir, "quant_state_summary.csv"), QUANT_STATE_SUMMARY_COLUMNS, summary_rows)
+    _write_rows(runtime_path("feature_outcome_correlation.csv"), FEATURE_OUTCOME_CORRELATION_COLUMNS, feature_rows); _write_rows(runtime_path("feature_correlation_matrix.csv"), FEATURE_CORRELATION_MATRIX_COLUMNS, matrix_rows); _write_rows(runtime_path("markov_regime_transitions.csv"), MARKOV_TRANSITION_COLUMNS, transition_rows); _write_rows(runtime_path("markov_regime_policy.csv"), MARKOV_POLICY_COLUMNS, policy_rows); _write_rows(runtime_path("kalman_filter_policy.csv"), KALMAN_POLICY_COLUMNS, kalman_rows); _write_rows(runtime_path("quant_state_summary.csv"), QUANT_STATE_SUMMARY_COLUMNS, summary_rows)
     log(f"[quant-state] completed rows={len(frame)} feature={len(feature_rows)} pair={len(matrix_rows)} markov={len(policy_rows)} kalman={len(kalman_rows)}")
     return {"rows": int(len(frame)), "feature_rows": int(len(feature_rows)), "matrix_rows": int(len(matrix_rows)), "markov_transition_rows": int(len(transition_rows)), "markov_policy_rows": int(len(policy_rows)), "kalman_policy_rows": int(len(kalman_rows))}
 
@@ -633,7 +654,7 @@ def _latest_frame(path: str) -> pd.DataFrame:
 
 
 def load_feature_policy_map(base_dir: str) -> Dict[str, List[Dict[str, Any]]]:
-    frame = _latest_frame(os.path.join(base_dir, "feature_outcome_correlation.csv"))
+    frame = _latest_frame(runtime_path("feature_outcome_correlation.csv"))
     if frame.empty: return {}
     frame = frame.copy(); frame["live_enabled_bool"] = frame.get("live_enabled", True).astype(str).str.lower().isin({"true", "1", "yes", "y"}); frame = frame[frame["live_enabled_bool"]]
     output: Dict[str, List[Dict[str, Any]]] = {}
@@ -651,7 +672,7 @@ def _normalize_regime_key(value: Any) -> str:
 
 
 def load_markov_policy_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
-    frame = _latest_frame(os.path.join(base_dir, "markov_regime_policy.csv"))
+    frame = _latest_frame(runtime_path("markov_regime_policy.csv"))
     if frame.empty: return {}
     if "ts" in frame.columns: frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce").fillna(0.0); frame = frame.sort_values("ts")
     output: Dict[str, Dict[str, Any]] = {}
@@ -660,7 +681,7 @@ def load_markov_policy_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
 
 
 def load_kalman_policy_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
-    frame = _latest_frame(os.path.join(base_dir, "kalman_filter_policy.csv"))
+    frame = _latest_frame(runtime_path("kalman_filter_policy.csv"))
     if frame.empty: return {}
     if "ts" in frame.columns: frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce").fillna(0.0); frame = frame.sort_values("ts")
     output: Dict[str, Dict[str, Any]] = {}

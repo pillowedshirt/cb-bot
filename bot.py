@@ -10,6 +10,7 @@ import json
 import time
 import sys
 import traceback
+import threading
 import shutil
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -25,6 +26,32 @@ from collections import deque
 from io import StringIO
 from types import SimpleNamespace
 from typing import Dict, Deque, List, Optional, Set, Tuple, Any, Callable, Sequence
+try:
+    from runtime_paths import (
+        CSV_ROOT_DIR, DEBUG_DIR, RESEARCH_DIR, ensure_runtime_dirs,
+        migrate_root_runtime_files_to_csv_tree, runtime_path, sidecar_meta_path,
+        write_generated_file_meta,
+    )
+except Exception:
+    CSV_ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CSVs")
+    DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    RESEARCH_DIR = os.path.join(CSV_ROOT_DIR, "09_continuous_research")
+    def ensure_runtime_dirs() -> None:
+        os.makedirs(CSV_ROOT_DIR, exist_ok=True); os.makedirs(DEBUG_DIR, exist_ok=True); os.makedirs(RESEARCH_DIR, exist_ok=True)
+    def migrate_root_runtime_files_to_csv_tree() -> Dict[str, object]:
+        return {"moved": [], "skipped": [], "errors": ["runtime_paths_import_failed"]}
+    def runtime_path(filename: str) -> str:
+        ensure_runtime_dirs(); return os.path.join(CSV_ROOT_DIR, os.path.basename(str(filename)))
+    def sidecar_meta_path(path: str) -> str:
+        return f"{path}.meta.json"
+    def write_generated_file_meta(path: str, reason: str = "") -> None:
+        pass
+
+try:
+    from continuous_research_engine import run_continuous_research_cycle
+except Exception:
+    run_continuous_research_cycle = None
+
 
 import numpy as np
 import pandas as pd
@@ -489,7 +516,7 @@ SELECTION_REFRESH_SEC: int = 6 * 60 * 60  # recompute selection every 6 hours
 SELECTION_BTC_STRESS_QUANTILE: float = 0.75   # top quartile of BTC rolling vol = "stress"
 MAX_ABS_CORR_TO_BTC: float = 0.88             # hard cap on |corr| to BTC for non-BTC assets
 MAX_AVG_ABS_CORR: float = 0.82                # soft cap on avg |corr| to current basket
-PRODUCTS_CACHE_PATH: str = os.path.join(BASE_DIR, "products_selected.json")
+PRODUCTS_CACHE_PATH: str = runtime_path("products_selected.json")
 
 # Runtime products list (populated at startup in main()).
 PRODUCTS: List[str] = list(PRODUCTS_DEFAULT)
@@ -498,29 +525,29 @@ PRODUCTS: List[str] = list(PRODUCTS_DEFAULT)
 # File paths for logging
 # Resolve paths relative to this script so that bot and viewer always refer to
 # the same files regardless of the current working directory.
-TRADES_CSV_PATH: str = os.path.join(BASE_DIR, "trades.csv")
-ORDERS_CSV_PATH: str = os.path.join(BASE_DIR, "orders.csv")
-MARKET_CSV_PATH: str = os.path.join(BASE_DIR, "market.csv")
-VIEWER_SNAPSHOT_PATH: str = os.path.join(BASE_DIR, "viewer_snapshot.json")
+TRADES_CSV_PATH: str = runtime_path("trades.csv")
+ORDERS_CSV_PATH: str = runtime_path("orders.csv")
+MARKET_CSV_PATH: str = runtime_path("market.csv")
+VIEWER_SNAPSHOT_PATH: str = runtime_path("viewer_snapshot.json")
 VIEWER_SNAPSHOT_JSON: str = VIEWER_SNAPSHOT_PATH
 VIEWER_SNAPSHOT_WRITE_EVERY_SEC: float = 2.0
-CALCULATION_STATUS_JSON_PATH: str = os.path.join(BASE_DIR, "calculation_status.json")
-CALCULATION_COMPLETE_LATCH_PATH: str = os.path.join(BASE_DIR, "calculation_complete_latch.json")
+CALCULATION_STATUS_JSON_PATH: str = runtime_path("calculation_status.json")
+CALCULATION_COMPLETE_LATCH_PATH: str = runtime_path("calculation_complete_latch.json")
 CALCULATION_UNLOCK_REQUIRES_LIVE_DATA_FRESHNESS: bool = False
 CALCULATION_STATUS_WRITE_EVERY_SEC: float = 5.0
 CALCULATION_STATUS_RESCAN_EVERY_SEC: float = 1.0
-MACRO_WEEK_CSV: str = os.path.join(BASE_DIR, "macro_week.csv")  # 15-minute candles (past week)
-MACRO_DAY_CSV: str = os.path.join(BASE_DIR, "macro_day.csv")    # 1-minute candles (past day)
-MACRO_LEVELS_CSV: str = os.path.join(BASE_DIR, "macro_levels.csv")
-CALIBRATION_CSV_PATH: str = os.path.join(BASE_DIR, "calibration.csv")
-MICRO_HISTORY_CSV_PATH: str = os.path.join(BASE_DIR, "micro_history.csv")
-CHART_1M_7D_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1m_7d.csv")
-CHART_15M_30D_CSV_PATH: str = os.path.join(BASE_DIR, "chart_15m_30d.csv")
-CHART_1H_90D_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1h_90d.csv")
-CHART_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "chart_1d_2y.csv")
-HIST_REPLAY_15M_90D_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_15m_90d.csv")
-HIST_REPLAY_1H_365D_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1h_365d.csv")
-HIST_REPLAY_1D_2Y_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_1d_2y.csv")
+MACRO_WEEK_CSV: str = runtime_path("macro_week.csv")  # 15-minute candles (past week)
+MACRO_DAY_CSV: str = runtime_path("macro_day.csv")    # 1-minute candles (past day)
+MACRO_LEVELS_CSV: str = runtime_path("macro_levels.csv")
+CALIBRATION_CSV_PATH: str = runtime_path("calibration.csv")
+MICRO_HISTORY_CSV_PATH: str = runtime_path("micro_history.csv")
+CHART_1M_7D_CSV_PATH: str = runtime_path("chart_1m_7d.csv")
+CHART_15M_30D_CSV_PATH: str = runtime_path("chart_15m_30d.csv")
+CHART_1H_90D_CSV_PATH: str = runtime_path("chart_1h_90d.csv")
+CHART_1D_2Y_CSV_PATH: str = runtime_path("chart_1d_2y.csv")
+HIST_REPLAY_15M_90D_CSV_PATH: str = runtime_path("historical_replay_15m_90d.csv")
+HIST_REPLAY_1H_365D_CSV_PATH: str = runtime_path("historical_replay_1h_365d.csv")
+HIST_REPLAY_1D_2Y_CSV_PATH: str = runtime_path("historical_replay_1d_2y.csv")
 
 # Compatibility aliases used by the historical replay process-worker path.
 # Keep both names because older helper functions still reference HISTORICAL_REPLAY_*.
@@ -550,8 +577,8 @@ EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED = STARTUP_BOOTSTRAP_PRIMARY_MIN_DAYS_CO
 EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED = STARTUP_BOOTSTRAP_REGIME_MIN_DAYS_COVERED if FAST_STARTUP_CALCULATION_MODE else 340
 EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT = STARTUP_BOOTSTRAP_PRIMARY_MIN_ROWS_PER_PRODUCT if FAST_STARTUP_CALCULATION_MODE else 8000
 EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT = STARTUP_BOOTSTRAP_REGIME_MIN_ROWS_PER_PRODUCT if FAST_STARTUP_CALCULATION_MODE else 8000
-POST_PATCH_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "post_patch_audit.csv")
-STARTUP_RUNTIME_INVENTORY_CSV_PATH: str = os.path.join(BASE_DIR, "startup_runtime_inventory.csv")
+POST_PATCH_AUDIT_CSV_PATH: str = runtime_path("post_patch_audit.csv")
+STARTUP_RUNTIME_INVENTORY_CSV_PATH: str = runtime_path("startup_runtime_inventory.csv")
 
 RAW_RUNTIME_FILES_TO_PRESERVE = [
     "historical_replay_15m_90d.csv", "historical_replay_1h_365d.csv",
@@ -648,11 +675,11 @@ EXTENDED_CHART_PRODUCTS_PER_PASS: int = 1
 EXTENDED_CHART_JOBS_PER_PASS: int = 1
 COINBASE_CANDLE_REQUEST_PAUSE_SEC: float = 0.45
 COINBASE_CANDLE_429_BACKOFF_SEC: float = 6.0
-POSITION_TARGETS_CSV_PATH: str = os.path.join(BASE_DIR, "position_targets.csv")
-SHADOW_SELL_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
-SHADOW_TRADES_CSV_PATH: str = os.path.join(BASE_DIR, "shadow_trades.csv")
-HISTORICAL_SHADOW_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
-HISTORICAL_REPLAY_MANIFEST_JSON_PATH: str = os.path.join(BASE_DIR, "historical_replay_manifest.json")
+POSITION_TARGETS_CSV_PATH: str = runtime_path("position_targets.csv")
+SHADOW_SELL_REPLAY_CSV_PATH: str = runtime_path("shadow_sell_replay.csv")
+SHADOW_TRADES_CSV_PATH: str = runtime_path("shadow_trades.csv")
+HISTORICAL_SHADOW_REPLAY_CSV_PATH: str = runtime_path("historical_shadow_replay.csv")
+HISTORICAL_REPLAY_MANIFEST_JSON_PATH: str = runtime_path("historical_replay_manifest.json")
 HISTORICAL_REPLAY_WORKER_OUTPUT_DIR: str = os.path.join(BASE_DIR, "historical_replay_worker_outputs")
 HISTORICAL_REPLAY_WORKER_TIMEFRAMES: List[str] = ["primary_15m_90d", "regime_1h_365d"]
 HISTORICAL_REPLAY_WORKER_INCLUDE_DAILY_CONTEXT: bool = False
@@ -667,65 +694,72 @@ HISTORICAL_REPLAY_PROCESS_WORKERS: int = max(
     ),
 )
 ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS: bool = True
-HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "historical_replay_summary.csv")
-REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
-STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "strategy_variant_replay_summary.csv")
+ENABLE_CONTINUOUS_RESEARCH_ENGINE: bool = True
+CONTINUOUS_RESEARCH_INTERVAL_SEC: float = 900.0
+CONTINUOUS_RESEARCH_START_DELAY_SEC: float = 60.0
+CONTINUOUS_RESEARCH_REQUIRE_STARTUP_COMPLETE: bool = True
+ENABLE_MARKET_STATE_ANALOG_LIVE_GATE: bool = True
+ANALOG_MIN_SAMPLE_COUNT_TO_BLOCK: int = 20
+ANALOG_BLOCK_AVG_BPS_BELOW: float = -5.0
+ANALOG_BLOCK_WIN_RATE_BELOW: float = 0.42
+ANALOG_SIZE_DOWN_WHEN_MISSING: float = 0.75
+HISTORICAL_REPLAY_SUMMARY_CSV_PATH: str = runtime_path("historical_replay_summary.csv")
+REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH: str = runtime_path("replay_fee_comparison_summary.csv")
+STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH: str = runtime_path("strategy_variant_replay_summary.csv")
 DEBUG_LOG_PATH: str = os.path.join(BASE_DIR, "debug.log")
-CANDIDATE_REPLAY_CSV_PATH: str = os.path.join(BASE_DIR, "candidate_replay.csv")
-PRODUCTS_ACTIVE_CSV_PATH: str = os.path.join(BASE_DIR, "products_active.csv")
-EXCHANGE_PRODUCT_MAP_CSV_PATH: str = os.path.join(BASE_DIR, "exchange_product_map.csv")
+CANDIDATE_REPLAY_CSV_PATH: str = runtime_path("candidate_replay.csv")
+PRODUCTS_ACTIVE_CSV_PATH: str = runtime_path("products_active.csv")
+EXCHANGE_PRODUCT_MAP_CSV_PATH: str = runtime_path("exchange_product_map.csv")
 HISTORY_FETCH_CONCURRENCY: int = max(2, min(env_int("HISTORY_FETCH_CONCURRENCY", 8), 15))
 MACRO_FETCH_CONCURRENCY: int = max(1, min(env_int("MACRO_FETCH_CONCURRENCY", 6), 15))
 MACRO_DAY_REFRESH_EVERY_SEC = 180
 MACRO_WEEK_REFRESH_EVERY_SEC = 900
 MACRO_PRODUCTS_PER_PASS = 1
-SIGNAL_EVENTS_CSV_PATH: str = os.path.join(BASE_DIR, "signal_events.csv")
-LEVEL8_COUNCIL_DECISIONS_CSV_PATH: str = os.path.join(
-    BASE_DIR, "council_decisions.csv"
-)
-TRADE_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "trade_outcomes.csv")
-MISSED_OPPORTUNITIES_CSV_PATH: str = os.path.join(BASE_DIR, "missed_opportunities.csv")
-COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH: str = os.path.join(
-    BASE_DIR, "council_observation_outcomes.csv"
-)
-RECONCILIATION_CSV_PATH: str = os.path.join(BASE_DIR, "reconciliation.csv")
-AGENT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "agent_performance.csv")
-AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH: str = os.path.join(BASE_DIR, "agent_component_replay_attribution.csv")
-AGENT_TRADE_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "agent_trade_policy.csv")
-AGENT_SIDE_RATINGS_CSV_PATH: str = os.path.join(BASE_DIR, "agent_side_ratings.csv")
-FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH: str = os.path.join(BASE_DIR, "four_pass_product_live_gate.csv")
-PRODUCT_COOLDOWNS_CSV_PATH: str = os.path.join(BASE_DIR, "product_cooldowns.csv")
-BACKTEST_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_recommendations.csv")
-BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_sell_recommendations.csv")
-BACKTEST_AGENT_PRIORS_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_agent_priors.csv")
-BACKTEST_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_summary.csv")
-BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "backtest_setup_performance.csv")
-WALK_FORWARD_VALIDATION_CSV_PATH: str = os.path.join(BASE_DIR, "walk_forward_validation.csv")
-AGENT_ABLATION_CSV_PATH: str = os.path.join(BASE_DIR, "agent_ablation.csv")
-PREVIOUS_SESSION_PROFILE_CSV_PATH: str = os.path.join(BASE_DIR, "previous_session_profile.csv")
-QUANT_CONTEXT_CSV_PATH: str = os.path.join(BASE_DIR, "quant_context.csv")
+SIGNAL_EVENTS_CSV_PATH: str = runtime_path("signal_events.csv")
+LEVEL8_COUNCIL_DECISIONS_CSV_PATH: str = runtime_path("council_decisions.csv")
+TRADE_OUTCOMES_CSV_PATH: str = runtime_path("trade_outcomes.csv")
+MISSED_OPPORTUNITIES_CSV_PATH: str = runtime_path("missed_opportunities.csv")
+COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH: str = runtime_path("council_observation_outcomes.csv")
+RECONCILIATION_CSV_PATH: str = runtime_path("reconciliation.csv")
+AGENT_PERFORMANCE_CSV_PATH: str = runtime_path("agent_performance.csv")
+AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH: str = runtime_path("agent_component_replay_attribution.csv")
+AGENT_TRADE_POLICY_CSV_PATH: str = runtime_path("agent_trade_policy.csv")
+AGENT_SIDE_RATINGS_CSV_PATH: str = runtime_path("agent_side_ratings.csv")
+FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH: str = runtime_path("four_pass_product_live_gate.csv")
+PRODUCT_COOLDOWNS_CSV_PATH: str = runtime_path("product_cooldowns.csv")
+BACKTEST_RECOMMENDATIONS_CSV_PATH: str = runtime_path("backtest_recommendations.csv")
+BACKTEST_SELL_RECOMMENDATIONS_CSV_PATH: str = runtime_path("backtest_sell_recommendations.csv")
+BACKTEST_AGENT_PRIORS_CSV_PATH: str = runtime_path("backtest_agent_priors.csv")
+BACKTEST_SUMMARY_CSV_PATH: str = runtime_path("backtest_summary.csv")
+BACKTEST_SETUP_PERFORMANCE_CSV_PATH: str = runtime_path("backtest_setup_performance.csv")
+WALK_FORWARD_VALIDATION_CSV_PATH: str = runtime_path("walk_forward_validation.csv")
+AGENT_ABLATION_CSV_PATH: str = runtime_path("agent_ablation.csv")
+PREVIOUS_SESSION_PROFILE_CSV_PATH: str = runtime_path("previous_session_profile.csv")
+QUANT_CONTEXT_CSV_PATH: str = runtime_path("quant_context.csv")
 
 # Decision-engine completion logs.
-DECISION_AUDIT_CSV_PATH: str = os.path.join(BASE_DIR, "decision_audit.csv")
-SELL_QUALITY_REVIEWS_CSV_PATH: str = os.path.join(BASE_DIR, "sell_quality_reviews.csv")
-MAKER_FILL_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_fill_outcomes.csv")
-MAKER_MISS_OUTCOMES_CSV_PATH: str = os.path.join(BASE_DIR, "maker_miss_outcomes.csv")
-ORDER_BOOK_SNAPSHOTS_CSV_PATH: str = os.path.join(BASE_DIR, "order_book_snapshots.csv")
-RISK_EV_CONFIDENCE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_ev_confidence.csv")
-RISK_MONTE_CARLO_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "risk_monte_carlo_summary.csv")
-RISK_CONTEXT_PERFORMANCE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_context_performance.csv")
-RISK_LIVE_GATE_CSV_PATH: str = os.path.join(BASE_DIR, "risk_live_gate.csv")
-FEATURE_OUTCOME_CORRELATION_CSV_PATH: str = os.path.join(BASE_DIR, "feature_outcome_correlation.csv")
-FEATURE_CORRELATION_MATRIX_CSV_PATH: str = os.path.join(BASE_DIR, "feature_correlation_matrix.csv")
-MARKOV_REGIME_TRANSITIONS_CSV_PATH: str = os.path.join(BASE_DIR, "markov_regime_transitions.csv")
-MARKOV_REGIME_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "markov_regime_policy.csv")
-KALMAN_FILTER_POLICY_CSV_PATH: str = os.path.join(BASE_DIR, "kalman_filter_policy.csv")
-KALMAN_LIVE_STATE_CSV_PATH: str = os.path.join(BASE_DIR, "kalman_live_state.csv")
-QUANT_STATE_SUMMARY_CSV_PATH: str = os.path.join(BASE_DIR, "quant_state_summary.csv")
-ADAPTIVE_GUARDRAILS_CSV_PATH: str = os.path.join(BASE_DIR, "adaptive_guardrails.csv")
-ACCOUNT_BALANCE_DIAGNOSTICS_CSV_PATH: str = os.path.join(BASE_DIR, "account_balance_diagnostics.csv")
-LIVE_TRADE_BLOCKERS_CSV_PATH: str = os.path.join(BASE_DIR, "live_trade_blockers.csv")
-APPROVED_BUT_SHADOWED_CSV_PATH: str = os.path.join(BASE_DIR, "approved_but_shadowed.csv")
+DECISION_AUDIT_CSV_PATH: str = runtime_path("decision_audit.csv")
+SELL_QUALITY_REVIEWS_CSV_PATH: str = runtime_path("sell_quality_reviews.csv")
+MAKER_FILL_OUTCOMES_CSV_PATH: str = runtime_path("maker_fill_outcomes.csv")
+MAKER_MISS_OUTCOMES_CSV_PATH: str = runtime_path("maker_miss_outcomes.csv")
+ORDER_BOOK_SNAPSHOTS_CSV_PATH: str = runtime_path("order_book_snapshots.csv")
+RISK_EV_CONFIDENCE_CSV_PATH: str = runtime_path("risk_ev_confidence.csv")
+RISK_MONTE_CARLO_SUMMARY_CSV_PATH: str = runtime_path("risk_monte_carlo_summary.csv")
+RISK_CONTEXT_PERFORMANCE_CSV_PATH: str = runtime_path("risk_context_performance.csv")
+RISK_LIVE_GATE_CSV_PATH: str = runtime_path("risk_live_gate.csv")
+FEATURE_OUTCOME_CORRELATION_CSV_PATH: str = runtime_path("feature_outcome_correlation.csv")
+FEATURE_CORRELATION_MATRIX_CSV_PATH: str = runtime_path("feature_correlation_matrix.csv")
+MARKOV_REGIME_TRANSITIONS_CSV_PATH: str = runtime_path("markov_regime_transitions.csv")
+MARKOV_REGIME_POLICY_CSV_PATH: str = runtime_path("markov_regime_policy.csv")
+KALMAN_FILTER_POLICY_CSV_PATH: str = runtime_path("kalman_filter_policy.csv")
+KALMAN_LIVE_STATE_CSV_PATH: str = runtime_path("kalman_live_state.csv")
+QUANT_STATE_SUMMARY_CSV_PATH: str = runtime_path("quant_state_summary.csv")
+ADAPTIVE_GUARDRAILS_CSV_PATH: str = runtime_path("adaptive_guardrails.csv")
+ACCOUNT_BALANCE_DIAGNOSTICS_CSV_PATH: str = runtime_path("account_balance_diagnostics.csv")
+LIVE_TRADE_BLOCKERS_CSV_PATH: str = runtime_path("live_trade_blockers.csv")
+APPROVED_BUT_SHADOWED_CSV_PATH: str = runtime_path("approved_but_shadowed.csv")
+MARKET_STATE_ANALOG_SUMMARY_CSV_PATH: str = runtime_path("market_state_analog_summary.csv")
+MARKET_STATE_ANALOG_MATCHES_CSV_PATH: str = runtime_path("market_state_analog_matches.csv")
 
 RUNTIME_CSV_ROW_LIMITS = {
     "market.csv": 15000,
@@ -6927,6 +6961,38 @@ class LEGACY_UNUSED_LivePortfolio:
         ).to_dict()
 
 
+def _normalize_completed_calculation_status(status: Dict[str, Any], source: str = "completed") -> Dict[str, Any]:
+    out = dict(status or {})
+    out["full_viewer_unlocked"] = True
+    out["calculation_work_complete"] = True
+    out["calculation_complete_latched"] = True
+    out["phase_label"] = "Complete"
+    out["overall_progress"] = 1.0
+    out["overall_progress_pct"] = 100.0
+    out["viewer_status_source"] = source
+    phase_progress = dict(out.get("phase_progress") or {})
+    phase_progress["live_data"] = 1.0
+    phase_progress["micro_backlog"] = 1.0
+    phase_progress["historical_candle_backlog"] = 1.0
+    phase_progress["historical_replay"] = 1.0
+    phase_progress["replay_calibration_verdicts"] = 1.0
+    out["phase_progress"] = phase_progress
+    product_status = out.get("product_status") or {}
+    if isinstance(product_status, dict):
+        for product_id, row in product_status.items():
+            if isinstance(row, dict):
+                row["complete"] = True
+                row["calculation_complete"] = True
+                row["historical_replay_progress"] = 1.0
+                row["calibration_verdict_progress"] = 1.0
+                row["micro_progress"] = 1.0
+                row["historical_candle_progress"] = 1.0
+        out["product_status"] = product_status
+        out["complete_products"] = len(product_status)
+        out["incomplete_products"] = 0
+    return out
+
+
 class TradingBot:
     """
     A structurally mean‑reverting trading bot.  Uses a three‑layer model:
@@ -6940,6 +7006,15 @@ class TradingBot:
         self.pem_secret = pem_secret
         self._bot_boot_ts = now_ts()
         self._calculation_started_ts = self._bot_boot_ts
+        self._continuous_research_thread: Optional[threading.Thread] = None
+        self._continuous_research_stop_event = threading.Event()
+        self._last_continuous_research_cycle_ts: float = 0.0
+        self._market_state_analog_cache: Dict[str, Dict[str, Any]] = {}
+        self._market_state_analog_cache_ts: float = 0.0
+
+        ensure_runtime_dirs()
+        self.runtime_file_migration_result = migrate_root_runtime_files_to_csv_tree()
+        module_debug(MODULE_NAME, "runtime_file_tree_migration_completed", data=self.runtime_file_migration_result, level="INFO", also_overall=True)
 
         # Import and capture pre-existing runtime state before logger constructors
         # create header-only CSV files or current-run rows.
@@ -7071,7 +7146,11 @@ class TradingBot:
             level="INFO" if HISTORICAL_REPLAY_WORKER_IMPORT_OK else "ERROR",
             also_overall=True,
         )
-        if bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL):
+        manifest_all_done, manifest_done_info = self._historical_replay_manifest_all_done()
+        if manifest_all_done:
+            self._historical_worker_pool = None
+            module_debug(MODULE_NAME, "historical_replay_process_pool_skipped_manifest_complete", data=manifest_done_info, level="INFO", also_overall=True)
+        elif bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL):
             try:
                 self._historical_worker_pool = ProcessPoolExecutor(max_workers=int(HISTORICAL_REPLAY_PROCESS_WORKERS))
                 module_debug(MODULE_NAME, "historical_replay_process_pool_started", data={"workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS)}, level="INFO", also_overall=True)
@@ -7371,6 +7450,7 @@ class TradingBot:
             log(f"[startup] micro preload failed: {e}")
             self._micro_history_ready = False
 
+        self._start_continuous_research_thread()
 
     # --------------------------------------------------------
     # Micro metrics (24h aware)
@@ -12460,8 +12540,8 @@ class TradingBot:
             last_run = float(getattr(self, "_last_backtest_intelligence_run_ts", 0.0) or 0.0)
             last_rows = int(getattr(self, "_last_backtest_intelligence_training_rows", 0) or 0)
 
-            candidate_path = os.path.join(BASE_DIR, "candidate_replay.csv")
-            historical_path = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
+            candidate_path = runtime_path("candidate_replay.csv")
+            historical_path = runtime_path("historical_shadow_replay.csv")
 
             candidate_ready = os.path.exists(candidate_path) and os.path.getsize(candidate_path) > 5000
             historical_ready = os.path.exists(historical_path) and os.path.getsize(historical_path) > 5000
@@ -15160,6 +15240,14 @@ class TradingBot:
             candidate["kalman_size_multiplier"] = float(candidate.get("kalman_size_multiplier", 1.0) or 1.0)
             if not kalman_allowed:
                 return False, ("live_buy_blocked:kalman_state_filter " f"product_id={product_id};reason={candidate.get('kalman_reason', '')}")
+
+            analog_gate = self._market_state_analog_gate_for_candidate(candidate)
+            candidate["analog_market_state_gate_available"] = bool(analog_gate.get("available", False))
+            candidate["analog_market_state_gate_allowed"] = bool(analog_gate.get("allowed", True))
+            candidate["analog_market_state_size_multiplier"] = float(analog_gate.get("size_multiplier", 1.0) or 1.0)
+            candidate["analog_market_state_gate_reason"] = str(analog_gate.get("reason", ""))
+            if not bool(analog_gate.get("allowed", True)):
+                return False, ("live_buy_blocked:analog_market_state_gate " f"product_id={product_id};reason={analog_gate.get('reason', '')}")
             if bool(ENABLE_REPLAY_POLICY_LIVE_BUY_GATE):
                 replay_gate = self._profitability_replay_gate_for_candidate(
                     product_id=product_id,
@@ -16721,7 +16809,7 @@ class TradingBot:
         Write adjusted council votes so each member can be graded against later outcomes.
         """
         try:
-            path = os.path.join(BASE_DIR, "council_votes.csv")
+            path = runtime_path("council_votes.csv")
 
             columns = [
                 "ts", "dt_utc", "dt_mst", "decision_id", "product_id", "agent", "strategy",
@@ -16969,7 +17057,7 @@ class TradingBot:
         stricter live-money quality gate converted it to SHADOW.
         """
         try:
-            path = os.path.join(BASE_DIR, "shadow_trades.csv")
+            path = runtime_path("shadow_trades.csv")
             columns = [
                 "ts",
                 "dt_utc",
@@ -17264,8 +17352,8 @@ class TradingBot:
         profiles: Dict[str, Dict[str, Any]] = {}
         paths = [
             (FOUR_PASS_PRODUCT_LIVE_GATE_CSV_PATH, "gate"),
-            (os.path.join(BASE_DIR, "trade_frequency_estimate.csv"), "freq"),
-            (os.path.join(BASE_DIR, "four_pass_sell_path_replay.csv"), "sell_path"),
+            (runtime_path("trade_frequency_estimate.csv"), "freq"),
+            (runtime_path("four_pass_sell_path_replay.csv"), "sell_path"),
         ]
         for path, kind in paths:
             try:
@@ -20412,7 +20500,7 @@ class TradingBot:
         try:
             self._ensure_agent_side_ratings_header()
 
-            four_pass_path = os.path.join(BASE_DIR, "four_pass_final_agent_ratings.csv")
+            four_pass_path = runtime_path("four_pass_final_agent_ratings.csv")
             if os.path.exists(four_pass_path) and os.path.getsize(four_pass_path) > 0:
                 four = pd.read_csv(four_pass_path)
                 if not four.empty and "agent" in four.columns:
@@ -21078,6 +21166,76 @@ class TradingBot:
         except Exception as exc:
             module_exception(MODULE_NAME, "write_historical_replay_summary_failed", exc, data={"product_id": product_id, "traceback": traceback.format_exc()}, also_overall=False)
 
+    def _startup_calculation_is_complete_for_research(self) -> bool:
+        try:
+            status = self._calculation_status()
+            return bool(status.get("full_viewer_unlocked") or status.get("calculation_work_complete") or status.get("calculation_complete_latched"))
+        except Exception:
+            return False
+
+    def _continuous_research_loop(self) -> None:
+        try:
+            time.sleep(float(CONTINUOUS_RESEARCH_START_DELAY_SEC))
+            while not self._continuous_research_stop_event.is_set():
+                try:
+                    if run_continuous_research_cycle is None:
+                        module_debug(MODULE_NAME, "continuous_research_unavailable", data={"reason": "continuous_research_engine_import_failed"}, level="WARN", also_overall=True)
+                        return
+                    if bool(CONTINUOUS_RESEARCH_REQUIRE_STARTUP_COMPLETE) and not self._startup_calculation_is_complete_for_research():
+                        time.sleep(10.0); continue
+                    now_value = now_ts()
+                    if now_value - float(self._last_continuous_research_cycle_ts or 0.0) < float(CONTINUOUS_RESEARCH_INTERVAL_SEC):
+                        time.sleep(5.0); continue
+                    self._last_continuous_research_cycle_ts = now_value
+                    result = run_continuous_research_cycle()
+                    module_debug(MODULE_NAME, "continuous_research_cycle_completed", data=result, level="INFO" if result.get("status") == "ok" else "WARN", also_overall=True)
+                except Exception as exc:
+                    module_exception(MODULE_NAME, "continuous_research_loop_cycle_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+                time.sleep(5.0)
+        except Exception as exc:
+            module_exception(MODULE_NAME, "continuous_research_loop_failed", exc, data={"traceback": traceback.format_exc()}, also_overall=True)
+
+    def _start_continuous_research_thread(self) -> None:
+        if not bool(ENABLE_CONTINUOUS_RESEARCH_ENGINE):
+            return
+        if self._continuous_research_thread and self._continuous_research_thread.is_alive():
+            return
+        self._continuous_research_thread = threading.Thread(target=self._continuous_research_loop, name="continuous_research_engine", daemon=True)
+        self._continuous_research_thread.start()
+        module_debug(MODULE_NAME, "continuous_research_thread_started", data={"interval_sec": float(CONTINUOUS_RESEARCH_INTERVAL_SEC), "start_delay_sec": float(CONTINUOUS_RESEARCH_START_DELAY_SEC)}, level="INFO", also_overall=True)
+
+    def _load_market_state_analog_summary_map(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            now_value = now_ts()
+            if self._market_state_analog_cache and now_value - float(self._market_state_analog_cache_ts or 0.0) < 15.0:
+                return dict(self._market_state_analog_cache)
+            df = self._read_csv_tail_for_bot(MARKET_STATE_ANALOG_SUMMARY_CSV_PATH, max_lines=5000)
+            if df.empty or "product_id" not in df.columns:
+                self._market_state_analog_cache = {}; self._market_state_analog_cache_ts = now_value; return {}
+            if "ts" in df.columns:
+                df["ts"] = pd.to_numeric(df["ts"], errors="coerce").fillna(0.0); df = df.sort_values("ts")
+            latest = df.groupby("product_id", as_index=False).tail(1)
+            result = {str(row.get("product_id", "")): row.to_dict() for _, row in latest.iterrows()}
+            self._market_state_analog_cache = result; self._market_state_analog_cache_ts = now_value
+            return dict(result)
+        except Exception:
+            return {}
+
+    def _market_state_analog_gate_for_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(ENABLE_MARKET_STATE_ANALOG_LIVE_GATE):
+            return {"available": False, "allowed": True, "size_multiplier": 1.0, "reason": "analog_gate_disabled"}
+        try:
+            product_id = str(candidate.get("product_id", ""))
+            row = dict(self._load_market_state_analog_summary_map().get(product_id, {}) or {})
+            if not row:
+                return {"available": False, "allowed": True, "size_multiplier": float(ANALOG_SIZE_DOWN_WHEN_MISSING), "reason": f"analog_summary_missing_size_down product_id={product_id}"}
+            sample_count = int(float(row.get("analog_sample_count", 0) or 0)); avg_bps = float(row.get("analog_avg_outcome_bps", 0.0) or 0.0); win_rate = float(row.get("analog_win_rate", 0.0) or 0.0); size_multiplier = float(row.get("size_multiplier", 1.0) or 1.0); analog_gate = str(row.get("analog_gate", ""))
+            if sample_count >= int(ANALOG_MIN_SAMPLE_COUNT_TO_BLOCK) and (avg_bps <= float(ANALOG_BLOCK_AVG_BPS_BELOW) or win_rate <= float(ANALOG_BLOCK_WIN_RATE_BELOW)):
+                return {"available": True, "allowed": False, "size_multiplier": 0.0, "sample_count": sample_count, "reason": f"analog_market_state_blocked;gate={analog_gate};sample_count={sample_count};avg_bps={avg_bps:.2f};win_rate={win_rate:.3f};source_reason={row.get('reason', '')}"}
+            return {"available": True, "allowed": True, "size_multiplier": max(0.0, min(1.0, size_multiplier)), "sample_count": sample_count, "reason": f"analog_market_state_allowed;gate={analog_gate};sample_count={sample_count};avg_bps={avg_bps:.2f};win_rate={win_rate:.3f};source_reason={row.get('reason', '')}"}
+        except Exception as exc:
+            return {"available": False, "allowed": True, "size_multiplier": float(ANALOG_SIZE_DOWN_WHEN_MISSING), "reason": f"analog_market_state_gate_error_size_down:{exc}"}
+
     def _calculation_status(self, *, include_readiness: bool = True, readiness_override: Optional[Dict[str, Any]] = None, force: bool = False) -> Dict[str, Any]:
         now_value = now_ts()
         if (not bool(force) and getattr(self, "_calculation_status_cache", None) and now_value - float(getattr(self, "_calculation_status_cache_ts", 0.0) or 0.0) < float(CALCULATION_STATUS_RESCAN_EVERY_SEC)):
@@ -21179,6 +21337,8 @@ class TradingBot:
             calculation_started_ts = float(getattr(self, "_calculation_started_ts", now_ts()) or now_ts())
             calculation_elapsed_sec = max(0.0, now_ts() - calculation_started_ts)
             status = {"ts": now_ts(), "fast_calibration_core_available": bool(FAST_CALIBRATION_CORE_AVAILABLE), "fast_calibration_warning": ("C++ fast calibration core is unavailable; Python fallback is active. Restore the cpp folder / compiled fast_calibration_core if you want the fastest startup." if not bool(FAST_CALIBRATION_CORE_AVAILABLE) else ""), "fast_calibration_core_import_error": str(FAST_CALIBRATION_CORE_IMPORT_ERROR), "fast_calibration_core_batch_available": bool(FAST_CALIBRATION_CORE_AVAILABLE and fast_calibration_core is not None and hasattr(fast_calibration_core, "evaluate_best_windows_batch_from_arrays")), "calculation_started_ts": float(calculation_started_ts), "calculation_elapsed_sec": float(calculation_elapsed_sec), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "full_viewer_unlocked": bool(full_viewer_unlocked), "calculation_work_complete": bool(calculation_work_complete or latched_complete), "calculation_complete_latched": bool(latched_complete or calculation_work_complete), "calculation_complete_latch": latch, "overall_progress": float(max(0.0, min(1.0, overall_progress))), "overall_progress_pct": float(max(0.0, min(100.0, overall_progress * 100.0))), "phase_label": phase_label, "phase_progress": phase_totals, "product_count": int(len(PRODUCTS)), "complete_products": int(complete_products), "profit_ready_products": int(profit_ready_products), "blocked_products": int(blocked_products), "incomplete_products": int(len(PRODUCTS) - complete_products), "product_status": product_status, "historical_replay_worker_manifest": worker_manifest_progress, "readiness": readiness, "policy": {"viewer_require_full_startup_calculation": bool(VIEWER_REQUIRE_FULL_STARTUP_CALCULATION), "require_full_startup_calculation_for_live_buy": bool(REQUIRE_FULL_STARTUP_CALCULATION_FOR_LIVE_BUY), "require_profit_replay_verdict_for_live_buy": bool(REQUIRE_PROFIT_REPLAY_VERDICT_FOR_LIVE_BUY), "accept_unprofitable_verdict_as_complete": bool(STARTUP_CALC_ACCEPT_UNPROFITABLE_VERDICT_AS_COMPLETE), "live_execution_exchange": "binance_us", "source_of_truth": "binance_us", "binance_bulk_historical_backfill_enabled": bool(ENABLE_BINANCE_BULK_HISTORICAL_BACKFILL), "binance_live_execution_enabled": bool(ENABLE_BINANCE_LIVE_EXECUTION), "binance_spot_trading_enabled": bool(BINANCE_US_ENABLE_SPOT_TRADING), "binance_live_real_order_mode": True, "binance_allow_real_orders": bool(BINANCE_US_ALLOW_REAL_ORDERS), "historical_source_priority": list(HISTORICAL_CANDLE_SOURCE_PRIORITY), "historical_replay_parallel_startup_enabled": bool(HIST_REPLAY_PARALLEL_STARTUP_ENABLED), "historical_replay_startup_parallel_jobs": int(HIST_REPLAY_STARTUP_PARALLEL_JOBS), "historical_replay_max_parallel_fetches": int(HIST_REPLAY_MAX_PARALLEL_FETCHES), "incremental_gapfill_enabled": True, "macro_fetch_concurrency": int(MACRO_FETCH_CONCURRENCY), "history_fetch_concurrency": int(HISTORY_FETCH_CONCURRENCY), "historical_replay_worker_architecture_enabled": bool(ENABLE_HISTORICAL_REPLAY_WORKER_ARCHITECTURE), "historical_replay_process_pool_enabled": bool(ENABLE_HISTORICAL_REPLAY_PROCESS_POOL), "historical_replay_process_workers": int(HISTORICAL_REPLAY_PROCESS_WORKERS), "full_replay_math_in_process_workers": bool(ENABLE_FULL_REPLAY_MATH_IN_PROCESS_WORKERS), "historical_replay_worker_import_ok": bool(HISTORICAL_REPLAY_WORKER_IMPORT_OK), "historical_replay_worker_import_error": str(HISTORICAL_REPLAY_WORKER_IMPORT_ERROR), "run_full_replay_worker_available": bool(run_full_replay_worker_job is not None), "replay_exchange_fee_comparison_enabled": bool(ENABLE_REPLAY_EXCHANGE_FEE_COMPARISON), "replay_primary_fee_model": "binance_us", "replay_fee_scenarios": list(REPLAY_FEE_SCENARIOS), "replay_comparison_fee_model": "none", "binance_us_comparison_maker_fee_bps": float(BINANCE_US_COMPARISON_MAKER_FEE_BPS), "binance_us_comparison_taker_fee_bps": float(BINANCE_US_COMPARISON_TAKER_FEE_BPS), "binance_us_tier0_maker_fee_bps": float(BINANCE_US_TIER0_MAKER_FEE_BPS), "binance_us_tier0_taker_fee_bps": float(BINANCE_US_TIER0_TAKER_FEE_BPS)}}
+            if bool(status.get("calculation_complete_latched")) or bool(status.get("calculation_work_complete")) or bool(status.get("full_viewer_unlocked")):
+                status = _normalize_completed_calculation_status(status, source="calculation_status_complete")
             if bool(status.get("full_viewer_unlocked")) and not bool(self._load_calculation_complete_latch().get("calculation_complete_latched")):
                 self._write_calculation_complete_latch(data=status)
                 try:
@@ -21200,6 +21360,7 @@ class TradingBot:
         latch = self._load_calculation_complete_latch()
         if bool(latch.get("calculation_complete_latched")):
             status.update(latch)
+            status = _normalize_completed_calculation_status(status, source="calculation_complete_latch")
             status["full_viewer_unlocked"] = True
             status["calculation_work_complete"] = True
             status["calculation_complete_latched"] = True
@@ -23432,7 +23593,7 @@ class TradingBot:
             ].copy()
             if sell_decisions.empty:
                 return
-            out_path = os.path.join(BASE_DIR, "sell_outcomes.csv")
+            out_path = runtime_path("sell_outcomes.csv")
             normalize_sell_outcomes_csv(out_path)
 
             existing_keys = set()
@@ -23597,10 +23758,10 @@ class TradingBot:
         based on what the final council decided.
         """
         try:
-            votes_path = os.path.join(BASE_DIR, "council_votes.csv")
+            votes_path = runtime_path("council_votes.csv")
             trade_outcomes_path = TRADE_OUTCOMES_CSV_PATH
             observation_outcomes_path = COUNCIL_OBSERVATION_OUTCOMES_CSV_PATH
-            sell_outcomes_path = os.path.join(BASE_DIR, "sell_outcomes.csv")
+            sell_outcomes_path = runtime_path("sell_outcomes.csv")
             out_path = AGENT_PERFORMANCE_CSV_PATH
 
             if not os.path.exists(votes_path):
@@ -24611,6 +24772,19 @@ class TradingBot:
         os.makedirs(HISTORICAL_REPLAY_WORKER_OUTPUT_DIR, exist_ok=True)
         return ensure_manifest(path=HISTORICAL_REPLAY_MANIFEST_JSON_PATH, products=list(PRODUCTS), timeframes=list(HISTORICAL_REPLAY_TIMEFRAMES), output_dir=HISTORICAL_REPLAY_WORKER_OUTPUT_DIR)
 
+    def _historical_replay_manifest_all_done(self) -> Tuple[bool, Dict[str, Any]]:
+        try:
+            manifest = self._load_historical_replay_manifest()
+            jobs = manifest.get("jobs", {}) or {}
+            if not jobs:
+                return False, {"reason": "no_jobs"}
+            completed_statuses = {"merged", "done", "completed", "success"}
+            total_jobs = len(jobs)
+            done_jobs = sum(1 for job in jobs.values() if str(job.get("status", "")).strip().lower() in completed_statuses)
+            return done_jobs >= total_jobs, {"total_jobs": total_jobs, "done_jobs": done_jobs, "pending_jobs": max(0, total_jobs - done_jobs)}
+        except Exception as exc:
+            return False, {"reason": f"manifest_check_failed:{exc}"}
+
     def _load_historical_replay_manifest(self) -> Dict[str, Any]:
         manifest = load_manifest(HISTORICAL_REPLAY_MANIFEST_JSON_PATH)
         if not manifest or "jobs" not in manifest:
@@ -24755,7 +24929,7 @@ class TradingBot:
             return {}
 
     def _write_calculation_complete_latch(self, data: Optional[Dict[str, Any]] = None) -> None:
-        payload = dict(data or {})
+        payload = _normalize_completed_calculation_status(dict(data or {}), source="calculation_complete_latch")
         payload.setdefault("calculation_complete_latched", True)
         payload.setdefault("latched_ts", now_ts())
         payload.setdefault("dt_mst", datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"))
@@ -26101,8 +26275,13 @@ class TradingBot:
                         0.0,
                         float(KALMAN_SIZE_MULTIPLIER_MAX),
                     )
+                    analog_size_multiplier = clamp_float(
+                        float(candidate.get("analog_market_state_size_multiplier", 1.0) or 1.0),
+                        0.0,
+                        1.0,
+                    )
                     combined_risk_multiplier = clamp_float(
-                        risk_size_multiplier * context_size_multiplier * feature_size_multiplier * markov_size_multiplier * kalman_size_multiplier,
+                        risk_size_multiplier * context_size_multiplier * feature_size_multiplier * markov_size_multiplier * kalman_size_multiplier * analog_size_multiplier,
                         0.0,
                         float(RISK_INTELLIGENCE_MAX_SIZE_MULTIPLIER),
                     )
@@ -26123,6 +26302,8 @@ class TradingBot:
                         f"feature_size_multiplier={feature_size_multiplier:.3f};"
                         f"markov_size_multiplier={markov_size_multiplier:.3f};"
                         f"kalman_size_multiplier={kalman_size_multiplier:.3f};"
+                        f"analog_size_multiplier={analog_size_multiplier:.3f};"
+                        f"analog_reason={candidate.get('analog_market_state_gate_reason', '')};"
                         f"combined_risk_multiplier={combined_risk_multiplier:.3f};"
                         f"risk_reason={candidate.get('risk_live_gate_reason', '')};"
                         f"context_reason={candidate.get('risk_context_gate_reason', '')};"

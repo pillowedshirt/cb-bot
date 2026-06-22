@@ -8,6 +8,27 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from io import StringIO
 from typing import Any, Dict
+try:
+    from runtime_paths import (
+        CSV_ROOT_DIR, DEBUG_DIR, RESEARCH_DIR, ensure_runtime_dirs,
+        migrate_root_runtime_files_to_csv_tree, runtime_path, sidecar_meta_path,
+        write_generated_file_meta,
+    )
+except Exception:
+    CSV_ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CSVs")
+    DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    RESEARCH_DIR = os.path.join(CSV_ROOT_DIR, "09_continuous_research")
+    def ensure_runtime_dirs() -> None:
+        os.makedirs(CSV_ROOT_DIR, exist_ok=True); os.makedirs(DEBUG_DIR, exist_ok=True); os.makedirs(RESEARCH_DIR, exist_ok=True)
+    def migrate_root_runtime_files_to_csv_tree() -> Dict[str, object]:
+        return {"moved": [], "skipped": [], "errors": ["runtime_paths_import_failed"]}
+    def runtime_path(filename: str) -> str:
+        ensure_runtime_dirs(); return os.path.join(CSV_ROOT_DIR, os.path.basename(str(filename)))
+    def sidecar_meta_path(path: str) -> str:
+        return f"{path}.meta.json"
+    def write_generated_file_meta(path: str, reason: str = "") -> None:
+        pass
+
 from urllib.parse import quote
 
 import pandas as pd
@@ -40,49 +61,49 @@ MODULE_NAME = "viewer"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 load_dotenv(ENV_PATH, override=True)
-VIEWER_SNAPSHOT_PATH = os.path.join(BASE_DIR, "viewer_snapshot.json")
+VIEWER_SNAPSHOT_PATH = runtime_path("viewer_snapshot.json")
 VIEWER_SNAPSHOT_CSV_SAFE_PATH = VIEWER_SNAPSHOT_PATH
-CALCULATION_STATUS_JSON_PATH = os.path.join(BASE_DIR, "calculation_status.json")
-CALCULATION_COMPLETE_LATCH_JSON_PATH = os.path.join(BASE_DIR, "calculation_complete_latch.json")
-CALIBRATION_CSV_PATH = os.path.join(BASE_DIR, "calibration.csv")
-POST_PATCH_AUDIT_CSV_PATH = os.path.join(BASE_DIR, "post_patch_audit.csv")
+CALCULATION_STATUS_JSON_PATH = runtime_path("calculation_status.json")
+CALCULATION_COMPLETE_LATCH_JSON_PATH = runtime_path("calculation_complete_latch.json")
+CALIBRATION_CSV_PATH = runtime_path("calibration.csv")
+POST_PATCH_AUDIT_CSV_PATH = runtime_path("post_patch_audit.csv")
 NEXT_PATCH_GENERATION_VERSION = "post_patch_recalc_v2_2026_06_21"
 EXPECTED_PRIMARY_REPLAY_MIN_DAYS_COVERED = 85
 EXPECTED_REGIME_REPLAY_MIN_DAYS_COVERED = 340
 EXPECTED_PRIMARY_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
 EXPECTED_REGIME_REPLAY_MIN_ROWS_PER_PRODUCT = 8000
-MARKET_CSV_PATH = os.path.join(BASE_DIR, "market.csv")
-TRADES_CSV_PATH = os.path.join(BASE_DIR, "trades.csv")
-POSITION_TARGETS_PATH = os.path.join(BASE_DIR, "position_targets.csv")
-COUNCIL_DECISIONS_PATH = os.path.join(BASE_DIR, "council_decisions.csv")
-COUNCIL_VOTES_CSV_PATH = os.path.join(BASE_DIR, "council_votes.csv")
-ORDERS_CSV_PATH = os.path.join(BASE_DIR, "orders.csv")
-WALK_FORWARD_VALIDATION_PATH = os.path.join(BASE_DIR, "walk_forward_validation.csv")
-AGENT_ABLATION_PATH = os.path.join(BASE_DIR, "agent_ablation.csv")
-AI_FEATURE_IMPORTANCE_PATH = os.path.join(BASE_DIR, "ai_feature_importance.csv")
-ORDER_BOOK_SNAPSHOTS_PATH = os.path.join(BASE_DIR, "order_book_snapshots.csv")
-RISK_EV_CONFIDENCE_PATH = os.path.join(BASE_DIR, "risk_ev_confidence.csv")
-RISK_MONTE_CARLO_SUMMARY_PATH = os.path.join(BASE_DIR, "risk_monte_carlo_summary.csv")
-RISK_CONTEXT_PERFORMANCE_PATH = os.path.join(BASE_DIR, "risk_context_performance.csv")
-RISK_LIVE_GATE_PATH = os.path.join(BASE_DIR, "risk_live_gate.csv")
-FEATURE_OUTCOME_CORRELATION_PATH = os.path.join(BASE_DIR, "feature_outcome_correlation.csv")
-FEATURE_CORRELATION_MATRIX_PATH = os.path.join(BASE_DIR, "feature_correlation_matrix.csv")
-MARKOV_REGIME_TRANSITIONS_PATH = os.path.join(BASE_DIR, "markov_regime_transitions.csv")
-MARKOV_REGIME_POLICY_PATH = os.path.join(BASE_DIR, "markov_regime_policy.csv")
-KALMAN_FILTER_POLICY_PATH = os.path.join(BASE_DIR, "kalman_filter_policy.csv")
-KALMAN_LIVE_STATE_PATH = os.path.join(BASE_DIR, "kalman_live_state.csv")
-QUANT_STATE_SUMMARY_PATH = os.path.join(BASE_DIR, "quant_state_summary.csv")
-MICRO_HISTORY_CSV_PATH = os.path.join(BASE_DIR, "micro_history.csv")
-MACRO_DAY_CSV_PATH = os.path.join(BASE_DIR, "macro_day.csv")
-MACRO_WEEK_CSV_PATH = os.path.join(BASE_DIR, "macro_week.csv")
-SHADOW_TRADES_CSV_PATH = os.path.join(BASE_DIR, "shadow_trades.csv")
-SHADOW_SELL_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "shadow_sell_replay.csv")
-HISTORICAL_SHADOW_REPLAY_CSV_PATH = os.path.join(BASE_DIR, "historical_shadow_replay.csv")
-HISTORICAL_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_summary.csv")
-HISTORICAL_REPLAY_MANIFEST_JSON_PATH = os.path.join(BASE_DIR, "historical_replay_manifest.json")
-STARTUP_RUNTIME_INVENTORY_PATH = os.path.join(BASE_DIR, "startup_runtime_inventory.csv")
-HIST_REPLAY_15M_90D_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_15m_90d.csv")
-HIST_REPLAY_1H_365D_CSV_PATH = os.path.join(BASE_DIR, "historical_replay_1h_365d.csv")
+MARKET_CSV_PATH = runtime_path("market.csv")
+TRADES_CSV_PATH = runtime_path("trades.csv")
+POSITION_TARGETS_PATH = runtime_path("position_targets.csv")
+COUNCIL_DECISIONS_PATH = runtime_path("council_decisions.csv")
+COUNCIL_VOTES_CSV_PATH = runtime_path("council_votes.csv")
+ORDERS_CSV_PATH = runtime_path("orders.csv")
+WALK_FORWARD_VALIDATION_PATH = runtime_path("walk_forward_validation.csv")
+AGENT_ABLATION_PATH = runtime_path("agent_ablation.csv")
+AI_FEATURE_IMPORTANCE_PATH = runtime_path("ai_feature_importance.csv")
+ORDER_BOOK_SNAPSHOTS_PATH = runtime_path("order_book_snapshots.csv")
+RISK_EV_CONFIDENCE_PATH = runtime_path("risk_ev_confidence.csv")
+RISK_MONTE_CARLO_SUMMARY_PATH = runtime_path("risk_monte_carlo_summary.csv")
+RISK_CONTEXT_PERFORMANCE_PATH = runtime_path("risk_context_performance.csv")
+RISK_LIVE_GATE_PATH = runtime_path("risk_live_gate.csv")
+FEATURE_OUTCOME_CORRELATION_PATH = runtime_path("feature_outcome_correlation.csv")
+FEATURE_CORRELATION_MATRIX_PATH = runtime_path("feature_correlation_matrix.csv")
+MARKOV_REGIME_TRANSITIONS_PATH = runtime_path("markov_regime_transitions.csv")
+MARKOV_REGIME_POLICY_PATH = runtime_path("markov_regime_policy.csv")
+KALMAN_FILTER_POLICY_PATH = runtime_path("kalman_filter_policy.csv")
+KALMAN_LIVE_STATE_PATH = runtime_path("kalman_live_state.csv")
+QUANT_STATE_SUMMARY_PATH = runtime_path("quant_state_summary.csv")
+MICRO_HISTORY_CSV_PATH = runtime_path("micro_history.csv")
+MACRO_DAY_CSV_PATH = runtime_path("macro_day.csv")
+MACRO_WEEK_CSV_PATH = runtime_path("macro_week.csv")
+SHADOW_TRADES_CSV_PATH = runtime_path("shadow_trades.csv")
+SHADOW_SELL_REPLAY_CSV_PATH = runtime_path("shadow_sell_replay.csv")
+HISTORICAL_SHADOW_REPLAY_CSV_PATH = runtime_path("historical_shadow_replay.csv")
+HISTORICAL_REPLAY_SUMMARY_CSV_PATH = runtime_path("historical_replay_summary.csv")
+HISTORICAL_REPLAY_MANIFEST_JSON_PATH = runtime_path("historical_replay_manifest.json")
+STARTUP_RUNTIME_INVENTORY_PATH = runtime_path("startup_runtime_inventory.csv")
+HIST_REPLAY_15M_90D_CSV_PATH = runtime_path("historical_replay_15m_90d.csv")
+HIST_REPLAY_1H_365D_CSV_PATH = runtime_path("historical_replay_1h_365d.csv")
 
 STARTUP_CALC_REQUIRED_MICRO_ROWS_PER_PRODUCT = 120
 STARTUP_CALC_REQUIRED_15M_CANDLE_ROWS_PER_PRODUCT = int(90 * 24 * 4 * 0.92)
@@ -90,42 +111,46 @@ STARTUP_CALC_REQUIRED_1H_CANDLE_ROWS_PER_PRODUCT = int(365 * 24 * 0.92)
 STARTUP_CALC_REQUIRED_15M_REPLAY_ROWS_PER_PRODUCT = 300
 STARTUP_CALC_REQUIRED_1H_REPLAY_ROWS_PER_PRODUCT = 100
 
-STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "strategy_variant_replay_summary.csv")
-REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH = os.path.join(BASE_DIR, "replay_fee_comparison_summary.csv")
-EXCHANGE_PRODUCT_MAP_CSV_PATH = os.path.join(BASE_DIR, "exchange_product_map.csv")
-ACCOUNT_BALANCE_DIAGNOSTICS_PATH = os.path.join(BASE_DIR, "account_balance_diagnostics.csv")
-LIVE_TRADE_BLOCKERS_PATH = os.path.join(BASE_DIR, "live_trade_blockers.csv")
-MISSED_OPPORTUNITIES_CSV_PATH = os.path.join(BASE_DIR, "missed_opportunities.csv")
-CHART_1M_7D_CSV_PATH = os.path.join(BASE_DIR, "chart_1m_7d.csv")
-CHART_15M_30D_CSV_PATH = os.path.join(BASE_DIR, "chart_15m_30d.csv")
-CHART_1H_90D_CSV_PATH = os.path.join(BASE_DIR, "chart_1h_90d.csv")
-CHART_1D_2Y_CSV_PATH = os.path.join(BASE_DIR, "chart_1d_2y.csv")
-CANDIDATE_REPLAY_PATH = os.path.join(BASE_DIR, "candidate_replay.csv")
-AGENT_ADJUSTMENTS_PATH = os.path.join(BASE_DIR, "agent_adjustments.csv")
-AGENT_PERFORMANCE_PATH = os.path.join(BASE_DIR, "agent_performance.csv")
-AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH = os.path.join(BASE_DIR, "agent_component_replay_attribution.csv")
-AGENT_TRADE_POLICY_CSV_PATH = os.path.join(BASE_DIR, "agent_trade_policy.csv")
-AGENT_SIDE_RATINGS_PATH = os.path.join(BASE_DIR, "agent_side_ratings.csv")
-FOUR_PASS_AGENT_BUY_PATH = os.path.join(BASE_DIR, "four_pass_agent_buy_timing.csv")
-FOUR_PASS_COUNCIL_BUY_PATH = os.path.join(BASE_DIR, "four_pass_council_buy_timing.csv")
-FOUR_PASS_AGENT_SELL_PATH = os.path.join(BASE_DIR, "four_pass_agent_sell_timing.csv")
-FOUR_PASS_COUNCIL_SELL_PATH = os.path.join(BASE_DIR, "four_pass_council_sell_timing.csv")
-FOUR_PASS_FINAL_AGENT_RATINGS_PATH = os.path.join(BASE_DIR, "four_pass_final_agent_ratings.csv")
-FOUR_PASS_PROFITABILITY_SUMMARY_PATH = os.path.join(BASE_DIR, "four_pass_profitability_summary.csv")
-FOUR_PASS_AGENT_CONTEXT_RATINGS_PATH = os.path.join(BASE_DIR, "four_pass_agent_context_ratings.csv")
-FOUR_PASS_SELL_PATH_REPLAY_PATH = os.path.join(BASE_DIR, "four_pass_sell_path_replay.csv")
-FOUR_PASS_PURGED_WALK_FORWARD_PATH = os.path.join(BASE_DIR, "four_pass_purged_walk_forward.csv")
-FOUR_PASS_PRODUCT_LIVE_GATE_PATH = os.path.join(BASE_DIR, "four_pass_product_live_gate.csv")
-PRODUCT_COOLDOWNS_PATH = os.path.join(BASE_DIR, "product_cooldowns.csv")
-AGENT_DECISION_INFLUENCE_PATH = os.path.join(BASE_DIR, "agent_decision_influence.csv")
-PRODUCT_AGENT_INFLUENCE_PATH = os.path.join(BASE_DIR, "product_agent_influence.csv")
-TRADE_FREQUENCY_ESTIMATE_PATH = os.path.join(BASE_DIR, "trade_frequency_estimate.csv")
-FIFTH_PASS_LIVE_STYLE_REPLAY_PATH = os.path.join(BASE_DIR, "fifth_pass_live_style_replay.csv")
-FIFTH_PASS_LIVE_STYLE_SUMMARY_PATH = os.path.join(BASE_DIR, "fifth_pass_live_style_summary.csv")
-FIFTH_PASS_PRODUCT_CONTRIBUTION_PATH = os.path.join(BASE_DIR, "fifth_pass_product_contribution.csv")
-FIFTH_PASS_BLOCKERS_PATH = os.path.join(BASE_DIR, "fifth_pass_blockers.csv")
-APPROVED_BUT_SHADOWED_PATH = os.path.join(BASE_DIR, "approved_but_shadowed.csv")
-DECISION_AUDIT_PATH = os.path.join(BASE_DIR, "decision_audit.csv")
+STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH = runtime_path("strategy_variant_replay_summary.csv")
+REPLAY_FEE_COMPARISON_SUMMARY_CSV_PATH = runtime_path("replay_fee_comparison_summary.csv")
+EXCHANGE_PRODUCT_MAP_CSV_PATH = runtime_path("exchange_product_map.csv")
+ACCOUNT_BALANCE_DIAGNOSTICS_PATH = runtime_path("account_balance_diagnostics.csv")
+LIVE_TRADE_BLOCKERS_PATH = runtime_path("live_trade_blockers.csv")
+MISSED_OPPORTUNITIES_CSV_PATH = runtime_path("missed_opportunities.csv")
+CHART_1M_7D_CSV_PATH = runtime_path("chart_1m_7d.csv")
+CHART_15M_30D_CSV_PATH = runtime_path("chart_15m_30d.csv")
+CHART_1H_90D_CSV_PATH = runtime_path("chart_1h_90d.csv")
+CHART_1D_2Y_CSV_PATH = runtime_path("chart_1d_2y.csv")
+CANDIDATE_REPLAY_PATH = runtime_path("candidate_replay.csv")
+AGENT_ADJUSTMENTS_PATH = runtime_path("agent_adjustments.csv")
+AGENT_PERFORMANCE_PATH = runtime_path("agent_performance.csv")
+AGENT_COMPONENT_REPLAY_ATTRIBUTION_CSV_PATH = runtime_path("agent_component_replay_attribution.csv")
+AGENT_TRADE_POLICY_CSV_PATH = runtime_path("agent_trade_policy.csv")
+AGENT_SIDE_RATINGS_PATH = runtime_path("agent_side_ratings.csv")
+FOUR_PASS_AGENT_BUY_PATH = runtime_path("four_pass_agent_buy_timing.csv")
+FOUR_PASS_COUNCIL_BUY_PATH = runtime_path("four_pass_council_buy_timing.csv")
+FOUR_PASS_AGENT_SELL_PATH = runtime_path("four_pass_agent_sell_timing.csv")
+FOUR_PASS_COUNCIL_SELL_PATH = runtime_path("four_pass_council_sell_timing.csv")
+FOUR_PASS_FINAL_AGENT_RATINGS_PATH = runtime_path("four_pass_final_agent_ratings.csv")
+FOUR_PASS_PROFITABILITY_SUMMARY_PATH = runtime_path("four_pass_profitability_summary.csv")
+FOUR_PASS_AGENT_CONTEXT_RATINGS_PATH = runtime_path("four_pass_agent_context_ratings.csv")
+FOUR_PASS_SELL_PATH_REPLAY_PATH = runtime_path("four_pass_sell_path_replay.csv")
+FOUR_PASS_PURGED_WALK_FORWARD_PATH = runtime_path("four_pass_purged_walk_forward.csv")
+FOUR_PASS_PRODUCT_LIVE_GATE_PATH = runtime_path("four_pass_product_live_gate.csv")
+PRODUCT_COOLDOWNS_PATH = runtime_path("product_cooldowns.csv")
+AGENT_DECISION_INFLUENCE_PATH = runtime_path("agent_decision_influence.csv")
+PRODUCT_AGENT_INFLUENCE_PATH = runtime_path("product_agent_influence.csv")
+TRADE_FREQUENCY_ESTIMATE_PATH = runtime_path("trade_frequency_estimate.csv")
+FIFTH_PASS_LIVE_STYLE_REPLAY_PATH = runtime_path("fifth_pass_live_style_replay.csv")
+FIFTH_PASS_LIVE_STYLE_SUMMARY_PATH = runtime_path("fifth_pass_live_style_summary.csv")
+FIFTH_PASS_PRODUCT_CONTRIBUTION_PATH = runtime_path("fifth_pass_product_contribution.csv")
+FIFTH_PASS_BLOCKERS_PATH = runtime_path("fifth_pass_blockers.csv")
+APPROVED_BUT_SHADOWED_PATH = runtime_path("approved_but_shadowed.csv")
+CONTINUOUS_RESEARCH_STATUS_PATH = runtime_path("continuous_research_status.json")
+CONTINUOUS_RESEARCH_HISTORY_PATH = runtime_path("continuous_research_history.csv")
+MARKET_STATE_ANALOG_SUMMARY_PATH = runtime_path("market_state_analog_summary.csv")
+MARKET_STATE_ANALOG_MATCHES_PATH = runtime_path("market_state_analog_matches.csv")
+DECISION_AUDIT_PATH = runtime_path("decision_audit.csv")
 
 SNAPSHOT_STALE_WARN_SEC = 20.0
 CHART_STALE_WARN_SEC_DAY = 180.0
@@ -840,42 +865,36 @@ def _status_is_startup_complete(status: dict) -> bool:
         return False
 
 
-def _normalize_completed_calculation_status(status: dict, *, source: str) -> dict:
-    """Force completed startup status to stay completed.
-
-    Once startup is latched, the viewer must not go back to a fake loading bar
-    because live data freshness temporarily looks stale.
-    """
+def _normalize_completed_calculation_status(status: dict, source: str = "completed_status") -> dict:
     out = dict(status or {})
-    now_value = time.time()
-
-    out["ts"] = float(out.get("ts", 0.0) or now_value)
     out["full_viewer_unlocked"] = True
     out["calculation_work_complete"] = True
     out["calculation_complete_latched"] = True
+    out["phase_label"] = "Complete"
     out["overall_progress"] = 1.0
     out["overall_progress_pct"] = 100.0
-    out["phase_label"] = "Complete"
-
+    out["viewer_status_source"] = source
     phase_progress = dict(out.get("phase_progress") or {})
+    phase_progress["live_data"] = 1.0
     phase_progress["micro_backlog"] = 1.0
     phase_progress["historical_candle_backlog"] = 1.0
     phase_progress["historical_replay"] = 1.0
     phase_progress["replay_calibration_verdicts"] = 1.0
-    phase_progress["live_data"] = max(0.0, min(1.0, float(phase_progress.get("live_data", 1.0) or 1.0)))
     out["phase_progress"] = phase_progress
-
     product_status = out.get("product_status") or {}
     if isinstance(product_status, dict):
-        out["product_count"] = int(out.get("product_count", len(product_status)) or len(product_status))
-        out["complete_products"] = int(out.get("complete_products", len(product_status)) or len(product_status))
+        for _product_id, row in product_status.items():
+            if isinstance(row, dict):
+                row["complete"] = True
+                row["calculation_complete"] = True
+                row["historical_replay_progress"] = 1.0
+                row["calibration_verdict_progress"] = 1.0
+                row["micro_progress"] = 1.0
+                row["historical_candle_progress"] = 1.0
+        out["product_status"] = product_status
+        out["complete_products"] = len(product_status)
         out["incomplete_products"] = 0
-
-    out["viewer_status_source"] = source
-    out["viewer_status_reason"] = "startup completion latch exists, so viewer remains unlocked even if calculation_status.json is stale"
-
     return out
-
 
 def _synthesize_calculation_status_for_viewer(snapshot: dict) -> dict:
     """Viewer-side fallback when bot has not written calculation_status.json yet.
@@ -1405,7 +1424,7 @@ def get_available_products(snapshot: Dict[str, Any]) -> list[str]:
     if products:
         return products
 
-    fallback_paths = [os.path.join(BASE_DIR, "products_active.csv"), MARKET_CSV_PATH, COUNCIL_DECISIONS_PATH, POSITION_TARGETS_PATH]
+    fallback_paths = [runtime_path("products_active.csv"), MARKET_CSV_PATH, COUNCIL_DECISIONS_PATH, POSITION_TARGETS_PATH]
     for path in fallback_paths:
         try:
             frame = load_csv(path, usecols=["product_id"])
@@ -3820,6 +3839,54 @@ def render_startup_runtime_inventory_panel(startup_runtime_inventory_df):
         st.dataframe(inv[cols_to_show], width="stretch", hide_index=True)
 
 
+def render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df):
+    st.markdown("### Continuous Background Research")
+    cols = st.columns(4)
+    cols[0].metric("Research cycles", 0 if continuous_research_history_df is None else len(continuous_research_history_df))
+    cols[1].metric("Analog summaries", 0 if market_state_analog_summary_df is None else len(market_state_analog_summary_df))
+    cols[2].metric("Analog matches", 0 if market_state_analog_matches_df is None else len(market_state_analog_matches_df))
+    cols[3].metric("Research mode", "Active")
+    if market_state_analog_summary_df is not None and not market_state_analog_summary_df.empty:
+        df = market_state_analog_summary_df.copy()
+        for col in ["analog_avg_outcome_bps", "analog_win_rate", "analog_sample_count", "size_multiplier"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        if "ts" in df.columns:
+            df["ts"] = pd.to_numeric(df["ts"], errors="coerce").fillna(0.0)
+            df = df.sort_values("ts")
+        if "product_id" in df.columns:
+            latest = df.groupby("product_id", as_index=False).tail(1)
+            fig = go.Figure()
+            fig.add_bar(x=latest["product_id"].astype(str), y=latest.get("analog_avg_outcome_bps", 0.0), name="Analog avg outcome bps", hovertemplate="Product=%{x}<br>Analog avg=%{y:.2f} bps<extra></extra>")
+            if "analog_win_rate" in latest.columns:
+                fig.add_scatter(x=latest["product_id"].astype(str), y=latest["analog_win_rate"] * 100.0, mode="lines+markers", name="Analog win rate %", yaxis="y2", hovertemplate="Product=%{x}<br>Analog win rate=%{y:.1f}%<extra></extra>")
+            fig.add_hline(y=0.0)
+            fig.update_layout(title="Market-State Analog Research — Similar Historical Pattern Outcomes", yaxis=dict(title="Analog avg outcome bps"), yaxis2=dict(title="Analog win rate %", overlaying="y", side="right"))
+            st.plotly_chart(_quant_fig_layout(fig, "Market-State Analog Research", height=440), width="stretch")
+            fig2 = go.Figure()
+            fig2.add_bar(x=latest["product_id"].astype(str), y=latest.get("size_multiplier", 1.0), name="Analog size multiplier", text=latest["analog_gate"].astype(str) if "analog_gate" in latest.columns else None, hovertemplate="Product=%{x}<br>Multiplier=%{y:.2f}x<br>Gate=%{text}<extra></extra>")
+            st.plotly_chart(_quant_fig_layout(fig2, "Analog Market-State Live Gate Permission", height=360), width="stretch")
+    if market_state_analog_matches_df is not None and not market_state_analog_matches_df.empty:
+        matches = market_state_analog_matches_df.copy()
+        for col in ["similarity_score", "outcome_bps"]:
+            if col in matches.columns:
+                matches[col] = pd.to_numeric(matches[col], errors="coerce").fillna(0.0)
+        if {"product_id", "similarity_score", "outcome_bps"}.issubset(matches.columns):
+            recent = matches.tail(750)
+            fig = go.Figure()
+            fig.add_scatter(x=recent["similarity_score"], y=recent["outcome_bps"], mode="markers", text=recent["product_id"].astype(str), hovertemplate="Product=%{text}<br>Similarity=%{x:.3f}<br>Outcome=%{y:.2f} bps<extra></extra>", name="Analog matches")
+            fig.add_hline(y=0.0)
+            fig.update_xaxes(title="Similarity score")
+            fig.update_yaxes(title="Historical analog outcome bps")
+            st.plotly_chart(_quant_fig_layout(fig, "Analog Match Cloud — Similarity vs Historical Outcome", height=440), width="stretch")
+    with st.expander("Continuous research tables", expanded=False):
+        if continuous_research_history_df is not None and not continuous_research_history_df.empty:
+            st.markdown("#### Research cycle history"); st.dataframe(continuous_research_history_df.tail(100), width="stretch", hide_index=True)
+        if market_state_analog_summary_df is not None and not market_state_analog_summary_df.empty:
+            st.markdown("#### Market-state analog summary"); st.dataframe(market_state_analog_summary_df.tail(100), width="stretch", hide_index=True)
+        if market_state_analog_matches_df is not None and not market_state_analog_matches_df.empty:
+            st.markdown("#### Market-state analog matches"); st.dataframe(market_state_analog_matches_df.tail(250), width="stretch", hide_index=True)
+
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
@@ -3841,6 +3908,9 @@ def render_live_dashboard(selected, refresh_config):
     shadow_sell_replay_df = load_csv_tail(SHADOW_SELL_REPLAY_CSV_PATH, max_lines=20000)
     historical_replay_df = load_csv_tail(HISTORICAL_SHADOW_REPLAY_CSV_PATH, max_lines=50000)
     historical_replay_summary_df = load_csv_tail(HISTORICAL_REPLAY_SUMMARY_CSV_PATH, max_lines=5000)
+    continuous_research_history_df = load_csv_tail(CONTINUOUS_RESEARCH_HISTORY_PATH, max_lines=1000)
+    market_state_analog_summary_df = load_csv_tail(MARKET_STATE_ANALOG_SUMMARY_PATH, max_lines=5000)
+    market_state_analog_matches_df = load_csv_tail(MARKET_STATE_ANALOG_MATCHES_PATH, max_lines=10000)
     strategy_variant_replay_summary_df = load_csv_tail(
         STRATEGY_VARIANT_REPLAY_SUMMARY_CSV_PATH,
         max_lines=10000,
@@ -3894,6 +3964,9 @@ def render_live_dashboard(selected, refresh_config):
         )
     with st.expander("Startup runtime inventory", expanded=False):
         render_startup_runtime_inventory_panel(startup_runtime_inventory_df)
+
+    with st.expander("Continuous background research", expanded=True):
+        render_continuous_research_panel(continuous_research_history_df, market_state_analog_summary_df, market_state_analog_matches_df)
     with st.expander("Profitability diagnostics", expanded=True):
         render_profitability_diagnostics_panel()
     with st.expander("Strategy variant replay comparison", expanded=False):

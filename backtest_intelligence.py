@@ -8,6 +8,27 @@ import pickle
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+try:
+    from runtime_paths import (
+        CSV_ROOT_DIR, DEBUG_DIR, RESEARCH_DIR, ensure_runtime_dirs,
+        migrate_root_runtime_files_to_csv_tree, runtime_path, sidecar_meta_path,
+        write_generated_file_meta,
+    )
+except Exception:
+    CSV_ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CSVs")
+    DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    RESEARCH_DIR = os.path.join(CSV_ROOT_DIR, "09_continuous_research")
+    def ensure_runtime_dirs() -> None:
+        os.makedirs(CSV_ROOT_DIR, exist_ok=True); os.makedirs(DEBUG_DIR, exist_ok=True); os.makedirs(RESEARCH_DIR, exist_ok=True)
+    def migrate_root_runtime_files_to_csv_tree() -> Dict[str, object]:
+        return {"moved": [], "skipped": [], "errors": ["runtime_paths_import_failed"]}
+    def runtime_path(filename: str) -> str:
+        ensure_runtime_dirs(); return os.path.join(CSV_ROOT_DIR, os.path.basename(str(filename)))
+    def sidecar_meta_path(path: str) -> str:
+        return f"{path}.meta.json"
+    def write_generated_file_meta(path: str, reason: str = "") -> None:
+        pass
+
 
 import numpy as np
 import pandas as pd
@@ -530,7 +551,7 @@ def _candidate_rows(base_dir: str, *, min_product_rows: int) -> Tuple[List[List[
     The output is intentionally conservative for weak products and only gives
     small relief to strong products.
     """
-    frame = _read_csv(os.path.join(base_dir, "candidate_replay.csv"))
+    frame = _read_csv(runtime_path("candidate_replay.csv"))
     ts_value = _utc_ts()
     dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
@@ -756,7 +777,7 @@ def _candidate_rows(base_dir: str, *, min_product_rows: int) -> Tuple[List[List[
     return rows, recs
 
 def _sell_recommendation_rows(base_dir: str) -> List[List[Any]]:
-    frame = _read_csv(os.path.join(base_dir, "sell_outcomes.csv")); ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); rows: List[List[Any]] = []
+    frame = _read_csv(runtime_path("sell_outcomes.csv")); ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); rows: List[List[Any]] = []
     if frame.empty or "product_id" not in frame.columns:
         return rows
     frame["move_after_sell_bps"] = _numeric(frame, "move_after_sell_bps", 0.0); frame["realized_net_pnl_bps"] = _numeric(frame, "realized_net_pnl_bps", 0.0); frame["earnings_quality_score"] = _numeric(frame, "earnings_quality_score", 0.5)
@@ -787,7 +808,7 @@ def _agent_prior_rows(base_dir: str) -> List[List[Any]]:
     This creates useful Level 8 memory without allowing old replay rows to overpower
     new live trade evidence.
     """
-    perf = _read_csv(os.path.join(base_dir, "agent_performance.csv"))
+    perf = _read_csv(runtime_path("agent_performance.csv"))
     ts_value = _utc_ts()
     dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
@@ -895,7 +916,7 @@ def _agent_prior_rows(base_dir: str) -> List[List[Any]]:
 
 
 def _setup_performance_rows(base_dir: str) -> List[List[Any]]:
-    frame = _read_csv(os.path.join(base_dir, "candidate_replay.csv"))
+    frame = _read_csv(runtime_path("candidate_replay.csv"))
     ts_value = _utc_ts()
     dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
@@ -1080,7 +1101,7 @@ def _compact_setup_key(frame: pd.DataFrame) -> pd.Series:
 
 
 def _walk_forward_validation_rows(base_dir: str) -> List[List[Any]]:
-    frame = _read_csv(os.path.join(base_dir, "candidate_replay.csv"))
+    frame = _read_csv(runtime_path("candidate_replay.csv"))
     ts_value = _utc_ts()
     dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
@@ -1359,7 +1380,7 @@ def _infer_market_regime(frame: pd.DataFrame) -> pd.Series:
 def _four_pass_cache_key(base_dir: str, filenames: List[str]) -> str:
     parts = [FOUR_PASS_FEATURE_CACHE_VERSION]
     for filename in filenames:
-        path = os.path.join(base_dir, filename)
+        path = runtime_path(filename)
         try:
             stat = os.stat(path)
             parts.append(f"{filename}:{int(stat.st_mtime)}:{int(stat.st_size)}")
@@ -1596,9 +1617,9 @@ def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
     if not cached.empty:
         return cached
 
-    frame = _read_csv(os.path.join(base_dir, "candidate_replay.csv"))
+    frame = _read_csv(runtime_path("candidate_replay.csv"))
     if frame.empty:
-        frame = _read_csv(os.path.join(base_dir, "historical_shadow_replay.csv"))
+        frame = _read_csv(runtime_path("historical_shadow_replay.csv"))
     if frame.empty or "product_id" not in frame.columns:
         return pd.DataFrame()
     frame = frame.copy()
@@ -1828,7 +1849,7 @@ def _build_sell_training_frame(base_dir: str, council_buy_entries: pd.DataFrame)
     sell_frame["too_early"] = sell_frame["move_after_sell_bps"] >= 120.0
 
     external_frames = []
-    for path in [os.path.join(base_dir, "sell_outcomes.csv"), os.path.join(base_dir, "shadow_sell_replay.csv")]:
+    for path in [runtime_path("sell_outcomes.csv"), runtime_path("shadow_sell_replay.csv")]:
         ext = _read_csv(path)
         if not ext.empty and "product_id" in ext.columns:
             external_frames.append(ext.copy())
@@ -2600,9 +2621,9 @@ def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
 
 
 def _agent_ablation_rows(base_dir: str) -> List[List[Any]]:
-    votes = _read_csv(os.path.join(base_dir, "council_votes.csv"))
-    audit = _read_csv(os.path.join(base_dir, "decision_audit.csv"))
-    observations = _read_csv(os.path.join(base_dir, "council_observation_outcomes.csv"))
+    votes = _read_csv(runtime_path("council_votes.csv"))
+    audit = _read_csv(runtime_path("decision_audit.csv"))
+    observations = _read_csv(runtime_path("council_observation_outcomes.csv"))
     ts_value = _utc_ts()
     dt_value = _utc_dt(ts_value)
     rows: List[List[Any]] = []
@@ -2696,42 +2717,42 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     four_pass = _four_pass_backtest_outputs(base_dir)
 
 
-    recommendations_path = os.path.join(base_dir, "backtest_recommendations.csv")
-    sell_recommendations_path = os.path.join(base_dir, "backtest_sell_recommendations.csv")
-    agent_priors_path = os.path.join(base_dir, "backtest_agent_priors.csv")
-    setup_performance_path = os.path.join(base_dir, "backtest_setup_performance.csv")
-    walk_forward_path = os.path.join(base_dir, "walk_forward_validation.csv")
-    agent_ablation_path = os.path.join(base_dir, "agent_ablation.csv")
-    four_pass_agent_buy_path = os.path.join(base_dir, "four_pass_agent_buy_timing.csv")
-    four_pass_council_buy_path = os.path.join(base_dir, "four_pass_council_buy_timing.csv")
-    four_pass_agent_sell_path = os.path.join(base_dir, "four_pass_agent_sell_timing.csv")
-    four_pass_council_sell_path = os.path.join(base_dir, "four_pass_council_sell_timing.csv")
-    four_pass_final_agent_ratings_path = os.path.join(base_dir, "four_pass_final_agent_ratings.csv")
-    four_pass_profitability_summary_path = os.path.join(base_dir, "four_pass_profitability_summary.csv")
-    four_pass_agent_context_ratings_path = os.path.join(base_dir, "four_pass_agent_context_ratings.csv")
-    four_pass_sell_path_replay_path = os.path.join(base_dir, "four_pass_sell_path_replay.csv")
-    four_pass_purged_walk_forward_path = os.path.join(base_dir, "four_pass_purged_walk_forward.csv")
-    four_pass_product_live_gate_path = os.path.join(base_dir, "four_pass_product_live_gate.csv")
-    product_cooldowns_path = os.path.join(base_dir, "product_cooldowns.csv")
-    feature_store_summary_path = os.path.join(base_dir, "feature_store_summary.csv")
-    agent_decision_influence_path = os.path.join(base_dir, "agent_decision_influence.csv")
-    product_agent_influence_path = os.path.join(base_dir, "product_agent_influence.csv")
-    trade_frequency_estimate_path = os.path.join(base_dir, "trade_frequency_estimate.csv")
-    fifth_pass_replay_path = os.path.join(base_dir, "fifth_pass_live_style_replay.csv")
-    fifth_pass_summary_path = os.path.join(base_dir, "fifth_pass_live_style_summary.csv")
-    fifth_pass_product_contribution_path = os.path.join(base_dir, "fifth_pass_product_contribution.csv")
-    fifth_pass_blockers_path = os.path.join(base_dir, "fifth_pass_blockers.csv")
-    risk_ev_confidence_path = os.path.join(base_dir, "risk_ev_confidence.csv")
-    risk_monte_carlo_summary_path = os.path.join(base_dir, "risk_monte_carlo_summary.csv")
-    risk_context_performance_path = os.path.join(base_dir, "risk_context_performance.csv")
-    risk_live_gate_path = os.path.join(base_dir, "risk_live_gate.csv")
-    feature_outcome_correlation_path = os.path.join(base_dir, "feature_outcome_correlation.csv")
-    feature_correlation_matrix_path = os.path.join(base_dir, "feature_correlation_matrix.csv")
-    markov_regime_transitions_path = os.path.join(base_dir, "markov_regime_transitions.csv")
-    markov_regime_policy_path = os.path.join(base_dir, "markov_regime_policy.csv")
-    kalman_filter_policy_path = os.path.join(base_dir, "kalman_filter_policy.csv")
-    quant_state_summary_path = os.path.join(base_dir, "quant_state_summary.csv")
-    summary_path = os.path.join(base_dir, "backtest_summary.csv")
+    recommendations_path = runtime_path("backtest_recommendations.csv")
+    sell_recommendations_path = runtime_path("backtest_sell_recommendations.csv")
+    agent_priors_path = runtime_path("backtest_agent_priors.csv")
+    setup_performance_path = runtime_path("backtest_setup_performance.csv")
+    walk_forward_path = runtime_path("walk_forward_validation.csv")
+    agent_ablation_path = runtime_path("agent_ablation.csv")
+    four_pass_agent_buy_path = runtime_path("four_pass_agent_buy_timing.csv")
+    four_pass_council_buy_path = runtime_path("four_pass_council_buy_timing.csv")
+    four_pass_agent_sell_path = runtime_path("four_pass_agent_sell_timing.csv")
+    four_pass_council_sell_path = runtime_path("four_pass_council_sell_timing.csv")
+    four_pass_final_agent_ratings_path = runtime_path("four_pass_final_agent_ratings.csv")
+    four_pass_profitability_summary_path = runtime_path("four_pass_profitability_summary.csv")
+    four_pass_agent_context_ratings_path = runtime_path("four_pass_agent_context_ratings.csv")
+    four_pass_sell_path_replay_path = runtime_path("four_pass_sell_path_replay.csv")
+    four_pass_purged_walk_forward_path = runtime_path("four_pass_purged_walk_forward.csv")
+    four_pass_product_live_gate_path = runtime_path("four_pass_product_live_gate.csv")
+    product_cooldowns_path = runtime_path("product_cooldowns.csv")
+    feature_store_summary_path = runtime_path("feature_store_summary.csv")
+    agent_decision_influence_path = runtime_path("agent_decision_influence.csv")
+    product_agent_influence_path = runtime_path("product_agent_influence.csv")
+    trade_frequency_estimate_path = runtime_path("trade_frequency_estimate.csv")
+    fifth_pass_replay_path = runtime_path("fifth_pass_live_style_replay.csv")
+    fifth_pass_summary_path = runtime_path("fifth_pass_live_style_summary.csv")
+    fifth_pass_product_contribution_path = runtime_path("fifth_pass_product_contribution.csv")
+    fifth_pass_blockers_path = runtime_path("fifth_pass_blockers.csv")
+    risk_ev_confidence_path = runtime_path("risk_ev_confidence.csv")
+    risk_monte_carlo_summary_path = runtime_path("risk_monte_carlo_summary.csv")
+    risk_context_performance_path = runtime_path("risk_context_performance.csv")
+    risk_live_gate_path = runtime_path("risk_live_gate.csv")
+    feature_outcome_correlation_path = runtime_path("feature_outcome_correlation.csv")
+    feature_correlation_matrix_path = runtime_path("feature_correlation_matrix.csv")
+    markov_regime_transitions_path = runtime_path("markov_regime_transitions.csv")
+    markov_regime_policy_path = runtime_path("markov_regime_policy.csv")
+    kalman_filter_policy_path = runtime_path("kalman_filter_policy.csv")
+    quant_state_summary_path = runtime_path("quant_state_summary.csv")
+    summary_path = runtime_path("backtest_summary.csv")
 
     _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
     _write_rows(sell_recommendations_path, BACKTEST_SELL_RECOMMENDATIONS_COLUMNS, sell_rows)

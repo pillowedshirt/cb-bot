@@ -415,12 +415,13 @@ class Level8Council:
     """Outcome-adaptive council with an 80% maximum portfolio deployment."""
 
     def __init__(self) -> None:
-        # Start risky so the bot learns from real outcomes.
-        self.base_buy_threshold = 0.30
+        # High-conviction buying:
+        # fewer live buys, stronger proof required.
+        self.base_buy_threshold = 0.38
         self.base_sell_threshold = 0.44
 
-        self.min_buy_threshold = 0.18
-        self.max_buy_threshold = 0.76
+        self.min_buy_threshold = 0.30
+        self.max_buy_threshold = 0.82
         self.min_sell_threshold = 0.30
         self.max_sell_threshold = 0.76
 
@@ -428,8 +429,8 @@ class Level8Council:
         self.min_agent_reliability = 0.20
         self.max_agent_reliability = 1.65
 
-        self.min_truth_to_trade = 0.42
-        self.min_truth_to_core_trade = 0.62
+        self.min_truth_to_trade = 0.55
+        self.min_truth_to_core_trade = 0.72
 
         # Portfolio allocation model.
         self.reserve_bucket_pct = 0.00
@@ -439,8 +440,10 @@ class Level8Council:
         # Council-controlled high-conviction sizing.
         # Weak setups should be SHADOW, not tiny live tests.
         # Approved setups start at 50%.
+        # Approved trades start at 50%.
+        # High-confidence CORE trades start at 80% and can scale to 100%.
         self.test_bucket_trade_pct = 0.50
-        self.min_core_trade_pct = 0.65
+        self.min_core_trade_pct = 0.80
         self.max_core_trade_pct = 1.00
 
         # These are descriptive only now; they do not hard-block spending.
@@ -2062,6 +2065,15 @@ class Level8Council:
             {"agent": "continuation_hold", "buy": 0.0, "sell": 1.0 - continuation_hold, "hold": continuation_hold, "wait": 0.20, "confidence": 0.68, "reason": "hold if the wave still appears to be continuing"},
             {"agent": "peak_capture", "buy": 0.0, "sell": peak_capture, "hold": 1.0 - peak_capture * 0.70, "wait": 0.25, "confidence": 0.72, "reason": "sell when price pulls back from a profitable local peak"},
             {"agent": "momentum_fade", "buy": 0.0, "sell": momentum_fade_sell, "hold": 1.0 - momentum_fade_sell * 0.65, "wait": 0.30, "confidence": 0.66, "reason": "sell more when short-term momentum fades"},
+            {
+                "agent": "higher_low_wave_stop",
+                "buy": 0.0,
+                "sell": 1.0 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.15,
+                "hold": 0.15 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.85,
+                "wait": 0.20,
+                "confidence": 0.86 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.55,
+                "reason": "ride wave until confirmed higher-low stop breaks",
+            },
             {"agent": "execution", "buy": 0.0, "sell": execution_sell_quality, "hold": 0.40, "wait": 1.0 - execution_sell_quality, "confidence": 0.65, "reason": "avoid selling into poor spread conditions unless necessary"},
             {"agent": "fee_recovery", "buy": 0.0, "sell": fee_recovery, "hold": clamp(0.85 - fee_recovery * 0.35, 0.0, 1.0), "wait": 0.30, "confidence": 0.67, "reason": "protect all-in fee-adjusted breakeven"},
             {"agent": "harvest_sizing", "buy": 0.0, "sell": harvest_pressure, "hold": 1.0 - harvest_pressure * 0.55, "wait": 0.25, "confidence": 0.64, "reason": "choose partial vs full sell pressure"},
@@ -2496,35 +2508,62 @@ class Level8Council:
         truth_score: float,
         risk_mode: str,
     ) -> Tuple[str, float, str]:
-        """High-conviction adaptive sizing model."""
+        """
+        High-conviction adaptive sizing.
+
+        Rules:
+        - below threshold = SHADOW
+        - below truth floor = SHADOW
+        - approved live trade = never below 50%
+        - core/high-conviction trade = 80%-100%
+        """
         margin = float(final_buy_score) - float(threshold)
+
         if margin < 0:
-            return "SHADOW", 0.0, f"below_threshold_shadow_only;margin={margin:.3f};truth={truth_score:.3f}"
+            return "SHADOW", 0.0, (
+                f"below_threshold_shadow_only;"
+                f"margin={margin:.3f};truth={truth_score:.3f}"
+            )
+
         if truth_score < self.min_truth_to_trade:
             return "SHADOW", 0.0, (
-                f"truth_below_live_trade_min;margin={margin:.3f};truth={truth_score:.3f};"
+                f"truth_below_live_trade_min;"
+                f"margin={margin:.3f};truth={truth_score:.3f};"
                 f"min_truth={self.min_truth_to_trade:.3f}"
             )
-        base_pct = 0.50
-        bucket = "APPROVED"
+
+        risk_mode_u = str(risk_mode).upper()
+
         conviction = clamp(
-            margin * 1.75 + max(0.0, truth_score - self.min_truth_to_trade) * 1.15,
+            margin * 2.10
+            + max(0.0, truth_score - self.min_truth_to_trade) * 1.65,
             0.0,
             1.0,
         )
-        if truth_score >= self.min_truth_to_core_trade or margin >= 0.06:
+
+        bucket = "APPROVED"
+        base_pct = 0.50
+        ceiling_pct = 0.80
+
+        if truth_score >= self.min_truth_to_core_trade or margin >= 0.10:
             bucket = "CORE"
-            base_pct = max(base_pct, self.min_core_trade_pct)
-        pct = base_pct + conviction * (self.max_single_asset_pct - base_pct)
-        risk_mode_u = str(risk_mode).upper()
+            base_pct = self.min_core_trade_pct
+            ceiling_pct = self.max_core_trade_pct
+
+        pct = base_pct + conviction * (ceiling_pct - base_pct)
+
         if risk_mode_u == "DEFENSIVE":
-            pct *= 0.70
+            pct *= 0.90
         elif risk_mode_u == "CAUTIOUS":
-            pct *= 0.85
+            pct *= 0.95
         elif risk_mode_u == "AGGRESSIVE":
-            pct *= 1.10
+            pct *= 1.05
+
         pct = clamp(pct, 0.50, self.max_single_asset_pct)
+
         return bucket, pct, (
-            f"high_conviction_{bucket.lower()}_bucket;margin={margin:.3f};truth={truth_score:.3f};"
-            f"risk={risk_mode_u};conviction={conviction:.3f};pct={pct:.3f}"
+            f"high_conviction_{bucket.lower()}_bucket;"
+            f"margin={margin:.3f};truth={truth_score:.3f};"
+            f"risk={risk_mode_u};conviction={conviction:.3f};"
+            f"pct={pct:.3f};sizing_floor=50pct"
         )

@@ -35,6 +35,17 @@ SELL_AGENT_WEIGHTS = {
 BUY_STRONG_THRESHOLD = 0.72
 BUY_ACCEPTABLE_THRESHOLD = 0.60
 BUY_SHADOW_THRESHOLD = 0.50
+REVERSAL_CONFIRMATION_THRESHOLD = 0.64
+REVERSAL_STRONG_THRESHOLD = 0.70
+
+REVERSAL_CONFIRMATION_WEIGHTS = {
+    "local_low_held_score": 0.20,
+    "mean_reclaim_score": 0.18,
+    "momentum_flip_score": 0.18,
+    "candle_reclaim_score": 0.16,
+    "downside_slowdown_score": 0.14,
+    "target_cost_confirmation_score": 0.14,
+}
 SELL_EXIT_THRESHOLD = 0.75
 SELL_ARM_TRAIL_THRESHOLD = 0.62
 SELL_TIGHTEN_THRESHOLD = 0.50
@@ -79,6 +90,38 @@ def add_basic_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     df["return_3_bps"] = df["close"].pct_change(3).fillna(0.0) * 10000.0
     df["return_5_bps"] = df["close"].pct_change(5).fillna(0.0) * 10000.0
     df["return_15_bps"] = df["close"].pct_change(15).fillna(0.0) * 10000.0
+    df["prev_open"] = df["open"].shift(1)
+    df["prev_high"] = df["high"].shift(1)
+    df["prev_low"] = df["low"].shift(1)
+    df["prev_close"] = df["close"].shift(1)
+
+    df["rolling_low_10"] = df["low"].rolling(10, min_periods=3).min()
+    df["rolling_low_10_prev"] = df["rolling_low_10"].shift(1)
+
+    df["rolling_high_3"] = df["high"].rolling(3, min_periods=2).max()
+    df["rolling_high_3_prev"] = df["rolling_high_3"].shift(1)
+
+    df["rolling_high_10"] = df["high"].rolling(10, min_periods=3).max()
+    df["rolling_high_10_prev"] = df["rolling_high_10"].shift(1)
+
+    candle_range = (df["high"] - df["low"]).replace(0.0, np.nan)
+    df["close_position_in_candle"] = ((df["close"] - df["low"]) / candle_range).clip(0.0, 1.0).fillna(0.5)
+
+    df["made_fresh_10_low"] = (
+        df["low"] < df["rolling_low_10_prev"].fillna(df["low"])
+    ).astype(int)
+
+    df["reclaimed_prev_high"] = (
+        df["close"] > df["prev_high"].fillna(df["close"])
+    ).astype(int)
+
+    df["reclaimed_micro_high"] = (
+        df["close"] > df["rolling_high_3_prev"].fillna(df["close"])
+    ).astype(int)
+
+    df["downside_pressure_change_bps"] = (
+        df["return_1_bps"] - df["return_5_bps"]
+    ).fillna(0.0)
     df["mean_20"] = df["close"].rolling(20, min_periods=5).mean()
     df["mean_60"] = df["close"].rolling(60, min_periods=10).mean()
     df["dist_mean_20_bps"] = (((df["close"] / df["mean_20"]) - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0) * 10000.0)
@@ -131,6 +174,70 @@ def score_buy_intersections(row: Dict[str, Any]) -> Dict[str, float]:
     scores["buy_intersection_score"] = clamp(sum(float(w) * float(scores.get(n, 0.0)) for n, w in BUY_AGENT_WEIGHTS.items()))
     return scores
 
+def score_reversal_confirmation(row: Dict[str, Any]) -> Dict[str, float]:
+    close = safe_float(row.get("close"), safe_float(row.get("price"), 0.0))
+    high = safe_float(row.get("high"), close)
+    low = safe_float(row.get("low"), close)
+
+    return_1 = safe_float(row.get("return_1_bps"), 0.0)
+    return_3 = safe_float(row.get("return_3_bps"), 0.0)
+    return_5 = safe_float(row.get("return_5_bps"), 0.0)
+    return_15 = safe_float(row.get("return_15_bps"), 0.0)
+
+    dist_mean_20 = safe_float(row.get("dist_mean_20_bps"), 0.0)
+    dist_mean_60 = safe_float(row.get("dist_mean_60_bps"), 0.0)
+
+    close_position = clamp(row.get("close_position_in_candle", 0.5))
+    made_fresh_low = int(safe_float(row.get("made_fresh_10_low"), 0.0) >= 0.5)
+    reclaimed_prev_high = int(safe_float(row.get("reclaimed_prev_high"), 0.0) >= 0.5)
+    reclaimed_micro_high = int(safe_float(row.get("reclaimed_micro_high"), 0.0) >= 0.5)
+
+    upside_room = safe_float(row.get("upside_room_bps"), safe_float(row.get("target_bps"), 0.0))
+    cost_bps = max(1.0, safe_float(row.get("cost_bps"), DEFAULT_FEE_AND_SLIPPAGE_BPS))
+
+    local_low_held_score = clamp(
+        (1.0 - float(made_fresh_low)) * 0.50
+        + close_position * 0.35
+        + clamp((return_1 + 8.0) / 24.0) * 0.15
+    )
+    mean_reclaim_score = clamp(
+        clamp((dist_mean_20 + 12.0) / 36.0) * 0.70
+        + clamp((dist_mean_60 + 20.0) / 60.0) * 0.30
+    )
+    momentum_flip_score = clamp(
+        clamp((return_1 + 4.0) / 20.0) * 0.35
+        + clamp((return_3 + 6.0) / 28.0) * 0.30
+        + clamp((return_5 + 8.0) / 36.0) * 0.25
+        + clamp((return_1 - return_5 + 10.0) / 40.0) * 0.10
+    )
+    candle_reclaim_score = clamp(
+        float(reclaimed_prev_high) * 0.45
+        + float(reclaimed_micro_high) * 0.40
+        + close_position * 0.15
+    )
+    downside_slowdown_score = clamp(
+        clamp((return_1 - return_5 + 12.0) / 42.0) * 0.45
+        + clamp((return_3 - return_15 + 18.0) / 60.0) * 0.35
+        + clamp((return_1 + return_3 + 12.0) / 36.0) * 0.20
+    )
+    target_cost_ratio = upside_room / cost_bps
+    target_cost_confirmation_score = clamp((target_cost_ratio - 1.5) / 3.0)
+
+    scores = {
+        "local_low_held_score": local_low_held_score,
+        "mean_reclaim_score": mean_reclaim_score,
+        "momentum_flip_score": momentum_flip_score,
+        "candle_reclaim_score": candle_reclaim_score,
+        "downside_slowdown_score": downside_slowdown_score,
+        "target_cost_confirmation_score": target_cost_confirmation_score,
+    }
+    total = 0.0
+    for name, weight in REVERSAL_CONFIRMATION_WEIGHTS.items():
+        total += float(weight) * float(scores.get(name, 0.0))
+    scores["reversal_confirmation_score"] = clamp(total)
+    scores["target_cost_ratio"] = float(target_cost_ratio)
+    return scores
+
 def score_sell_intersections(row: Dict[str, Any], entry_price: float, peak_price: float, profit_armed: bool) -> Dict[str, float]:
     close = safe_float(row.get("close", row.get("mid", 0.0)), 0.0); range_pos = safe_float(row.get("range_position"), 0.5); rsi = safe_float(row.get("rsi"), 50.0); ret_5 = safe_float(row.get("return_5_bps", row.get("momentum_5_bps", 0.0)), 0.0); ret_15 = safe_float(row.get("return_15_bps", row.get("momentum_15_bps", 0.0)), 0.0); dist20 = safe_float(row.get("dist_mean_20_bps"), 0.0); dist60 = safe_float(row.get("dist_mean_60_bps"), 0.0); vol = safe_float(row.get("volatility_60_bps", row.get("volatility_bps", 0.0)), 0.0); volume_z = safe_float(row.get("volume_z"), 0.0); upside_room = safe_float(row.get("upside_room_bps", row.get("room_to_target_bps", 0.0)), 0.0)
     move_from_entry_bps = bps_change(close, entry_price); giveback_from_peak_bps = bps_change(close, peak_price) if peak_price > 0 else 0.0
@@ -150,9 +257,49 @@ def score_sell_intersections(row: Dict[str, Any], entry_price: float, peak_price
     return scores
 
 def fixed_buy_decision(row: Dict[str, Any]) -> Dict[str, Any]:
-    scores = score_buy_intersections(row); score = scores["buy_intersection_score"]
-    decision = "STRONG_BUY" if score >= BUY_STRONG_THRESHOLD else "ALLOW_BUY" if score >= BUY_ACCEPTABLE_THRESHOLD else "WATCH" if score >= BUY_SHADOW_THRESHOLD else "NO_BUY"
-    return {"decision": decision, "buy_intersection_score": score, **scores}
+    buy_scores = score_buy_intersections(row)
+    reversal_scores = score_reversal_confirmation(row)
+
+    buy_score = buy_scores["buy_intersection_score"]
+    reversal_score = reversal_scores["reversal_confirmation_score"]
+
+    opportunity_passed = buy_score >= BUY_ACCEPTABLE_THRESHOLD
+    reversal_passed = reversal_score >= REVERSAL_CONFIRMATION_THRESHOLD
+
+    if buy_score >= BUY_STRONG_THRESHOLD and reversal_score >= REVERSAL_STRONG_THRESHOLD:
+        decision = "STRONG_BUY"
+    elif opportunity_passed and reversal_passed:
+        decision = "ALLOW_BUY"
+    elif buy_score >= BUY_SHADOW_THRESHOLD:
+        decision = "WATCH"
+    else:
+        decision = "NO_BUY"
+
+    buy_block_reason = ""
+    if opportunity_passed and not reversal_passed:
+        buy_block_reason = (
+            f"reversal_confirmation_failed;"
+            f"buy_score={buy_score:.4f};"
+            f"reversal_score={reversal_score:.4f};"
+            f"required={REVERSAL_CONFIRMATION_THRESHOLD:.4f}"
+        )
+    elif not opportunity_passed:
+        buy_block_reason = (
+            f"fixed_buy_opportunity_failed;"
+            f"buy_score={buy_score:.4f};"
+            f"required={BUY_ACCEPTABLE_THRESHOLD:.4f}"
+        )
+
+    return {
+        "decision": decision,
+        "buy_intersection_score": buy_score,
+        "reversal_confirmation_score": reversal_score,
+        "opportunity_passed": bool(opportunity_passed),
+        "reversal_passed": bool(reversal_passed),
+        "buy_block_reason": buy_block_reason,
+        **buy_scores,
+        **reversal_scores,
+    }
 
 def fixed_sell_decision(row: Dict[str, Any], entry_price: float, peak_price: float, profit_armed: bool) -> Dict[str, Any]:
     scores = score_sell_intersections(row, entry_price=entry_price, peak_price=peak_price, profit_armed=profit_armed); score = scores["sell_intersection_score"]
@@ -164,14 +311,14 @@ def simulate_fixed_policy_on_candles(*, frame: pd.DataFrame, product_id: str, ti
     if "product_id" in df.columns:
         df = df[df["product_id"].astype(str).eq(str(product_id))].copy()
     df = df.sort_values("ts").reset_index(drop=True)
-    trades = []; snapshots = []; in_trade = False; entry_idx = -1; entry_ts = entry_price = peak_price = trough_price = entry_buy_score = 0.0; profit_armed = False
+    trades = []; snapshots = []; in_trade = False; entry_idx = -1; entry_ts = entry_price = peak_price = trough_price = entry_buy_score = 0.0; entry_reversal_score = 0.0; profit_armed = False
     for i in range(int(min_prefix_rows), len(df)):
-        row = df.iloc[i].to_dict(); ts = safe_float(row.get("ts"), 0.0); close = safe_float(row.get("close"), 0.0); high = safe_float(row.get("high"), close); low = safe_float(row.get("low"), close)
+        row = df.iloc[i].to_dict(); row["cost_bps"] = float(fee_and_slippage_bps); ts = safe_float(row.get("ts"), 0.0); close = safe_float(row.get("close"), 0.0); high = safe_float(row.get("high"), close); low = safe_float(row.get("low"), close)
         if close <= 0: continue
         if not in_trade:
             buy = fixed_buy_decision(row); snapshots.append({"ts": ts, "product_id": product_id, "timeframe": timeframe, "side": "BUY_SCAN", **buy})
             if buy["decision"] in {"STRONG_BUY", "ALLOW_BUY"}:
-                in_trade = True; entry_idx = i; entry_ts = ts; entry_price = close; peak_price = close; trough_price = close; profit_armed = False; entry_buy_score = buy["buy_intersection_score"]
+                in_trade = True; entry_idx = i; entry_ts = ts; entry_price = close; peak_price = close; trough_price = close; profit_armed = False; entry_buy_score = buy["buy_intersection_score"]; entry_reversal_score = buy.get("reversal_confirmation_score", 0.0)
             continue
         peak_price = max(peak_price, high); trough_price = min(trough_price, low); favorable_bps = bps_change(peak_price, entry_price); adverse_bps = bps_change(trough_price, entry_price)
         if favorable_bps >= SIM_MIN_PROFIT_TARGET_BPS: profit_armed = True
@@ -183,7 +330,7 @@ def simulate_fixed_policy_on_candles(*, frame: pd.DataFrame, product_id: str, ti
         elif i - entry_idx >= int(max_hold_bars): exit_reason = "max_hold"; exit_price = close
         if exit_price is not None:
             gross_bps = bps_change(exit_price, entry_price); net_bps = gross_bps - float(fee_and_slippage_bps)
-            trades.append({"entry_ts": entry_ts, "exit_ts": ts, "product_id": product_id, "timeframe": timeframe, "entry_price": entry_price, "exit_price": exit_price, "gross_bps": gross_bps, "net_bps": net_bps, "max_favorable_bps": favorable_bps, "max_adverse_bps": adverse_bps, "held_bars": i - entry_idx, "entry_buy_score": entry_buy_score, "exit_sell_score": sell["sell_intersection_score"], "exit_reason": exit_reason, "won": int(net_bps > 0)})
+            trades.append({"entry_ts": entry_ts, "exit_ts": ts, "product_id": product_id, "timeframe": timeframe, "entry_price": entry_price, "exit_price": exit_price, "gross_bps": gross_bps, "net_bps": net_bps, "max_favorable_bps": favorable_bps, "max_adverse_bps": adverse_bps, "held_bars": i - entry_idx, "entry_buy_score": entry_buy_score, "entry_reversal_score": entry_reversal_score, "exit_sell_score": sell["sell_intersection_score"], "exit_reason": exit_reason, "won": int(net_bps > 0)})
             in_trade = False
     return pd.DataFrame(trades), pd.DataFrame(snapshots)
 

@@ -16473,6 +16473,58 @@ class TradingBot:
         c["return_5_bps"] = first_float(["return_5_bps", "momentum_5_bps", "variant_momentum_5_bps"], 0.0)
         c["return_15_bps"] = first_float(["return_15_bps", "momentum_15_bps", "variant_momentum_15_bps"], 0.0)
 
+        # Live reversal-confirmation aliases.
+        c["close"] = first_float(["close", "price", "mid", "current_price", "price_now"], first_float(["price"], 0.0))
+        c["high"] = first_float(["high", "recent_high", "range_high"], c["close"])
+        c["low"] = first_float(["low", "recent_low", "range_low"], c["close"])
+
+        c["dist_mean_20_bps"] = first_float([
+            "dist_mean_20_bps",
+            "distance_to_mean_20_bps",
+            "distance_to_vwap_bps",
+            "vwap_distance_bps",
+        ], 0.0)
+
+        c["dist_mean_60_bps"] = first_float([
+            "dist_mean_60_bps",
+            "distance_to_mean_60_bps",
+            "poc_distance_bps",
+            "distance_to_poc_bps",
+        ], 0.0)
+
+        c["close_position_in_candle"] = first_float([
+            "close_position_in_candle",
+            "candle_close_position",
+            "range_close_position",
+        ], 0.5)
+
+        c["made_fresh_10_low"] = 1.0 if bool(c.get("made_fresh_10_low", False)) else 0.0
+
+        # If explicit fresh-low detection is not available, infer from structure/dip fields.
+        if "made_fresh_10_low" not in candidate:
+            dip_speed = first_float(["dip_speed_score"], 0.0)
+            reversal = first_float(["reversal_score"], 0.0)
+            c["made_fresh_10_low"] = 1.0 if dip_speed > 0.70 and reversal < 0.45 else 0.0
+
+        c["reclaimed_prev_high"] = 1.0 if bool(c.get("reclaimed_prev_high", False)) else 0.0
+        c["reclaimed_micro_high"] = 1.0 if bool(c.get("reclaimed_micro_high", False)) else 0.0
+
+        if "reclaimed_prev_high" not in candidate:
+            price_action_buy = first_float(["price_action_buy_score"], 0.0)
+            candle_continuation = first_float(["candle_continuation_score"], 0.0)
+            c["reclaimed_prev_high"] = 1.0 if price_action_buy >= 0.65 else 0.0
+            c["reclaimed_micro_high"] = 1.0 if candle_continuation >= 0.65 else 0.0
+
+        c["cost_bps"] = max(
+            1.0,
+            first_float([
+                "cost_bps",
+                "current_total_fee_bps",
+                "round_trip_cost_bps",
+                "target_over_cost_bps",
+            ], 20.0),
+        )
+
         c["volatility_60_bps"] = first_float([
             "volatility_60_bps",
             "quant_conditional_volatility_bps",
@@ -16579,7 +16631,7 @@ class TradingBot:
                 position_pct = clamp_float(position_pct, 0.50, 1.00)
         else:
             position_pct = 0.0
-        info = {"action": "ALLOW_BUY" if allow_buy else "WAIT", "strategy": str(candidate.get("timeframe", candidate.get("fixed_intersection_timeframe", "unknown_timeframe"))), "bucket": "FIXED_INTERSECTION_BUY" if allow_buy else "FIXED_INTERSECTION_WAIT", "risk_mode": "NORMAL", "recommended_position_pct": float(position_pct), "decision_id": f"fixed-buy-{product_id}-{int(now_ts())}-{uuid.uuid4().hex[:8]}", "truth_score": float(buy_score), "final_buy_score": float(buy_score), "buy_threshold": 0.60, "confidence": float(buy_score), "learning_score": 0.0, "setup_tag": "fixed_intersection", "market_regime": str(candidate.get("market_regime", candidate.get("regime_tag", "unknown"))), "calibrated_p_win": float(candidate.get("calibrated_p_win", candidate.get("estimated_prob_up", 0.50)) or 0.50), "expected_win_bps": float(candidate.get("expected_win_bps", 0.0) or 0.0), "expected_loss_bps": float(candidate.get("expected_loss_bps", 0.0) or 0.0), "payoff_ratio": float(candidate.get("payoff_ratio", 0.0) or 0.0), "expected_value_bps": float(candidate.get("expected_net_edge_bps", 0.0) or 0.0), "expected_utility_bps": float(candidate.get("expected_utility_bps", candidate.get("expected_net_edge_bps", 0.0)) or 0.0), "maker_adjusted_expected_value_bps": float(candidate.get("maker_adjusted_expected_value_bps", candidate.get("expected_net_edge_bps", 0.0)) or 0.0), "utility_size_multiplier": 1.0, "wait_utility_bps": 0.0, "buy_vs_wait_edge_bps": float(candidate.get("expected_net_edge_bps", 0.0) or 0.0), "reason": (f"fixed_intersection_only_buy;decision={decision_text};buy_intersection_score={buy_score:.4f};timeframe={candidate.get('timeframe', candidate.get('fixed_intersection_timeframe', ''))};weights={BUY_AGENT_WEIGHTS}"), "fixed_buy_scores": fixed_result}
+        info = {"action": "ALLOW_BUY" if allow_buy else "WAIT", "strategy": str(candidate.get("timeframe", candidate.get("fixed_intersection_timeframe", "unknown_timeframe"))), "bucket": "FIXED_INTERSECTION_BUY" if allow_buy else "FIXED_INTERSECTION_WAIT", "risk_mode": "NORMAL", "recommended_position_pct": float(position_pct), "decision_id": f"fixed-buy-{product_id}-{int(now_ts())}-{uuid.uuid4().hex[:8]}", "truth_score": float(buy_score), "final_buy_score": float(buy_score), "buy_threshold": 0.60, "confidence": float(buy_score), "learning_score": 0.0, "setup_tag": "fixed_intersection", "market_regime": str(candidate.get("market_regime", candidate.get("regime_tag", "unknown"))), "calibrated_p_win": float(candidate.get("calibrated_p_win", candidate.get("estimated_prob_up", 0.50)) or 0.50), "expected_win_bps": float(candidate.get("expected_win_bps", 0.0) or 0.0), "expected_loss_bps": float(candidate.get("expected_loss_bps", 0.0) or 0.0), "payoff_ratio": float(candidate.get("payoff_ratio", 0.0) or 0.0), "expected_value_bps": float(candidate.get("expected_net_edge_bps", 0.0) or 0.0), "expected_utility_bps": float(candidate.get("expected_utility_bps", candidate.get("expected_net_edge_bps", 0.0)) or 0.0), "maker_adjusted_expected_value_bps": float(candidate.get("maker_adjusted_expected_value_bps", candidate.get("expected_net_edge_bps", 0.0)) or 0.0), "utility_size_multiplier": 1.0, "wait_utility_bps": 0.0, "buy_vs_wait_edge_bps": float(candidate.get("expected_net_edge_bps", 0.0) or 0.0), "reason": (f"fixed_intersection_only_buy;decision={decision_text};buy_intersection_score={buy_score:.4f};reversal_confirmation_score={float(fixed_result.get('reversal_confirmation_score', 0.0) or 0.0):.4f};opportunity_passed={bool(fixed_result.get('opportunity_passed', False))};reversal_passed={bool(fixed_result.get('reversal_passed', False))};buy_block_reason={fixed_result.get('buy_block_reason', '')};timeframe={candidate.get('timeframe', candidate.get('fixed_intersection_timeframe', ''))};weights={BUY_AGENT_WEIGHTS};reversal_weights={getattr(__import__('fixed_intersection_policy'), 'REVERSAL_CONFIRMATION_WEIGHTS', {})}"), "fixed_buy_scores": fixed_result}
         return allow_buy, info
 
     def _level8_decision_for_candidate(
@@ -22306,7 +22358,7 @@ class TradingBot:
         write_generated_file_meta(FIXED_INTERSECTION_TIMEFRAME_SIMULATION_CSV_PATH, reason="fixed_intersection_startup_simulation")
         gate_df.to_csv(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH, index=False)
         write_generated_file_meta(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH, reason="fixed_intersection_startup_live_gate")
-        trade_columns = ["entry_ts", "exit_ts", "product_id", "timeframe", "entry_price", "exit_price", "gross_bps", "net_bps", "max_favorable_bps", "max_adverse_bps", "held_bars", "entry_buy_score", "exit_sell_score", "exit_reason", "won"]
+        trade_columns = ["entry_ts", "exit_ts", "product_id", "timeframe", "entry_price", "exit_price", "gross_bps", "net_bps", "max_favorable_bps", "max_adverse_bps", "held_bars", "entry_buy_score", "entry_reversal_score", "exit_sell_score", "exit_reason", "won"]
         trade_df = pd.concat(all_trade_frames, ignore_index=True) if all_trade_frames else pd.DataFrame(columns=trade_columns)
         trade_df.to_csv(FIXED_INTERSECTION_TRADE_LOG_CSV_PATH, index=False)
         write_generated_file_meta(FIXED_INTERSECTION_TRADE_LOG_CSV_PATH, reason="fixed_intersection_trade_log")

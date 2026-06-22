@@ -232,6 +232,34 @@ INITIAL_AGENT_RELIABILITY_PRIORS.update({
     "order_book_liquidity_agent": 0.50, "exploration": 0.05,
 })
 
+
+INITIAL_AGENT_RELIABILITY_PRIORS.update({
+    "volume_profile_leader": 0.10,
+    "volume_profile_agent": 0.10,
+    "quant_boundary_agent": 0.10,
+    "fresh_zone_retest_agent": 0.05,
+    "fair_value_gap_agent": 0.05,
+    "trend": 0.05,
+    "mean_reversion": 0.05,
+    "breakout": 0.05,
+    "execution": 0.05,
+    "order_book_liquidity_agent": 0.05,
+    "exploration": 0.00,
+    "reclaimed_value_low_reversal_agent": 1.40,
+    "inside_fair_fvg_retest_agent": 1.40,
+    "poc_compression_release_agent": 1.32,
+    "high_volume_absorption_agent": 1.24,
+    "liquidity_sweep_reclaim_agent": 1.34,
+    "chart_analog_similarity_agent": 1.45,
+    "bad_intersection_veto_agent": 1.50,
+    "execution_cost_gate_agent": 1.20,
+    "profit_pullback_wave_agent": 1.45,
+    "higher_low_wave_stop_agent": 1.38,
+    "wick_exhaustion_sell_agent": 1.25,
+    "liquidity_target_hit_agent": 1.30,
+    "failed_run_escape_agent": 1.35,
+    "analog_sell_path_agent": 1.40,
+})
 # ============================================================
 # AGENT PRIORITY / REDUNDANCY POLICY
 # ============================================================
@@ -2296,6 +2324,16 @@ class Level8Council:
             },
         ]
 
+        intersection_sell_votes = [
+            {"agent": "profit_pullback_wave_agent", "buy": 0.0, "sell": clamp(profit_capture * 0.45 + peak_capture * 0.35 + max(0.0, pullback_from_peak_bps) / 240.0, 0.0, 1.0), "hold": clamp(1.0 - peak_capture * 0.55, 0.0, 1.0), "wait": 0.20, "confidence": 0.86, "reason": "sell_path_intersection_profit_pullback_wave"},
+            {"agent": "higher_low_wave_stop_agent", "buy": 0.0, "sell": 1.0 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.15, "hold": 0.15 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.85, "wait": 0.20, "confidence": 0.86 if bool(context.get("wave_stop_exit_confirmed", False)) else 0.55, "reason": "sell_path_intersection_higher_low_stop"},
+            {"agent": "wick_exhaustion_sell_agent", "buy": 0.0, "sell": clamp(candle_exhaustion_score * pa_confidence + max(0.0, net_after_exit_bps) / 260.0, 0.0, 1.0), "hold": clamp(0.70 - candle_exhaustion_score * 0.35, 0.0, 1.0), "wait": 0.25, "confidence": clamp(0.25 + pa_confidence * 0.55, 0.15, 0.85), "reason": f"sell_path_intersection_wick_exhaustion;{pa_reason}"},
+            {"agent": "liquidity_target_hit_agent", "buy": 0.0, "sell": clamp(session_sell_score * session_confidence + volume_profile_leader_sell_score * 0.25, 0.0, 1.0), "hold": clamp(session_hold_score, 0.0, 1.0), "wait": 0.25, "confidence": clamp(0.30 + session_confidence * 0.50, 0.15, 0.85), "reason": f"sell_path_intersection_liquidity_target;{session_reason}"},
+            {"agent": "failed_run_escape_agent", "buy": 0.0, "sell": clamp(loss_exit * 0.50 + max(0.0, -net_after_exit_bps) / 120.0 + max(0.0, -momentum_1_bps) / 160.0, 0.0, 1.0), "hold": clamp(0.75 - loss_exit * 0.55, 0.0, 1.0), "wait": 0.25, "confidence": 0.78, "reason": "sell_path_intersection_failed_run_escape"},
+            {"agent": "analog_sell_path_agent", "buy": 0.0, "sell": clamp(adaptive_wave_pressure * 0.35 + peak_capture * 0.25 + momentum_fade_sell * 0.20 + loss_exit * 0.20, 0.0, 1.0), "hold": clamp(continuation_hold * 0.65, 0.0, 1.0), "wait": 0.20, "confidence": 0.72 if adaptive_enabled else 0.35, "reason": f"sell_path_intersection_analog;{adaptive_reason}"},
+        ]
+        votes = intersection_sell_votes
+
         truth_vote = {
             "agent": "exit_truth",
             "buy": 0.0,
@@ -2324,7 +2362,7 @@ class Level8Council:
             ),
             "wait": 1.0 - execution_sell_quality,
             "confidence": 0.72,
-            "reason": "exit truth weighs profit, peak capture, continuation, candle exhaustion, value-area/FVG/SMT context, cost, and execution",
+            "reason": "exit truth weighs sell-path intersections: realized net bps, giveback, wick exhaustion, liquidity target, higher-low stop, failed-run escape, and max-hold decay",
         }
 
         adjusted = [self._adjust_vote(vote, product_id, "EXIT_REVIEW") for vote in votes]

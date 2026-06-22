@@ -16325,7 +16325,7 @@ class TradingBot:
         context: Dict[str, Any],
         common: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """Build the data-ranked entry alpha/veto council votes."""
+        """Build intersection-only entry alpha/veto council votes."""
         def cf(value: Any, default: float = 0.0) -> float:
             try:
                 return float(value if value is not None else default)
@@ -16333,96 +16333,72 @@ class TradingBot:
                 return float(default)
         def clamp01(value: Any) -> float:
             return clamp_float(cf(value, 0.0), 0.0, 1.0)
-        def low_text(value: Any) -> str:
+        def low(value: Any) -> str:
             return str(value or "").lower()
         def vote(agent: str, buy: float, hold: float, wait: float, confidence: float, reason: str) -> Dict[str, Any]:
             buy_v = clamp01(buy)
             return {**common, "agent": agent, "buy": buy_v, "sell": clamp_float(1.0 - buy_v, 0.0, 1.0), "hold": clamp01(hold), "wait": clamp01(wait), "confidence": clamp01(confidence), "reason": reason}
-        product_id = str(candidate.get("product_id", ""))
         pa = dict(context.get("price_action_context", {}) or {})
         quant = dict(context.get("quant_context", {}) or {})
-        setup_tag = low_text(candidate.get("setup_tag", common.get("setup_tag", "")))
-        market_regime = low_text(candidate.get("market_regime", common.get("market_regime", "")))
-        structure_state = low_text(pa.get("structure_state", candidate.get("structure_state", "")))
-        value_area_state = low_text(pa.get("value_area_state", candidate.get("value_area_state", "")))
-        value_acceptance_state = low_text(pa.get("value_acceptance_state", candidate.get("value_acceptance_state", "")))
-        volume_node_state = low_text(pa.get("volume_node_state", candidate.get("volume_node_state", "")))
-        fvg_state = low_text(pa.get("fvg_state", candidate.get("fvg_state", "")))
-        score_raw = cf(candidate.get("score", 0.0), 0.0)
-        score_norm = clamp_float(score_raw / 100.0 if score_raw > 1.50 else score_raw, 0.0, 1.0)
+        setup = low(candidate.get("setup_tag", common.get("setup_tag", "")))
+        structure = low(pa.get("structure_state", candidate.get("structure_state", "")))
+        value_area = low(pa.get("value_area_state", candidate.get("value_area_state", "")))
+        value_acceptance = low(pa.get("value_acceptance_state", candidate.get("value_acceptance_state", "")))
+        volume_node = low(pa.get("volume_node_state", candidate.get("volume_node_state", "")))
+        fvg = low(pa.get("fvg_state", candidate.get("fvg_state", "")))
+        session_setup = low(context.get("session_liquidity_setup", candidate.get("session_liquidity_setup", "")))
+        reason_text = low(pa.get("reason", candidate.get("price_action_reason", "")))
+        score_raw = cf(candidate.get("score", 0.0), 0.0); score_norm = clamp_float(score_raw / 100.0 if score_raw > 1.50 else score_raw, 0.0, 1.0)
         probability = clamp_float(cf(candidate.get("estimated_prob_up", candidate.get("probability", 0.50)), 0.50), 0.0, 1.0)
-        expected_edge = cf(candidate.get("expected_net_edge_bps", 0.0), 0.0)
-        expected_utility = cf(candidate.get("expected_utility_bps", 0.0), 0.0)
-        spread_bps = cf(candidate.get("spread_bps", 0.0), 0.0)
-        cost_bps = cf(candidate.get("cost_bps", 0.0), 0.0)
-        bearish_fvg_retest = "bearish_fvg_retest" in setup_tag or "bearish_fvg_retest" in fvg_state
-        inside_value = "inside_value" in setup_tag or "inside" in value_area_state or "inside" in value_acceptance_state
-        inside_fair_value = "inside_fair_value" in value_acceptance_state or "fair" in value_area_state
-        lower_high_lower_low = "lower_high_lower_low" in structure_state or "lower_high_lower_low" in setup_tag
-        lower_high_higher_low = "lower_high_higher_low" in structure_state or "lower_high_higher_low" in setup_tag
-        reclaimed_value_low = "reclaimed_value_low" in value_acceptance_state or "reclaimed_value_low" in setup_tag
-        high_volume_node = "high_volume" in volume_node_state or "high_volume_node" in setup_tag
-        accepted_above_value = "accepted_above" in value_acceptance_state or "accepted_above_value" in setup_tag
-        bullish_fvg_open = "bullish_fvg_open" in setup_tag or "bullish_fvg_open" in fvg_state
-        setup_pattern_edge = 0.30
-        if lower_high_lower_low and bearish_fvg_retest: setup_pattern_edge = 0.96
-        elif inside_value and bearish_fvg_retest: setup_pattern_edge = 0.90
-        elif reclaimed_value_low and bearish_fvg_retest: setup_pattern_edge = 0.82
-        elif lower_high_higher_low and inside_fair_value: setup_pattern_edge = 0.76
-        market_structure_score = clamp01(candidate.get("market_structure_buy_score", pa.get("market_structure_buy_score", 0.50)))
-        validated_liquidity_score = clamp01(candidate.get("validated_liquidity_buy_score", pa.get("validated_liquidity_buy_score", 0.50)))
-        market_structure_reclaim = clamp_float(market_structure_score * 0.52 + validated_liquidity_score * 0.18 + (0.16 if reclaimed_value_low else 0.0) + (0.14 if lower_high_higher_low else 0.0), 0.0, 1.0)
-        score_band = clamp_float(1.0 - abs(score_norm - 0.50) / 0.14, 0.0, 1.0)
-        probability_band = clamp_float(1.0 - abs(probability - 0.58) / 0.18, 0.0, 1.0)
-        score_band_anti_chase = clamp_float(score_band * 0.72 + probability_band * 0.18 + (1.0 - min(1.0, abs(expected_edge) / 260.0)) * 0.10, 0.0, 1.0)
-        backtest_expected_net = cf(candidate.get("backtest_expected_net_bps", 0.0), 0.0)
-        backtest_win = cf(candidate.get("backtest_expected_win_rate", 0.50), 0.50)
-        replay_quality = cf(candidate.get("backtest_replay_quality_score", 0.50), 0.50)
-        product_edge_governor = clamp_float(0.42 + backtest_expected_net / 80.0 + (backtest_win - 0.50) * 0.75 + (replay_quality - 0.50) * 0.35, 0.0, 1.0)
-        clean_allowed = bool(candidate.get("clean_profit_path_gate_allowed", False))
-        clean_confidence = cf(candidate.get("clean_profit_path_confidence", 0.0), 0.0)
-        clean_path_analog = clamp_float((0.72 if clean_allowed else 0.26) + clean_confidence * 0.22 + max(0.0, expected_utility) / 180.0, 0.0, 1.0)
-        bad_setup_veto_strength = 0.95 if bullish_fvg_open and high_volume_node else 0.92 if accepted_above_value and high_volume_node else 0.84 if "higher_high_higher_low" in structure_state and bullish_fvg_open else 0.0
+        poc_distance = cf(candidate.get("poc_distance_bps", pa.get("poc_distance_bps", 0.0)), 0.0)
         volume_wait = clamp01(candidate.get("volume_profile_leader_wait_score", pa.get("volume_profile_leader_wait_score", 0.50)))
         volume_buy = clamp01(candidate.get("volume_profile_leader_buy_score", pa.get("volume_profile_leader_buy_score", 0.50)))
-        volume_chop_veto_strength = clamp_float(volume_wait * 0.55 + (0.25 if high_volume_node else 0.0) + (1.0 - volume_buy) * 0.20, 0.0, 1.0)
+        market_structure = clamp01(candidate.get("market_structure_buy_score", pa.get("market_structure_buy_score", 0.50)))
+        validated_liquidity = clamp01(candidate.get("validated_liquidity_buy_score", pa.get("validated_liquidity_buy_score", 0.50)))
         quant_wait = clamp01(quant.get("quant_wait_score", candidate.get("quant_wait_score", 0.50)))
-        quant_buy = clamp01(quant.get("quant_buy_score", candidate.get("quant_buy_score", 0.50)))
-        quant_regime_veto_strength = clamp_float(quant_wait * 0.45 + (1.0 - quant_buy) * 0.28 + (0.27 if any(x in market_regime for x in ["downtrend", "range_chop", "chop"]) else 0.0), 0.0, 1.0)
-        order_book_buy = clamp01(candidate.get("order_book_buy_score", 0.50))
-        order_book_wait = clamp01(candidate.get("order_book_wait_score", 0.20))
-        execution_quality = clamp_float((1.0 - min(1.0, max(0.0, spread_bps) / 80.0)) * 0.36 + (1.0 - min(1.0, max(0.0, cost_bps) / 140.0)) * 0.24 + order_book_buy * 0.22 + (1.0 - order_book_wait) * 0.18, 0.0, 1.0)
-        row_for_model = dict(candidate); row_for_model.update(common)
-        logistic_p = predict_meta_probability(self.logistic_meta_agent_model, row_for_model)
-        tree_p = predict_meta_probability(self.tree_regime_agent_model, row_for_model)
-        candidate["calibrated_logistic_meta_buy_score"] = float(logistic_p)
-        candidate["tree_regime_buy_score"] = float(tree_p)
-        candidate["bayesian_setup_pattern_edge_buy_score"] = float(
-            candidate.get("bayesian_setup_score_norm", setup_pattern_edge)
-        )
-        candidate["market_structure_reclaim_buy_score"] = float(market_structure_reclaim)
-        candidate["validated_liquidity_confirmer_buy_score"] = float(validated_liquidity_score)
-        candidate["score_band_anti_chase_buy_score"] = float(score_band_anti_chase)
-        candidate["product_edge_governor_buy_score"] = float(product_edge_governor)
-        candidate["clean_path_analog_gate_buy_score"] = float(clean_path_analog)
-        candidate["bad_setup_veto_buy_score"] = float(1.0 - bad_setup_veto_strength)
-        candidate["volume_chop_veto_buy_score"] = float(1.0 - volume_chop_veto_strength)
-        candidate["quant_regime_veto_buy_score"] = float(1.0 - quant_regime_veto_strength)
-        candidate["execution_cost_gate_buy_score"] = float(execution_quality)
+        inside_fair_value = "inside_fair_value" in value_acceptance or "inside_value" in value_area
+        inside_near_poc = "inside_value_near_poc" in value_acceptance
+        reclaimed_value_low = "reclaimed_value_low" in value_acceptance
+        high_volume_node = "high_volume_node" in volume_node or "high_volume_node" in setup
+        low_volume_node = "low_volume_node" in volume_node
+        bearish_fvg_retest = "bearish_fvg_retest" in setup or "bearish_fvg_retest" in fvg
+        bullish_fvg_open = "bullish_fvg_open" in setup or "bullish_fvg_open" in fvg
+        lower_high_lower_low = "lower_high_lower_low" in setup or "lower_high_lower_low" in structure
+        higher_high_higher_low = "higher_high_higher_low" in setup or "higher_high_higher_low" in structure
+        lower_rejection = "lower_rejection=true" in reason_text
+        swept_low = "swept_low=true" in reason_text or "sweep_reclaim" in session_setup
+        reclaimed_low = "reclaimed_low=true" in reason_text or reclaimed_value_low
+        score_q4_zone = 0.68 <= score_norm <= 0.735; score_q5_zone = score_norm > 0.735; probability_q4_zone = 0.72 <= probability <= 0.845
+        poc_q2_zone = 37.0 <= poc_distance <= 70.0; poc_q4_far = 106.0 < poc_distance <= 180.0
+        high_volume_wait = volume_wait >= 0.68; very_high_volume_wait = volume_wait >= 0.86
+        reclaimed_score = clamp_float((0.42 if reclaimed_value_low else 0) + (0.20 if probability_q4_zone else 0) + (0.16 if score_q5_zone else 0) + (0.10 if "normal_volume_node" in volume_node else 0) + market_structure*0.07 + validated_liquidity*0.05,0,1)
+        fvg_score = clamp_float((0.25 if inside_fair_value else 0) + (0.20 if high_volume_node else 0) + (0.18 if lower_high_lower_low else 0) + (0.18 if bearish_fvg_retest else 0) + (0.11 if high_volume_wait else 0) + market_structure*0.08,0,1)
+        poc_score = clamp_float((0.22 if inside_fair_value else 0) + (0.18 if score_q4_zone else 0) + (0.18 if poc_q2_zone else 0) + (0.17 if high_volume_wait else 0) + market_structure*0.15 + validated_liquidity*0.10,0,1)
+        absorption_score = clamp_float((0.24 if high_volume_node else 0) + (0.20 if inside_near_poc else 0) + (0.18 if very_high_volume_wait else 0) + (1.0-volume_buy)*0.10 + market_structure*0.16 + validated_liquidity*0.12,0,1)
+        sweep_score = clamp_float((0.24 if swept_low else 0) + (0.24 if reclaimed_low else 0) + (0.14 if lower_rejection else 0) + validated_liquidity*0.14 + market_structure*0.14 + (0.10 if probability_q4_zone else 0),0,1)
+        analog_score = clamp_float(cf(candidate.get("chart_analog_similarity_buy_score", 0.0), 0.0) or (reclaimed_score*0.22+fvg_score*0.22+poc_score*0.20+absorption_score*0.14+sweep_score*0.22),0,1)
+        bad_strength = (0.35 if inside_fair_value and low_volume_node and poc_q4_far else 0) + (0.35 if inside_fair_value and high_volume_node and higher_high_higher_low and bullish_fvg_open else 0) + (0.20 if score_q5_zone and poc_q4_far and 0.50 <= volume_wait <= 0.86 else 0) + (0.10 if quant_wait > 0.60 and score_q5_zone and poc_q4_far else 0)
+        veto_score = clamp_float(1.0 - bad_strength, 0.0, 1.0)
+        spread_bps = cf(candidate.get("spread_bps", 0.0), 0.0); cost_bps = cf(candidate.get("cost_bps", 0.0), 0.0); expected_edge = cf(candidate.get("expected_net_edge_bps", 0.0), 0.0)
+        execution_score = clamp_float((1.0-min(1.0,spread_bps/80.0))*0.35 + (1.0-min(1.0,cost_bps/140.0))*0.30 + clamp_float(expected_edge/180.0+0.50,0,1)*0.20 + validated_liquidity*0.15,0,1)
+        scores = {
+            "reclaimed_value_low_reversal_buy_score": reclaimed_score, "inside_fair_fvg_retest_buy_score": fvg_score,
+            "poc_compression_release_buy_score": poc_score, "high_volume_absorption_buy_score": absorption_score,
+            "liquidity_sweep_reclaim_buy_score": sweep_score, "chart_analog_similarity_buy_score": analog_score,
+            "bad_intersection_veto_buy_score": veto_score, "execution_cost_gate_buy_score": execution_score,
+        }
+        candidate.update(scores)
         return [
-            vote("calibrated_logistic_meta_agent", logistic_p, 0.40 + logistic_p * 0.25, 1.0 - logistic_p, 0.82, f"calibrated_logistic_meta;p_win={logistic_p:.3f}"),
-            vote("tree_regime_agent", tree_p, 0.40 + tree_p * 0.22, 1.0 - tree_p, 0.70, f"tree_regime;p_win={tree_p:.3f}"),
-            vote("bayesian_setup_pattern_edge_agent", clamp_float(0.35 + max(0.0, float(candidate.get("bayesian_setup_p_low", 0.50) or 0.50) - float(candidate.get("bayesian_setup_p_break_even", 0.55) or 0.55)) * 2.0 + max(0.0, float(candidate.get("bayesian_setup_ev_low_bps", 0.0) or 0.0)) / 80.0, 0.0, 1.0), 0.45 + setup_pattern_edge * 0.25, 0.70 - setup_pattern_edge * 0.45, 0.78, f"setup_pattern_edge;setup={setup_tag};buy={setup_pattern_edge:.3f}"),
-            vote("market_structure_reclaim_agent", market_structure_reclaim, 0.45 + market_structure_reclaim * 0.25, 0.68 - market_structure_reclaim * 0.42, 0.74, f"market_structure_reclaim;structure={structure_state};value={value_acceptance_state};buy={market_structure_reclaim:.3f}"),
-            vote("validated_liquidity_confirmer_agent", validated_liquidity_score, 0.40 + validated_liquidity_score * 0.25, 1.0 - validated_liquidity_score, 0.72, f"validated_liquidity_confirmer;score={validated_liquidity_score:.3f}"),
-            vote("score_band_anti_chase_agent", score_band_anti_chase, 0.45 + score_band_anti_chase * 0.20, 0.70 - score_band_anti_chase * 0.40, 0.68, f"score_band_anti_chase;score={score_norm:.3f};prob={probability:.3f};buy={score_band_anti_chase:.3f}"),
-            vote("product_edge_governor_agent", product_edge_governor, 0.40 + product_edge_governor * 0.26, 0.72 - product_edge_governor * 0.42, clamp_float(0.35 + replay_quality * 0.45, 0.20, 0.86), f"product_edge_governor;product={product_id};bt_net={backtest_expected_net:.2f};bt_win={backtest_win:.3f};quality={replay_quality:.3f}"),
-            vote("clean_path_analog_gate_agent", clean_path_analog, 0.42 + clean_path_analog * 0.28, 0.74 - clean_path_analog * 0.48, clamp_float(0.25 + clean_confidence * 0.62, 0.20, 0.90), f"clean_path_analog;allowed={clean_allowed};confidence={clean_confidence:.3f};buy={clean_path_analog:.3f}"),
-            vote("bad_setup_veto_agent", 1.0 - bad_setup_veto_strength, 0.35, bad_setup_veto_strength, 0.88 if bad_setup_veto_strength > 0.50 else 0.55, f"bad_setup_veto;veto={bad_setup_veto_strength:.3f}"),
-            vote("volume_chop_veto_agent", 1.0 - volume_chop_veto_strength, 0.42, volume_chop_veto_strength, 0.74, f"volume_chop_veto;veto={volume_chop_veto_strength:.3f}"),
-            vote("quant_regime_veto_agent", 1.0 - quant_regime_veto_strength, 0.42, quant_regime_veto_strength, 0.70, f"quant_regime_veto;veto={quant_regime_veto_strength:.3f};regime={market_regime}"),
-            vote("execution_cost_gate_agent", execution_quality, 0.36 + execution_quality * 0.20, 1.0 - execution_quality, 0.76, f"execution_quality_gate;spread={spread_bps:.2f};cost={cost_bps:.2f};quality={execution_quality:.3f}"),
+            vote("reclaimed_value_low_reversal_agent", reclaimed_score, .45+reclaimed_score*.25, 1-reclaimed_score, .78, f"reclaimed_value_low_reversal;score={reclaimed_score:.3f}"),
+            vote("inside_fair_fvg_retest_agent", fvg_score, .45+fvg_score*.25, 1-fvg_score, .76, f"inside_fair_fvg_retest;score={fvg_score:.3f}"),
+            vote("poc_compression_release_agent", poc_score, .45+poc_score*.25, 1-poc_score, .74, f"poc_compression_release;score={poc_score:.3f}"),
+            vote("high_volume_absorption_agent", absorption_score, .45+absorption_score*.25, 1-absorption_score, .74, f"high_volume_absorption;score={absorption_score:.3f}"),
+            vote("liquidity_sweep_reclaim_agent", sweep_score, .45+sweep_score*.25, 1-sweep_score, .78, f"liquidity_sweep_reclaim;score={sweep_score:.3f}"),
+            vote("chart_analog_similarity_agent", analog_score, .42+analog_score*.28, 1-analog_score, .72, f"chart_analog_similarity;score={analog_score:.3f}"),
+            vote("bad_intersection_veto_agent", veto_score, .35, 1-veto_score, .88 if veto_score < .70 else .60, f"bad_intersection_veto;pass_score={veto_score:.3f}"),
+            vote("execution_cost_gate_agent", execution_score, .36+execution_score*.20, 1-execution_score, .76, f"execution_cost_gate;spread={spread_bps:.2f};cost={cost_bps:.2f};score={execution_score:.3f}"),
         ]
+
 
     def _level8_decision_for_candidate(
         self,
@@ -16758,18 +16734,26 @@ class TradingBot:
                     return clamp_float(float(vote_by_agent.get(agent, {}).get("wait", default) or default), 0.0, 1.0)
                 except Exception:
                     return float(default)
-            setup_alpha = agent_buy("bayesian_setup_pattern_edge_agent", 0.30)
-            structure_alpha = agent_buy("market_structure_reclaim_agent", 0.30)
-            anti_chase_alpha = agent_buy("score_band_anti_chase_agent", 0.30)
-            product_alpha = agent_buy("product_edge_governor_agent", 0.30)
-            clean_path_alpha = agent_buy("clean_path_analog_gate_agent", 0.25)
-            execution_alpha = agent_buy("execution_cost_gate_agent", 0.30)
-            veto_pressure = clamp_float(agent_wait("bad_setup_veto_agent", 0.0) * 0.42 + agent_wait("volume_chop_veto_agent", 0.0) * 0.24 + agent_wait("quant_regime_veto_agent", 0.0) * 0.20 + agent_wait("execution_cost_gate_agent", 0.0) * 0.14, 0.0, 1.0)
-            utility_truth_component = clamp_float(0.50 + float(candidate.get("expected_utility_bps", 0.0) or 0.0) / 260.0 + (float(candidate.get("calibrated_p_win", 0.50) or 0.50) - 0.50) * 0.50 + (float(candidate.get("payoff_ratio", 0.0) or 0.0) - 1.0) * 0.14, 0.0, 1.0)
-            logistic_alpha = agent_buy("calibrated_logistic_meta_agent", 0.50)
-            tree_alpha = agent_buy("tree_regime_agent", 0.50)
-            liquidity_alpha = agent_buy("validated_liquidity_confirmer_agent", 0.50)
-            truth_buy = clamp_float(setup_alpha * 0.22 + logistic_alpha * 0.20 + tree_alpha * 0.10 + structure_alpha * 0.14 + liquidity_alpha * 0.10 + anti_chase_alpha * 0.08 + product_alpha * 0.08 + clean_path_alpha * 0.08 + utility_truth_component * 0.18 + execution_alpha * 0.14 - veto_pressure * 0.34, 0.0, 1.0)
+            reclaimed_value_low_reversal = agent_buy("reclaimed_value_low_reversal_agent", 0.0)
+            inside_fair_fvg_retest = agent_buy("inside_fair_fvg_retest_agent", 0.0)
+            poc_compression_release = agent_buy("poc_compression_release_agent", 0.0)
+            high_volume_absorption = agent_buy("high_volume_absorption_agent", 0.0)
+            liquidity_sweep_reclaim = agent_buy("liquidity_sweep_reclaim_agent", 0.0)
+            chart_analog_similarity = agent_buy("chart_analog_similarity_agent", 0.0)
+            execution_cost_gate = agent_buy("execution_cost_gate_agent", 0.0)
+            bad_intersection_veto = agent_buy("bad_intersection_veto_agent", 1.0)
+            alpha_score = (
+                reclaimed_value_low_reversal * 0.18
+                + inside_fair_fvg_retest * 0.18
+                + poc_compression_release * 0.16
+                + high_volume_absorption * 0.12
+                + liquidity_sweep_reclaim * 0.14
+                + chart_analog_similarity * 0.16
+                + execution_cost_gate * 0.06
+            )
+            veto_pressure = clamp_float(1.0 - bad_intersection_veto, 0.0, 1.0)
+            truth_buy = clamp_float(alpha_score - veto_pressure * 0.45, 0.0, 1.0)
+            strong_intersection_agents = sum(1 for v in [reclaimed_value_low_reversal, inside_fair_fvg_retest, poc_compression_release, high_volume_absorption, liquidity_sweep_reclaim] if v >= 0.70)
             truth_vote = vote(
                 "truth",
                 truth_buy,
@@ -16778,17 +16762,16 @@ class TradingBot:
                 clamp_float(0.30 + truth_buy * 0.55, 0.20, 0.90),
                 (
                     f"truth evidence={truth_buy:.3f};"
-                    f"setup_alpha={setup_alpha:.3f};"
-                    f"structure_alpha={structure_alpha:.3f};"
-                    f"anti_chase_alpha={anti_chase_alpha:.3f};"
-                    f"product_alpha={product_alpha:.3f};"
-                    f"clean_path_alpha={clean_path_alpha:.3f};"
-                    f"utility_component={utility_truth_component:.3f};"
-                    f"execution_alpha={execution_alpha:.3f};"
-                    f"veto_pressure={veto_pressure:.3f};"
-                    f"expected_utility={float(candidate.get('expected_utility_bps', 0.0) or 0.0):.2f};"
-                    f"calibrated_p_win={float(candidate.get('calibrated_p_win', 0.50) or 0.50):.3f};"
-                    f"payoff={float(candidate.get('payoff_ratio', 0.0) or 0.0):.3f};"
+                    f"alpha_score={alpha_score:.3f};"
+                    f"reclaimed={reclaimed_value_low_reversal:.3f};"
+                    f"fair_fvg={inside_fair_fvg_retest:.3f};"
+                    f"poc_release={poc_compression_release:.3f};"
+                    f"absorption={high_volume_absorption:.3f};"
+                    f"sweep={liquidity_sweep_reclaim:.3f};"
+                    f"analog={chart_analog_similarity:.3f};"
+                    f"execution={execution_cost_gate:.3f};"
+                    f"bad_veto={bad_intersection_veto:.3f};"
+                    f"strong_agents={strong_intersection_agents};"
                     f"setup={setup_tag};regime={market_regime}"
                 ),
             )
@@ -16820,9 +16803,9 @@ class TradingBot:
                 f"fvg={fvg_state_for_strategy}|"
                 f"smt={smt_state_for_strategy}|"
                 f"utility={utility_state_for_strategy}|"
-                f"setup_alpha={setup_alpha:.3f}|"
-                f"structure_alpha={structure_alpha:.3f}|"
-                f"clean_path_alpha={clean_path_alpha:.3f}|"
+                f"reclaimed={reclaimed_value_low_reversal:.3f}|"
+                f"fair_fvg={inside_fair_fvg_retest:.3f}|"
+                f"analog={chart_analog_similarity:.3f}|"
                 f"veto_pressure={veto_pressure:.3f}|"
                 f"execution={execution_state}"
             )
@@ -16980,6 +16963,33 @@ class TradingBot:
             )
 
             log(f"[setup-performance] shadowed weak setup {product_id}: {weak_reason}")
+
+        if str(action).upper() == "ALLOW_BUY":
+            intersection_blocks = []
+            if truth_buy < float(decision.get("buy_threshold", info.get("buy_threshold", 0.0)) or 0.0):
+                intersection_blocks.append("truth_below_threshold")
+            if bad_intersection_veto < 0.70:
+                intersection_blocks.append("bad_intersection_veto")
+            if execution_cost_gate < 0.58:
+                intersection_blocks.append("execution_cost_gate")
+            if strong_intersection_agents < 2:
+                intersection_blocks.append("fewer_than_two_strong_intersection_agents")
+            realized_mode = str(candidate.get("buy_profitability_mode", candidate.get("profitability_mode", ""))).lower()
+            exact_realized_proof = bool(candidate.get("exact_intersection_realized_replay_strong", False))
+            if chart_analog_similarity < 0.60 and not exact_realized_proof:
+                intersection_blocks.append("chart_analog_similarity")
+            if "opportunity_proxy" in realized_mode:
+                intersection_blocks.append("opportunity_proxy_not_live_authority")
+            if float(candidate.get("expected_net_edge_bps", 0.0) or 0.0) <= 0.0:
+                intersection_blocks.append("non_positive_conservative_edge")
+            if intersection_blocks:
+                action = "SHADOW"
+                info["action"] = "SHADOW"
+                info["bucket"] = "SHADOW"
+                info["recommended_position_pct"] = 0.0
+                block_reason = "intersection_live_buy_block:" + ",".join(intersection_blocks)
+                info["reason"] = f"{info.get('reason', '')};{block_reason}"
+                self._append_level8_shadow_trade(candidate=candidate, level8_info=info, reason=block_reason)
 
         if (
             ENABLE_LEVEL8_COUNCIL

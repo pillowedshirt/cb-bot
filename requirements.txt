@@ -13,3 +13,7 @@ streamlit
 pybind11
 setuptools
 wheel
+
+pyarrow
+polars
+scipy

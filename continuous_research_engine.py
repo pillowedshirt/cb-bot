@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from runtime_paths import ensure_runtime_dirs, runtime_path, write_generated_file_meta
+from fast_data_store import read_table, write_rows_table
 
 try:
     from historical_data_provider import BinanceBulkHistoricalProvider, write_normalized_candles_to_bot_cache
@@ -59,12 +60,11 @@ def _utc_dt(ts_value=None): return datetime.fromtimestamp(_utc_ts() if ts_value 
 def _clip(v,lo,hi): return max(float(lo), min(float(hi), float(v)))
 def _read_csv(path):
     try:
-        return pd.read_csv(path) if os.path.exists(path) and os.path.getsize(path)>0 else pd.DataFrame()
+        return read_table(path, prefer_parquet=True)
     except Exception: return pd.DataFrame()
 def _write_rows(path, cols, rows, reason):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True); tmp=path+'.tmp'
-    with open(tmp,'w',newline='',encoding='utf-8') as f: w=csv.writer(f); w.writerow(cols); w.writerows(rows)
-    os.replace(tmp,path); write_generated_file_meta(path, reason=reason)
+    write_rows_table(path, cols, rows, write_csv=True, write_parquet=True)
+    write_generated_file_meta(path, reason=reason)
 def _append_rows(path, cols, rows, reason):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True); hdr=not os.path.exists(path) or os.path.getsize(path)<=0
     with open(path,'a',newline='',encoding='utf-8') as f:

@@ -44,6 +44,27 @@ RESEARCH_FILES = {
     "research_backfill_plan.csv",
 }
 
+PARQUET_ACCELERATED_FILES = set()
+for _bucket in [RAW_CACHE_FILES, REPLAY_FILES, BACKTEST_FILES, RISK_FILES, QUANT_FILES, RESEARCH_FILES]:
+    PARQUET_ACCELERATED_FILES.update(_bucket)
+
+CSV_APPEND_ONLY_FILES = {
+    "trades.csv", "orders.csv", "live_trade_blockers.csv", "approved_but_shadowed.csv",
+    "position_targets.csv", "account_balance_diagnostics.csv", "reconciliation.csv",
+    "signal_events.csv", "decision_audit.csv", "council_votes.csv", "council_decisions.csv",
+}
+
+def parquet_runtime_path(filename: str) -> str:
+    path = runtime_path(filename)
+    base, _ = os.path.splitext(path)
+    return base + ".parquet"
+
+def is_parquet_accelerated(filename: str) -> bool:
+    return os.path.basename(str(filename)) in PARQUET_ACCELERATED_FILES
+
+def is_csv_append_only(filename: str) -> bool:
+    return os.path.basename(str(filename)) in CSV_APPEND_ONLY_FILES
+
 def ensure_runtime_dirs() -> None:
     for path in [CSV_ROOT_DIR, RAW_CACHE_DIR, REPLAY_DIR, BACKTEST_DIR, RISK_DIR, QUANT_DIR, LIVE_DIR, RUNTIME_DIR, VIEWER_DIR, RESEARCH_DIR, ARCHIVE_DIR, DEBUG_DIR]:
         os.makedirs(path, exist_ok=True)

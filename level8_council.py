@@ -208,6 +208,30 @@ INITIAL_AGENT_RELIABILITY_PRIORS.update({
     "exploration": 0.10,
 })
 
+
+INITIAL_AGENT_RELIABILITY_PRIORS.update({
+    "bayesian_setup_pattern_edge_agent": 1.45,
+    "calibrated_logistic_meta_agent": 1.42,
+    "tree_regime_agent": 1.24,
+    "market_structure_reclaim_agent": 1.34,
+    "validated_liquidity_confirmer_agent": 1.26,
+    "score_band_anti_chase_agent": 1.22,
+    "product_edge_governor_agent": 1.24,
+    "clean_path_analog_gate_agent": 1.38,
+    "volume_chop_veto_agent": 1.24,
+    "quant_regime_veto_agent": 1.20,
+    "execution_cost_gate_agent": 1.26,
+    "profit_pullback_capture_agent": 1.40,
+    "higher_low_wave_stop_agent": 1.34,
+    "failed_entry_hazard_escape_agent": 1.32,
+    "hard_stop_prevention_agent": 1.30,
+    "max_hold_decay_agent": 1.16,
+    "volume_profile_leader": 0.35, "volume_profile_agent": 0.40, "quant_boundary_agent": 0.45,
+    "fresh_zone_retest_agent": 0.45, "fair_value_gap_agent": 0.50, "trend": 0.40,
+    "mean_reversion": 0.40, "breakout": 0.40, "execution": 0.50,
+    "order_book_liquidity_agent": 0.50, "exploration": 0.05,
+})
+
 # ============================================================
 # AGENT PRIORITY / REDUNDANCY POLICY
 # ============================================================
@@ -217,22 +241,37 @@ AGENT_UNPROVEN_MAX_DIRECTIONAL_ADJ: float = 0.07
 AGENT_PROVEN_MAX_DIRECTIONAL_ADJ: float = 0.24
 
 BUY_REDUNDANCY_GROUP_CAPS = {
-    "buy_alpha": 0.42, "buy_veto": 0.34, "economics": 0.30,
-    "volume": 0.16, "previous_session": 0.16, "quant": 0.14,
-    "price_action": 0.26, "session_liquidity": 0.20, "cross_asset": 0.12,
-    "risk_execution": 0.22, "learning": 0.20, "other": 0.12,
+    "institutional_alpha": 0.48,
+    "institutional_veto": 0.36,
+    "economics": 0.30,
+    "execution": 0.24,
+    "legacy_context": 0.12,
+    "risk": 0.24,
+    "learning": 0.18,
+    "other": 0.10,
 }
 SELL_REDUNDANCY_GROUP_CAPS = {
-    "sell_alpha": 0.46, "profit_capture": 0.38, "economics": 0.28,
-    "volume": 0.18, "previous_session": 0.16, "quant": 0.14,
-    "price_action": 0.22, "session_liquidity": 0.18, "cross_asset": 0.12,
-    "risk_execution": 0.24, "learning": 0.18, "other": 0.12,
+    "institutional_sell_alpha": 0.50,
+    "profit_capture": 0.38,
+    "risk_exit": 0.34,
+    "execution": 0.20,
+    "legacy_context": 0.12,
+    "learning": 0.14,
+    "other": 0.10,
 }
 
 
 def agent_redundancy_group(agent: str) -> str:
     """Return the evidence family for redundancy control."""
     text = str(agent or "").lower()
+    if text in {"bayesian_setup_pattern_edge_agent", "calibrated_logistic_meta_agent", "tree_regime_agent", "market_structure_reclaim_agent", "validated_liquidity_confirmer_agent", "score_band_anti_chase_agent", "product_edge_governor_agent", "clean_path_analog_gate_agent"}:
+        return "institutional_alpha"
+    if text in {"volume_chop_veto_agent", "quant_regime_veto_agent", "execution_cost_gate_agent"}:
+        return "institutional_veto"
+    if text in {"profit_pullback_capture_agent", "higher_low_wave_stop_agent", "failed_entry_hazard_escape_agent", "hard_stop_prevention_agent", "max_hold_decay_agent"}:
+        return "institutional_sell_alpha"
+    if text in {"volume_profile_leader", "volume_profile_agent", "quant_boundary_agent", "fresh_zone_retest_agent", "fair_value_gap_agent", "trend", "mean_reversion", "breakout", "execution", "order_book_liquidity_agent"}:
+        return "legacy_context"
     if text in {"setup_pattern_edge_agent", "market_structure_reclaim_agent", "score_band_anti_chase_agent", "product_edge_governor_agent", "clean_path_analog_agent"}:
         return "buy_alpha"
     if text in {"bad_setup_veto_agent", "volume_chop_veto_agent", "quant_regime_veto_agent", "execution_quality_gate_agent"}:

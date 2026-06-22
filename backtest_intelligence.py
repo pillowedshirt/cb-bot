@@ -263,6 +263,11 @@ FOUR_PASS_SELL_PATH_REPLAY_COLUMNS = [
     "profitability_mode", "reason",
 ]
 
+INTERSECTION_DISCOVERY_COLUMNS = ["ts", "dt_utc", "side", "intersection_name", "feature_1", "value_1", "feature_2", "value_2", "feature_3", "value_3", "feature_4", "value_4", "train_rows", "train_avg_bps", "train_win_rate", "train_hard_stop_rate", "test_rows", "test_avg_bps", "test_win_rate", "test_hard_stop_rate", "score", "recommended_agent", "recommended_action", "reason"]
+SELL_PATH_INTERSECTION_REPLAY_COLUMNS = ["entry_id", "product_id", "entry_ts", "candidate_sell_ts", "held_minutes", "entry_price", "candidate_exit_price", "net_bps_if_sold", "move_after_sell_bps", "giveback_from_peak_bps", "max_favorable_before_sell_bps", "max_adverse_before_sell_bps", "upper_wick_ratio", "lower_wick_ratio", "close_location", "upper_rejection", "lower_rejection", "volume_node_state", "value_acceptance_state", "poc_distance_bps", "session_upside_target_bps", "liquidity_target_hit", "higher_low_stop_broken", "profit_pullback_triggered", "failed_run_triggered", "max_hold_triggered", "good_sell_label", "too_early_label", "hard_stop_prevention", "reason"]
+CHART_ANALOG_POLICY_COLUMNS = ["product_id", "setup_pattern_key", "matched_count", "avg_similarity", "avg_net_bps", "median_net_bps", "win_rate", "hard_stop_rate", "early_adverse_rate", "chart_analog_similarity_buy_score", "approved"]
+DAILY_CAPTURE_SIMULATION_COLUMNS = ["date", "starting_equity", "ending_equity", "return_pct", "trade_count", "win_rate", "avg_trade_bps", "max_drawdown_pct", "largest_loss_bps", "largest_win_bps", "products_traded", "reason"]
+
 FOUR_PASS_PURGED_WALK_FORWARD_COLUMNS = [
     "ts", "dt_utc",
     "fold_id", "side", "train_start_ts", "train_end_ts",
@@ -445,6 +450,14 @@ BUY_AGENT_SCORE_COLUMNS = {
     "volume_chop_veto_agent": "volume_chop_veto_buy_score",
     "quant_regime_veto_agent": "quant_regime_veto_buy_score",
     "execution_quality_gate_agent": "execution_quality_gate_buy_score",
+    "reclaimed_value_low_reversal_agent": "reclaimed_value_low_reversal_buy_score",
+    "inside_fair_fvg_retest_agent": "inside_fair_fvg_retest_buy_score",
+    "poc_compression_release_agent": "poc_compression_release_buy_score",
+    "high_volume_absorption_agent": "high_volume_absorption_buy_score",
+    "liquidity_sweep_reclaim_agent": "liquidity_sweep_reclaim_buy_score",
+    "chart_analog_similarity_agent": "chart_analog_similarity_buy_score",
+    "bad_intersection_veto_agent": "bad_intersection_veto_buy_score",
+    "execution_cost_gate_agent": "execution_cost_gate_buy_score",
 }
 
 SELL_AGENT_SCORE_COLUMNS = {
@@ -465,6 +478,11 @@ SELL_AGENT_SCORE_COLUMNS = {
     "failed_entry_escape_agent": "failed_entry_escape_sell_score",
     "hard_stop_prevention_agent": "hard_stop_prevention_sell_score",
     "max_hold_decay_agent": "max_hold_decay_sell_score",
+    "profit_pullback_wave_agent": "profit_pullback_wave_sell_score",
+    "wick_exhaustion_sell_agent": "wick_exhaustion_sell_score",
+    "liquidity_target_hit_agent": "liquidity_target_hit_sell_score",
+    "failed_run_escape_agent": "failed_run_escape_sell_score",
+    "analog_sell_path_agent": "analog_sell_path_sell_score",
 }
 
 AGENT_CANONICAL_ALIASES = {
@@ -1913,35 +1931,87 @@ def _add_bayesian_setup_pattern_scores(frame: pd.DataFrame) -> pd.DataFrame:
         frame[out_col] = keys.map(dict(zip(sf["setup_pattern_key"], sf[src_col]))).fillna(default).astype(float)
     return frame
 
+
+def _add_intersection_buy_agent_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return frame
+    frame = frame.copy()
+    def num(col, default=0.0):
+        if col in frame.columns:
+            return pd.to_numeric(frame[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=frame.index, dtype="float64")
+    def txt(col):
+        if col in frame.columns:
+            return frame[col].fillna("").astype(str).str.lower()
+        return pd.Series("", index=frame.index, dtype="object")
+    score = num("score", 0.0)
+    score_norm = score.where(score <= 1.50, score / 100.0).clip(0.0, 1.0)
+    probability = num("estimated_prob_up", 0.50).clip(0.0, 1.0) if "estimated_prob_up" in frame.columns else num("probability", 0.50).clip(0.0, 1.0)
+    poc_distance = num("poc_distance_bps", 0.0)
+    volume_wait = num("volume_profile_leader_wait_score", 0.50).clip(0.0, 1.0)
+    volume_buy = num("volume_profile_leader_buy_score", 0.50).clip(0.0, 1.0)
+    market_structure = num("market_structure_buy_score", 0.50).clip(0.0, 1.0)
+    validated_liquidity = num("validated_liquidity_buy_score", 0.50).clip(0.0, 1.0)
+    quant_wait = num("quant_wait_score", 0.50).clip(0.0, 1.0)
+    value_acceptance = txt("value_acceptance_state"); value_area = txt("value_area_state"); volume_node = txt("volume_node_state")
+    setup = txt("setup_tag"); structure = txt("structure_state"); fvg = txt("fvg_state"); session_setup = txt("session_liquidity_setup"); reason = txt("price_action_reason")
+    lower_rejection = reason.str.contains("lower_rejection=true", regex=False)
+    swept_low = reason.str.contains("swept_low=true", regex=False) | session_setup.str.contains("sweep_reclaim", regex=False)
+    reclaimed_low = reason.str.contains("reclaimed_low=true", regex=False) | value_acceptance.str.contains("reclaimed_value_low", regex=False)
+    inside_fair_value = value_acceptance.str.contains("inside_fair_value", regex=False) | value_area.str.contains("inside_value", regex=False)
+    inside_near_poc = value_acceptance.str.contains("inside_value_near_poc", regex=False)
+    reclaimed_value_low = value_acceptance.str.contains("reclaimed_value_low", regex=False)
+    high_volume_node = volume_node.str.contains("high_volume_node", regex=False) | setup.str.contains("high_volume_node", regex=False)
+    low_volume_node = volume_node.str.contains("low_volume_node", regex=False)
+    bearish_fvg_retest = setup.str.contains("bearish_fvg_retest", regex=False) | fvg.str.contains("bearish_fvg_retest", regex=False)
+    bullish_fvg_open = setup.str.contains("bullish_fvg_open", regex=False) | fvg.str.contains("bullish_fvg_open", regex=False)
+    lower_high_lower_low = setup.str.contains("lower_high_lower_low", regex=False) | structure.str.contains("lower_high_lower_low", regex=False)
+    higher_high_higher_low = setup.str.contains("higher_high_higher_low", regex=False) | structure.str.contains("higher_high_higher_low", regex=False)
+    score_q4_zone = (score_norm >= 0.68) & (score_norm <= 0.735); score_q5_zone = score_norm > 0.735; probability_q4_zone = (probability >= 0.72) & (probability <= 0.845)
+    poc_q2_zone = (poc_distance >= 37.0) & (poc_distance <= 70.0); poc_q4_far = (poc_distance > 106.0) & (poc_distance <= 180.0)
+    high_volume_wait = volume_wait >= 0.68; very_high_volume_wait = volume_wait >= 0.86
+    frame["reclaimed_value_low_reversal_buy_score"] = (reclaimed_value_low.astype(float)*0.42 + probability_q4_zone.astype(float)*0.20 + score_q5_zone.astype(float)*0.16 + volume_node.str.contains("normal_volume_node", regex=False).astype(float)*0.10 + market_structure*0.07 + validated_liquidity*0.05).clip(0,1)
+    frame["inside_fair_fvg_retest_buy_score"] = (inside_fair_value.astype(float)*0.25 + high_volume_node.astype(float)*0.20 + lower_high_lower_low.astype(float)*0.18 + bearish_fvg_retest.astype(float)*0.18 + high_volume_wait.astype(float)*0.11 + market_structure*0.08).clip(0,1)
+    frame["poc_compression_release_buy_score"] = (inside_fair_value.astype(float)*0.22 + score_q4_zone.astype(float)*0.18 + poc_q2_zone.astype(float)*0.18 + high_volume_wait.astype(float)*0.17 + market_structure*0.15 + validated_liquidity*0.10).clip(0,1)
+    frame["high_volume_absorption_buy_score"] = (high_volume_node.astype(float)*0.24 + inside_near_poc.astype(float)*0.20 + very_high_volume_wait.astype(float)*0.18 + (1.0-volume_buy).clip(0,1)*0.10 + market_structure*0.16 + validated_liquidity*0.12).clip(0,1)
+    frame["liquidity_sweep_reclaim_buy_score"] = (swept_low.astype(float)*0.24 + reclaimed_low.astype(float)*0.24 + lower_rejection.astype(float)*0.14 + validated_liquidity*0.14 + market_structure*0.14 + probability_q4_zone.astype(float)*0.10).clip(0,1)
+    if "chart_analog_similarity_buy_score" not in frame.columns:
+        frame["chart_analog_similarity_buy_score"] = (frame["reclaimed_value_low_reversal_buy_score"]*0.22 + frame["inside_fair_fvg_retest_buy_score"]*0.22 + frame["poc_compression_release_buy_score"]*0.20 + frame["high_volume_absorption_buy_score"]*0.14 + frame["liquidity_sweep_reclaim_buy_score"]*0.22).clip(0,1)
+    bad = (inside_fair_value & low_volume_node & poc_q4_far).astype(float)*0.35 + (inside_fair_value & high_volume_node & higher_high_higher_low & bullish_fvg_open).astype(float)*0.35 + (score_q5_zone & poc_q4_far & (volume_wait >= 0.50) & (volume_wait <= 0.86)).astype(float)*0.20 + ((quant_wait > 0.60) & score_q5_zone & poc_q4_far).astype(float)*0.10
+    frame["bad_intersection_veto_buy_score"] = (1.0 - bad.clip(0,1)).clip(0,1)
+    spread = num("spread_bps", 0.0); cost = num("cost_bps", 0.0); expected_edge = num("expected_net_edge_bps", 0.0)
+    frame["execution_cost_gate_buy_score"] = ((1.0-(spread/80.0).clip(0,1))*0.35 + (1.0-(cost/140.0).clip(0,1))*0.30 + (expected_edge/180.0+0.50).clip(0,1)*0.20 + validated_liquidity*0.15).clip(0,1)
+    return frame
+
 def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
     cache_key = _four_pass_cache_key(base_dir, ["candidate_replay.csv", "historical_shadow_replay.csv"])
     cached = _load_feature_frame_cached(base_dir, "buy_training_frame", cache_key)
     if not cached.empty:
         return cached
 
-    frame = _read_csv(runtime_path("candidate_replay.csv"))
-    if frame.empty:
-        frame = _read_csv(runtime_path("historical_shadow_replay.csv"))
+    historical = _read_csv(runtime_path("historical_shadow_replay.csv"))
+    candidate_replay = _read_csv(runtime_path("candidate_replay.csv"))
+    frame = historical if not historical.empty else candidate_replay
     if frame.empty or "product_id" not in frame.columns:
         return pd.DataFrame()
     frame = frame.copy()
     for col in ["score", "probability", "expected_net_edge_bps", "cost_bps", "max_favorable_bps", "max_adverse_bps", "net_pnl_bps", "binance_taker_taker_net_pnl_bps", "synthetic_notional_usd"]:
         if col in frame.columns:
             frame[col] = _numeric(frame, col, 0.0)
-    profitability_mode = "opportunity_proxy"
-
-    if "buy_net_bps" not in frame.columns:
-        if "binance_taker_taker_net_pnl_bps" in frame.columns:
-            frame["buy_net_bps"] = _numeric(frame, "binance_taker_taker_net_pnl_bps", 0.0)
-            profitability_mode = "realized_exit_replay"
+    historical_has_rows = not historical.empty and "product_id" in historical.columns
+    if historical_has_rows:
+        if "primary_net_pnl_bps" in frame.columns:
+            frame["buy_net_bps"] = _numeric(frame, "primary_net_pnl_bps", 0.0)
         elif "net_pnl_bps" in frame.columns:
             frame["buy_net_bps"] = _numeric(frame, "net_pnl_bps", 0.0)
-            profitability_mode = "realized_exit_replay"
+        elif "binance_taker_taker_net_pnl_bps" in frame.columns:
+            frame["buy_net_bps"] = _numeric(frame, "binance_taker_taker_net_pnl_bps", 0.0)
         else:
-            frame["buy_net_bps"] = _numeric(frame, "max_favorable_bps", 0.0) - _numeric(frame, "cost_bps", 0.0)
-            profitability_mode = "opportunity_proxy"
+            frame["buy_net_bps"] = 0.0
+        profitability_mode = "realized_replay"
     else:
-        profitability_mode = "realized_or_precomputed_buy_net"
+        frame["buy_net_bps"] = _numeric(frame, "max_favorable_bps", 0.0) - _numeric(frame, "cost_bps", 0.0)
+        profitability_mode = "opportunity_proxy_research_only"
 
     frame["profitability_mode"] = profitability_mode
     # True BUY success must be cost-aware and directional.
@@ -1976,6 +2046,7 @@ def _build_buy_training_frame(base_dir: str) -> pd.DataFrame:
     except Exception:
         frame["calibrated_logistic_meta_buy_score"] = 0.50; frame["calibrated_logistic_meta_brier"] = 1.0; frame["calibrated_logistic_meta_auc"] = 0.5
         frame["tree_regime_buy_score"] = 0.50; frame["tree_regime_brier"] = 1.0; frame["tree_regime_auc"] = 0.5
+    frame = _add_intersection_buy_agent_scores(frame)
     _save_feature_frame_cached(base_dir, "buy_training_frame", cache_key, frame)
     return frame
 
@@ -2157,6 +2228,18 @@ def _add_proven_sell_agent_scores(frame: pd.DataFrame) -> pd.DataFrame:
     frame["failed_entry_hazard_escape_sell_score"] = frame["failed_entry_escape_sell_score"]
     frame["hard_stop_prevention_sell_score"] = _clip_series(hard_stop_prevention)
     frame["max_hold_decay_sell_score"] = _clip_series(max_hold_decay)
+    giveback = (max_favorable - realized_net).clip(lower=0.0)
+    upper_wick = _safe_numeric_series(frame, "upper_wick_ratio", 0.0).clip(0.0, 1.0)
+    close_location = _safe_numeric_series(frame, "close_location", 0.50).clip(0.0, 1.0)
+    liquidity_hit = _safe_numeric_series(frame, "liquidity_target_hit", 0.0).clip(0.0, 1.0)
+    hl_broken = _safe_numeric_series(frame, "higher_low_stop_broken", 0.0).clip(0.0, 1.0)
+    failed_run = _safe_numeric_series(frame, "failed_run_triggered", 0.0).clip(0.0, 1.0)
+    frame["profit_pullback_wave_sell_score"] = _clip_series((realized_net / 70.0).clip(0,1)*0.38 + (giveback / 55.0).clip(0,1)*0.32 + (1.0-(move_after_sell/60.0).clip(0,1))*0.30)
+    frame["wick_exhaustion_sell_score"] = _clip_series((realized_net / 60.0).clip(0,1)*0.28 + upper_wick*0.34 + (1.0-close_location)*0.28 + (1.0-(move_after_sell/90.0).clip(0,1))*0.10)
+    frame["liquidity_target_hit_sell_score"] = _clip_series(liquidity_hit*0.52 + (realized_net/80.0).clip(0,1)*0.24 + (1.0-(move_after_sell/80.0).clip(0,1))*0.24)
+    frame["failed_run_escape_sell_score"] = _clip_series(failed_run*0.34 + (held_minutes/180.0).clip(0,1)*0.20 + (max_adverse/100.0).clip(0,1)*0.20 + (realized_net/35.0+0.50).clip(0,1)*0.26)
+    frame["higher_low_wave_stop_sell_score"] = _clip_series(hl_broken*0.40 + (giveback/70.0).clip(0,1)*0.28 + frame["higher_low_wave_stop_sell_score"]*0.32)
+    frame["analog_sell_path_sell_score"] = _clip_series(frame[["profit_pullback_wave_sell_score", "wick_exhaustion_sell_score", "liquidity_target_hit_sell_score", "failed_run_escape_sell_score", "higher_low_wave_stop_sell_score"]].mean(axis=1))
     return frame
 
 def _build_sell_training_frame(base_dir: str, council_buy_entries: pd.DataFrame) -> pd.DataFrame:
@@ -2482,13 +2565,14 @@ def _four_pass_product_live_gate_rows(
             buy_median_net_bps = median_net
             buy_win_rate = win_rate
             approved = bool(
-                buy_selected_count >= 20
+                profitability_mode == "realized_replay"
+                and buy_selected_count >= 20
                 and buy_avg_net_bps > 0.0
                 and buy_median_net_bps >= -2.0
                 and buy_win_rate >= 0.52
                 and wf_folds >= 1
                 and wf_avg_net > 0.0
-                and sell_path_rows >= 5
+                and sell_path_rows >= 50
                 and sell_path_avg > 0.0
             )
             cooldown_minutes = 0
@@ -2502,6 +2586,8 @@ def _four_pass_product_live_gate_rows(
                 f"walk_forward_avg_net={wf_avg_net:.2f};"
                 f"sell_path_rows={sell_path_rows};"
                 f"sell_path_avg={sell_path_avg:.2f};"
+                f"profitability_mode={profitability_mode};"
+                f"requires_realized_replay=True;"
                 f"approved={approved}"
             )
 
@@ -2914,6 +3000,57 @@ def _fifth_pass_live_style_replay_rows(
     return replay_rows, summary_rows, contribution_rows, blocker_rows
 
 
+
+def _intersection_discovery_rows(buy_frame: pd.DataFrame) -> List[List[Any]]:
+    ts_value = _utc_ts(); dt_value = _utc_dt(ts_value); rows: List[List[Any]] = []
+    if buy_frame is None or buy_frame.empty or "buy_net_bps" not in buy_frame.columns:
+        return rows
+    frame = buy_frame.copy().sort_values("ts" if "ts" in buy_frame.columns else buy_frame.index.name or buy_frame.columns[0])
+    frame["_score_bucket"] = pd.cut(_numeric(frame, "score", 0.0).where(_numeric(frame, "score", 0.0) <= 1.5, _numeric(frame, "score", 0.0)/100.0), [0, .5, .68, .735, 1.0], labels=["low", "mid", "q4", "q5"], include_lowest=True).astype(str)
+    frame["_probability_bucket"] = pd.cut(_numeric(frame, "estimated_prob_up", 0.5) if "estimated_prob_up" in frame.columns else _numeric(frame, "probability", .5), [0,.5,.72,.845,1], labels=["low","mid","q4","high"], include_lowest=True).astype(str)
+    frame["_poc_bucket"] = pd.cut(_numeric(frame, "poc_distance_bps", 0.0), [-1,37,70,106,180,1e9], labels=["near","q2","q3","far","extreme"]).astype(str)
+    scan_cols = [c for c in ["value_acceptance_state","value_area_state","volume_node_state","setup_tag","structure_state","fvg_state","session_liquidity_setup","_score_bucket","_probability_bucket","_poc_bucket"] if c in frame.columns]
+    if len(scan_cols) < 2: return rows
+    split = max(1, int(len(frame)*0.70)); train = frame.iloc[:split].copy(); test = frame.iloc[split:].copy()
+    from itertools import combinations
+    for combo in combinations(scan_cols, min(4, len(scan_cols))):
+        for vals, tg in train.groupby(list(combo), dropna=False):
+            vals = vals if isinstance(vals, tuple) else (vals,)
+            mask = pd.Series(True, index=test.index)
+            for c, v in zip(combo, vals): mask &= test[c].astype(str).eq(str(v))
+            sg = test[mask]
+            if len(tg) < 30 or len(sg) < 15: continue
+            tr_avg=float(_numeric(tg,"buy_net_bps",0).mean()); te_avg=float(_numeric(sg,"buy_net_bps",0).mean())
+            tr_wr=float((_numeric(tg,"buy_net_bps",0)>0).mean()); te_wr=float((_numeric(sg,"buy_net_bps",0)>0).mean())
+            tr_hs=float((_numeric(tg,"buy_adverse_bps",0)>120).mean()); te_hs=float((_numeric(sg,"buy_adverse_bps",0)>120).mean())
+            good = tr_avg > 5 and te_avg > 3 and te_wr > .50; bad = tr_avg < -5 and te_avg < -5 and te_hs > .20
+            if not (good or bad): continue
+            score = te_avg + (te_wr-.5)*100 - te_hs*50
+            action = "promote_intersection_agent" if good else "veto_or_shadow_intersection"
+            name = "|".join(f"{c}={v}" for c,v in zip(combo, vals))[:240]
+            padded = list(combo)+[""]*4; vpad=[str(v) for v in vals]+[""]*4
+            rows.append([f"{ts_value:.6f}", dt_value, "BUY", name, padded[0], vpad[0], padded[1], vpad[1], padded[2], vpad[2], padded[3], vpad[3], len(tg), f"{tr_avg:.6f}", f"{tr_wr:.6f}", f"{tr_hs:.6f}", len(sg), f"{te_avg:.6f}", f"{te_wr:.6f}", f"{te_hs:.6f}", f"{score:.6f}", "intersection_candidate_agent", action, "chronological_70_30_intersection_scan"])
+    return rows[:5000]
+
+def _sell_path_intersection_replay_rows(council_buy_entries: pd.DataFrame) -> List[List[Any]]:
+    rows=[]
+    if council_buy_entries is None or council_buy_entries.empty: return rows
+    frame=council_buy_entries.copy().head(5000)
+    for i,r in frame.iterrows():
+        entry_ts=float(r.get("entry_ts", r.get("replay_ts", r.get("ts",0))) or 0); net=float(r.get("buy_net_bps", r.get("net_pnl_bps",0)) or 0); mf=float(r.get("max_favorable_bps", max(net,0)) or 0); ma=abs(float(r.get("max_adverse_bps",0) or 0)); move=max(0.0,mf-max(net,0)); give=max(0.0,mf-net)
+        rows.append([str(r.get("decision_id", f"entry-{i}")), str(r.get("product_id","")), f"{entry_ts:.6f}", f"{entry_ts:.6f}", "0.000", f"{float(r.get('entry_price',0) or 0):.12f}", f"{float(r.get('exit_price',0) or 0):.12f}", f"{net:.6f}", f"{move:.6f}", f"{give:.6f}", f"{mf:.6f}", f"{ma:.6f}", "0.000000", "0.000000", "0.500000", 0, 0, str(r.get("volume_node_state","")), str(r.get("value_acceptance_state","")), f"{float(r.get('poc_distance_bps',0) or 0):.6f}", "0.000000", 0, 0, int(net>0 and give>10), int(net<=0), 0, int(net>0 and move<=20), int(move>40), int(ma>120 and net>=0), "proxy_from_weighted_buy_entry_until_candle_path_available"])
+    return rows
+
+def _daily_capture_simulation_rows(council_buy_entries: pd.DataFrame) -> List[List[Any]]:
+    if council_buy_entries is None or council_buy_entries.empty: return []
+    f=council_buy_entries.copy(); tscol="entry_ts" if "entry_ts" in f.columns else "ts" if "ts" in f.columns else "replay_ts"
+    if tscol not in f.columns: return []
+    f["_date"]=pd.to_datetime(pd.to_numeric(f[tscol], errors="coerce"), unit="s", utc=True).dt.strftime("%Y-%m-%d"); rows=[]; equity=10000.0
+    for d,g in f.groupby("_date"):
+        vals=_numeric(g,"buy_net_bps",0.0); start=equity; ret=float((vals.clip(lower=-250, upper=400)*0.75/10000.0).sum()); equity=start*(1+ret)
+        rows.append([d, f"{start:.2f}", f"{equity:.2f}", f"{ret*100:.6f}", len(g), f"{float((vals>0).mean()):.6f}", f"{float(vals.mean()):.6f}", "0.000000", f"{float(vals.min()):.6f}", f"{float(vals.max()):.6f}", ";".join(sorted(set(g['product_id'].astype(str)))) if 'product_id' in g else "", "50_to_100_pct_sizing_proxy;requires_sell_path_replay_for_final_claim"])
+    return rows
+
 def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     buy_agent_rows, buy_weights, buy_frame, buy_context_rows = _four_pass_buy_agent_rows(base_dir)
     walk_forward_buy_rows = _purged_walk_forward_rows(base_dir, buy_frame, side="BUY")
@@ -2931,6 +3068,9 @@ def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     agent_decision_influence_rows = _agent_decision_influence_rows(buy_agent_rows, sell_agent_rows, buy_frame, sell_frame)
     product_agent_influence_rows = _product_agent_influence_rows(buy_context_rows, buy_frame)
     trade_frequency_estimate_rows = _estimate_trade_frequency_rows(council_buy_entries, council_buy_rows, product_live_gate_rows)
+    intersection_discovery_rows = _intersection_discovery_rows(buy_frame)
+    sell_path_intersection_rows = _sell_path_intersection_replay_rows(council_buy_entries)
+    daily_capture_rows = _daily_capture_simulation_rows(council_buy_entries)
 
     fifth_pass_replay_rows, fifth_pass_summary_rows, fifth_pass_product_contribution_rows, fifth_pass_blocker_rows = _fifth_pass_live_style_replay_rows(
         council_buy_entries,
@@ -2951,6 +3091,8 @@ def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
     return {
         "buy_agent_rows": buy_agent_rows,
         "buy_weights": buy_weights,
+        "buy_frame": buy_frame,
+        "sell_frame": sell_frame,
         "council_buy_rows": council_buy_rows,
         "council_buy_entries": council_buy_entries,
         "sell_agent_rows": sell_agent_rows,
@@ -2971,6 +3113,9 @@ def _four_pass_backtest_outputs(base_dir: str) -> Dict[str, Any]:
         "fifth_pass_summary_rows": fifth_pass_summary_rows,
         "fifth_pass_product_contribution_rows": fifth_pass_product_contribution_rows,
         "fifth_pass_blocker_rows": fifth_pass_blocker_rows,
+        "intersection_discovery_rows": intersection_discovery_rows,
+        "sell_path_intersection_rows": sell_path_intersection_rows,
+        "daily_capture_rows": daily_capture_rows,
     }
 
 
@@ -3106,6 +3251,15 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     markov_regime_policy_path = runtime_path("markov_regime_policy.csv")
     kalman_filter_policy_path = runtime_path("kalman_filter_policy.csv")
     quant_state_summary_path = runtime_path("quant_state_summary.csv")
+    intersection_discovery_path = runtime_path("intersection_discovery.csv")
+    buy_intersection_scores_path = runtime_path("buy_intersection_agent_scores.csv")
+    sell_path_intersection_path = runtime_path("sell_path_intersection_replay.csv")
+    sell_intersection_scores_path = runtime_path("sell_intersection_agent_scores.csv")
+    chart_analog_matches_path = runtime_path("chart_analog_matches.csv")
+    chart_analog_policy_path = runtime_path("chart_analog_policy.csv")
+    daily_capture_path = runtime_path("daily_capture_simulation.csv")
+    intersection_product_live_gate_path = runtime_path("intersection_product_live_gate.csv")
+    intersection_agent_final_ratings_path = runtime_path("intersection_agent_final_ratings.csv")
     summary_path = runtime_path("backtest_summary.csv")
 
     _write_rows(recommendations_path, BACKTEST_RECOMMENDATIONS_COLUMNS, buy_rows)
@@ -3132,6 +3286,25 @@ def run_backtest_intelligence(*, base_dir: str, log_fn: Optional[Callable[[str],
     _write_rows(trade_frequency_estimate_path, TRADE_FREQUENCY_ESTIMATE_COLUMNS, four_pass["trade_frequency_estimate_rows"])
     _write_rows(fifth_pass_replay_path, FIFTH_PASS_LIVE_STYLE_REPLAY_COLUMNS, four_pass["fifth_pass_replay_rows"])
     _write_rows(fifth_pass_summary_path, FIFTH_PASS_LIVE_STYLE_SUMMARY_COLUMNS, four_pass["fifth_pass_summary_rows"])
+    _write_rows(intersection_discovery_path, INTERSECTION_DISCOVERY_COLUMNS, four_pass["intersection_discovery_rows"])
+    buy_score_cols = ["product_id"] + [c for c in BUY_AGENT_SCORE_COLUMNS.values() if "intersection" in c or c in {"reclaimed_value_low_reversal_buy_score","inside_fair_fvg_retest_buy_score","poc_compression_release_buy_score","high_volume_absorption_buy_score","liquidity_sweep_reclaim_buy_score","chart_analog_similarity_buy_score","bad_intersection_veto_buy_score","execution_cost_gate_buy_score"}]
+    buy_score_frame = four_pass["council_buy_entries"] if hasattr(four_pass.get("council_buy_entries"), "columns") and not four_pass["council_buy_entries"].empty else four_pass.get("buy_frame", pd.DataFrame())
+    if hasattr(buy_score_frame, "columns") and not buy_score_frame.empty:
+        buy_score_frame[[c for c in buy_score_cols if c in buy_score_frame.columns]].to_csv(buy_intersection_scores_path, index=False)
+    else:
+        _write_rows(buy_intersection_scores_path, buy_score_cols, [])
+    _write_rows(sell_path_intersection_path, SELL_PATH_INTERSECTION_REPLAY_COLUMNS, four_pass["sell_path_intersection_rows"])
+    sell_score_cols = ["product_id"] + [c for c in SELL_AGENT_SCORE_COLUMNS.values() if c.endswith("_sell_score")]
+    sell_frame_for_scores = four_pass.get("sell_frame", pd.DataFrame())
+    if hasattr(sell_frame_for_scores, "columns") and not sell_frame_for_scores.empty:
+        sell_frame_for_scores[[c for c in sell_score_cols if c in sell_frame_for_scores.columns]].to_csv(sell_intersection_scores_path, index=False)
+    else:
+        _write_rows(sell_intersection_scores_path, sell_score_cols, [])
+    _write_rows(chart_analog_matches_path, CHART_ANALOG_POLICY_COLUMNS, [])
+    _write_rows(chart_analog_policy_path, CHART_ANALOG_POLICY_COLUMNS, [])
+    _write_rows(daily_capture_path, DAILY_CAPTURE_SIMULATION_COLUMNS, four_pass["daily_capture_rows"])
+    _write_rows(intersection_product_live_gate_path, FOUR_PASS_PRODUCT_LIVE_GATE_COLUMNS, four_pass["product_live_gate_rows"])
+    _write_rows(intersection_agent_final_ratings_path, FOUR_PASS_FINAL_AGENT_RATINGS_COLUMNS, four_pass["final_rating_rows"])
     _write_rows(fifth_pass_product_contribution_path, FIFTH_PASS_PRODUCT_CONTRIBUTION_COLUMNS, four_pass["fifth_pass_product_contribution_rows"])
     _write_rows(fifth_pass_blockers_path, FIFTH_PASS_BLOCKER_COLUMNS, four_pass["fifth_pass_blocker_rows"])
 

@@ -5,6 +5,27 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from runtime_paths import (
+        CSV_ROOT_DIR, DEBUG_DIR, RESEARCH_DIR, ensure_runtime_dirs,
+        migrate_root_runtime_files_to_csv_tree, runtime_path, sidecar_meta_path,
+        write_generated_file_meta,
+    )
+except Exception:
+    CSV_ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CSVs")
+    DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    RESEARCH_DIR = os.path.join(CSV_ROOT_DIR, "09_continuous_research")
+    def ensure_runtime_dirs() -> None:
+        os.makedirs(CSV_ROOT_DIR, exist_ok=True); os.makedirs(DEBUG_DIR, exist_ok=True); os.makedirs(RESEARCH_DIR, exist_ok=True)
+    def migrate_root_runtime_files_to_csv_tree() -> Dict[str, object]:
+        return {"moved": [], "skipped": [], "errors": ["runtime_paths_import_failed"]}
+    def runtime_path(filename: str) -> str:
+        ensure_runtime_dirs(); return os.path.join(CSV_ROOT_DIR, os.path.basename(str(filename)))
+    def sidecar_meta_path(path: str) -> str:
+        return f"{path}.meta.json"
+    def write_generated_file_meta(path: str, reason: str = "") -> None:
+        pass
+
 
 import numpy as np
 import pandas as pd
@@ -281,7 +302,7 @@ def _training_frame(base_dir: str) -> pd.DataFrame:
         ("trade_outcomes.csv", "fixed_window_trade_outcome"),
     ]
     for filename, source_name in sources:
-        frame = _standardize_source_frame(_read_csv(os.path.join(base_dir, filename)), source_name)
+        frame = _standardize_source_frame(_read_csv(runtime_path(filename)), source_name)
         if not frame.empty:
             frames.append(frame)
     if not frames:
@@ -378,10 +399,10 @@ def run_risk_intelligence(*, base_dir: str, log_fn=None, bootstrap_trials: int =
     ts_value = _utc_ts(); dt_value = _utc_dt(ts_value)
     ev_rows: List[List[Any]] = []; mc_rows: List[List[Any]] = []; context_rows: List[List[Any]] = []; live_gate_rows: List[List[Any]] = []
     if frame.empty:
-        _write_rows(os.path.join(base_dir, "risk_ev_confidence.csv"), RISK_EV_CONFIDENCE_COLUMNS, [])
-        _write_rows(os.path.join(base_dir, "risk_monte_carlo_summary.csv"), RISK_MONTE_CARLO_COLUMNS, [])
-        _write_rows(os.path.join(base_dir, "risk_context_performance.csv"), RISK_CONTEXT_PERFORMANCE_COLUMNS, [])
-        _write_rows(os.path.join(base_dir, "risk_live_gate.csv"), RISK_LIVE_GATE_COLUMNS, [])
+        _write_rows(runtime_path("risk_ev_confidence.csv"), RISK_EV_CONFIDENCE_COLUMNS, [])
+        _write_rows(runtime_path("risk_monte_carlo_summary.csv"), RISK_MONTE_CARLO_COLUMNS, [])
+        _write_rows(runtime_path("risk_context_performance.csv"), RISK_CONTEXT_PERFORMANCE_COLUMNS, [])
+        _write_rows(runtime_path("risk_live_gate.csv"), RISK_LIVE_GATE_COLUMNS, [])
         return {"rows": 0, "reason": "no_training_frame"}
     product_groups = [("ALL", frame)] + [(str(pid), group.copy()) for pid, group in frame.groupby("product_id")]
     product_ev_map: Dict[str, Dict[str, float]] = {}
@@ -413,12 +434,12 @@ def run_risk_intelligence(*, base_dir: str, log_fn=None, bootstrap_trials: int =
         elif path_grade == "ELEVATED_PATH_RISK": size_mult = min(float(size_mult), 0.75)
         if not live_allowed: size_mult = 0.0
         live_gate_rows.append([f"{ts_value:.6f}", dt_value, str(product_id), int(stats["sample_count"]), f"{stats['ev_mean_bps']:.6f}", f"{stats['ev_ci_low_bps']:.6f}", f"{stats['prob_ev_positive']:.6f}", f"{p95_dd30:.6f}", f"{prob_loss7:.6f}", f"{prob_dd3_30:.6f}", f"{grade}|{path_grade}", bool(live_allowed), f"{float(size_mult):.6f}", f"risk_live_gate;product={product_id};action={action};ev={stats['ev_mean_bps']:.2f};ci_low={stats['ev_ci_low_bps']:.2f};p_ev_positive={stats['prob_ev_positive']:.3f};p95_dd30={p95_dd30:.2f};prob_loss7={prob_loss7:.3f};prob_dd3_30={prob_dd3_30:.3f};block_reasons={','.join(block_reasons) if block_reasons else 'none'}"])
-    _write_rows(os.path.join(base_dir, "risk_ev_confidence.csv"), RISK_EV_CONFIDENCE_COLUMNS, ev_rows)
-    _write_rows(os.path.join(base_dir, "risk_monte_carlo_summary.csv"), RISK_MONTE_CARLO_COLUMNS, mc_rows)
-    _write_rows(os.path.join(base_dir, "risk_context_performance.csv"), RISK_CONTEXT_PERFORMANCE_COLUMNS, context_rows)
-    _write_rows(os.path.join(base_dir, "risk_live_gate.csv"), RISK_LIVE_GATE_COLUMNS, live_gate_rows)
+    _write_rows(runtime_path("risk_ev_confidence.csv"), RISK_EV_CONFIDENCE_COLUMNS, ev_rows)
+    _write_rows(runtime_path("risk_monte_carlo_summary.csv"), RISK_MONTE_CARLO_COLUMNS, mc_rows)
+    _write_rows(runtime_path("risk_context_performance.csv"), RISK_CONTEXT_PERFORMANCE_COLUMNS, context_rows)
+    _write_rows(runtime_path("risk_live_gate.csv"), RISK_LIVE_GATE_COLUMNS, live_gate_rows)
     log(f"[risk-intelligence] completed frame_rows={len(frame)} ev_rows={len(ev_rows)} mc_rows={len(mc_rows)} context_rows={len(context_rows)} live_gate_rows={len(live_gate_rows)}")
-    return {"rows": int(len(frame)), "ev_rows": int(len(ev_rows)), "monte_carlo_rows": int(len(mc_rows)), "context_rows": int(len(context_rows)), "live_gate_rows": int(len(live_gate_rows)), "paths": {"risk_ev_confidence": os.path.join(base_dir, "risk_ev_confidence.csv"), "risk_monte_carlo_summary": os.path.join(base_dir, "risk_monte_carlo_summary.csv"), "risk_context_performance": os.path.join(base_dir, "risk_context_performance.csv"), "risk_live_gate": os.path.join(base_dir, "risk_live_gate.csv")}}
+    return {"rows": int(len(frame)), "ev_rows": int(len(ev_rows)), "monte_carlo_rows": int(len(mc_rows)), "context_rows": int(len(context_rows)), "live_gate_rows": int(len(live_gate_rows)), "paths": {"risk_ev_confidence": runtime_path("risk_ev_confidence.csv"), "risk_monte_carlo_summary": runtime_path("risk_monte_carlo_summary.csv"), "risk_context_performance": runtime_path("risk_context_performance.csv"), "risk_live_gate": runtime_path("risk_live_gate.csv")}}
 
 
 def _latest_by_key(frame: pd.DataFrame, key_col: str) -> Dict[str, Dict[str, Any]]:
@@ -432,7 +453,7 @@ def _latest_by_key(frame: pd.DataFrame, key_col: str) -> Dict[str, Dict[str, Any
 
 
 def load_risk_live_gate_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
-    return _latest_by_key(_read_csv(os.path.join(base_dir, "risk_live_gate.csv")), "product_id")
+    return _latest_by_key(_read_csv(runtime_path("risk_live_gate.csv")), "product_id")
 
 
 def _split_context_key(context_key: str) -> Dict[str, str]:
@@ -543,7 +564,7 @@ def _weighted_summary_rows_to_context_map(frame: pd.DataFrame) -> Dict[str, Dict
 
 
 def load_risk_context_map(base_dir: str) -> Dict[str, Dict[str, Any]]:
-    frame = _read_csv(os.path.join(base_dir, "risk_context_performance.csv"))
+    frame = _read_csv(runtime_path("risk_context_performance.csv"))
     if frame.empty:
         return {}
     return _weighted_summary_rows_to_context_map(frame)

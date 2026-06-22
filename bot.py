@@ -53,6 +53,23 @@ try:
 except Exception:
     run_continuous_research_cycle = None
 
+try:
+    from fixed_intersection_policy import (
+        BUY_AGENT_WEIGHTS,
+        SELL_AGENT_WEIGHTS,
+        fixed_buy_decision,
+        fixed_sell_decision,
+        simulate_fixed_policy_on_candles,
+        summarize_fixed_policy_trades,
+    )
+except Exception:
+    BUY_AGENT_WEIGHTS = {}
+    SELL_AGENT_WEIGHTS = {}
+    fixed_buy_decision = None
+    fixed_sell_decision = None
+    simulate_fixed_policy_on_candles = None
+    summarize_fixed_policy_trades = None
+
 
 import numpy as np
 import pandas as pd
@@ -591,6 +608,15 @@ CHART_1D_2Y_CSV_PATH: str = runtime_path("chart_1d_2y.csv")
 HIST_REPLAY_15M_90D_CSV_PATH: str = runtime_path("historical_replay_15m_90d.csv")
 HIST_REPLAY_1H_365D_CSV_PATH: str = runtime_path("historical_replay_1h_365d.csv")
 HIST_REPLAY_1D_2Y_CSV_PATH: str = runtime_path("historical_replay_1d_2y.csv")
+HIST_REPLAY_1M_60D_CSV_PATH: str = runtime_path("historical_replay_1m_60d.csv")
+HIST_REPLAY_5M_180D_CSV_PATH: str = runtime_path("historical_replay_5m_180d.csv")
+HIST_REPLAY_15M_365D_CSV_PATH: str = runtime_path("historical_replay_15m_365d.csv")
+HIST_REPLAY_1H_3Y_CSV_PATH: str = runtime_path("historical_replay_1h_3y.csv")
+FIXED_INTERSECTION_TIMEFRAME_SIMULATION_CSV_PATH: str = runtime_path("fixed_intersection_timeframe_simulation.csv")
+FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH: str = runtime_path("fixed_intersection_timeframe_live_gate.csv")
+FIXED_INTERSECTION_TRADE_LOG_CSV_PATH: str = runtime_path("fixed_intersection_trade_log.csv")
+FIXED_INTERSECTION_AGENT_SNAPSHOTS_CSV_PATH: str = runtime_path("fixed_intersection_agent_snapshots.csv")
+FIXED_INTERSECTION_PRODUCT_SUMMARY_CSV_PATH: str = runtime_path("fixed_intersection_product_summary.csv")
 
 # Compatibility aliases used by the historical replay process-worker path.
 # Keep both names because older helper functions still reference HISTORICAL_REPLAY_*.
@@ -750,7 +776,7 @@ ANALOG_BLOCK_AVG_BPS_BELOW: float = 5.0
 ANALOG_BLOCK_WIN_RATE_BELOW: float = 0.55
 ANALOG_SIZE_DOWN_WHEN_MISSING: float = 0.50
 
-ENABLE_ADAPTIVE_DECISION_POLICY: bool = True
+ENABLE_ADAPTIVE_DECISION_POLICY: bool = False
 ADAPTIVE_DECISION_POLICY_CACHE_SEC: float = 15.0
 ADAPTIVE_POLICY_MIN_SAMPLE_COUNT: int = 25
 ADAPTIVE_POLICY_MIN_CONFIDENCE_FOR_LIVE_ADJUST: float = 0.35
@@ -763,12 +789,28 @@ ADAPTIVE_MAX_EV_DELTA_BPS: float = 9.0
 ADAPTIVE_MIN_POSITION_SIZE_MULTIPLIER: float = 0.50
 ADAPTIVE_MAX_POSITION_SIZE_MULTIPLIER: float = 1.00
 
-ENABLE_CROSS_ASSET_ADAPTIVE_POLICY: bool = True
+ENABLE_CROSS_ASSET_ADAPTIVE_POLICY: bool = False
 CROSS_ASSET_POLICY_CACHE_SEC: float = 15.0
 CROSS_ASSET_POLICY_MIN_SAMPLE_COUNT: int = 35
 CROSS_ASSET_POLICY_MIN_CONFIDENCE: float = 0.35
 CROSS_ASSET_POLICY_MAX_SIZE_MULTIPLIER: float = 1.00
 CROSS_ASSET_POLICY_MISSING_SIZE_MULTIPLIER: float = 0.50
+
+ENABLE_FIXED_INTERSECTION_ONLY_MODEL: bool = True
+DISABLE_OLD_ADAPTIVE_AGENT_WEIGHTING: bool = True
+FIXED_INTERSECTION_STARTUP_TIMEFRAMES = [
+    {"timeframe": "startup_1m_60d", "csv_path": HIST_REPLAY_1M_60D_CSV_PATH, "lookback_days": 60, "min_prefix_rows": 240, "max_hold_bars": 360},
+    {"timeframe": "startup_5m_180d", "csv_path": HIST_REPLAY_5M_180D_CSV_PATH, "lookback_days": 180, "min_prefix_rows": 240, "max_hold_bars": 288},
+    {"timeframe": "startup_15m_365d", "csv_path": HIST_REPLAY_15M_365D_CSV_PATH, "lookback_days": 365, "min_prefix_rows": 192, "max_hold_bars": 192},
+    {"timeframe": "startup_1h_3y", "csv_path": HIST_REPLAY_1H_3Y_CSV_PATH, "lookback_days": 365 * 3, "min_prefix_rows": 240, "max_hold_bars": 168},
+]
+FIXED_INTERSECTION_MIN_TRADES_FOR_LIVE_TIMEFRAME: int = 20
+FIXED_INTERSECTION_MIN_WIN_RATE_FOR_LIVE_TIMEFRAME: float = 0.52
+FIXED_INTERSECTION_MIN_PROFIT_FACTOR_FOR_LIVE_TIMEFRAME: float = 1.15
+FIXED_INTERSECTION_MIN_AVG_NET_BPS_FOR_LIVE_TIMEFRAME: float = 0.0
+FIXED_INTERSECTION_MIN_TRADES_PER_DAY_FOR_LIVE_TIMEFRAME: float = 0.05
+FIXED_INTERSECTION_STARTUP_SIM_REQUIRED: bool = True
+FIXED_INTERSECTION_TRADE_ALL_PROFITABLE_TIMEFRAMES: bool = True
 
 # Clean Profit Path Gate.
 # This is the main high-accuracy live-buy filter.
@@ -7316,6 +7358,16 @@ class TradingBot:
         self._historical_replay_existing_keys_cache_ts: float = 0.0
         self._last_historical_replay_cache_compact_ts: float = 0.0
         self._level8_product_rotation_index = 0
+        self._fixed_intersection_live_gate_cache: Dict[str, List[str]] = {}
+        self._fixed_intersection_live_gate_cache_ts: float = 0.0
+        self.fixed_intersection_backlog_result = {}
+        self.fixed_intersection_startup_sim_result = {}
+
+        if bool(ENABLE_FIXED_INTERSECTION_ONLY_MODEL):
+            self.fixed_intersection_backlog_result = self._ensure_fixed_intersection_backlog_candles()
+            module_debug(MODULE_NAME, "fixed_intersection_backlog_complete", data=self.fixed_intersection_backlog_result, level="INFO", also_overall=True)
+            self.fixed_intersection_startup_sim_result = self._run_fixed_intersection_startup_simulation()
+            module_debug(MODULE_NAME, "fixed_intersection_startup_simulation_complete", data=self.fixed_intersection_startup_sim_result, level="INFO", also_overall=True)
 
         log(
             f"[startup-state] existing_runtime_csv_state="
@@ -16325,80 +16377,32 @@ class TradingBot:
         context: Dict[str, Any],
         common: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """Build intersection-only entry alpha/veto council votes."""
-        def cf(value: Any, default: float = 0.0) -> float:
-            try:
-                return float(value if value is not None else default)
-            except Exception:
-                return float(default)
-        def clamp01(value: Any) -> float:
-            return clamp_float(cf(value, 0.0), 0.0, 1.0)
-        def low(value: Any) -> str:
-            return str(value or "").lower()
-        def vote(agent: str, buy: float, hold: float, wait: float, confidence: float, reason: str) -> Dict[str, Any]:
-            buy_v = clamp01(buy)
-            return {**common, "agent": agent, "buy": buy_v, "sell": clamp_float(1.0 - buy_v, 0.0, 1.0), "hold": clamp01(hold), "wait": clamp01(wait), "confidence": clamp01(confidence), "reason": reason}
-        pa = dict(context.get("price_action_context", {}) or {})
-        quant = dict(context.get("quant_context", {}) or {})
-        setup = low(candidate.get("setup_tag", common.get("setup_tag", "")))
-        structure = low(pa.get("structure_state", candidate.get("structure_state", "")))
-        value_area = low(pa.get("value_area_state", candidate.get("value_area_state", "")))
-        value_acceptance = low(pa.get("value_acceptance_state", candidate.get("value_acceptance_state", "")))
-        volume_node = low(pa.get("volume_node_state", candidate.get("volume_node_state", "")))
-        fvg = low(pa.get("fvg_state", candidate.get("fvg_state", "")))
-        session_setup = low(context.get("session_liquidity_setup", candidate.get("session_liquidity_setup", "")))
-        reason_text = low(pa.get("reason", candidate.get("price_action_reason", "")))
-        score_raw = cf(candidate.get("score", 0.0), 0.0); score_norm = clamp_float(score_raw / 100.0 if score_raw > 1.50 else score_raw, 0.0, 1.0)
-        probability = clamp_float(cf(candidate.get("estimated_prob_up", candidate.get("probability", 0.50)), 0.50), 0.0, 1.0)
-        poc_distance = cf(candidate.get("poc_distance_bps", pa.get("poc_distance_bps", 0.0)), 0.0)
-        volume_wait = clamp01(candidate.get("volume_profile_leader_wait_score", pa.get("volume_profile_leader_wait_score", 0.50)))
-        volume_buy = clamp01(candidate.get("volume_profile_leader_buy_score", pa.get("volume_profile_leader_buy_score", 0.50)))
-        market_structure = clamp01(candidate.get("market_structure_buy_score", pa.get("market_structure_buy_score", 0.50)))
-        validated_liquidity = clamp01(candidate.get("validated_liquidity_buy_score", pa.get("validated_liquidity_buy_score", 0.50)))
-        quant_wait = clamp01(quant.get("quant_wait_score", candidate.get("quant_wait_score", 0.50)))
-        inside_fair_value = "inside_fair_value" in value_acceptance or "inside_value" in value_area
-        inside_near_poc = "inside_value_near_poc" in value_acceptance
-        reclaimed_value_low = "reclaimed_value_low" in value_acceptance
-        high_volume_node = "high_volume_node" in volume_node or "high_volume_node" in setup
-        low_volume_node = "low_volume_node" in volume_node
-        bearish_fvg_retest = "bearish_fvg_retest" in setup or "bearish_fvg_retest" in fvg
-        bullish_fvg_open = "bullish_fvg_open" in setup or "bullish_fvg_open" in fvg
-        lower_high_lower_low = "lower_high_lower_low" in setup or "lower_high_lower_low" in structure
-        higher_high_higher_low = "higher_high_higher_low" in setup or "higher_high_higher_low" in structure
-        lower_rejection = "lower_rejection=true" in reason_text
-        swept_low = "swept_low=true" in reason_text or "sweep_reclaim" in session_setup
-        reclaimed_low = "reclaimed_low=true" in reason_text or reclaimed_value_low
-        score_q4_zone = 0.68 <= score_norm <= 0.735; score_q5_zone = score_norm > 0.735; probability_q4_zone = 0.72 <= probability <= 0.845
-        poc_q2_zone = 37.0 <= poc_distance <= 70.0; poc_q4_far = 106.0 < poc_distance <= 180.0
-        high_volume_wait = volume_wait >= 0.68; very_high_volume_wait = volume_wait >= 0.86
-        reclaimed_score = clamp_float((0.42 if reclaimed_value_low else 0) + (0.20 if probability_q4_zone else 0) + (0.16 if score_q5_zone else 0) + (0.10 if "normal_volume_node" in volume_node else 0) + market_structure*0.07 + validated_liquidity*0.05,0,1)
-        fvg_score = clamp_float((0.25 if inside_fair_value else 0) + (0.20 if high_volume_node else 0) + (0.18 if lower_high_lower_low else 0) + (0.18 if bearish_fvg_retest else 0) + (0.11 if high_volume_wait else 0) + market_structure*0.08,0,1)
-        poc_score = clamp_float((0.22 if inside_fair_value else 0) + (0.18 if score_q4_zone else 0) + (0.18 if poc_q2_zone else 0) + (0.17 if high_volume_wait else 0) + market_structure*0.15 + validated_liquidity*0.10,0,1)
-        absorption_score = clamp_float((0.24 if high_volume_node else 0) + (0.20 if inside_near_poc else 0) + (0.18 if very_high_volume_wait else 0) + (1.0-volume_buy)*0.10 + market_structure*0.16 + validated_liquidity*0.12,0,1)
-        sweep_score = clamp_float((0.24 if swept_low else 0) + (0.24 if reclaimed_low else 0) + (0.14 if lower_rejection else 0) + validated_liquidity*0.14 + market_structure*0.14 + (0.10 if probability_q4_zone else 0),0,1)
-        analog_score = clamp_float(cf(candidate.get("chart_analog_similarity_buy_score", 0.0), 0.0) or (reclaimed_score*0.22+fvg_score*0.22+poc_score*0.20+absorption_score*0.14+sweep_score*0.22),0,1)
-        bad_strength = (0.35 if inside_fair_value and low_volume_node and poc_q4_far else 0) + (0.35 if inside_fair_value and high_volume_node and higher_high_higher_low and bullish_fvg_open else 0) + (0.20 if score_q5_zone and poc_q4_far and 0.50 <= volume_wait <= 0.86 else 0) + (0.10 if quant_wait > 0.60 and score_q5_zone and poc_q4_far else 0)
-        veto_score = clamp_float(1.0 - bad_strength, 0.0, 1.0)
-        spread_bps = cf(candidate.get("spread_bps", 0.0), 0.0); cost_bps = cf(candidate.get("cost_bps", 0.0), 0.0); expected_edge = cf(candidate.get("expected_net_edge_bps", 0.0), 0.0)
-        execution_score = clamp_float((1.0-min(1.0,spread_bps/80.0))*0.35 + (1.0-min(1.0,cost_bps/140.0))*0.30 + clamp_float(expected_edge/180.0+0.50,0,1)*0.20 + validated_liquidity*0.15,0,1)
-        scores = {
-            "reclaimed_value_low_reversal_buy_score": reclaimed_score, "inside_fair_fvg_retest_buy_score": fvg_score,
-            "poc_compression_release_buy_score": poc_score, "high_volume_absorption_buy_score": absorption_score,
-            "liquidity_sweep_reclaim_buy_score": sweep_score, "chart_analog_similarity_buy_score": analog_score,
-            "bad_intersection_veto_buy_score": veto_score, "execution_cost_gate_buy_score": execution_score,
-        }
-        candidate.update(scores)
-        return [
-            vote("reclaimed_value_low_reversal_agent", reclaimed_score, .45+reclaimed_score*.25, 1-reclaimed_score, .78, f"reclaimed_value_low_reversal;score={reclaimed_score:.3f}"),
-            vote("inside_fair_fvg_retest_agent", fvg_score, .45+fvg_score*.25, 1-fvg_score, .76, f"inside_fair_fvg_retest;score={fvg_score:.3f}"),
-            vote("poc_compression_release_agent", poc_score, .45+poc_score*.25, 1-poc_score, .74, f"poc_compression_release;score={poc_score:.3f}"),
-            vote("high_volume_absorption_agent", absorption_score, .45+absorption_score*.25, 1-absorption_score, .74, f"high_volume_absorption;score={absorption_score:.3f}"),
-            vote("liquidity_sweep_reclaim_agent", sweep_score, .45+sweep_score*.25, 1-sweep_score, .78, f"liquidity_sweep_reclaim;score={sweep_score:.3f}"),
-            vote("chart_analog_similarity_agent", analog_score, .42+analog_score*.28, 1-analog_score, .72, f"chart_analog_similarity;score={analog_score:.3f}"),
-            vote("bad_intersection_veto_agent", veto_score, .35, 1-veto_score, .88 if veto_score < .70 else .60, f"bad_intersection_veto;pass_score={veto_score:.3f}"),
-            vote("execution_cost_gate_agent", execution_score, .36+execution_score*.20, 1-execution_score, .76, f"execution_cost_gate;spread={spread_bps:.2f};cost={cost_bps:.2f};score={execution_score:.3f}"),
-        ]
+        if fixed_buy_decision is None:
+            return []
 
+        buy_result = fixed_buy_decision(candidate)
+        candidate.update(buy_result)
+
+        votes = []
+        for agent_name, weight in BUY_AGENT_WEIGHTS.items():
+            raw_score = float(buy_result.get(agent_name, 0.0) or 0.0)
+            votes.append({
+                **common,
+                "agent": agent_name,
+                "buy": raw_score,
+                "sell": clamp_float(1.0 - raw_score, 0.0, 1.0),
+                "hold": clamp_float(0.35 + raw_score * 0.35, 0.0, 1.0),
+                "wait": clamp_float(0.85 - raw_score * 0.65, 0.0, 1.0),
+                "confidence": clamp_float(0.40 + raw_score * 0.45, 0.0, 1.0),
+                "weight": float(weight),
+                "reason": (
+                    f"fixed_buy_agent;agent={agent_name};score={raw_score:.4f};"
+                    f"weight={float(weight):.4f};weighted={raw_score * float(weight):.4f};"
+                    f"total_buy_score={float(buy_result.get('buy_intersection_score', 0.0)):.4f}"
+                ),
+            })
+
+        return votes
 
     def _level8_decision_for_candidate(
         self,
@@ -16723,57 +16727,20 @@ class TradingBot:
             if bool(ENABLE_LEVEL8_LEARNING_MODE):
                 votes.append(vote("exploration", 0.0, 0.35, 0.70, 0.20, f"shadow_only_learning_score={learning_score:.3f};setup={setup_tag};regime={market_regime}"))
 
-            vote_by_agent = {str(v.get("agent", "")): v for v in votes}
-            def agent_buy(agent: str, default: float = 0.0) -> float:
-                try:
-                    return clamp_float(float(vote_by_agent.get(agent, {}).get("buy", default) or default), 0.0, 1.0)
-                except Exception:
-                    return float(default)
-            def agent_wait(agent: str, default: float = 0.0) -> float:
-                try:
-                    return clamp_float(float(vote_by_agent.get(agent, {}).get("wait", default) or default), 0.0, 1.0)
-                except Exception:
-                    return float(default)
-            reclaimed_value_low_reversal = agent_buy("reclaimed_value_low_reversal_agent", 0.0)
-            inside_fair_fvg_retest = agent_buy("inside_fair_fvg_retest_agent", 0.0)
-            poc_compression_release = agent_buy("poc_compression_release_agent", 0.0)
-            high_volume_absorption = agent_buy("high_volume_absorption_agent", 0.0)
-            liquidity_sweep_reclaim = agent_buy("liquidity_sweep_reclaim_agent", 0.0)
-            chart_analog_similarity = agent_buy("chart_analog_similarity_agent", 0.0)
-            execution_cost_gate = agent_buy("execution_cost_gate_agent", 0.0)
-            bad_intersection_veto = agent_buy("bad_intersection_veto_agent", 1.0)
-            alpha_score = (
-                reclaimed_value_low_reversal * 0.18
-                + inside_fair_fvg_retest * 0.18
-                + poc_compression_release * 0.16
-                + high_volume_absorption * 0.12
-                + liquidity_sweep_reclaim * 0.14
-                + chart_analog_similarity * 0.16
-                + execution_cost_gate * 0.06
-            )
-            veto_pressure = clamp_float(1.0 - bad_intersection_veto, 0.0, 1.0)
-            truth_buy = clamp_float(alpha_score - veto_pressure * 0.45, 0.0, 1.0)
-            strong_intersection_agents = sum(1 for v in [reclaimed_value_low_reversal, inside_fair_fvg_retest, poc_compression_release, high_volume_absorption, liquidity_sweep_reclaim] if v >= 0.70)
+            fixed_buy_result = fixed_buy_decision(candidate) if fixed_buy_decision is not None else {"buy_intersection_score": 0.0}
+            truth_buy = clamp_float(float(fixed_buy_result.get("buy_intersection_score", 0.0) or 0.0), 0.0, 1.0)
+            candidate.update(fixed_buy_result)
+            reclaimed_value_low_reversal = truth_buy
+            inside_fair_fvg_retest = float(fixed_buy_result.get("fvg_fresh_zone_score", 0.0) or 0.0)
+            chart_analog_similarity = float(fixed_buy_result.get("cross_asset_analog_score", 0.0) or 0.0)
+            veto_pressure = clamp_float(1.0 - truth_buy, 0.0, 1.0)
             truth_vote = vote(
                 "truth",
                 truth_buy,
                 clamp_float(0.35 + truth_buy * 0.30, 0.0, 1.0),
-                clamp_float(0.80 - truth_buy * 0.55, 0.0, 1.0),
-                clamp_float(0.30 + truth_buy * 0.55, 0.20, 0.90),
-                (
-                    f"truth evidence={truth_buy:.3f};"
-                    f"alpha_score={alpha_score:.3f};"
-                    f"reclaimed={reclaimed_value_low_reversal:.3f};"
-                    f"fair_fvg={inside_fair_fvg_retest:.3f};"
-                    f"poc_release={poc_compression_release:.3f};"
-                    f"absorption={high_volume_absorption:.3f};"
-                    f"sweep={liquidity_sweep_reclaim:.3f};"
-                    f"analog={chart_analog_similarity:.3f};"
-                    f"execution={execution_cost_gate:.3f};"
-                    f"bad_veto={bad_intersection_veto:.3f};"
-                    f"strong_agents={strong_intersection_agents};"
-                    f"setup={setup_tag};regime={market_regime}"
-                ),
+                clamp_float(0.85 - truth_buy * 0.65, 0.0, 1.0),
+                clamp_float(0.35 + truth_buy * 0.55, 0.20, 0.90),
+                f"fixed_intersection_truth;buy_intersection_score={truth_buy:.4f};weights={BUY_AGENT_WEIGHTS}",
             )
             session_agent_for_strategy = str(session_liquidity_vote.get("agent", "session_none"))
             session_setup_for_strategy = str(session_liquidity_vote.get("session_liquidity_setup", "none"))
@@ -22031,6 +21998,91 @@ class TradingBot:
         except Exception as exc:
             return {"available": False, "allowed": False, "confidence": 0.0, "reason": f"clean_profit_path_gate_error_fail_closed:{exc}"}
 
+
+    def _ensure_fixed_intersection_backlog_candles(self) -> Dict[str, Any]:
+        result = {"started": True, "products": len(PRODUCTS), "timeframes": len(FIXED_INTERSECTION_STARTUP_TIMEFRAMES), "rows_written": 0, "details": []}
+        if BinanceBulkHistoricalProvider is None or write_normalized_candles_to_bot_cache is None:
+            result["error"] = "historical_data_provider_unavailable"
+            return result
+        provider = BinanceBulkHistoricalProvider(base_dir=CSV_ROOT_DIR)
+        end_ts = int(now_ts())
+        for product_id in PRODUCTS:
+            for spec in FIXED_INTERSECTION_STARTUP_TIMEFRAMES:
+                timeframe = str(spec["timeframe"]); path = str(spec["csv_path"]); start_ts = int(end_ts - int(spec["lookback_days"]) * 86400)
+                try:
+                    candles, info = provider.fetch_bulk_candles(product_id=product_id, timeframe=timeframe, start_ts=start_ts, end_ts=end_ts)
+                    rows_written = write_normalized_candles_to_bot_cache(path=path, product_id=product_id, candles=candles, min_ts=start_ts)
+                    detail = {"product_id": product_id, "timeframe": timeframe, "rows_written": int(rows_written), "candles_available": len(candles), "info": info}
+                    result["rows_written"] += int(rows_written); result["details"].append(detail)
+                    module_debug(MODULE_NAME, "fixed_intersection_backlog_candles_ready", data=detail, level="INFO", also_overall=True)
+                except Exception as exc:
+                    result["details"].append({"product_id": product_id, "timeframe": timeframe, "error": str(exc)})
+                    module_exception(MODULE_NAME, "fixed_intersection_backlog_fetch_failed", exc, data={"product_id": product_id, "timeframe": timeframe}, also_overall=True)
+        return result
+
+    def _run_fixed_intersection_startup_simulation(self) -> Dict[str, Any]:
+        if simulate_fixed_policy_on_candles is None or summarize_fixed_policy_trades is None:
+            return {"ok": False, "reason": "fixed_intersection_policy_module_unavailable"}
+        all_trade_frames = []; all_snapshot_frames = []; summary_rows = []; live_gate_rows = []
+        try:
+            fee_and_slippage_bps = float(EST_SLIPPAGE_BPS) + float(EST_ADVERSE_FILL_BPS) + float(globals().get("CURRENT_TOTAL_FEE_BPS", 20.0))
+        except Exception:
+            fee_and_slippage_bps = 20.0
+        for product_id in PRODUCTS:
+            for spec in FIXED_INTERSECTION_STARTUP_TIMEFRAMES:
+                timeframe = str(spec["timeframe"]); path = str(spec["csv_path"])
+                try:
+                    frame = self._read_csv_tail_for_bot(path, max_lines=2_000_000)
+                    if frame.empty:
+                        summary = {"product_id": product_id, "timeframe": timeframe, "trade_count": 0, "win_rate": 0.0, "avg_net_bps": 0.0, "median_net_bps": 0.0, "total_net_bps": 0.0, "profit_factor": 0.0, "trades_per_day": 0.0, "approved_for_live": False, "reason": "no_candle_rows"}
+                    else:
+                        trades, snapshots = simulate_fixed_policy_on_candles(frame=frame, product_id=product_id, timeframe=timeframe, fee_and_slippage_bps=fee_and_slippage_bps, min_prefix_rows=int(spec["min_prefix_rows"]), max_hold_bars=int(spec["max_hold_bars"]), stop_loss_bps=-100.0)
+                        summary = summarize_fixed_policy_trades(trades=trades, product_id=product_id, timeframe=timeframe)
+                        if trades is not None and not trades.empty: all_trade_frames.append(trades)
+                        if snapshots is not None and not snapshots.empty: all_snapshot_frames.append(snapshots)
+                    approved = bool(int(summary.get("trade_count", 0) or 0) >= int(FIXED_INTERSECTION_MIN_TRADES_FOR_LIVE_TIMEFRAME) and float(summary.get("win_rate", 0.0) or 0.0) >= float(FIXED_INTERSECTION_MIN_WIN_RATE_FOR_LIVE_TIMEFRAME) and float(summary.get("profit_factor", 0.0) or 0.0) >= float(FIXED_INTERSECTION_MIN_PROFIT_FACTOR_FOR_LIVE_TIMEFRAME) and float(summary.get("avg_net_bps", 0.0) or 0.0) > float(FIXED_INTERSECTION_MIN_AVG_NET_BPS_FOR_LIVE_TIMEFRAME) and float(summary.get("trades_per_day", 0.0) or 0.0) >= float(FIXED_INTERSECTION_MIN_TRADES_PER_DAY_FOR_LIVE_TIMEFRAME))
+                    summary["approved_for_live"] = approved; summary_rows.append(summary)
+                    live_gate_rows.append({"ts": now_ts(), "dt_mst": datetime.fromtimestamp(now_ts(), tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S"), "product_id": product_id, "timeframe": timeframe, "approved_for_live": approved, "trade_count": int(summary.get("trade_count", 0) or 0), "win_rate": float(summary.get("win_rate", 0.0) or 0.0), "avg_net_bps": float(summary.get("avg_net_bps", 0.0) or 0.0), "median_net_bps": float(summary.get("median_net_bps", 0.0) or 0.0), "total_net_bps": float(summary.get("total_net_bps", 0.0) or 0.0), "profit_factor": float(summary.get("profit_factor", 0.0) or 0.0), "trades_per_day": float(summary.get("trades_per_day", 0.0) or 0.0), "reason": str(summary.get("reason", ""))})
+                except Exception as exc:
+                    module_exception(MODULE_NAME, "fixed_intersection_startup_sim_failed", exc, data={"product_id": product_id, "timeframe": timeframe, "traceback": traceback.format_exc()}, also_overall=True)
+        summary_df = pd.DataFrame(summary_rows); gate_df = pd.DataFrame(live_gate_rows)
+        summary_df.to_csv(FIXED_INTERSECTION_TIMEFRAME_SIMULATION_CSV_PATH, index=False); gate_df.to_csv(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH, index=False)
+        (pd.concat(all_trade_frames, ignore_index=True) if all_trade_frames else pd.DataFrame()).to_csv(FIXED_INTERSECTION_TRADE_LOG_CSV_PATH, index=False)
+        (pd.concat(all_snapshot_frames, ignore_index=True) if all_snapshot_frames else pd.DataFrame()).to_csv(FIXED_INTERSECTION_AGENT_SNAPSHOTS_CSV_PATH, index=False)
+        product_summary = gate_df.groupby("product_id", as_index=False).agg(approved_timeframes=("approved_for_live", "sum"), total_trade_count=("trade_count", "sum"), avg_win_rate=("win_rate", "mean"), avg_net_bps=("avg_net_bps", "mean"), avg_trades_per_day=("trades_per_day", "mean")) if not gate_df.empty else pd.DataFrame()
+        product_summary.to_csv(FIXED_INTERSECTION_PRODUCT_SUMMARY_CSV_PATH, index=False)
+        return {"ok": True, "summary_rows": len(summary_rows), "approved_pairs": int(gate_df["approved_for_live"].sum()) if not gate_df.empty else 0, "products": len(PRODUCTS), "timeframes": len(FIXED_INTERSECTION_STARTUP_TIMEFRAMES), "total_product_timeframe_tests": len(PRODUCTS) * len(FIXED_INTERSECTION_STARTUP_TIMEFRAMES)}
+
+    def _load_fixed_intersection_approved_timeframes(self) -> Dict[str, List[str]]:
+        try:
+            now_value = now_ts()
+            if self._fixed_intersection_live_gate_cache and now_value - float(self._fixed_intersection_live_gate_cache_ts or 0.0) < 30.0:
+                return dict(self._fixed_intersection_live_gate_cache)
+            df = self._read_csv_tail_for_bot(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH, max_lines=1000)
+            if df.empty or "product_id" not in df.columns or "timeframe" not in df.columns:
+                self._fixed_intersection_live_gate_cache = {}; self._fixed_intersection_live_gate_cache_ts = now_value; return {}
+            df["approved_bool"] = df["approved_for_live"].astype(str).str.lower().isin({"true", "1", "yes", "y"}); df = df[df["approved_bool"]].copy()
+            result: Dict[str, List[str]] = {str(pid): sorted(group["timeframe"].dropna().astype(str).unique().tolist()) for pid, group in df.groupby("product_id")}
+            self._fixed_intersection_live_gate_cache = result; self._fixed_intersection_live_gate_cache_ts = now_value; return dict(result)
+        except Exception:
+            return {}
+
+    def _fixed_intersection_timeframe_allowed(self, product_id: str, timeframe: str) -> bool:
+        return str(timeframe) in set(self._load_fixed_intersection_approved_timeframes().get(str(product_id), []) or [])
+
+    def _live_timeframes_for_product(self, product_id: str) -> List[str]:
+        return list(self._load_fixed_intersection_approved_timeframes().get(str(product_id), []) or [])
+
+    def _best_fixed_timeframe_candidate_per_product(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        grouped = {}; gate_df = self._read_csv_tail_for_bot(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH, max_lines=1000); gate_lookup = {}
+        if not gate_df.empty:
+            for _, row in gate_df.iterrows(): gate_lookup[(str(row.get("product_id", "")), str(row.get("timeframe", "")))] = row.to_dict()
+        for candidate in candidates:
+            product_id = str(candidate.get("product_id", "")); timeframe = str(candidate.get("timeframe", candidate.get("fixed_intersection_timeframe", ""))); gate = gate_lookup.get((product_id, timeframe), {})
+            rank = float(candidate.get("buy_intersection_score", 0.0) or 0.0) * 1000.0 + float(gate.get("avg_net_bps", 0.0) or 0.0) * 2.0 + float(gate.get("win_rate", 0.0) or 0.0) * 100.0 - float(candidate.get("spread_bps", 999.0) or 999.0)
+            if product_id not in grouped or rank > grouped[product_id][0]: grouped[product_id] = (rank, candidate)
+        return [item[1] for item in grouped.values()]
+
     def _calculation_status(self, *, include_readiness: bool = True, readiness_override: Optional[Dict[str, Any]] = None, force: bool = False) -> Dict[str, Any]:
         now_value = now_ts()
         if (not bool(force) and getattr(self, "_calculation_status_cache", None) and now_value - float(getattr(self, "_calculation_status_cache_ts", 0.0) or 0.0) < float(CALCULATION_STATUS_RESCAN_EVERY_SEC)):
@@ -22040,7 +22092,7 @@ class TradingBot:
             candle_15m_counts = self._count_rows_by_product_from_csv(HIST_REPLAY_15M_90D_CSV_PATH, max_lines=250000)
             candle_1h_counts = self._count_rows_by_product_from_csv(HIST_REPLAY_1H_365D_CSV_PATH, max_lines=250000)
             product_status: Dict[str, Dict[str, Any]] = {}
-            phase_totals = {"live_data": 0.0, "micro_backlog": 0.0, "historical_candle_backlog": 0.0, "historical_replay": 0.0, "replay_calibration_verdicts": 0.0}
+            phase_totals = {"live_data": 0.0, "micro_backlog": 0.0, "historical_candle_backlog": 0.0, "historical_replay": 0.0, "fixed_intersection_backlog": 0.0, "fixed_intersection_simulation": 0.0, "replay_calibration_verdicts": 0.0}
             readiness = dict(readiness_override or {}) if readiness_override is not None else (self._live_readiness_status(include_calculation=False) if include_readiness else {})
             live_data_checks = [bool(readiness.get("viewer_snapshot_recent")), bool(readiness.get("websocket_recent")), bool(readiness.get("market_csv_recent")), bool(readiness.get("council_recent")), bool(readiness.get("fee_tier_ready")), bool(readiness.get("micro_history_ready"))]
             phase_totals["live_data"] = sum(1.0 for x in live_data_checks if x) / max(1, len(live_data_checks))
@@ -22081,13 +22133,16 @@ class TradingBot:
             phase_totals["historical_candle_backlog"] = sum(product_status[p]["historical_candle_progress"] for p in PRODUCTS) / product_count
             phase_totals["historical_replay"] = sum(product_status[p]["historical_replay_progress"] for p in PRODUCTS) / product_count
             phase_totals["replay_calibration_verdicts"] = sum(product_status[p]["calibration_verdict_progress"] for p in PRODUCTS) / product_count
+            phase_totals["fixed_intersection_backlog"] = 1.0 if bool(getattr(self, "fixed_intersection_backlog_result", {}).get("started", False)) else 0.0
+            phase_totals["fixed_intersection_simulation"] = 1.0 if os.path.exists(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH) and os.path.getsize(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_CSV_PATH) > 0 else 0.0
+            fixed_intersection_ready = bool(phase_totals["fixed_intersection_simulation"] >= 1.0)
             all_products_complete = all(bool(product_status[p]["complete"]) for p in PRODUCTS)
-            calculation_work_complete = bool(all_products_complete and phase_totals["micro_backlog"] >= 1.0 and phase_totals["historical_candle_backlog"] >= 1.0 and phase_totals["historical_replay"] >= 1.0 and phase_totals["replay_calibration_verdicts"] >= 1.0)
+            calculation_work_complete = bool(all_products_complete and phase_totals["micro_backlog"] >= 1.0 and phase_totals["historical_candle_backlog"] >= 1.0 and phase_totals["historical_replay"] >= 1.0 and phase_totals["replay_calibration_verdicts"] >= 1.0 and ((not bool(FIXED_INTERSECTION_STARTUP_SIM_REQUIRED)) or fixed_intersection_ready))
             latch = self._load_calculation_complete_latch()
             latched_complete = bool(latch.get("calculation_complete_latched"))
             if not latched_complete and not calculation_work_complete:
                 self._final_startup_backtest_intelligence_completed = False
-            full_viewer_unlocked = bool((not VIEWER_REQUIRE_FULL_STARTUP_CALCULATION) or latched_complete or calculation_work_complete)
+            full_viewer_unlocked = bool(((not VIEWER_REQUIRE_FULL_STARTUP_CALCULATION) or latched_complete or calculation_work_complete) and ((not bool(FIXED_INTERSECTION_STARTUP_SIM_REQUIRED)) or latched_complete or fixed_intersection_ready))
             complete_products = sum(1 for p in PRODUCTS if bool(product_status[p]["complete"]))
             profit_ready_products = sum(1 for p in PRODUCTS if bool(product_status[p]["profit_ready"]))
             blocked_products = sum(
@@ -22106,15 +22161,19 @@ class TradingBot:
                 phase_totals["historical_candle_backlog"] = 1.0
                 phase_totals["historical_replay"] = 1.0
                 phase_totals["replay_calibration_verdicts"] = 1.0
+                phase_totals["fixed_intersection_backlog"] = 1.0
+                phase_totals["fixed_intersection_simulation"] = 1.0
                 overall_progress = 1.0
                 phase_label = "Complete"
             else:
                 overall_progress = (
-                    phase_totals["live_data"] * 0.10
-                    + phase_totals["micro_backlog"] * 0.15
+                    phase_totals["live_data"] * 0.05
+                    + phase_totals["micro_backlog"] * 0.10
                     + phase_totals["historical_candle_backlog"] * 0.20
-                    + phase_totals["historical_replay"] * 0.35
-                    + phase_totals["replay_calibration_verdicts"] * 0.20
+                    + phase_totals["historical_replay"] * 0.15
+                    + phase_totals["fixed_intersection_backlog"] * 0.20
+                    + phase_totals["fixed_intersection_simulation"] * 0.20
+                    + phase_totals["replay_calibration_verdicts"] * 0.10
                 )
 
                 if overall_progress < 0.15:
@@ -22123,6 +22182,10 @@ class TradingBot:
                     phase_label = "Building historical candle backlogs"
                 elif phase_totals["historical_replay"] < 1.0:
                     phase_label = "Running historical replay across all products"
+                elif phase_totals["fixed_intersection_backlog"] < 1.0:
+                    phase_label = "Building fixed intersection candle backlogs"
+                elif phase_totals["fixed_intersection_simulation"] < 1.0:
+                    phase_label = "Running fixed intersection startup simulation"
                 elif phase_totals["replay_calibration_verdicts"] < 1.0:
                     phase_label = "Calculating replay-based product verdicts"
                 elif not full_viewer_unlocked:
@@ -26670,6 +26733,22 @@ class TradingBot:
                     )
 
                     candidates.append(c)
+
+                if bool(ENABLE_FIXED_INTERSECTION_ONLY_MODEL):
+                    timeframe_candidates = []
+                    for candidate in candidates:
+                        approved_timeframes = self._live_timeframes_for_product(str(candidate.get("product_id", "")))
+                        if not approved_timeframes:
+                            candidate["fixed_intersection_timeframe_allowed"] = False
+                            candidate["fixed_intersection_block_reason"] = "no_profitable_startup_timeframe"
+                            continue
+                        for fixed_timeframe in approved_timeframes:
+                            candidate_copy = dict(candidate)
+                            candidate_copy["fixed_intersection_timeframe"] = fixed_timeframe
+                            candidate_copy["timeframe"] = fixed_timeframe
+                            candidate_copy["fixed_intersection_timeframe_allowed"] = True
+                            timeframe_candidates.append(candidate_copy)
+                    candidates = self._best_fixed_timeframe_candidate_per_product(timeframe_candidates)
 
                 buy_ready_count = len(candidates)
 

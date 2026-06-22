@@ -107,6 +107,11 @@ RESEARCH_FILE_HEALTH_PATH = runtime_path("research_file_health.csv")
 RESEARCH_BACKFILL_PLAN_PATH = runtime_path("research_backfill_plan.csv")
 HIST_REPLAY_15M_90D_CSV_PATH = runtime_path("historical_replay_15m_90d.csv")
 HIST_REPLAY_1H_365D_CSV_PATH = runtime_path("historical_replay_1h_365d.csv")
+FIXED_INTERSECTION_TIMEFRAME_SIMULATION_PATH = runtime_path("fixed_intersection_timeframe_simulation.csv")
+FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_PATH = runtime_path("fixed_intersection_timeframe_live_gate.csv")
+FIXED_INTERSECTION_TRADE_LOG_PATH = runtime_path("fixed_intersection_trade_log.csv")
+FIXED_INTERSECTION_AGENT_SNAPSHOTS_PATH = runtime_path("fixed_intersection_agent_snapshots.csv")
+FIXED_INTERSECTION_PRODUCT_SUMMARY_PATH = runtime_path("fixed_intersection_product_summary.csv")
 
 def load_fast_calibration_build_status() -> dict:
     try:
@@ -2793,6 +2798,12 @@ def render_calibration_loading_screen(calc_status: dict, snapshot: dict) -> None
     if calc_status.get("viewer_runtime_completion_override"):
         st.success(str(calc_status.get("viewer_runtime_completion_reason", "")))
 
+    phase_progress = calc_status.get("phase_progress", {}) or {}
+    if "fixed_intersection_backlog" in phase_progress:
+        st.caption(f"Fixed intersection backlog candles: {float(phase_progress.get('fixed_intersection_backlog', 0.0)) * 100.0:.1f}%")
+    if "fixed_intersection_simulation" in phase_progress:
+        st.caption(f"Fixed intersection startup simulation: {float(phase_progress.get('fixed_intersection_simulation', 0.0)) * 100.0:.1f}%")
+
     product_status = calc_status.get("product_status", {}) or {}
     low_signal_done = [
         product_id
@@ -4047,6 +4058,47 @@ def render_continuous_research_panel(continuous_research_history_df, market_stat
         if cross_asset_sell_model_ratio_grid_df is not None and not cross_asset_sell_model_ratio_grid_df.empty:
             st.markdown("#### Cross-asset sell model ratio grid"); st.dataframe(cross_asset_sell_model_ratio_grid_df.tail(250), width="stretch", hide_index=True)
 
+
+def render_fixed_intersection_simulation_panel(
+    fixed_intersection_simulation_df,
+    fixed_intersection_live_gate_df,
+    fixed_intersection_trade_log_df,
+    fixed_intersection_product_summary_df,
+):
+    st.markdown("### Fixed Intersection Buy/Sell Model Simulation")
+    st.caption("Startup backlog simulation using the fixed 10-buy-agent and 10-sell-agent policy weights. Daily candles are not included.")
+    if fixed_intersection_live_gate_df is None or fixed_intersection_live_gate_df.empty:
+        st.info("Fixed intersection simulation has not produced live-gate rows yet.")
+        return
+    gate = fixed_intersection_live_gate_df.copy()
+    for col in ["trade_count", "win_rate", "avg_net_bps", "median_net_bps", "total_net_bps", "profit_factor", "trades_per_day"]:
+        if col in gate.columns:
+            gate[col] = pd.to_numeric(gate[col], errors="coerce").fillna(0.0)
+    gate["approved_bool"] = gate["approved_for_live"].astype(str).str.lower().isin({"true", "1", "yes", "y"})
+    cols = st.columns(5)
+    cols[0].metric("Approved product/timeframes", int(gate["approved_bool"].sum()))
+    cols[1].metric("Total simulated trades", int(gate["trade_count"].sum()))
+    cols[2].metric("Avg win rate", f"{float(gate['win_rate'].mean()) * 100.0:.1f}%")
+    cols[3].metric("Avg net bps", f"{float(gate['avg_net_bps'].mean()):.2f}")
+    cols[4].metric("Avg trades/day", f"{float(gate['trades_per_day'].mean()):.2f}")
+    fig = go.Figure()
+    fig.add_bar(x=gate["product_id"].astype(str) + " · " + gate["timeframe"].astype(str), y=gate["avg_net_bps"], name="Avg net bps", text=gate["approved_bool"].astype(str), hovertemplate="%{x}<br>Avg net=%{y:.2f} bps<br>Approved=%{text}<extra></extra>")
+    fig.add_hline(y=0.0)
+    st.plotly_chart(_quant_fig_layout(fig, "Fixed Model Profitability by Product + Timeframe", height=560), width="stretch")
+    fig2 = go.Figure()
+    fig2.add_bar(x=gate["product_id"].astype(str) + " · " + gate["timeframe"].astype(str), y=gate["trades_per_day"], name="Trades per day", hovertemplate="%{x}<br>Trades/day=%{y:.3f}<extra></extra>")
+    st.plotly_chart(_quant_fig_layout(fig2, "Fixed Model Trade Frequency by Product + Timeframe", height=520), width="stretch")
+    fig3 = go.Figure()
+    fig3.add_scatter(x=gate["win_rate"] * 100.0, y=gate["avg_net_bps"], mode="markers+text", text=gate["product_id"].astype(str) + " " + gate["timeframe"].astype(str), marker=dict(size=(gate["trade_count"].clip(lower=1.0) ** 0.5) + 7), hovertemplate="%{text}<br>Win rate=%{x:.1f}%<br>Avg net=%{y:.2f} bps<extra></extra>")
+    fig3.add_hline(y=0.0); fig3.update_xaxes(title="Win rate %"); fig3.update_yaxes(title="Avg net bps")
+    st.plotly_chart(_quant_fig_layout(fig3, "Fixed Model Edge Map — Win Rate vs Avg Profit", height=520), width="stretch")
+    if fixed_intersection_product_summary_df is not None and not fixed_intersection_product_summary_df.empty:
+        st.markdown("#### Product summary"); st.dataframe(fixed_intersection_product_summary_df, width="stretch", hide_index=True)
+    with st.expander("Fixed intersection simulation tables", expanded=False):
+        st.markdown("#### Live gate"); st.dataframe(gate, width="stretch", hide_index=True)
+        if fixed_intersection_trade_log_df is not None and not fixed_intersection_trade_log_df.empty:
+            st.markdown("#### Simulated trades"); st.dataframe(fixed_intersection_trade_log_df.tail(500), width="stretch", hide_index=True)
+
 def render_live_dashboard(selected, refresh_config):
     now_tick = int(time.time()); st.session_state["_viewer_live_tick"] = now_tick
     module_debug(MODULE_NAME, "viewer_live_tick", data={"tick": now_tick, "selected_coin": selected, "timeframe": st.session_state.get("chart_timeframe_label", "1D · 1m"), "interval_label": refresh_config.get("interval_label")}, level="DEBUG", also_overall=False)
@@ -4117,6 +4169,11 @@ def render_live_dashboard(selected, refresh_config):
     kalman_live_df = load_csv_tail(KALMAN_LIVE_STATE_PATH, max_lines=5000)
     quant_state_summary_df = load_csv_tail(QUANT_STATE_SUMMARY_PATH, max_lines=5000)
     startup_runtime_inventory_df = load_csv_tail(STARTUP_RUNTIME_INVENTORY_PATH, max_lines=500)
+    fixed_intersection_simulation_df = load_csv_tail(FIXED_INTERSECTION_TIMEFRAME_SIMULATION_PATH, max_lines=1000)
+    fixed_intersection_live_gate_df = load_csv_tail(FIXED_INTERSECTION_TIMEFRAME_LIVE_GATE_PATH, max_lines=1000)
+    fixed_intersection_trade_log_df = load_csv_tail(FIXED_INTERSECTION_TRADE_LOG_PATH, max_lines=50000)
+    fixed_intersection_agent_snapshots_df = load_csv_tail(FIXED_INTERSECTION_AGENT_SNAPSHOTS_PATH, max_lines=50000)
+    fixed_intersection_product_summary_df = load_csv_tail(FIXED_INTERSECTION_PRODUCT_SUMMARY_PATH, max_lines=1000)
     with st.container(): st.markdown('<section class="screen-section command-deck">', unsafe_allow_html=True); render_all_coin_landing_page(snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, refresh_config); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<div id="strategy-arena-anchor"></div>', unsafe_allow_html=True); scroll_to_strategy_arena_if_requested(); st.markdown('<section class="screen-section strategy-arena">', unsafe_allow_html=True); render_strategy_screen(selected, snapshot, market_df, decisions_df, council_votes_df, targets_df, trades_df, shadow_df, agent_side_ratings_df); st.markdown('</section>', unsafe_allow_html=True)
     with st.container(): st.markdown('<section class="screen-section deep-learning">', unsafe_allow_html=True); render_deep_learning_screen(selected, snapshot, market_df, decisions_df, council_votes_df, order_book_df, targets_df); st.markdown('</section>', unsafe_allow_html=True)
@@ -4132,6 +4189,8 @@ def render_live_dashboard(selected, refresh_config):
             fifth_pass_blockers_df,
             risk_monte_carlo_df,
         )
+    with st.expander("Fixed intersection model simulation", expanded=True):
+        render_fixed_intersection_simulation_panel(fixed_intersection_simulation_df, fixed_intersection_live_gate_df, fixed_intersection_trade_log_df, fixed_intersection_product_summary_df)
     with st.expander("Startup runtime inventory", expanded=False):
         render_startup_runtime_inventory_panel(startup_runtime_inventory_df)
 

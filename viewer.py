@@ -4099,6 +4099,12 @@ def render_fixed_intersection_simulation_panel(
     with st.expander("Fixed intersection simulation tables", expanded=False):
         st.markdown("#### Live gate"); st.dataframe(gate, width="stretch", hide_index=True)
         if fixed_intersection_trade_log_df is not None and not fixed_intersection_trade_log_df.empty:
+            if "entry_reversal_score" in fixed_intersection_trade_log_df.columns:
+                rev = pd.to_numeric(
+                    fixed_intersection_trade_log_df["entry_reversal_score"],
+                    errors="coerce",
+                ).fillna(0.0)
+                st.metric("Avg entry reversal score", f"{float(rev.mean()):.3f}")
             st.markdown("#### Simulated trades"); st.dataframe(fixed_intersection_trade_log_df.tail(500), width="stretch", hide_index=True)
 
 def render_live_dashboard(selected, refresh_config):
